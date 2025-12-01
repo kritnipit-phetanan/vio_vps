@@ -1,0 +1,106 @@
+# =============================================================================
+# VIO/VPS Project .gitignore
+# =============================================================================
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# =============================================================================
+# Project-specific ignores
+# =============================================================================
+
+# Large data files (GeoTIFF DEMs, videos, images)
+*.tif
+*.tiff
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.jpg
+*.jpeg
+*.png
+*.bmp
+
+# Dataset directories
+camera__image_mono/
+extracted_data/
+flight_record/
+
+# Output directories (benchmark results)
+benchmark_*/
+out_*/
+output_*/
+evaluation_results/
+
+# Log files
+*.log
+nohup.out
+
+# CSV data files (except configs)
+*.csv
+!config*.csv
+
+# Temporary/test outputs
+test_*.sh
+quick_*.py
+
+# Backup files
+*.bak
+*_backup*
+*_old*
+src_old/
+module_old/
+vio_backup_src/
+
+# HTML trajectory visualizations
+*.html
+
+# Generated plots/images
+*.png
+!docs/*.png
+
+# Calibration data (keep calibration scripts, ignore large data)
+mag_calibration_data.csv
+mag_calibration_final.csv
+
+# Model weights and large binaries
+*.pth
+*.onnx
+*.bin
+*.weights
+

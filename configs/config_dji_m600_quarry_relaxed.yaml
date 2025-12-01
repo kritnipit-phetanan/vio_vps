@@ -1,0 +1,138 @@
+camera:
+  image_height: 1080
+  image_width: 1440
+  k2: -0.079377
+  k3: 0.02228435
+  k4: -0.03852023
+  k5: 0.01346873
+  model: kannala_brandt
+  mu: 854.383024
+  mv: 853.285954
+  u0: 780.324522
+  v0: 520.690672
+default_camera_view: nadir
+extrinsics:
+  front:
+    name: BODY_T_CAMFRONT
+    transform:
+    - - -0.04200713
+      - -0.01166497
+      - 0.99904921
+      - 0.17666233
+    - - 0.99899047
+      - 0.01544242
+      - 0.04218496
+      - -0.05171531
+    - - -0.01591983
+      - 0.99981271
+      - 0.01100451
+      - -0.04656282
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
+  nadir:
+    name: BODY_T_CAMDOWN
+    transform:
+    - - 0.00235643
+      - 0.99997843
+      - -0.00613037
+      - -0.25805624
+    - - -0.99960218
+      - 0.00218315
+      - -0.02811962
+      - -0.01138283
+    - - -0.02810563
+      - 0.0061942
+      - 0.99958577
+      - 0.09243762
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
+  side:
+    name: BODY_T_CAMSIDE
+    transform:
+    - - 1.0
+      - 0.0
+      - 0.0
+      - 0.0
+    - - 0.0
+      - 0.0
+      - 1.0
+      - 0.2
+    - - 0.0
+      - 1.0
+      - 0.0
+      - -0.05
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
+imu:
+  acc_n: 0.08
+  acc_w: 0.001
+  g_norm: 9.803
+  gyr_n: 0.004
+  gyr_w: 0.0001
+  preintegration:
+    acc_n: 0.08
+    acc_w: 0.0001
+    gyr_n: 0.004
+    gyr_w: 2.0e-05
+magnetometer:
+  declination: -0.34
+  expected_field_strength: 79.8
+  hard_iron_offset:
+  - 0.071295
+  - 1.0027
+  - -7.844761
+  max_field_strength: 100.0
+  min_field_strength: 5.0
+  soft_iron_matrix:
+  - - 3.275489
+    - 0.082112
+    - -0.221314
+  - - 0.082112
+    - 4.173449
+    - -0.691909
+  - - -0.221314
+    - -0.691909
+    - 8.867694
+  update_rate_limit: 5
+process_noise:
+  sigma_accel: 0.8
+  sigma_agl_z: 2.5
+  sigma_mag_yaw: 0.5
+  sigma_vo_vel: 1.0
+  sigma_vps_xy: 1.0
+use_fisheye: true
+vio:
+  min_inliers: 10
+  min_msckf_baseline: 0.05
+  min_parallax_px: 1.0
+  msckf_chi2_multiplier: 6.0
+  msckf_max_reprojection_error: 5.0
+  ratio_test: 0.75
+  views:
+    front:
+      max_corners: 2000
+      min_parallax: 8
+      nadir_threshold_deg: 60.0
+      sigma_scale_xy: 0.8
+      sigma_scale_z: 1.5
+      use_vz_only: false
+    nadir:
+      max_corners: 1500
+      min_parallax: 3
+      nadir_threshold_deg: 30.0
+      sigma_scale_xy: 1.5
+      sigma_scale_z: 0.7
+      use_vz_only: true
+    side:
+      max_corners: 2000
+      min_parallax: 10
+      nadir_threshold_deg: 60.0
+      sigma_scale_xy: 1.0
+      sigma_scale_z: 1.2
+      use_vz_only: false

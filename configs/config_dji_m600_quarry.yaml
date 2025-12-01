@@ -1,0 +1,147 @@
+# ============================================================================
+# VIO Configuration: DJI M600 - Quarry Dataset
+# ============================================================================
+# Camera: Fisheye (Kannala-Brandt model)
+# IMU: DJI onboard IMU @ 400 Hz
+# Dataset: quarry flight with hover phase
+# ============================================================================
+
+# Camera Intrinsics (Kannala-Brandt Fisheye Model)
+camera:
+  model: "kannala_brandt"
+  image_width: 1440
+  image_height: 1080
+  
+  # Kannala-Brandt distortion parameters
+  k2: -0.07937700
+  k3:  0.02228435
+  k4: -0.03852023
+  k5:  0.01346873
+  
+  # Principal point and focal length
+  mu:  854.383024
+  mv:  853.285954
+  u0:  780.324522
+  v0:  520.690672
+
+# Camera-IMU Extrinsics (Body frame to Camera frame)
+# Convention: T_body_cam transforms points from camera frame to body frame
+extrinsics:
+  # Nadir camera (downward-facing)
+  nadir:
+    name: "BODY_T_CAMDOWN"
+    transform:
+      - [ 0.00235643,  0.99997843, -0.00613037, -0.25805624]
+      - [-0.99960218,  0.00218315, -0.02811962, -0.01138283]
+      - [-0.02810563,  0.00619420,  0.99958577,  0.09243762]
+      - [ 0.0,         0.0,         0.0,         1.0       ]
+  
+  # Front camera (forward-facing)
+  front:
+    name: "BODY_T_CAMFRONT"
+    transform:
+      - [-0.04200713, -0.01166497,  0.99904921,  0.17666233]
+      - [ 0.99899047,  0.01544242,  0.04218496, -0.05171531]
+      - [-0.01591983,  0.99981271,  0.01100451, -0.04656282]
+      - [ 0.0,         0.0,         0.0,         1.0       ]
+  
+  # Side camera (oblique)
+  side:
+    name: "BODY_T_CAMSIDE"
+    transform:
+      - [ 1.0,  0.0,  0.0,  0.0]
+      - [ 0.0,  0.0,  1.0,  0.2]
+      - [ 0.0,  1.0,  0.0, -0.05]
+      - [ 0.0,  0.0,  0.0,  1.0]
+
+# IMU Parameters (Noise characteristics)
+imu:
+  # Standard noise parameters
+  acc_n: 0.08      # Accelerometer noise density [m/s²/√Hz]
+  gyr_n: 0.004     # Gyroscope noise density [rad/s/√Hz]
+  acc_w: 0.001     # Accelerometer random walk [m/s³/√Hz]
+  gyr_w: 0.0001    # Gyroscope random walk [rad/s²/√Hz]
+  g_norm: 9.803    # Gravity magnitude [m/s²]
+  
+  # Preintegration-specific (more conservative)
+  preintegration:
+    acc_n: 0.08      # Accelerometer noise density
+    gyr_n: 0.004     # Gyroscope noise density
+    acc_w: 0.0001    # Accelerometer random walk (reduced)
+    gyr_w: 0.00002   # Gyroscope random walk (reduced)
+
+# Magnetometer Calibration
+magnetometer:
+  # Hard-iron offset [µT]
+  hard_iron_offset: [0.071295, 1.002700, -7.844761]
+  
+  # Soft-iron matrix
+  soft_iron_matrix:
+    - [3.275489, 0.082112, -0.221314]
+    - [0.082112, 4.173449, -0.691909]
+    - [-0.221314, -0.691909, 8.867694]
+  
+  # Magnetic declination [radians]
+  declination: -0.340  # -19.5° for Newfoundland
+  
+  # Field strength bounds [µT]
+  expected_field_strength: 79.8
+  min_field_strength: 5.0
+  max_field_strength: 100.0
+  
+  # Update rate limiting
+  update_rate_limit: 5  # Apply update every N samples
+
+# EKF Process Noise
+process_noise:
+  sigma_accel: 0.8           # Process acceleration magnitude [m/s²]
+  sigma_vo_vel: 2.0          # VO velocity measurement [m/s]
+  sigma_vps_xy: 1.0          # VPS position measurement [m]
+  sigma_agl_z: 2.5           # AGL height measurement [m]
+  sigma_mag_yaw: 0.5         # Magnetometer yaw measurement [rad]
+
+# VIO/VO Parameters
+vio:
+  # Parallax thresholds
+  min_parallax_px: 2.0       # Minimum optical flow for VIO updates [pixels]
+  min_msckf_baseline: 0.15   # Minimum baseline for MSCKF triangulation [m]
+  
+  # MSCKF parameters
+  msckf_chi2_multiplier: 4.0        # Chi-square threshold multiplier
+  msckf_max_reprojection_error: 3.0 # Max reprojection error [pixels]
+  
+  # Feature tracking
+  min_inliers: 15            # Minimum RANSAC inliers
+  ratio_test: 0.75           # Lowe's ratio test threshold
+  
+  # Camera view configurations
+  views:
+    nadir:
+      nadir_threshold_deg: 30.0    # Nadir alignment threshold
+      sigma_scale_xy: 1.5          # XY uncertainty scale
+      sigma_scale_z: 0.7           # Z uncertainty scale
+      use_vz_only: true            # Use only VZ for nadir
+      min_parallax: 3              # Min parallax for MSCKF [pixels]
+      max_corners: 1500            # Max features to track
+    
+    front:
+      nadir_threshold_deg: 60.0
+      sigma_scale_xy: 0.8
+      sigma_scale_z: 1.5
+      use_vz_only: false
+      min_parallax: 8
+      max_corners: 2000
+    
+    side:
+      nadir_threshold_deg: 60.0
+      sigma_scale_xy: 1.0
+      sigma_scale_z: 1.2
+      use_vz_only: false
+      min_parallax: 10
+      max_corners: 2000
+
+# Default camera view (nadir/front/side)
+default_camera_view: "nadir"
+
+# Use fisheye undistortion backend
+use_fisheye: true

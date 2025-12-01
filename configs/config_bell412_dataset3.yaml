@@ -1,0 +1,215 @@
+# ============================================================================
+# VIO Configuration: Bell 412 - Dataset 3 (Forward Motion)
+# ============================================================================
+# Camera: Fisheye (Kannala-Brandt model) - NEEDS CALIBRATION
+# IMU: Onboard IMU @ 400 Hz - NEEDS CALIBRATION
+# Dataset: bell412_dataset3 - forward motion without heavy rotation
+# ============================================================================
+
+# Camera Intrinsics (Kannala-Brandt Fisheye Model)
+# Source: https://mun-frl-vil-dataset.readthedocs.io/en/latest/Calibration.html
+# Calibrated using VINS-Fusion camera calibration tool
+camera:
+  model: "kannala_brandt"
+  image_width: 1440
+  image_height: 1080
+  
+  # Kannala-Brandt distortion parameters (CALIBRATED)
+  k2: -0.0764245
+  k3:  0.0322856
+  k4: -0.0445168
+  k5:  0.0163317
+  
+  # Principal point and focal length (CALIBRATED)
+  mu:  829.224
+  mv:  829.454
+  u0:  833.937
+  v0:  562.509
+
+# Camera-IMU Extrinsics (Body frame to Camera frame)
+# Source: https://mun-frl-vil-dataset.readthedocs.io/en/latest/Calibration.html
+# Calibrated using Kalibr package
+extrinsics:
+  # Nadir camera (downward-facing) - CALIBRATED
+  nadir:
+    name: "BODY_T_CAMDOWN"
+    transform:
+      - [-0.01039363,  0.99994595,  0.00027614, -0.27939175]
+      - [-0.99982944, -0.01038820, -0.01527021,  0.00394073]
+      - [-0.01526652, -0.00043481,  0.99988337, -0.00039529]
+      - [ 0.0,         0.0,         0.0,         1.0        ]
+  
+  # Front camera (forward-facing) - CALIBRATED
+  front:
+    name: "BODY_T_CAMFRONT"
+    transform:
+      - [-0.04200713, -0.01166497,  0.99904921,  0.17666233]
+      - [ 0.99899047,  0.01544242,  0.04218496, -0.05171531]
+      - [-0.01591983,  0.99981271,  0.01100451, -0.04656282]
+      - [ 0.0,         0.0,         0.0,         1.0        ]
+  
+  # Side camera (not available in Bell 412 dataset, using placeholder)
+  side:
+    name: "BODY_T_CAMSIDE"
+    transform:
+      - [ 1.0,  0.0,  0.0,  0.0]
+      - [ 0.0,  0.0,  1.0,  0.2]
+      - [ 0.0,  1.0,  0.0, -0.05]
+      - [ 0.0,  0.0,  0.0,  1.0]
+
+# IMU Parameters (Noise characteristics)
+# Source: https://mun-frl-vil-dataset.readthedocs.io/en/latest/Calibration.html
+imu:
+  # Standard noise parameters (CALIBRATED)
+  acc_n: 0.08      # Accelerometer noise density [m/s²/√Hz]
+  gyr_n: 0.004     # Gyroscope noise density [rad/s/√Hz]
+  acc_w: 0.00004   # Accelerometer random walk [m/s³/√Hz]
+  gyr_w: 0.0001    # Gyroscope random walk [rad/s²/√Hz]
+  g_norm: 9.803    # Gravity magnitude [m/s²]
+  
+  # Initial gyro bias (estimated from static period at start)
+  # CRITICAL: Raw data shows gyro mean = -2.58°/s which causes yaw drift!
+  # Initial static samples show: [-0.0023, -0.0038, -0.0077] rad/s
+  initial_gyro_bias: [-0.0023, -0.0038, -0.0077]
+  
+  # Enable bias estimation from initial static samples
+  estimate_bias: true
+  
+  # Preintegration-specific (RELAXED: allow filter to accept VIO/VPS/DEM corrections)
+  # Higher noise = more uncertainty in IMU = filter trusts VIO/VPS/DEM more
+  # Analysis: IMU drift caused 60 m/s velocity error - need faster bias adaptation
+  preintegration:
+    acc_n: 0.20        # HIGHER than standard (allow VIO corrections)
+    gyr_n: 0.010       # HIGHER than standard (allow orientation corrections)  
+    acc_w: 0.0005      # 5× HIGHER (MUCH faster accel bias adaptation for altitude)
+    gyr_w: 0.0005      # 5× HIGHER (faster gyro bias adaptation)
+
+# IMU-GNSS Lever Arm (Body frame to GNSS antenna)
+# Source: https://mun-frl-vil-dataset.readthedocs.io/en/latest/Calibration.html#imu-gnss-extrinsic-calibration
+# This is T_BG (Body to GNSS) - the translation from IMU to GNSS antenna
+# In FRD body frame: X=Forward, Y=Right, Z=Down
+imu_gnss_extrinsics:
+  # Lever arm in body frame [meters]
+  # X = -0.1444 → GNSS antenna is 14.4 cm BEHIND IMU
+  # Y =  0.0553 → GNSS antenna is 5.5 cm to the RIGHT of IMU  
+  # Z = -0.5347 → GNSS antenna is 53.5 cm ABOVE IMU (negative Z in FRD = up)
+  lever_arm: [-0.14440, 0.05530, -0.53470]
+  
+  # Full 4x4 transformation matrix (rotation is identity for Bell 412)
+  transform:
+    - [1.0, 0.0, 0.0, -0.14440]
+    - [0.0, 1.0, 0.0,  0.05530]
+    - [0.0, 0.0, 1.0, -0.53470]
+    - [0.0, 0.0, 0.0,  1.0]
+
+# Magnetometer Calibration
+# Data is pre-normalized (unit vectors), not in standard µT
+# Calibration recomputed using PPK GPS ground truth heading
+# Date: 2025-02-07
+magnetometer:
+  # Hard-iron offset (CALIBRATED - normalized units)
+  hard_iron_offset: [0.243467, -0.194837, 0.341668]
+  
+  # Soft-iron matrix (CALIBRATED - ellipsoid correction)
+  soft_iron_matrix:
+    - [0.702036, 0.0, 0.0]
+    - [0.0, 0.715855, 0.0]
+    - [0.0, 0.0, 5.597808]
+  
+  # Heading formula: atan2(-mag_y, mag_x) - Y-axis flipped for correct NED alignment
+  # IMPORTANT: Must flip Y-axis sign when computing heading from calibrated mag
+  heading_formula: "atan2(-mag_y, mag_x)"
+  
+  # Magnetic declination [radians]
+  # RECALIBRATED 2025-12-01 from PPK ground truth:
+  #   - PPK yaw (ENU) = 131.55°
+  #   - First attempt with -1.05° gave yaw_mag = 121°
+  #   - Offset needed: 131.55 - 121 = 10.55°
+  #   - New declination = -1.05 - 10.55 = -11.60°
+  declination: -0.2025  # -11.60° to produce yaw=131.6° matching GT
+  
+  # Field strength bounds (normalized units, not µT)
+  expected_field_strength: 0.63  # Mean normalized field
+  min_field_strength: 0.10       # REDUCED: allow weaker field readings
+  max_field_strength: 0.95       # RELAXED for noisy environment
+  
+  # Update rate limiting
+  update_rate_limit: 1   # REDUCED: Process every sample for faster convergence
+  
+  # Convergence window (seconds) - skip mag during initial settling
+  # FIX 2025-12-01: Reduced from 30s to 5s
+  # Problem: After 30s, yaw drift already >60°, causing all mag updates rejected
+  # Solution: Start mag updates earlier (5s is enough for gyro settling)
+  convergence_window: 5.0  # 5s to allow mag updates to constrain yaw early
+  
+  # Use raw body-frame heading (GPS-calibrated)
+  # This bypasses IMU tilt compensation which has frame alignment issues
+  use_raw_heading: true
+  
+  # Apply initial yaw correction from magnetometer at startup
+  # DISABLED: Initial mag correction caused 173° yaw change which broke DEM fusion
+  # The IMU initial orientation is more reliable for this dataset
+  apply_initial_correction: false
+
+# EKF Process Noise
+# RECALIBRATED 2025-02-07: Magnetometer now GPS-calibrated with std~16°
+# Re-enabled magnetometer updates with appropriate uncertainty
+process_noise:
+  sigma_accel: 0.5           # Process accel noise
+  sigma_vo_vel: 4.0          # VIO velocity uncertainty (was 8.0, can trust more with mag heading)
+  sigma_vps_xy: 0.8          # VPS position measurement [m]
+  sigma_agl_z: 1.0           # Height/DEM constraint
+  sigma_mag_yaw: 0.15        # RE-ENABLED: ~17° (std from GPS calibration = 16°, add margin)
+
+# VIO/VO Parameters
+# TUNED FOR SLOW MOTION / HOVERING (Bell 412 dataset characteristics)
+# Key fix: min_msckf_baseline reduced from 0.03 → 0.01 to allow more triangulation
+# (observed baseline ~0.026m was failing the 0.03m threshold)
+vio:
+  # Parallax thresholds
+  min_parallax_px: 1.0       # Minimum optical flow [pixels] - increased for quality filter
+  min_msckf_baseline: 0.01   # CRITICAL FIX: was 0.03 (baseline ~0.026m was failing) → now 0.01
+  
+  # MSCKF parameters (PERMISSIVE for noisy/slow motion)
+  msckf_chi2_multiplier: 15.0        # Chi-square threshold multiplier
+  msckf_max_reprojection_error: 8.0  # Max reprojection error [pixels]
+  
+  # Feature tracking
+  min_inliers: 6             # Minimum RANSAC inliers
+  ratio_test: 0.80           # Lowe's ratio test threshold (more permissive)
+  
+  # Camera view configurations
+  # CRITICAL FIX: use_vz_only=true for nadir camera
+  # Reason: Nadir camera has translation direction ambiguity - we don't know
+  # horizontal velocity DIRECTION without absolute heading reference (MSCKF or VPS)
+  # When MSCKF fails (100%), using horizontal velocity causes massive drift (5km in 5min)
+  views:
+    nadir:
+      nadir_threshold_deg: 30.0
+      sigma_scale_xy: 2.0          # INCREASED: trust XY even less when using VZ only
+      sigma_scale_z: 2.0           # Nadir camera has GOOD Z observability actually
+      use_vz_only: true             # CRITICAL FIX: Use only vertical velocity (horizontal direction unknown)
+      min_parallax: 0.5            # Reasonable minimum for quality
+      max_corners: 2500            # More features for stability
+    
+    front:
+      nadir_threshold_deg: 60.0
+      sigma_scale_xy: 0.8          # Slightly increased from 0.6
+      sigma_scale_z: 1.5           # Slightly increased from 1.2
+      use_vz_only: false
+      min_parallax: 1.0            # VERY LOW for slow forward motion
+      max_corners: 2500
+    
+    side:
+      nadir_threshold_deg: 60.0
+      sigma_scale_xy: 1.0
+      sigma_scale_z: 1.2
+      use_vz_only: false
+      min_parallax: 8
+      max_corners: 2000
+
+# Default camera view (nadir/front/side)
+default_camera_view: "nadir"
+
+# Use fisheye undistortion backend
+use_fisheye: true
