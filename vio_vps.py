@@ -6588,6 +6588,17 @@ def run(
     t0 = imu[0].t
     last_t = t0
 
+    # =====================================================
+    # FLIGHT PHASE DETECTION
+    # Phase 0: Rotor spin-up (0-15s) - high vibration, don't trust IMU heading
+    # Phase 1: Early flight (15-60s) - stabilizing, gradually trust mag more
+    # Phase 2: Normal flight (>60s) - full trust in mag corrections
+    # =====================================================
+    PHASE_SPINUP_END = 15.0      # seconds - rotor spin-up period
+    PHASE_EARLY_FLIGHT_END = 60.0  # seconds - early flight period
+    current_flight_phase = 0
+    flight_phase_names = ["SPINUP", "EARLY", "NORMAL"]
+
     # GRAVITY VECTOR convention:
     # - Stationary IMU after rotation to world: a_world ≈ [0, 0, +9.8] (specific force)
     # - To get motion acceleration: a_motion = a_world - expected_stationary
@@ -7136,9 +7147,21 @@ def run(
             # Extract current yaw from state
             yaw_state = quaternion_to_yaw(q_state)
             
-            # Compute yaw innovation (unwrap to [-π, π])
+            # =====================================================
+            # YAW WRAP-AROUND HANDLING
+            # When yaw approaches ±180°, naive subtraction can give
+            # wrong sign. Use atan2 to properly wrap to [-π, π].
+            # Also detect and log wrap-around events.
+            # =====================================================
             yaw_innov = yaw_mag - yaw_state
             yaw_innov = np.arctan2(np.sin(yaw_innov), np.cos(yaw_innov))
+            
+            # Detect wrap-around: if state and mag are on opposite sides of ±180°
+            near_wrap = abs(yaw_state) > np.radians(160.0) or abs(yaw_mag) > np.radians(160.0)
+            wrapped = near_wrap and (np.sign(yaw_state) != np.sign(yaw_mag))
+            
+            if wrapped and i % 50 == 0:
+                print(f"[MAG] WRAP-AROUND: yaw_state={np.degrees(yaw_state):.1f}°, yaw_mag={np.degrees(yaw_mag):.1f}°, innov={np.degrees(yaw_innov):.1f}°")
             
             # ==========================================
             # INITIAL CONVERGENCE PERIOD
@@ -7254,18 +7277,21 @@ def run(
                 # During first 15 seconds (rotor spin-up), yaw drifts rapidly
                 # due to vibration. After that, normal flight begins.
                 # 
-                # Strategy:
-                # - t < 15s: K_MIN = 0.40 (trust MAG during spin-up)
-                # - t >= 15s: K_MIN = 0.20 (normal flight)
-                # 
-                # NOTE: Removed gyro-based logic because helicopter rotor
-                # vibration keeps gyro_mag high (~10 rad/s) even in normal
-                # flight, which isn't an indicator of yaw drift.
                 # =====================================================
-                if time_elapsed < 15.0:
-                    K_MIN = 0.40  # Rotor spin-up period
+                # PHASE-BASED KALMAN GAIN TUNING
+                # v6-style: 2 phases only (simpler, worked better)
+                # Phase 0 (spin-up): K_MIN=0.40, MAX_CORRECTION=30°
+                # Phase 1 (normal):  K_MIN=0.20, MAX_CORRECTION=15°
+                # =====================================================
+                if time_elapsed < 15.0:  # PHASE_SPINUP_END
+                    current_flight_phase = 0
+                    K_MIN = 0.40
+                    MAX_YAW_CORRECTION = np.radians(30.0)
                 else:
-                    K_MIN = 0.20  # Normal flight
+                    current_flight_phase = 1  # Normal flight
+                    K_MIN = 0.20
+                    MAX_YAW_CORRECTION = np.radians(15.0)
+                
                 if K_yaw < K_MIN:
                     # Inflate P to achieve target K
                     # K = P / (P + R) → P_new = K_min * R / (1 - K_min)
@@ -7279,17 +7305,11 @@ def run(
                 expected_correction = K_yaw * yaw_innov
                 
                 # =====================================================
-                # CRITICAL: Limit maximum yaw correction per update!
+                # LIMIT MAXIMUM YAW CORRECTION
                 # Large corrections can destabilize attitude matrix and
                 # cause velocity projection errors → altitude drift
-                # 
-                # FIX 2025-12-01f: TIME-BASED MAX for rotor spin-up!
-                # During first 15 seconds, allow larger corrections.
+                # MAX_YAW_CORRECTION is set by flight phase above
                 # =====================================================
-                if time_elapsed < 15.0:
-                    MAX_YAW_CORRECTION = np.radians(30.0)  # Spin-up period
-                else:
-                    MAX_YAW_CORRECTION = np.radians(15.0)  # Normal flight
                 if abs(expected_correction) > MAX_YAW_CORRECTION:
                     # Inflate measurement noise to limit correction magnitude
                     # K_new * innov = MAX_CORRECTION → K_new = MAX_CORRECTION / innov
@@ -7337,10 +7357,30 @@ def run(
                 # if kf.P[theta_cov_idx, theta_cov_idx] < MIN_P_YAW:
                 #     kf.P[theta_cov_idx, theta_cov_idx] = MIN_P_YAW
                 
+                # =====================================================
+                # GYRO BIAS Z ESTIMATION FROM MAGNETOMETER
+                # DISABLED 2025-12-01: Causing instability!
+                # Problem: Large yaw innovations (e.g., ±180° wrap-around)
+                # divided by small dt creates unrealistic drift estimates
+                # that corrupt the gyro bias state.
+                # 
+                # The Kalman filter already handles bias estimation through
+                # the P(yaw,bg) cross-covariance. Explicit update is not
+                # needed and causes harm.
+                # =====================================================
+                # DISABLED: See above
+                # if mag_update_count > 1 and hasattr(kf, 'last_mag_time'):
+                #     dt_since_mag = t - kf.last_mag_time
+                #     if dt_since_mag > 0.1:  # At least 100ms between updates
+                #         bg_z_estimate = yaw_innov / dt_since_mag
+                #         ...
+                
+                kf.last_mag_time = t  # Save time for potential future use
+                
                 # Log Kalman gain periodically (every 50 updates)
                 if mag_update_count % 50 == 1 or mag_update_count <= 10:
-                    mode = "SPINUP" if time_elapsed < 15.0 else "NORMAL"
-                    print(f"[MAG] K={K_yaw:.3f} | P_yaw={np.degrees(np.sqrt(P_yaw)):.1f}° | R={np.degrees(sigma_yaw_scaled):.1f}° | correction={np.degrees(expected_correction):.1f}° | t={time_elapsed:.1f}s [{mode}]")
+                    phase_name = "SPINUP" if current_flight_phase == 0 else "NORMAL"
+                    print(f"[MAG] K={K_yaw:.3f} | P_yaw={np.degrees(np.sqrt(P_yaw)):.1f}° | R={np.degrees(sigma_yaw_scaled):.1f}° | correction={np.degrees(expected_correction):.1f}° | t={time_elapsed:.1f}s [{phase_name}]")
                 
                 # Log residual for debugging
                 if save_debug_data and residual_csv:
