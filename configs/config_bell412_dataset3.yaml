@@ -137,10 +137,11 @@ magnetometer:
   update_rate_limit: 1   # REDUCED: Process every sample for faster convergence
   
   # Convergence window (seconds) - skip mag during initial settling
-  # FIX 2025-12-01: Reduced from 30s to 5s
-  # Problem: After 30s, yaw drift already >60°, causing all mag updates rejected
-  # Solution: Start mag updates earlier (5s is enough for gyro settling)
-  convergence_window: 5.0  # 5s to allow mag updates to constrain yaw early
+  # FIX 2025-12-01b: Reduced from 5s to 0s - START IMMEDIATELY!
+  # Problem: Even 5s delay causes 19.8° initial yaw error (gyro bias ~4°/s)
+  # Solution: Start mag updates immediately to prevent any gyro-only drift
+  # Note: PPK initial yaw is accurate, but VIO gyro integration drifts fast
+  convergence_window: 0.0  # 0s = start mag updates immediately
   
   # Use raw body-frame heading (GPS-calibrated)
   # This bypasses IMU tilt compensation which has frame alignment issues

@@ -21,7 +21,7 @@ fi
 
 # Common arguments WITHOUT VPS
 COMMON_ARGS="
-    --config config_bell412_dataset3.yaml
+    --config configs/config_bell412_dataset3.yaml
     --imu /mnt/External_Storage/CV_team/vio_dataset/bell412_dataset3/extracted_data/imu_data/imu__data/imu.csv
     --quarry /mnt/External_Storage/CV_team/vio_dataset/bell412_dataset3/flight_log_from_gga.csv
     --images_dir /mnt/External_Storage/CV_team/vio_dataset/bell412_dataset3/extracted_data/cam_data/camera__image_mono/images

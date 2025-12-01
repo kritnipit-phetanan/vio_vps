@@ -20,6 +20,7 @@ from copy import deepcopy
 from math import log, exp, sqrt
 from numpy import dot, zeros, eye
 import scipy.linalg as linalg
+from pyproj import CRS, Transformer
 
 
 KB_PARAMS = {
@@ -314,8 +315,6 @@ class IMUPreintegration:
         w_hat = w_meas - self.bg_lin
         a_hat = a_meas - self.ba_lin
         
-        # Forster et al. TRO 2017, Eq. 5: a_k = a_meas_k - b_a + R_WB @ g_world
-        # In body frame: a_body = a_meas - b_a + g_body
         g_body = np.array([0.0, 0.0, IMU_PARAMS["g_norm"]], dtype=float)  # [0, 0, +9.8]
         a_hat = a_hat + g_body  # Add gravity to get true acceleration
         
@@ -390,11 +389,6 @@ class IMUPreintegration:
         B[3:6, 3:6] = self.delta_R * dt  # Velocity noise from accel
         B[6:9, 3:6] = 0.5 * self.delta_R * (dt ** 2)  # Position noise from accel
         
-        # Noise covariance Q (6x6: gyro + accel)
-        # CRITICAL FIX: Multiply by dt to convert continuous-time spectral density
-        # to discrete-time covariance (Forster TRO 2017, Eq. 47)
-        # sigma_g, sigma_a are continuous-time noise densities (rad/s/√Hz, m/s²/√Hz)
-        # Without dt: covariance is 400x too large (1/0.0025 = 400 for 400Hz IMU)
         Q = np.diag([
             self.sigma_g**2 * dt, self.sigma_g**2 * dt, self.sigma_g**2 * dt,
             self.sigma_a**2 * dt, self.sigma_a**2 * dt, self.sigma_a**2 * dt
@@ -884,6 +878,92 @@ class MagRecord:
     t: float
     mag: np.ndarray
 
+@dataclass
+class VPSItem:
+    """VPS (Visual Positioning System) measurement."""
+    t: float
+    lat: float
+    lon: float
+
+# ===============================
+# DEM Reader for Height Constraint
+# ===============================
+try:
+    import rasterio
+    from pyproj import CRS, Transformer
+    RASTERIO_AVAILABLE = True
+except ImportError:
+    RASTERIO_AVAILABLE = False
+    print("[WARNING] rasterio not available - DEM support disabled")
+
+
+@dataclass
+class DEMReader:
+    """Read Digital Elevation Model (DEM) from GeoTIFF."""
+    ds: object 
+    to_raster: object 
+
+    @classmethod
+    def open(cls, path: Optional[str]) -> 'DEMReader':
+        """Open DEM file and create coordinate transformer."""
+        if not RASTERIO_AVAILABLE:
+            return cls(None, None)
+        if not path or not os.path.exists(path):
+            print(f"[DEM] No DEM file found at: {path}")
+            return cls(None, None)
+        try:
+            ds = rasterio.open(path)
+            to_raster = Transformer.from_crs("EPSG:4326", ds.crs, always_xy=True)
+            print(f"[DEM] Loaded DEM: {path}")
+            print(f"[DEM] CRS: {ds.crs}, Bounds: {ds.bounds}")
+            return cls(ds, to_raster)
+        except Exception as e:
+            print(f"[DEM] Failed to open DEM: {e}")
+            return cls(None, None)
+
+    def sample_m(self, lat: float, lon: float) -> Optional[float]:
+        """Sample elevation at lat/lon in meters."""
+        if self.ds is None:
+            return None
+        import math
+        x, y = self.to_raster.transform(lon, lat)
+        nodata = self.ds.nodatavals[0]
+        try:
+            for v in self.ds.sample([(x, y)]):
+                h = float(v[0])
+                if (h is not None) and (h != nodata) and math.isfinite(h):
+                    return h
+                return None
+        except Exception:
+            return None
+
+
+def load_flight_log_df(path: str) -> Optional[pd.DataFrame]:
+    """Load flight log for MSL interpolation.
+    
+    Returns DataFrame with stamp_log and altitude_MSL_m columns.
+    """
+    if not os.path.exists(path):
+        return None
+    try:
+        df = pd.read_csv(path)
+        # Find timestamp column
+        stamp_col = next((c for c in df.columns if "stamp" in c.lower()), None)
+        # Find MSL column
+        msl_col = next((c for c in df.columns if "altitude_msl_m" in c.lower() or "altitude_above_sealevel" in c.lower()), None)
+        
+        if stamp_col is None or msl_col is None:
+            print(f"[FlightLog] Missing required columns (stamp/MSL). Found: {list(df.columns)}")
+            return None
+        
+        # Rename columns for consistency
+        df = df.rename(columns={stamp_col: 'stamp_log', msl_col: 'altitude_MSL_m'})
+        print(f"[FlightLog] Loaded {len(df)} records for MSL interpolation")
+        return df[['stamp_log', 'altitude_MSL_m']]
+    except Exception as e:
+        print(f"[FlightLog] Failed to load: {e}")
+        return None
+
 
 def load_imu_csv(path: str) -> List[IMURecord]:
     if not os.path.exists(path):
@@ -956,13 +1036,45 @@ def load_images(images_dir: Optional[str], index_csv: Optional[str]) -> List[Ima
         print(f"[Images] Missing examples (first 3): {examples_missing}")
     return items
 
-    fx = kb["mu"] * sx
-    fy = kb["mv"] * sy
-    cx = kb["u0"] * sx
-    cy = kb["v0"] * sy
-    K = np.array([[fx, 0,  cx], [0,  fy, cy], [0, 0, 1.0]], dtype=np.float64)
-    D = np.array([kb["k2"], kb["k3"], kb["k4"], kb["k5"]], dtype=np.float64)
-    return K, D
+
+def load_vps_csv(path: Optional[str]) -> List[VPSItem]:
+    """Load VPS (Visual Positioning System) data from CSV.
+    
+    Expected format: stamp_log,lat,lon
+    Or alternative headers: time/timestamp, latitude, longitude
+    """
+    if not path or not os.path.exists(path):
+        return []
+    items: List[VPSItem] = []
+    # Try flexible readers: either csv header or simple lines "Ts,lat,lon"
+    try:
+        df = pd.read_csv(path)
+        tcol = next((c for c in df.columns if c.lower().startswith("t") or "stamp" in c.lower()), None)
+        latcol = next((c for c in df.columns if c.lower().startswith("lat")), None)
+        loncol = next((c for c in df.columns if c.lower().startswith("lon")), None)
+        if tcol and latcol and loncol:
+            for _, r in df.iterrows():
+                items.append(VPSItem(float(r[tcol]), float(r[latcol]), float(r[loncol])))
+            items.sort(key=lambda x: x.t)
+            print(f"[VPS] Loaded {len(items)} VPS records from {path}")
+            return items
+    except Exception:
+        pass
+    # raw text fallback
+    with open(path, "r") as f:
+        for line in f:
+            p = [x.strip() for x in line.strip().split(",")]
+            if len(p) < 3:  
+                continue
+            t_str = p[0].replace("s", "")
+            try:
+                items.append(VPSItem(float(t_str), float(p[1]), float(p[2])))
+            except Exception:
+                continue
+    items.sort(key=lambda x: x.t)
+    if len(items) > 0:
+        print(f"[VPS] Loaded {len(items)} VPS records from {path}")
+    return items
 
 
 def make_KD_for_size(kb: dict, dst_w: int, dst_h: int) -> Tuple[np.ndarray, np.ndarray]:
@@ -1827,6 +1939,8 @@ def compute_trajectory_errors_against_gt(
 
 def run(imu_path, quarry_path, output_dir,
         images_dir=None, images_index_csv=None,
+        vps_csv=None,
+        dem_path=None,
         downscale_size=(1440, 1080),
         camera_view="nadir"):
     import os
@@ -1853,6 +1967,25 @@ def run(imu_path, quarry_path, output_dir,
     
     imgs = load_images(images_dir, images_index_csv) if images_dir else []
     print(f"[Images] Loaded {len(imgs)} images")
+    
+    # Load VPS data
+    vps_list = load_vps_csv(vps_csv) if vps_csv else []
+    if len(vps_list) > 0:
+        print(f"[VPS] VPS time range: {vps_list[0].t:.3f} - {vps_list[-1].t:.3f}")
+    
+    # Load DEM for height constraint
+    dem = DEMReader.open(dem_path)
+    has_dem = dem.ds is not None
+    
+    # Load flight log for MSL interpolation
+    flight_log_df = load_flight_log_df(quarry_path)
+    has_flight_log = flight_log_df is not None
+    
+    # Height update tracking
+    last_valid_dem = None
+    last_height = msl0_m
+    last_absolute_correction_time_height = 0.0
+    height_update_count = 0
     
     vio_fe = None
     if len(imgs) > 0:
@@ -1890,11 +2023,14 @@ def run(imu_path, quarry_path, output_dir,
     print("\n=== Processing ===")
     t0 = imu[0].t
     img_idx = 0
+    vps_idx = 0
     vio_frame = -1
     zupt_count = 0
     zupt_applied = 0
+    vps_update_count = 0
     imu_window = []
     last_preint_time = t0
+    last_absolute_correction_time = t0  # For VPS adaptive uncertainty
     
     for i, imu_rec in enumerate(imu):
         t = imu_rec.t
@@ -1929,11 +2065,11 @@ def run(imu_path, quarry_path, output_dir,
                 q_new = quat_multiply(q, delta_q)
                 kf.x[6:10, 0] = quat_normalize(q_new)
                 
+                # R_old transforms body frame to world frame
                 R_old = quat_to_rot(q)
-                g_world = np.array([0.0, 0.0, -IMU_PARAMS['g_norm']])
-                kf.x[3:6, 0] = v + R_old @ delta_v + g_world * preint.dt_sum
                 
-                kf.x[0:3, 0] = p + v * preint.dt_sum + R_old @ delta_p + 0.5 * g_world * (preint.dt_sum ** 2)
+                kf.x[3:6, 0] = v + R_old @ delta_v
+                kf.x[0:3, 0] = p + v * preint.dt_sum + R_old @ delta_p
                 
                 Phi_err = compute_error_state_jacobian(q, a_corr, w_corr, preint.dt_sum, R_bw)
                 Q_err = compute_error_state_process_noise(preint.dt_sum, False, t, t0)
@@ -2132,6 +2268,291 @@ def run(imu_path, quarry_path, output_dir,
             
             img_idx += 1
         
+        # -------------- Optional VPS update (XY) with adaptive uncertainty --------------
+        while vps_idx < len(vps_list) and vps_list[vps_idx].t <= t:
+            vps = vps_list[vps_idx]
+            vps_idx += 1
+            vps_xy = latlon_to_xy(vps.lat, vps.lon, lat0, lon0)
+            
+            # ESKF: VPS Jacobian maps to error state (15 + 6*clones)
+            num_clones = (kf.x.shape[0] - 16) // 7
+            err_dim_vps = 15 + 6 * num_clones
+            h_xy = np.zeros((2, err_dim_vps), dtype=float)
+            h_xy[0, 0] = 1.0  # Measure position error δp_x
+            h_xy[1, 1] = 1.0  # Measure position error δp_y
+
+            def h_vps_fun(x, h=h_xy):
+                return h
+
+            def hx_vps_fun(x, h=h_xy):
+                # x is nominal state, measurement is position (2D)
+                return x[0:2].reshape(2, 1)
+
+            # Adaptive uncertainty based on speed
+            speed_xy = float(math.hypot(kf.x[3,0], kf.x[4,0]))
+            scale = 1.0 + max(0.0, (speed_xy-10.0)/10.0) if speed_xy > 10 else 1.0
+            r_mat_vps = np.diag([(SIGMA_VPS_XY**2)*scale, (SIGMA_VPS_XY**2)*scale])
+
+            # Innovation gating
+            s_mat_vps = h_xy @ kf.P @ h_xy.T + r_mat_vps
+            try:
+                xy_pred = kf.x[0:2].reshape(2,)
+                innovation_vps = (vps_xy - xy_pred).reshape(-1,1)
+                m2_test_vps = _mahalanobis2(innovation_vps, s_mat_vps)
+            except Exception as e:
+                print(f"[VPS] ERROR computing innovation: {e}")
+                m2_test_vps = np.inf
+
+            # Adaptive VPS integration based on time since last absolute correction
+            time_since_correction = t - last_absolute_correction_time
+            innovation_mag = np.linalg.norm(innovation_vps)
+                        
+            # Track consecutive rejections for recovery
+            if not hasattr(run, '_vps_consecutive_rejects'):
+                run._vps_consecutive_rejects = 0
+            
+            # SPECIAL CASE: First VPS ever (vps_update_count == 0) should always be accepted
+            if vps_update_count == 0:
+                # TIER 0: First VPS - always accept (trust initial VPS position)
+                base_threshold_m = 100000.0  # Very large threshold
+                max_drift_rate = 0.0
+                r_scale = 50.0  # High uncertainty for first update
+                tier_name = "FIRST VPS (initial)"
+            elif time_since_correction > 60.0:
+                # TIER 1: Very long drift - be very permissive
+                base_threshold_m = 500.0
+                max_drift_rate = 300.0  # m/s assumed max drift
+                r_scale = min(100.0, 20.0 + time_since_correction / 5.0)
+                tier_name = "VERY LONG DRIFT"
+            elif time_since_correction > 10.0:
+                # TIER 2: Long drift - more permissive
+                base_threshold_m = 300.0
+                max_drift_rate = 200.0  # m/s
+                r_scale = min(50.0, 5.0 + time_since_correction / 3.0)
+                tier_name = "LONG DRIFT"
+            elif time_since_correction > 3.0:
+                # TIER 3a: Medium drift (3-10s)
+                base_threshold_m = 200.0
+                max_drift_rate = 100.0  # m/s
+                r_scale = min(20.0, 2.0 + time_since_correction / 2.0)
+                tier_name = "MEDIUM DRIFT"
+            else:
+                # TIER 3b: Recent VPS (<3s) - moderate acceptance
+                base_threshold_m = 150.0  # Increased from 50m
+                max_drift_rate = 80.0  # m/s - Increased from 50
+                r_scale = 1.0
+                tier_name = "RECENT"
+            
+            # Calculate innovation threshold
+            max_innovation_m = base_threshold_m + max_drift_rate * time_since_correction
+            max_innovation_m = min(max_innovation_m, 50000.0)  # Cap at 50km
+            
+            # SOFT GATING: Instead of hard reject, use scaled acceptance
+            # If innovation is moderately over threshold, accept with higher uncertainty
+            soft_gate_margin = 3.0  # Accept up to 3x threshold with scaled R
+            soft_threshold = max_innovation_m * soft_gate_margin
+            
+            # Recovery mechanism: after consecutive rejections, be more permissive
+            if run._vps_consecutive_rejects >= 3:
+                # Force accept after 3 consecutive rejections to recover from drift
+                soft_threshold = max(soft_threshold, innovation_mag * 1.5)
+                r_scale = max(r_scale, 50.0)  # High uncertainty recovery
+                tier_name += " (RECOVERY)"
+            
+            # Determine acceptance and R scaling
+            if innovation_mag < max_innovation_m:
+                # Normal acceptance
+                chi2_accepted = True
+                # Keep original r_scale
+            elif innovation_mag < soft_threshold:
+                # Soft acceptance - scale R based on how much innovation exceeds threshold
+                chi2_accepted = True
+                innovation_ratio = innovation_mag / max_innovation_m
+                r_scale = r_scale * (innovation_ratio ** 2)  # Quadratic scaling
+                tier_name += " (SOFT)"
+            else:
+                # Hard rejection - innovation too large
+                chi2_accepted = False
+            
+            # Apply R matrix scaling
+            r_mat_vps_scaled = r_mat_vps * (r_scale ** 2)
+            
+            # Execute VPS update if accepted
+            if chi2_accepted:
+                kf.update(
+                    z=vps_xy.reshape(-1,1),
+                    HJacobian=h_vps_fun,
+                    Hx=hx_vps_fun,
+                    R=r_mat_vps_scaled
+                )
+                
+                # Update timestamp for adaptive noise
+                last_absolute_correction_time = t
+                vps_update_count += 1
+                run._vps_consecutive_rejects = 0  # Reset rejection counter
+                
+                print(f"[VPS] ✓ {tier_name} ({time_since_correction:.1f}s): t={t:.3f} "
+                      f"meas=({vps_xy[0]:.1f},{vps_xy[1]:.1f}) "
+                      f"pred=({xy_pred[0]:.1f},{xy_pred[1]:.1f}) "
+                      f"innov={innovation_mag:.1f}m < {max_innovation_m:.1f}m, R_scale={r_scale:.1f}x")
+            else:
+                run._vps_consecutive_rejects += 1
+                print(f"[VPS] ✗ {tier_name} REJECTED ({time_since_correction:.1f}s): "
+                      f"innov={innovation_mag:.1f}m > {soft_threshold:.1f}m (OUTLIER, reject#{run._vps_consecutive_rejects})")
+        
+        # ===============================================================
+        # HEIGHT UPDATE (DEM/MSL constraint) - matches vio_vps.py strategy
+        # ===============================================================
+        lat_now, lon_now = xy_to_latlon(kf.x[0,0], kf.x[1,0], lat0, lon0)
+        dem_now = dem.sample_m(lat_now, lon_now) if dem.ds else None
+        
+        # Determine if we have valid DEM data
+        has_valid_dem = False
+        if dem_now is not None and not np.isnan(dem_now):
+            has_valid_dem = True
+            last_valid_dem = dem_now
+        elif last_valid_dem is not None:
+            # Use last known DEM value if available
+            dem_now = last_valid_dem
+            has_valid_dem = True
+        
+        # Get MSL measurement from flight log by timestamp
+        msl_measured = None
+        if flight_log_df is not None:
+            time_diffs = np.abs(flight_log_df['stamp_log'].values - t)
+            closest_idx = np.argmin(time_diffs)
+            time_diff = time_diffs[closest_idx]
+            if time_diff < 0.5:  # Only use if timestamp is close enough
+                msl_measured = float(flight_log_df['altitude_MSL_m'].iloc[closest_idx])
+        
+        # Decide height measurement strategy
+        height_m = None
+        update_mode = None
+        msl_now = kf.x[2, 0]
+        agl_now = msl_now - (dem_now if dem_now is not None else 0.0)
+        
+        if has_valid_dem and msl_measured is not None:
+            # BEST CASE: Both DEM and MSL available - use MSL from flight log
+            height_m = msl_measured
+            update_mode = "MSL (from flight_log)"
+        elif has_valid_dem:
+            # DEM available but no MSL - use DEM + estimated AGL
+            if agl_now < 0.5:
+                # Emergency: below ground - lift up
+                height_m = dem_now + 2.0
+                update_mode = "DEM+AGL (emergency lift)"
+            elif agl_now < 150:
+                # Reasonable altitude - use current AGL estimate
+                height_m = dem_now + max(agl_now, 5.0)
+                update_mode = f"DEM+AGL ({agl_now:.1f}m)"
+            else:
+                # High altitude - use fallback
+                height_m = dem_now + 100.0
+                update_mode = "DEM+AGL (high alt fallback)"
+        elif msl_measured is not None:
+            # No DEM but MSL available
+            height_m = msl_measured
+            update_mode = "MSL only (no DEM)"
+        else:
+            # Fallback to initial MSL
+            height_m = msl0_m
+            update_mode = "Initial MSL (no data)"
+        
+        # Perform height update with adaptive uncertainty
+        if height_m is not None and not np.isnan(height_m):
+            # ESKF height Jacobian
+            num_clones = (kf.x.shape[0] - 16) // 7
+            err_dim_h = 15 + 6 * num_clones
+            h_height = np.zeros((1, err_dim_h), dtype=float)
+            h_height[0, 2] = 1.0  # Height is δp_z
+            
+            def h_height_fun(x, h=h_height):
+                return h
+            
+            def hx_height_fun(x):
+                return x[2:3].reshape(1, 1)
+            
+            # ========== ADAPTIVE UNCERTAINTY SCALING ==========
+            height_cov_scale = 1.0
+            
+            # 1. Scale with XY position uncertainty (key insight from vio_vps.py)
+            xy_uncertainty = float(np.trace(kf.P[0:2, 0:2]))
+            xy_std = np.sqrt(xy_uncertainty / 2.0)
+            if xy_std > 1.0:
+                xy_scale_factor = 1.0 + (xy_std * 0.25)
+                height_cov_scale *= xy_scale_factor
+            
+            # 2. Scale with time since last absolute correction
+            time_since_corr = t - last_absolute_correction_time_height
+            if time_since_corr > 10.0:
+                time_scale_factor = 1.0 + (time_since_corr - 10.0) / 40.0
+                height_cov_scale *= time_scale_factor
+            
+            # 3. Scale with speed
+            speed_ms = float(np.linalg.norm(kf.x[3:6, 0]))
+            if speed_ms > 10:
+                speed_scale_factor = 1.0 + (speed_ms - 10) / 15.0
+                height_cov_scale *= speed_scale_factor
+            
+            # 4. Scale with vertical rate of change
+            height_rate = abs(height_m - last_height) / max(dt, 0.001)
+            if height_rate > 2.0:
+                height_cov_scale *= (1.0 + height_rate / 4.0)
+            last_height = height_m
+            
+            # 5. Higher uncertainty if no DEM
+            if not has_valid_dem:
+                height_cov_scale *= 5.0
+            
+            # Measurement noise
+            r_height = np.array([[SIGMA_AGL_Z**2 * height_cov_scale]])
+            
+            # ========== INNOVATION GATING ==========
+            predicted_height = kf.x[2, 0]
+            innovation_h = height_m - predicted_height
+            s_mat_h = h_height @ kf.P @ h_height.T + r_height
+            
+            try:
+                m2_h = (innovation_h ** 2) / s_mat_h[0, 0]
+            except:
+                m2_h = np.inf
+            
+            # Base threshold for logging
+            if len(imgs) == 0 and len(vps_list) == 0:
+                threshold_h = 100.0  # Very relaxed for IMU-only
+            elif xy_std > 10.0:
+                threshold_h = 15.0  # Relaxed for high XY uncertainty
+            elif xy_std > 5.0:
+                threshold_h = 9.21  # 99.9% confidence
+            else:
+                threshold_h = 6.63  # Standard 99% confidence
+            
+            abs_innovation = abs(innovation_h)
+            
+            if abs_innovation > 100.0:
+                r_scale = (abs_innovation / 10.0) ** 2  # Quadratic scaling
+                r_height = r_height * r_scale
+                update_mode += " (EMERGENCY)"
+            elif abs_innovation > 20.0:
+                # Moderate innovation - scaled uncertainty
+                r_scale = (abs_innovation / 10.0) ** 1.5
+                r_height = r_height * r_scale
+                update_mode += " (SCALED)"
+            # else: normal update with original r_height
+            
+            # ALWAYS apply HEIGHT update (soft gating)
+            kf.update(
+                z=np.array([[height_m]]),
+                HJacobian=h_height_fun,
+                Hx=hx_height_fun,
+                R=r_height
+            )
+            height_update_count += 1
+            last_absolute_correction_time_height = t
+            
+            if i % 1000 == 0 or abs_innovation > 50.0:  # Log every 1000 samples or large innovations
+                print(f"[HEIGHT] ✓ {update_mode}: innov={innovation_h:.1f}m, m²={m2_h:.1f} < {threshold_h:.1f}")
+        
         imu_window.append(imu_rec)
         if len(imu_window) > 20:
             imu_window.pop(0)
@@ -2179,7 +2600,8 @@ def run(imu_path, quarry_path, output_dir,
     
     
     print(f"\n\nDone! Processed {len(imu)} IMU samples, {vio_frame+1 if vio_frame>=0 else 0} VIO frames, "
-          f"{zupt_applied}/{zupt_count} ZUPT updates applied")
+          f"{zupt_applied}/{zupt_count} ZUPT updates applied, {vps_update_count}/{len(vps_list)} VPS updates applied, "
+          f"{height_update_count} height updates applied")
     print(f"Output: {pose_csv}, {error_csv}")
     
     print("\n" + "="*60)
@@ -2211,6 +2633,8 @@ if __name__ == "__main__":
     ap.add_argument("--output", default="out_vio_streamlined", help="Output directory")
     ap.add_argument("--images_dir", default=None, help="Directory containing images")
     ap.add_argument("--images_index", default=None, help="CSV with image timestamps")
+    ap.add_argument("--vps_csv", default=None, help="Path to VPS CSV (stamp_log,lat,lon)")
+    ap.add_argument("--dem", default=None, help="Path to DEM GeoTIFF for height constraint")
     ap.add_argument("--img_w", type=int, default=1440, help="Image width for processing")
     ap.add_argument("--img_h", type=int, default=1080, help="Image height for processing")
     ap.add_argument("--camera_view", choices=["nadir","front","side"], default="nadir", help="Camera orientation")
@@ -2223,6 +2647,8 @@ if __name__ == "__main__":
         output_dir=args.output,
         images_dir=args.images_dir,
         images_index_csv=args.images_index,
+        vps_csv=args.vps_csv,
+        dem_path=args.dem,
         downscale_size=(args.img_w, args.img_h),
         camera_view=args.camera_view
     )

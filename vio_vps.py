@@ -1287,12 +1287,13 @@ def compute_error_state_process_noise(dt, estimate_imu_bias, t, t0):
     # Without this, magnetometer Kalman gain drops to ~0.01 after convergence,
     # making mag updates ineffective at correcting yaw drift.
     # 
-    # FIX 2025-12-01: Increased from 0.5 to 3.0 deg/sqrt(Hz)
-    # Problem: K was dropping to 0.10 causing yaw oscillations ±150°
-    # Root cause: P_yaw dropped to 3° while gyro drift >> 3° per update
-    # Solution: Keep P_yaw higher to maintain K ≈ 0.3-0.5
+    # FIX 2025-12-01c: Increased from 5.0 to 8.0 deg/sqrt(Hz)
+    # Problem: With K_MIN=0.30, P_yaw needs to be higher to maintain K
+    # P_yaw = K * R / (1-K) = 0.30 * 8.6² / 0.70 = 31.6 deg²
+    # With MIN_YAW_PROCESS_NOISE=8.0, P_yaw grows by (8*√0.0025)² = 0.16°²/step
+    # At 400Hz, between 20Hz mag: 20*0.16 = 3.2°² growth → adequate
     # =====================================================================
-    MIN_YAW_PROCESS_NOISE = np.radians(3.0)  # 3.0 deg/sqrt(Hz) - FIX: increased from 0.5
+    MIN_YAW_PROCESS_NOISE = np.radians(8.0)  # 8.0 deg/sqrt(Hz) - FIX: increased from 5.0
     q_theta_z_min = (MIN_YAW_PROCESS_NOISE * np.sqrt(dt))**2
     
     # Bias random walk with adaptive tuning
@@ -2287,8 +2288,18 @@ def load_quarry_initial(path: str) -> Tuple[float, float, float, np.ndarray]:
 class IMURecord:
     t: float
     q: np.ndarray  # [x,y,z,w]
-    ang: np.ndarray  # [wx,wy,wz] rad/s (unused for now)
+    ang: np.ndarray  # [wx,wy,wz] rad/s
     lin: np.ndarray  # [ax,ay,az] m/s^2 (body)
+    
+    @property
+    def w(self) -> np.ndarray:
+        """Alias for angular velocity (gyro)"""
+        return self.ang
+    
+    @property
+    def a(self) -> np.ndarray:
+        """Alias for linear acceleration"""
+        return self.lin
 
 @dataclass
 class MagRecord:
@@ -6867,6 +6878,20 @@ def run(
                 zupt_applied_count += 1
                 v_before = kf.x[3:6,0].copy()
                 
+                # =====================================================
+                # CRITICAL FIX: Decouple yaw from velocity before ZUPT!
+                # ZUPT observes velocity, but cross-covariance P(v,θ) can
+                # cause yaw to be modified by ZUPT update via Kalman gain.
+                # This was causing massive yaw drift (200°/s apparent rate)
+                # even though gyro shows only ~1°/s!
+                # =====================================================
+                # Zero out cross-covariance between velocity and yaw
+                kf.P[3:6, 8] = 0.0  # Cov(v, yaw)
+                kf.P[8, 3:6] = 0.0
+                # Also decouple velocity from roll/pitch (for altitude stability)
+                kf.P[3:6, 6:8] = 0.0  # Cov(v, roll/pitch)
+                kf.P[6:8, 3:6] = 0.0
+                
                 # Compute innovation for ZUPT (before update)
                 zupt_innovation = z_zupt - kf.x[3:6].reshape(3,1)
                 zupt_s_mat = h_zupt_jacobian(None) @ kf.P @ h_zupt_jacobian(None).T + R_zupt
@@ -7157,14 +7182,15 @@ def run(
             if in_convergence_period:
                 innovation_threshold = np.radians(180.0)  # Accept ANY yaw difference
             else:
-                # ADAPTIVE: Use MAX of (3σ_R, 3σ_P, 150°)
-                # FIX 2025-12-01: Increased min_threshold from 60° to 150°
-                # Problem: yaw drift of 80-130° was being rejected, causing 1km position error
-                # Root cause: σ_P stays small (1-2°) because gyro integration doesn't grow P
-                # Solution: Accept large innovations - magnetometer is absolute reference!
+                # ADAPTIVE: Use MAX of (3σ_R, 3σ_P, 179°)
+                # FIX 2025-12-01b: Increased min_threshold from 150° to 179°
+                # Problem: yaw drift >150° was being rejected after ~20 updates
+                # Root cause: gyro bias causes ~190°/s drift, exceeding 150° threshold quickly
+                # Solution: Accept almost any innovation - magnetometer is ABSOLUTE reference!
+                # Note: 180° would create ambiguity (±π wrap), so use 179° max
                 base_threshold = 3.0 * sigma_yaw_scaled
                 state_based_threshold = 3.0 * yaw_sigma_from_P
-                min_threshold = np.radians(150.0)  # FIX: Accept up to 150° innovation (was 60°)
+                min_threshold = np.radians(179.0)  # FIX: Accept up to 179° innovation (was 150°)
                 innovation_threshold = max(base_threshold, state_based_threshold, min_threshold)
             
             if abs(yaw_innov) > innovation_threshold:
@@ -7223,10 +7249,23 @@ def run(
                 # CRITICAL: Enforce minimum K to prevent yaw drift!
                 # Without gyro bias estimation, gyro drift (~4°/s from
                 # helicopter vibration) requires continuous mag correction.
-                # K_min = 0.15 allows ~15% of innovation to correct drift.
-                # NOTE: Decouple yaw from pitch/roll to prevent altitude drift!
+                # 
+                # FIX 2025-12-01f: TIME-BASED K_MIN for rotor spin-up!
+                # During first 15 seconds (rotor spin-up), yaw drifts rapidly
+                # due to vibration. After that, normal flight begins.
+                # 
+                # Strategy:
+                # - t < 15s: K_MIN = 0.40 (trust MAG during spin-up)
+                # - t >= 15s: K_MIN = 0.20 (normal flight)
+                # 
+                # NOTE: Removed gyro-based logic because helicopter rotor
+                # vibration keeps gyro_mag high (~10 rad/s) even in normal
+                # flight, which isn't an indicator of yaw drift.
                 # =====================================================
-                K_MIN = 0.15  # Minimum Kalman gain for yaw
+                if time_elapsed < 15.0:
+                    K_MIN = 0.40  # Rotor spin-up period
+                else:
+                    K_MIN = 0.20  # Normal flight
                 if K_yaw < K_MIN:
                     # Inflate P to achieve target K
                     # K = P / (P + R) → P_new = K_min * R / (1 - K_min)
@@ -7243,8 +7282,14 @@ def run(
                 # CRITICAL: Limit maximum yaw correction per update!
                 # Large corrections can destabilize attitude matrix and
                 # cause velocity projection errors → altitude drift
+                # 
+                # FIX 2025-12-01f: TIME-BASED MAX for rotor spin-up!
+                # During first 15 seconds, allow larger corrections.
                 # =====================================================
-                MAX_YAW_CORRECTION = np.radians(10.0)  # Max 10° correction per update
+                if time_elapsed < 15.0:
+                    MAX_YAW_CORRECTION = np.radians(30.0)  # Spin-up period
+                else:
+                    MAX_YAW_CORRECTION = np.radians(15.0)  # Normal flight
                 if abs(expected_correction) > MAX_YAW_CORRECTION:
                     # Inflate measurement noise to limit correction magnitude
                     # K_new * innov = MAX_CORRECTION → K_new = MAX_CORRECTION / innov
@@ -7294,7 +7339,8 @@ def run(
                 
                 # Log Kalman gain periodically (every 50 updates)
                 if mag_update_count % 50 == 1 or mag_update_count <= 10:
-                    print(f"[MAG] K={K_yaw:.3f} | P_yaw={np.degrees(np.sqrt(P_yaw)):.1f}° | R={np.degrees(sigma_yaw_scaled):.1f}° | correction={np.degrees(expected_correction):.1f}°")
+                    mode = "SPINUP" if time_elapsed < 15.0 else "NORMAL"
+                    print(f"[MAG] K={K_yaw:.3f} | P_yaw={np.degrees(np.sqrt(P_yaw)):.1f}° | R={np.degrees(sigma_yaw_scaled):.1f}° | correction={np.degrees(expected_correction):.1f}° | t={time_elapsed:.1f}s [{mode}]")
                 
                 # Log residual for debugging
                 if save_debug_data and residual_csv:
