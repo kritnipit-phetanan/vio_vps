@@ -6584,6 +6584,35 @@ def run(
     mag_idx = 0
     mag_update_count = 0
     mag_reject_count = 0
+    
+    # =====================================================
+    # YAW RESET TRACKING (Goal 1)
+    # Track prolonged high yaw innovation for potential reset
+    # =====================================================
+    high_yaw_innovation_start_time = None  # When high innovation started
+    HIGH_YAW_INNOVATION_THRESHOLD = np.radians(90.0)  # 90° threshold
+    HIGH_YAW_INNOVATION_DURATION = 5.0  # seconds before reset
+    yaw_reset_count = 0
+    
+    # =====================================================
+    # VIBRATION DETECTION (Goal 2)
+    # Track gyro variance over sliding window for vibration detection
+    # =====================================================
+    gyro_buffer = []  # Rolling buffer of recent gyro readings
+    GYRO_BUFFER_SIZE = 100  # ~0.25s at 400Hz
+    VIBRATION_THRESHOLD = 0.5  # rad/s std - extreme vibration
+    VIBRATION_NOISE_INFLATE = 3.0  # Inflate process noise by this factor during vibration
+    current_vibration_level = 0.0  # Current gyro std
+    vibration_detected_count = 0
+    
+    # =====================================================
+    # SENSOR QUALITY METRICS (Goal 3)
+    # Replace time-based K_MIN with quality-based approach
+    # =====================================================
+    mag_quality_history = []  # Recent MAG quality scores
+    MAG_QUALITY_BUFFER_SIZE = 20  # ~1 second of MAG readings (20Hz)
+    innovation_history = []  # Recent innovation magnitudes
+    INNOVATION_BUFFER_SIZE = 20
 
     t0 = imu[0].t
     last_t = t0
@@ -6659,6 +6688,24 @@ def run(
         a_corr = a_meas - ba
         w_corr = w_meas - bg
 
+        # =====================================================
+        # VIBRATION DETECTION (Goal 2)
+        # Track gyro magnitude in rolling buffer to detect vibration
+        # High vibration = high gyro std = unreliable integration
+        # =====================================================
+        gyro_mag = np.linalg.norm(w_corr)
+        gyro_buffer.append(gyro_mag)
+        if len(gyro_buffer) > GYRO_BUFFER_SIZE:
+            gyro_buffer.pop(0)
+        
+        # Compute gyro std over buffer
+        if len(gyro_buffer) >= 10:  # Need minimum samples
+            current_vibration_level = np.std(gyro_buffer)
+            is_high_vibration = current_vibration_level > VIBRATION_THRESHOLD
+            if is_high_vibration:
+                vibration_detected_count += 1
+        else:
+            is_high_vibration = False
         # Compute rotation matrix for transforming to world frame (needed for ZUPT)
         quat_xyzw = np.array([q[1], q[2], q[3], q[0]])  # to [x,y,z,w] for scipy
         R_world_to_body = R_scipy.from_quat(quat_xyzw).as_matrix()
@@ -6751,6 +6798,18 @@ def run(
             
             # Error-state process noise (15×15 for core state)
             Q_err = compute_error_state_process_noise(dt, estimate_imu_bias, t, t0)
+            
+            # =====================================================
+            # VIBRATION-BASED PROCESS NOISE INFLATION (Goal 2)
+            # During high vibration, IMU integration is less reliable
+            # Inflate process noise to allow corrections from MAG/VIO
+            # =====================================================
+            if is_high_vibration:
+                # Inflate rotation and velocity noise during high vibration
+                Q_err[6:9, 6:9] *= VIBRATION_NOISE_INFLATE  # Rotation noise
+                Q_err[3:6, 3:6] *= VIBRATION_NOISE_INFLATE  # Velocity noise
+                if i % 500 == 0:
+                    print(f"[VIBRATION] t={time_elapsed:.1f}s: High vibration detected (std={current_vibration_level:.3f} rad/s) - inflating Q by {VIBRATION_NOISE_INFLATE}x")
             
             # Get number of camera clones
             num_clones = (kf.x.shape[0] - 16) // 7
@@ -7127,6 +7186,18 @@ def run(
                     print(f"[MAG] t={t:.2f}: Rejected (field strength {mag_norm:.1f} µT, expect {MAG_MIN_FIELD_STRENGTH}-{MAG_MAX_FIELD_STRENGTH})")
                 continue
             
+            # =====================================================
+            # SPEED-BASED MAG QUALITY CHECK (DISABLED)
+            # FIX 2025-12-02a: REVERT speed-based rejection
+            # Analysis shows speed-based rejection makes performance WORSE:
+            # - With speed filtering: 3228m RMSE
+            # - Without (v9): 736m RMSE
+            # 
+            # The issue is MAG is still needed for correction even at hover.
+            # Better approach: use innovation-based rejection instead.
+            # =====================================================
+            speed_factor = 1.0  # Always full trust
+            
             # Compute yaw from magnetometer
             # Use GPS-calibrated raw heading (default) or tilt-compensated
             q_state = kf.x[6:10, 0]  # Current quaternion [w,x,y,z]
@@ -7162,6 +7233,54 @@ def run(
             
             if wrapped and i % 50 == 0:
                 print(f"[MAG] WRAP-AROUND: yaw_state={np.degrees(yaw_state):.1f}°, yaw_mag={np.degrees(yaw_mag):.1f}°, innov={np.degrees(yaw_innov):.1f}°")
+            
+            # =====================================================
+            # YAW RESET ON PROLONGED HIGH INNOVATION (Goal 1)
+            # If innovation > 90° for more than 5 seconds, something is
+            # seriously wrong - reset yaw to MAG value directly
+            # =====================================================
+            if abs(yaw_innov) > HIGH_YAW_INNOVATION_THRESHOLD:
+                if high_yaw_innovation_start_time is None:
+                    high_yaw_innovation_start_time = t
+                    print(f"[MAG] HIGH INNOVATION START: |{np.degrees(yaw_innov):.1f}°| > {np.degrees(HIGH_YAW_INNOVATION_THRESHOLD):.0f}° at t={time_elapsed:.1f}s")
+                else:
+                    duration = t - high_yaw_innovation_start_time
+                    if duration > HIGH_YAW_INNOVATION_DURATION:
+                        # RESET YAW STATE TO MAGNETOMETER
+                        print(f"[MAG] ⚠️ YAW RESET #{yaw_reset_count+1}: Innovation >{np.degrees(HIGH_YAW_INNOVATION_THRESHOLD):.0f}° for {duration:.1f}s")
+                        print(f"       Before: yaw_state={np.degrees(yaw_state):.1f}°, yaw_mag={np.degrees(yaw_mag):.1f}°")
+                        
+                        # Extract current quaternion
+                        q_current = kf.x[6:10, 0].copy()
+                        
+                        # Replace yaw while keeping roll/pitch
+                        q_xyzw = np.array([q_current[1], q_current[2], q_current[3], q_current[0]])
+                        euler = R_scipy.from_quat(q_xyzw).as_euler('ZYX')  # [yaw, pitch, roll]
+                        euler[0] = yaw_mag  # Replace yaw with magnetometer
+                        
+                        # Reconstruct quaternion
+                        q_new_xyzw = R_scipy.from_euler('ZYX', euler).as_quat()
+                        q_new = np.array([q_new_xyzw[3], q_new_xyzw[0], q_new_xyzw[1], q_new_xyzw[2]])
+                        
+                        # Update state
+                        kf.x[6:10, 0] = q_new
+                        
+                        # Inflate yaw uncertainty to reflect reset
+                        kf.P[8, 8] = np.radians(30.0)**2  # 30° uncertainty after reset
+                        
+                        yaw_reset_count += 1
+                        high_yaw_innovation_start_time = None
+                        
+                        print(f"       After: yaw_state={np.degrees(quaternion_to_yaw(q_new)):.1f}°")
+                        
+                        # Skip normal MAG update this cycle
+                        continue
+            else:
+                # Innovation back to normal - reset timer
+                if high_yaw_innovation_start_time is not None:
+                    duration = t - high_yaw_innovation_start_time
+                    print(f"[MAG] High innovation ended after {duration:.1f}s (no reset needed)")
+                high_yaw_innovation_start_time = None
             
             # ==========================================
             # INITIAL CONVERGENCE PERIOD
@@ -7273,33 +7392,74 @@ def run(
                 # Without gyro bias estimation, gyro drift (~4°/s from
                 # helicopter vibration) requires continuous mag correction.
                 # 
-                # FIX 2025-12-01f: TIME-BASED K_MIN for rotor spin-up!
-                # During first 15 seconds (rotor spin-up), yaw drifts rapidly
-                # due to vibration. After that, normal flight begins.
-                # 
+                # FIX 2025-12-02b: SENSOR-QUALITY BASED K_MIN (Goal 3)
+                # Replace time-based K_MIN with sensor quality metrics
+                # - High vibration → lower K_MIN (less trust in MAG during shake)
+                # - Low MAG quality → lower K_MIN
+                # - Large recent innovations → higher K_MIN (need correction)
                 # =====================================================
-                # PHASE-BASED KALMAN GAIN TUNING
-                # v6-style: 2 phases only (simpler, worked better)
-                # Phase 0 (spin-up): K_MIN=0.40, MAX_CORRECTION=30°
-                # Phase 1 (normal):  K_MIN=0.20, MAX_CORRECTION=15°
-                # =====================================================
+                
+                # Update quality history
+                mag_quality_history.append(quality)
+                if len(mag_quality_history) > MAG_QUALITY_BUFFER_SIZE:
+                    mag_quality_history.pop(0)
+                
+                innovation_history.append(abs(yaw_innov))
+                if len(innovation_history) > INNOVATION_BUFFER_SIZE:
+                    innovation_history.pop(0)
+                
+                # Compute quality metrics
+                avg_quality = np.mean(mag_quality_history) if mag_quality_history else quality
+                avg_innovation = np.mean(innovation_history) if innovation_history else abs(yaw_innov)
+                
+                # Base K_MIN from time (still useful for initial stabilization)
                 if time_elapsed < 15.0:  # PHASE_SPINUP_END
                     current_flight_phase = 0
-                    K_MIN = 0.40
+                    K_MIN_BASE = 0.40
                     MAX_YAW_CORRECTION = np.radians(30.0)
                 else:
                     current_flight_phase = 1  # Normal flight
-                    K_MIN = 0.20
+                    K_MIN_BASE = 0.20
                     MAX_YAW_CORRECTION = np.radians(15.0)
+                
+                # =====================================================
+                # SENSOR-QUALITY MODULATION OF K_MIN
+                # =====================================================
+                K_MIN = K_MIN_BASE
+                
+                # 1. MAG Quality Factor: higher quality → higher K_MIN
+                # quality ranges 0-1, avg_quality ~0.5-0.9 typically
+                quality_factor = min(1.0, avg_quality / 0.7)  # Normalize to 0.7 as "good"
+                
+                # 2. Vibration Factor: high vibration → lower K_MIN
+                # During vibration, MAG readings are less reliable
+                if is_high_vibration:
+                    vibration_factor = 0.5  # Halve K_MIN during high vibration
+                else:
+                    vibration_factor = 1.0
+                
+                # 3. Innovation Factor: large innovations → higher K_MIN (need correction)
+                # If yaw is drifting fast, we need aggressive correction
+                if avg_innovation > np.radians(30.0):  # >30° average innovation
+                    innovation_factor = 1.5  # Boost K_MIN by 50%
+                elif avg_innovation > np.radians(15.0):  # >15° average innovation
+                    innovation_factor = 1.2  # Boost K_MIN by 20%
+                else:
+                    innovation_factor = 1.0
+                
+                # Combine factors
+                K_MIN = K_MIN_BASE * quality_factor * vibration_factor * innovation_factor
+                K_MIN = np.clip(K_MIN, 0.10, 0.60)  # Clamp to reasonable range
                 
                 if K_yaw < K_MIN:
                     # Inflate P to achieve target K
                     # K = P / (P + R) → P_new = K_min * R / (1 - K_min)
-                    P_yaw_min = K_MIN * sigma_yaw_scaled**2 / (1.0 - K_MIN)
-                    if kf.P[theta_cov_idx, theta_cov_idx] < P_yaw_min:
-                        kf.P[theta_cov_idx, theta_cov_idx] = P_yaw_min
-                        P_yaw = P_yaw_min
-                        K_yaw = K_MIN
+                    if K_MIN > 0.01:  # Avoid division by near-zero
+                        P_yaw_min = K_MIN * sigma_yaw_scaled**2 / (1.0 - K_MIN)
+                        if kf.P[theta_cov_idx, theta_cov_idx] < P_yaw_min:
+                            kf.P[theta_cov_idx, theta_cov_idx] = P_yaw_min
+                            P_yaw = P_yaw_min
+                            K_yaw = K_MIN
                 
                 # Expected yaw correction = K * innovation
                 expected_correction = K_yaw * yaw_innov
@@ -7380,7 +7540,8 @@ def run(
                 # Log Kalman gain periodically (every 50 updates)
                 if mag_update_count % 50 == 1 or mag_update_count <= 10:
                     phase_name = "SPINUP" if current_flight_phase == 0 else "NORMAL"
-                    print(f"[MAG] K={K_yaw:.3f} | P_yaw={np.degrees(np.sqrt(P_yaw)):.1f}° | R={np.degrees(sigma_yaw_scaled):.1f}° | correction={np.degrees(expected_correction):.1f}° | t={time_elapsed:.1f}s [{phase_name}]")
+                    vib_marker = " [VIB]" if is_high_vibration else ""
+                    print(f"[MAG] K={K_yaw:.3f} (K_MIN={K_MIN:.2f}, qf={quality_factor:.2f}, vf={vibration_factor:.1f}, if={innovation_factor:.1f}) | P_yaw={np.degrees(np.sqrt(P_yaw)):.1f}° | correction={np.degrees(expected_correction):.1f}° | t={time_elapsed:.1f}s [{phase_name}]{vib_marker}")
                 
                 # Log residual for debugging
                 if save_debug_data and residual_csv:
@@ -8898,6 +9059,7 @@ def run(
     print("\n\n--- Done ---")
     print(f"Total IMU samples: {len(imu)} | Images used: {max(0,vio_frame+1) if vio_frame>=0 else 0} | VPS used: {vps_idx}")
     print(f"Magnetometer: {mag_update_count} updates applied | {mag_reject_count} rejected | {len(mag_list)} total samples")
+    print(f"  Yaw resets: {yaw_reset_count} | Vibration detected: {vibration_detected_count} samples")
     print(f"ZUPT: {zupt_applied_count} applied | {zupt_rejected_count} rejected | {zupt_total_detected} detected stationary")
     
     # Print MSCKF triangulation statistics
