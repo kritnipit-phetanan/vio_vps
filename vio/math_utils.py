@@ -2,8 +2,45 @@
 # -*- coding: utf-8 -*-
 """
 VIO Math Utilities Module
+=========================
 
-Contains quaternion operations, rotation matrices, and mathematical helpers.
+Contains quaternion operations, rotation matrices, and mathematical helpers
+for Visual-Inertial Odometry.
+
+Quaternion Convention:
+----------------------
+All quaternions use Hamilton convention with [w, x, y, z] ordering:
+- w is the scalar (real) part
+- [x, y, z] is the vector (imaginary) part
+- q = w + xi + yj + zk
+
+Quaternion represents rotation R such that:
+    v' = q ⊗ v ⊗ q* (passive/frame rotation)
+    
+where v is a pure quaternion [0, vx, vy, vz] and q* is the conjugate.
+
+Frame Conventions:
+------------------
+- ENU (East-North-Up): X=East, Y=North, Z=Up
+  Used by Xsens IMU output
+  
+- NED (North-East-Down): X=North, Y=East, Z=Down  
+  Used by aviation/aerospace convention
+  
+- FRD (Forward-Right-Down): Body frame for aircraft
+  X=Forward, Y=Right, Z=Down
+
+Key Operations:
+---------------
+- quat_multiply: Hamilton quaternion product
+- quat_normalize: Ensure unit quaternion
+- quat_to_rot: Convert to 3x3 rotation matrix
+- rot_to_quat: Convert rotation matrix to quaternion
+- quat_boxplus: Quaternion ⊞ rotation vector (perturbation)
+- quat_boxminus: Extract rotation vector between quaternions
+- skew_symmetric: Create 3x3 skew-symmetric matrix for cross product
+
+Author: VIO project
 """
 
 import numpy as np
@@ -26,11 +63,23 @@ R_NED_FROM_ENU = np.array([
 
 
 # =============================================================================
-# Quaternion Operations (all use [w, x, y, z] format)
+# Quaternion Operations (all use [w, x, y, z] Hamilton convention)
 # =============================================================================
 
 def quat_multiply(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
-    """Quaternion multiplication: q1 * q2, both in [w,x,y,z] format."""
+    """
+    Quaternion multiplication: q1 ⊗ q2, both in [w,x,y,z] format.
+    
+    Implements Hamilton product following right-hand convention:
+    q1 ⊗ q2 represents rotation q2 followed by rotation q1.
+    
+    Args:
+        q1: First quaternion [w, x, y, z]
+        q2: Second quaternion [w, x, y, z]
+        
+    Returns:
+        Product quaternion [w, x, y, z]
+    """
     w1, x1, y1, z1 = q1
     w2, x2, y2, z2 = q2
     return np.array([
@@ -42,7 +91,18 @@ def quat_multiply(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
 
 
 def quat_normalize(q: np.ndarray) -> np.ndarray:
-    """Normalize quaternion to unit length."""
+    """
+    Normalize quaternion to unit length.
+    
+    Unit quaternions (||q|| = 1) represent valid rotations.
+    Numerical errors can cause drift from unit norm.
+    
+    Args:
+        q: Quaternion [w, x, y, z]
+        
+    Returns:
+        Normalized quaternion with ||q|| = 1
+    """
     norm = np.linalg.norm(q)
     if norm < 1e-10:
         return np.array([1.0, 0.0, 0.0, 0.0])

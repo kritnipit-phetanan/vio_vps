@@ -305,16 +305,37 @@ class VIORunner:
         print(f"[VIO] Camera view mode: {self.config.camera_view}")
     
     def setup_output_files(self):
-        """Create output directory and CSV files."""
+        """
+        Create output directory and all CSV files.
+        
+        Creates the following output files:
+        - pose.csv: Main trajectory output (position, velocity, orientation)
+        - error_log.csv: Error comparison vs ground truth
+        - state_debug.csv: Detailed state evolution for debugging
+        - inference_log.csv: Processing time per frame
+        - vo_debug.csv: Visual odometry debug info
+        - msckf_debug.csv: MSCKF update statistics
+        
+        If save_debug_data is enabled, also creates:
+        - debug_imu_raw.csv: Raw IMU measurements
+        - debug_state_covariance.csv: Covariance evolution
+        - debug_residuals.csv: Innovation/residual statistics
+        - debug_feature_stats.csv: Feature tracking quality
+        - debug_msckf_window.csv: MSCKF sliding window state
+        - debug_fej_consistency.csv: First-estimate Jacobian consistency
+        - debug_calibration.txt: Calibration parameters snapshot
+        """
         os.makedirs(self.config.output_dir, exist_ok=True)
         
-        # Pose output
+        # ===== CORE OUTPUT FILES =====
+        
+        # Pose output - main trajectory
         self.pose_csv = os.path.join(self.config.output_dir, "pose.csv")
         with open(self.pose_csv, "w") as f:
             f.write("Timestamp(s),dt,Frame,PX,PY,PZ_MSL,VX,VY,VZ,lat,lon,AGL(m),"
                     "vo_dx,vo_dy,vo_dz,vo_d_roll,vo_d_pitch,vo_d_yaw\n")
         
-        # Error log
+        # Error log - comparison with ground truth
         self.error_csv = os.path.join(self.config.output_dir, "error_log.csv")
         with open(self.error_csv, "w") as f:
             f.write("t,pos_error_m,pos_error_E,pos_error_N,pos_error_U,"
@@ -322,10 +343,124 @@ class VIORunner:
                     "alt_error_m,yaw_vio_deg,yaw_gps_deg,yaw_error_deg,"
                     "gps_lat,gps_lon,gps_alt,vio_E,vio_N,vio_U\n")
         
-        # State debug log
+        # State debug log - detailed state evolution
         self.state_dbg_csv = os.path.join(self.config.output_dir, "state_debug.csv")
         with open(self.state_dbg_csv, "w") as f:
             f.write("t,px,py,pz,vx,vy,vz,a_world_x,a_world_y,a_world_z,dem,agl,msl\n")
+        
+        # Inference timing log
+        self.inf_csv = os.path.join(self.config.output_dir, "inference_log.csv")
+        with open(self.inf_csv, "w") as f:
+            f.write("Index,Inference Time (s),FPS\n")
+        
+        # VO debug log
+        self.vo_dbg_csv = os.path.join(self.config.output_dir, "vo_debug.csv")
+        with open(self.vo_dbg_csv, "w") as f:
+            f.write("Frame,num_inliers,rot_angle_deg,alignment_deg,rotation_rate_deg_s,"
+                    "use_only_vz,skip_vo,vo_dx,vo_dy,vo_dz,vel_vx,vel_vy,vel_vz\n")
+        
+        # MSCKF debug log
+        self.msckf_dbg_csv = os.path.join(self.config.output_dir, "msckf_debug.csv")
+        with open(self.msckf_dbg_csv, "w") as f:
+            f.write("frame,feature_id,num_observations,triangulation_success,"
+                    "reprojection_error_px,innovation_norm,update_applied,chi2_test\n")
+        
+        # ===== OPTIONAL DEBUG DATA FILES =====
+        
+        self.imu_raw_csv = None
+        self.state_cov_csv = None
+        self.residual_csv = None
+        self.feature_stats_csv = None
+        self.msckf_window_csv = None
+        self.fej_csv = None
+        self.keyframe_dir = None
+        
+        if self.config.save_debug_data:
+            # Raw IMU data log
+            self.imu_raw_csv = os.path.join(self.config.output_dir, "debug_imu_raw.csv")
+            with open(self.imu_raw_csv, "w") as f:
+                f.write("t,ori_x,ori_y,ori_z,ori_w,ang_x,ang_y,ang_z,lin_x,lin_y,lin_z\n")
+            
+            # State & covariance evolution
+            self.state_cov_csv = os.path.join(self.config.output_dir, "debug_state_covariance.csv")
+            with open(self.state_cov_csv, "w") as f:
+                f.write("t,frame,P_pos_xx,P_pos_yy,P_pos_zz,P_vel_xx,P_vel_yy,P_vel_zz,"
+                        "P_rot_xx,P_rot_yy,P_rot_zz,P_bg_xx,P_bg_yy,P_bg_zz,"
+                        "P_ba_xx,P_ba_yy,P_ba_zz,bg_x,bg_y,bg_z,ba_x,ba_y,ba_z\n")
+            
+            # Residual & innovation log
+            self.residual_csv = os.path.join(self.config.output_dir, "debug_residuals.csv")
+            with open(self.residual_csv, "w") as f:
+                f.write("t,frame,update_type,innovation_x,innovation_y,innovation_z,"
+                        "mahalanobis_dist,chi2_threshold,accepted,NIS,NEES\n")
+            
+            # Feature tracking statistics
+            self.feature_stats_csv = os.path.join(self.config.output_dir, "debug_feature_stats.csv")
+            with open(self.feature_stats_csv, "w") as f:
+                f.write("frame,t,num_features_detected,num_features_tracked,num_inliers,"
+                        "mean_parallax_px,max_parallax_px,tracking_ratio,inlier_ratio\n")
+            
+            # MSCKF window & marginalization log
+            self.msckf_window_csv = os.path.join(self.config.output_dir, "debug_msckf_window.csv")
+            with open(self.msckf_window_csv, "w") as f:
+                f.write("frame,t,num_camera_clones,num_tracked_features,num_mature_features,"
+                        "window_start_time,window_duration,marginalized_clone_id\n")
+            
+            # FEJ consistency log
+            self.fej_csv = os.path.join(self.config.output_dir, "debug_fej_consistency.csv")
+            with open(self.fej_csv, "w") as f:
+                f.write("timestamp,frame,clone_idx,pos_fej_drift_m,rot_fej_drift_deg,"
+                        "bg_fej_drift_rad_s,ba_fej_drift_m_s2\n")
+            
+            print(f"[DEBUG] Debug data logging enabled")
+        
+        if self.config.save_keyframe_images:
+            self.keyframe_dir = os.path.join(self.config.output_dir, "debug_keyframes")
+            os.makedirs(self.keyframe_dir, exist_ok=True)
+            print(f"[DEBUG] Keyframe images will be saved to: {self.keyframe_dir}")
+        
+        # Save calibration snapshot
+        if self.config.save_debug_data:
+            self._save_calibration_snapshot()
+    
+    def _save_calibration_snapshot(self):
+        """Save calibration parameters for reproducibility."""
+        cal_path = os.path.join(self.config.output_dir, "debug_calibration.txt")
+        with open(cal_path, "w") as f:
+            f.write("=== VIO System Calibration & Configuration ===\n\n")
+            f.write(f"[Camera View]\n")
+            f.write(f"  Mode: {self.config.camera_view}\n\n")
+            
+            f.write(f"[Image Processing]\n")
+            f.write(f"  Downscale size: {self.config.downscale_size[0]}x{self.config.downscale_size[1]}\n\n")
+            
+            f.write(f"[Camera Intrinsics - Kannala-Brandt]\n")
+            kb_params = self.global_config.get('KB_PARAMS', {})
+            for key, val in kb_params.items():
+                f.write(f"  {key}: {val}\n")
+            f.write(f"\n")
+            
+            f.write(f"[IMU Parameters]\n")
+            imu_params = self.global_config.get('IMU_PARAMS', {})
+            for key, val in imu_params.items():
+                f.write(f"  {key}: {val}\n")
+            f.write(f"\n")
+            
+            f.write(f"[EKF Configuration]\n")
+            f.write(f"  z_state: {self.config.z_state}\n")
+            f.write(f"  estimate_imu_bias: {self.config.estimate_imu_bias}\n")
+            f.write(f"  use_preintegration: {self.config.use_preintegration}\n")
+            f.write(f"  use_magnetometer: {self.config.use_magnetometer}\n")
+            f.write(f"  use_vio_velocity: {self.config.use_vio_velocity}\n\n")
+            
+            f.write(f"[Initial State]\n")
+            f.write(f"  Origin: ({self.lat0:.8f}°, {self.lon0:.8f}°)\n")
+            f.write(f"  MSL altitude: {self.msl0:.2f} m\n")
+            if self.dem0 is not None:
+                f.write(f"  DEM elevation: {self.dem0:.2f} m\n")
+            f.write(f"  Initial velocity: {self.v_init} m/s\n")
+        
+        print(f"[DEBUG] Calibration snapshot saved: {cal_path}")
     
     def get_flight_phase(self, time_elapsed: float) -> int:
         """

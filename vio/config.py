@@ -2,8 +2,35 @@
 # -*- coding: utf-8 -*-
 """
 VIO Configuration Module
+========================
 
-Handles YAML configuration loading and global constants.
+Handles YAML configuration loading and defines global constants for the
+VIO+ESKF+MSCKF system.
+
+Configuration Structure:
+------------------------
+The YAML config file contains:
+- camera: Kannala-Brandt fisheye intrinsics (k2-k5, mu, mv, u0, v0)
+- extrinsics: Camera-to-body transforms (BODY_T_CAMDOWN, etc.)
+- imu: IMU noise parameters (gyro/accel noise densities and random walks)
+- magnetometer: MAG calibration (hard-iron, soft-iron, declination)
+- lever_arm: IMU-GNSS lever arm vector in body frame
+
+Frame Conventions:
+------------------
+- Body Frame: FRD (Forward-Right-Down) for Bell 412
+- World Frame: ENU (East-North-Up) - local tangent plane
+- Camera Frame: OpenCV convention (X-right, Y-down, Z-forward)
+- Quaternion: [w, x, y, z] Hamilton convention
+
+Sensor Noise Parameters:
+------------------------
+- acc_n: Accelerometer noise density [m/s²/√Hz]
+- gyr_n: Gyroscope noise density [rad/s/√Hz]
+- acc_w: Accelerometer random walk [m/s³/√Hz]
+- gyr_w: Gyroscope random walk [rad/s²/√Hz]
+
+Author: VIO project
 """
 
 import os
@@ -11,47 +38,84 @@ import yaml
 import numpy as np
 from typing import Dict, Any
 
-# Debug verbosity control - set to False for cleaner output
-VERBOSE_DEBUG = False  # Set to True for detailed per-IMU debug output
-VERBOSE_DEM = False    # Set to True for per-IMU DEM update logs
+# ========================================
+# Debug verbosity control
+# ========================================
+# Set to True for detailed per-sample debug output
+VERBOSE_DEBUG = False  # Per-IMU sample debug
+VERBOSE_DEM = False    # Per-IMU DEM update logs
 
 
 def load_config(config_path: str) -> Dict[str, Any]:
-    """Load YAML configuration file and convert to global variables format."""
+    """
+    Load YAML configuration file and convert to global variables format.
+    
+    Args:
+        config_path: Path to YAML configuration file
+        
+    Returns:
+        Dictionary with configuration parameters including:
+        - KB_PARAMS: Kannala-Brandt camera intrinsics
+        - BODY_T_CAMDOWN: 4x4 transform from body to down camera
+        - BODY_T_CAMFRONT: 4x4 transform from body to front camera
+        - BODY_T_CAMSIDE: 4x4 transform from body to side camera
+        - IMU_PARAMS: IMU noise parameters
+        - IMU_GNSS_LEVER_ARM: Lever arm vector [x, y, z] in body frame
+        - MAG_*: Magnetometer calibration parameters
+        - SIGMA_*: Process noise sigmas
+        - CAMERA_VIEW_CONFIGS: Camera view-specific configurations
+        
+    Raises:
+        FileNotFoundError: If config file doesn't exist
+        yaml.YAMLError: If config file is malformed
+        
+    Example:
+        >>> config = load_config("configs/config_bell412_dataset3.yaml")
+        >>> kb_params = config['KB_PARAMS']
+        >>> print(f"Focal length: {kb_params['mu']:.1f} px")
+    """
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
     
     # Convert nested dictionary to flat structure for compatibility
     result = {}
     
-    # Camera intrinsics - build KB_PARAMS dict from camera section
+    # ========================================
+    # Camera Intrinsics (Kannala-Brandt Model)
+    # ========================================
+    # The Kannala-Brandt model handles fisheye distortion:
+    # r(θ) = k1*θ + k2*θ³ + k3*θ⁵ + k4*θ⁷ + k5*θ⁹
+    # where θ is the angle from optical axis
     cam = config['camera']
     result['KB_PARAMS'] = {
-        'k2': cam['k2'],
+        'k2': cam['k2'],  # Note: k1 is implicit (=1 for equidistant)
         'k3': cam['k3'],
         'k4': cam['k4'],
         'k5': cam['k5'],
-        'mu': cam['mu'],
-        'mv': cam['mv'],
-        'u0': cam['u0'],
-        'v0': cam['v0'],
+        'mu': cam['mu'],  # Focal length in x (pixels)
+        'mv': cam['mv'],  # Focal length in y (pixels)
+        'u0': cam['u0'],  # Principal point x (pixels)
+        'v0': cam['v0'],  # Principal point y (pixels)
         'w': cam['image_width'],
         'h': cam['image_height'],
     }
     
-    # Extrinsics (convert lists to numpy arrays)
+    # ========================================
+    # Extrinsics (Camera-to-Body Transforms)
+    # ========================================
     extr = config['extrinsics']
     
     # CRITICAL: Body frame convention determines whether we need R_flip!
-    # - FLU body (Z-up): Original Kalibr calibration has camera Z pointing UP
-    #   Need R_flip to make camera Z point DOWN for nadir camera
-    # - FRD body (Z-down): Kalibr calibration already has camera Z pointing DOWN
-    #   No R_flip needed!
+    # ========================================================================
+    # Frame Convention Notes:
+    # - FLU body (Z-up): Kalibr outputs camera Z pointing UP
+    #   → Need R_flip = diag(1, -1, -1) to make camera Z point DOWN for nadir
+    # - FRD body (Z-down): Kalibr already has camera Z pointing DOWN
+    #   → No R_flip needed!
     #
-    # Bell 412 dataset uses FRD body frame (quaternion shows body Z pointing down)
+    # Bell 412 dataset uses FRD body frame (IMU quaternion shows body Z down)
     # So we should NOT apply R_flip here!
-    #
-    # R_flip = diag(1, -1, -1) rotates 180° around X-axis
+    # ========================================================================
     R_flip = np.array([
         [1,  0,  0],
         [0, -1,  0],

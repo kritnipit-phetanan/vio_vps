@@ -2,8 +2,51 @@
 # -*- coding: utf-8 -*-
 """
 IMU Preintegration Module
+=========================
 
-Implements IMU preintegration on manifold (Forster et al., TRO 2017).
+Implements IMU preintegration on manifold following Forster et al., TRO 2017:
+"On-Manifold Preintegration for Real-Time Visual-Inertial Odometry"
+
+Theory Overview:
+----------------
+IMU preintegration avoids recomputing the entire IMU integration when biases
+change. Instead of integrating from t_i to t_j with specific biases, we:
+
+1. Preintegrate relative measurements in body frame:
+   - ΔR_ij: Relative rotation from i to j
+   - Δv_ij: Velocity increment in frame i
+   - Δp_ij: Position increment in frame i
+
+2. Store Jacobians w.r.t. biases for efficient correction:
+   - When bias estimate changes, correct preintegrated quantities using:
+     ΔR_corr = ΔR * Exp(J_R_bg * δbg)
+     Δv_corr = Δv + J_v_bg * δbg + J_v_ba * δba
+     Δp_corr = Δp + J_p_bg * δbg + J_p_ba * δba
+
+State Update:
+-------------
+Given state at i: (R_i, v_i, p_i) and preintegrated quantities, the state at j:
+    R_j = R_i * ΔR_ij
+    v_j = v_i + g*Δt + R_i * Δv_ij
+    p_j = p_i + v_i*Δt + 0.5*g*Δt² + R_i * Δp_ij
+
+Note: Gravity is handled during state update, NOT in preintegration!
+
+Covariance Propagation:
+-----------------------
+Discrete noise propagation follows:
+    Σ_{k+1} = F_k * Σ_k * F_k' + G_k * Q_d * G_k'
+
+where F is the discrete state transition matrix and Q_d is discrete noise.
+
+References:
+-----------
+[1] Forster et al., "On-Manifold Preintegration for Real-Time Visual-Inertial
+    Odometry", IEEE TRO 2017
+[2] Leutenegger et al., "Keyframe-based visual-inertial odometry using 
+    nonlinear optimization", IJRR 2015
+
+Author: VIO project
 """
 
 from typing import Tuple
@@ -17,25 +60,43 @@ class IMUPreintegration:
     IMU Preintegration on Manifold (Forster et al., TRO 2017).
     
     Preintegrates IMU measurements between keyframes to compute:
-      - ΔR: Preintegrated rotation (SO(3))
-      - Δv: Preintegrated velocity (3D)
-      - Δp: Preintegrated position (3D)
+      - ΔR: Preintegrated rotation (SO(3) rotation matrix)
+      - Δv: Preintegrated velocity (3D vector)
+      - Δp: Preintegrated position (3D vector)
     
-    Also maintains Jacobians w.r.t. biases for bias correction:
-      - ∂ΔR/∂bg: (3x3) rotation Jacobian w.r.t. gyro bias
-      - ∂Δv/∂bg, ∂Δv/∂ba: (3x3) velocity Jacobians
-      - ∂Δp/∂bg, ∂Δp/∂ba: (3x3) position Jacobians
+    Also maintains Jacobians w.r.t. biases for efficient bias correction:
+      - J_R_bg (3×3): ∂ΔR/∂bg rotation Jacobian w.r.t. gyro bias
+      - J_v_bg (3×3): ∂Δv/∂bg velocity Jacobian w.r.t. gyro bias
+      - J_v_ba (3×3): ∂Δv/∂ba velocity Jacobian w.r.t. accel bias
+      - J_p_bg (3×3): ∂Δp/∂bg position Jacobian w.r.t. gyro bias
+      - J_p_ba (3×3): ∂Δp/∂ba position Jacobian w.r.t. accel bias
     
-    Key advantages over naive integration:
-      1. Reduced numerical error (integrate once, apply once)
-      2. Fast bias correction via Jacobians (no re-integration)
-      3. Proper manifold handling for rotation (SO(3))
+    Key advantages over naive sample-by-sample integration:
+      1. Reduced numerical error (integrate once, apply once per keyframe)
+      2. Fast bias correction via Jacobians (no re-integration needed)
+      3. Proper manifold handling for rotation (SO(3), not Euler angles)
+      4. Theoretically grounded covariance propagation
     
-    Usage:
-        preint = IMUPreintegration(bg_init, ba_init, sigma_g, sigma_a, sigma_bg, sigma_ba)
-        for imu in imu_buffer:
-            preint.integrate_measurement(imu.w, imu.a, dt, g_norm)
-        delta_R, delta_v, delta_p = preint.get_deltas()
+    Usage Example:
+        # Initialize with current bias estimates
+        preint = IMUPreintegration(
+            bg=gyro_bias,    # [3,] current gyro bias estimate
+            ba=accel_bias,   # [3,] current accel bias estimate
+            sigma_g=0.01,    # Gyroscope noise density [rad/s/√Hz]
+            sigma_a=0.1,     # Accelerometer noise density [m/s²/√Hz]
+            sigma_bg=0.0001, # Gyro bias random walk [rad/s²/√Hz]
+            sigma_ba=0.001   # Accel bias random walk [m/s³/√Hz]
+        )
+        
+        # Integrate IMU samples between keyframes
+        for imu in imu_buffer_between_keyframes:
+            preint.integrate_measurement(imu.gyro, imu.accel, dt)
+        
+        # Get preintegrated quantities (corrected for current bias)
+        delta_R, delta_v, delta_p = preint.get_deltas_corrected(bg_current, ba_current)
+        
+        # Get Jacobians for EKF propagation
+        J_R_bg, J_v_bg, J_v_ba, J_p_bg, J_p_ba = preint.get_jacobians()
     """
     
     def __init__(self, bg: np.ndarray, ba: np.ndarray, 
@@ -45,9 +106,9 @@ class IMUPreintegration:
         Initialize preintegration with initial biases and noise parameters.
         
         Args:
-            bg: Gyroscope bias (3D)
-            ba: Accelerometer bias (3D)
-            sigma_g: Gyroscope measurement noise std (rad/s)
+            bg: Gyroscope bias [rad/s], shape (3,)
+            ba: Accelerometer bias [m/s²], shape (3,)
+            sigma_g: Gyroscope measurement noise std [rad/s/√Hz]
             sigma_a: Accelerometer measurement noise std (m/s²)
             sigma_bg: Gyroscope bias random walk std (rad/s/√s)
             sigma_ba: Accelerometer bias random walk std (m/s²/√s)
