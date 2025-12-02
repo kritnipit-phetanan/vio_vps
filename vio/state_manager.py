@@ -503,3 +503,67 @@ def get_error_state_dim(kf) -> int:
     """
     num_clones = get_num_clones(kf)
     return 15 + 6 * num_clones
+
+
+# ===============================
+# IMU-GNSS Lever Arm Compensation
+# ===============================
+
+def gnss_to_imu_position(p_gnss_enu: np.ndarray, 
+                         R_body_to_world: np.ndarray,
+                         lever_arm: np.ndarray) -> np.ndarray:
+    """
+    Convert GNSS antenna position to IMU position using lever arm.
+    
+    The GNSS antenna is offset from IMU in body frame by lever_arm.
+    PPK ground truth gives GNSS antenna position, but VIO state tracks IMU position.
+    
+    Formula: p_imu = p_gnss - R_body_to_world @ lever_arm
+    
+    Args:
+        p_gnss_enu: GNSS position in ENU world frame [x, y, z] meters
+        R_body_to_world: Rotation matrix from body (FRD) to world (ENU)
+        lever_arm: IMU-GNSS lever arm in body frame [x, y, z] meters
+        
+    Returns:
+        p_imu_enu: IMU position in ENU world frame [x, y, z] meters
+    """
+    lever_arm_world = R_body_to_world @ lever_arm
+    p_imu = p_gnss_enu - lever_arm_world
+    return p_imu
+
+
+def imu_to_gnss_position(p_imu_enu: np.ndarray, 
+                         R_body_to_world: np.ndarray,
+                         lever_arm: np.ndarray) -> np.ndarray:
+    """
+    Convert IMU position to GNSS antenna position using lever arm.
+    
+    Inverse of gnss_to_imu_position().
+    Formula: p_gnss = p_imu + R_body_to_world @ lever_arm
+    
+    Args:
+        p_imu_enu: IMU position in ENU world frame [x, y, z] meters
+        R_body_to_world: Rotation matrix from body (FRD) to world (ENU)
+        lever_arm: IMU-GNSS lever arm in body frame [x, y, z] meters
+        
+    Returns:
+        p_gnss_enu: GNSS position in ENU world frame [x, y, z] meters
+    """
+    lever_arm_world = R_body_to_world @ lever_arm
+    p_gnss = p_imu_enu + lever_arm_world
+    return p_gnss
+
+
+def load_ground_truth_initial_yaw(path: str) -> Optional[float]:
+    """
+    Load initial yaw (heading) from PPK ground truth file.
+    (Legacy function - use load_ppk_initial_state() for comprehensive data)
+    
+    Returns yaw in radians (NED convention: 0=North, positive=CW) or None if not found.
+    """
+    from .data_loaders import load_ppk_initial_state
+    state = load_ppk_initial_state(path)
+    if state is not None:
+        return state.yaw
+    return None

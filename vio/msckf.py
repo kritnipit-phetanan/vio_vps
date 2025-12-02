@@ -170,6 +170,103 @@ def find_mature_features_for_msckf(vio_fe, cam_observations: List[dict],
     return mature_features
 
 
+def triangulate_point_linear(observations: List[dict], cam_states: List[dict]) -> Optional[np.ndarray]:
+    """
+    Linear triangulation using DLT (Direct Linear Transform).
+    
+    Solves the linear least squares problem for 3D point from multiple views.
+    Used as initial estimate for nonlinear refinement.
+    
+    Args:
+        observations: List of observation dicts with 'uv' (normalized coordinates)
+        cam_states: List of camera state dicts with 'q' and 'p'
+        
+    Returns:
+        3D point in world frame, or None if insufficient observations
+    """
+    if len(observations) < 2:
+        return None
+        
+    # Build DLT matrix
+    A_rows = []
+    
+    for obs in observations:
+        # Find matching camera state
+        cam_state = None
+        for cs in cam_states:
+            if cs.get('frame_idx') == obs.get('frame_idx') or cs.get('clone_id') == obs.get('clone_id'):
+                cam_state = cs
+                break
+        
+        if cam_state is None:
+            continue
+            
+        # Get camera pose (world to camera)
+        q_wc = cam_state['q']  # [w,x,y,z]
+        p_w = cam_state['p']   # Camera position in world
+        
+        # Convert quaternion to rotation matrix
+        from scipy.spatial.transform import Rotation as R_scipy
+        q_xyzw = np.array([q_wc[1], q_wc[2], q_wc[3], q_wc[0]])
+        R_wc = R_scipy.from_quat(q_xyzw).as_matrix()  # World to camera
+        R_cw = R_wc.T  # Camera to world
+        
+        # Projection: p_cam = R_wc @ (p_world - p_w)
+        # Normalized: [u, v, 1]^T ~ R_wc @ (p_world - p_w)
+        # Let t = -R_wc @ p_w, then p_cam = R_wc @ p_world + t
+        t_cw = -R_wc @ p_w
+        
+        # Build 2 equations from each observation
+        uv = obs['uv']  # Normalized image coordinates
+        u, v = uv[0], uv[1]
+        
+        # Row for u: u*(r3^T @ P + t3) - (r1^T @ P + t1) = 0
+        # Row for v: v*(r3^T @ P + t3) - (r2^T @ P + t2) = 0
+        r1 = R_wc[0, :]
+        r2 = R_wc[1, :]
+        r3 = R_wc[2, :]
+        
+        A_rows.append(u * r3 - r1)
+        A_rows.append(v * r3 - r2)
+    
+    if len(A_rows) < 4:  # Need at least 2 observations
+        return None
+    
+    A = np.array(A_rows)
+    
+    # Build b vector
+    b_rows = []
+    for i, obs in enumerate(observations):
+        cam_state = None
+        for cs in cam_states:
+            if cs.get('frame_idx') == obs.get('frame_idx') or cs.get('clone_id') == obs.get('clone_id'):
+                cam_state = cs
+                break
+        if cam_state is None:
+            continue
+            
+        q_wc = cam_state['q']
+        p_w = cam_state['p']
+        q_xyzw = np.array([q_wc[1], q_wc[2], q_wc[3], q_wc[0]])
+        R_wc = R_scipy.from_quat(q_xyzw).as_matrix()
+        t_cw = -R_wc @ p_w
+        
+        uv = obs['uv']
+        u, v = uv[0], uv[1]
+        
+        b_rows.append(t_cw[0] - u * t_cw[2])
+        b_rows.append(t_cw[1] - v * t_cw[2])
+    
+    b = np.array(b_rows)
+    
+    # Solve least squares: A @ p = b
+    try:
+        p_world, residuals, rank, s = np.linalg.lstsq(A, b, rcond=None)
+        return p_world
+    except np.linalg.LinAlgError:
+        return None
+
+
 def triangulate_point_nonlinear(observations: List[dict], cam_states: List[dict], 
                                 p_init: np.ndarray, kf: ExtendedKalmanFilter,
                                 max_iters: int = 10, debug: bool = False) -> Optional[np.ndarray]:

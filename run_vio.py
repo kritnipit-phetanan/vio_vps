@@ -1,0 +1,169 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+VIO Lightweight Entry Point (run_vio.py)
+
+This is a simple wrapper that calls the original vio_vps.py run() function.
+Use this script to run VIO with the modular vio/ package components.
+
+The modular package provides:
+- vio.config: Configuration loading
+- vio.data_loaders: IMU, MAG, VPS, DEM data loading
+- vio.ekf: Extended Kalman Filter
+- vio.imu_preintegration: IMU preintegration
+- vio.magnetometer: Magnetometer calibration & yaw
+- vio.vio_frontend: Visual front-end (feature tracking)
+- vio.msckf: Multi-State Constraint Kalman Filter
+- vio.propagation: IMU propagation, ZUPT
+- vio.vps_integration: VPS/DEM updates
+- vio.state_manager: State initialization
+- vio.measurement_updates: Measurement update functions
+- vio.output_utils: Debug output
+
+Usage:
+    python run_vio.py --config configs/config_bell412_dataset3.yaml \\
+        --imu path/to/imu.csv \\
+        --quarry path/to/flight_log_from_gga.csv \\
+        --output output_dir/
+
+Author: VIO project
+"""
+
+import argparse
+import sys
+import os
+
+# Add workspace to path
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+
+def parse_args():
+    """Parse command line arguments (same as vio_vps.py)."""
+    parser = argparse.ArgumentParser(
+        description="VIO+EKF Pipeline - Lightweight Entry Point",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    
+    # Required inputs
+    parser.add_argument("--imu", type=str, required=True, 
+                        help="Path to IMU CSV file")
+    parser.add_argument("--quarry", type=str, required=True, 
+                        help="Path to flight_log_from_gga.csv")
+    parser.add_argument("--output", type=str, required=True, 
+                        help="Output directory")
+    
+    # Configuration
+    parser.add_argument("--config", type=str, 
+                        default="configs/config_bell412_dataset3.yaml",
+                        help="Path to YAML config file")
+    
+    # Optional inputs
+    parser.add_argument("--images_dir", type=str, default=None, 
+                        help="Directory containing images")
+    parser.add_argument("--images_index", type=str, default=None, 
+                        help="Path to images_index.csv")
+    parser.add_argument("--vps", type=str, default=None, 
+                        help="Path to VPS results CSV")
+    parser.add_argument("--mag", type=str, default=None, 
+                        help="Path to magnetometer CSV")
+    parser.add_argument("--dem", type=str, default=None, 
+                        help="Path to DEM/DSM TIF file")
+    parser.add_argument("--ground_truth", type=str, default=None,
+                        help="Path to PPK ground truth file")
+    
+    # Image processing
+    parser.add_argument("--img_w", type=int, default=1440, 
+                        help="Downscaled image width")
+    parser.add_argument("--img_h", type=int, default=1080, 
+                        help="Downscaled image height")
+    
+    # State configuration
+    parser.add_argument("--z_state", type=str, default="msl", 
+                        choices=["msl", "agl"],
+                        help="Z state representation")
+    parser.add_argument("--camera_view", type=str, default="nadir",
+                        choices=["nadir", "front", "side"],
+                        help="Camera view configuration")
+    
+    # Optional features
+    parser.add_argument("--use_magnetometer", action="store_true", 
+                        help="Enable magnetometer updates")
+    parser.add_argument("--estimate_imu_bias", action="store_true", 
+                        help="Enable IMU bias estimation")
+    parser.add_argument("--use_vio_velocity", action="store_true", 
+                        help="Enable VIO velocity updates")
+    parser.add_argument("--save_debug_data", action="store_true", 
+                        help="Save debug CSV files")
+    parser.add_argument("--save_keyframe_images", action="store_true", 
+                        help="Save keyframe overlay images")
+    
+    return parser.parse_args()
+
+
+def main():
+    """Main entry point."""
+    args = parse_args()
+    
+    # Print header
+    print("=" * 70)
+    print("VIO+EKF Pipeline - Lightweight Entry Point")
+    print("=" * 70)
+    print(f"Config: {args.config}")
+    print(f"IMU: {args.imu}")
+    print(f"Output: {args.output}")
+    print("=" * 70)
+    
+    # Import the main run function from vio_vps.py
+    # This maintains backward compatibility while using modular components
+    try:
+        from vio_vps import run
+        
+        # Load configuration first
+        from vio.config import load_config
+        config = load_config(args.config)
+        
+        # Apply config to vio_vps globals
+        import vio_vps
+        for key, value in config.items():
+            if hasattr(vio_vps, key):
+                setattr(vio_vps, key, value)
+        
+        # Run VIO pipeline
+        run(
+            imu_path=args.imu,
+            quarry_path=args.quarry,
+            output_dir=args.output,
+            images_dir=args.images_dir,
+            images_index_csv=args.images_index,
+            vps_csv=args.vps,
+            mag_csv=args.mag,
+            dem_path=args.dem,
+            downscale_size=(args.img_w, args.img_h),
+            z_state=args.z_state,
+            camera_view=args.camera_view,
+            estimate_imu_bias=args.estimate_imu_bias,
+            use_magnetometer=args.use_magnetometer,
+            use_vio_velocity=args.use_vio_velocity,
+            save_debug_data=args.save_debug_data,
+            save_keyframe_images=args.save_keyframe_images,
+            use_preintegration=True,
+            ground_truth_path=args.ground_truth,
+        )
+        
+        print("=" * 70)
+        print("✅ VIO pipeline completed successfully")
+        print("=" * 70)
+        
+    except ImportError as e:
+        print(f"❌ Error importing modules: {e}")
+        print("\nMake sure you are in the vio_vps_repo directory.")
+        sys.exit(1)
+    except Exception as e:
+        print(f"❌ Error running VIO pipeline: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
