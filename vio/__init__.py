@@ -17,6 +17,7 @@ This package contains modularized components of the VIO+EKF system:
 - state_manager: EKF state initialization, lever arm compensation
 - measurement_updates: MAG, DEM, ZUPT measurement updates
 - main_loop: VIORunner class for complete pipeline
+- loop_closure: Loop closure detection for yaw drift correction
 
 Author: VIO project
 
@@ -37,6 +38,7 @@ Usage:
     from vio import state_manager
     from vio import measurement_updates
     from vio import main_loop
+    from vio import loop_closure
     
     # Or import specific functions
     from vio.config import load_config
@@ -50,9 +52,10 @@ Usage:
     from vio.output_utils import DebugCSVWriters, print_error_statistics
     from vio.state_manager import initialize_ekf_state
     from vio.main_loop import VIORunner, VIOConfig
+    from vio.loop_closure import LoopClosureDetector, init_loop_closure
 """
 
-__version__ = "2.3.0"
+__version__ = "2.4.0"
 
 # Lazy module imports - access as vio.config, vio.math_utils, etc.
 # This avoids importing all dependencies at once
@@ -63,7 +66,7 @@ _SUBMODULES = {
     "config", "math_utils", "imu_preintegration", "ekf", 
     "data_loaders", "magnetometer", "camera", "vio_frontend", "msckf",
     "propagation", "vps_integration", "output_utils",
-    "state_manager", "measurement_updates", "main_loop"
+    "state_manager", "measurement_updates", "main_loop", "loop_closure"
 }
 
 def __getattr__(name):
