@@ -11,6 +11,9 @@ This package contains modularized components of the VIO+EKF system:
 - camera: Kannala-Brandt fisheye camera model helpers
 - vio_frontend: OpenVINS-style visual front-end for feature tracking
 - msckf: Multi-State Constraint Kalman Filter backend
+- propagation: IMU propagation, ZUPT, flight phase detection
+- vps_integration: VPS position updates, DEM height updates
+- output_utils: Debug logging, visualization, error statistics
 
 Author: VIO project
 
@@ -25,6 +28,9 @@ Usage:
     from vio import camera
     from vio import vio_frontend
     from vio import msckf
+    from vio import propagation
+    from vio import vps_integration
+    from vio import output_utils
     
     # Or import specific functions
     from vio.config import load_config
@@ -33,9 +39,12 @@ Usage:
     from vio.camera import kannala_brandt_unproject
     from vio.vio_frontend import VIOFrontEnd
     from vio.msckf import perform_msckf_updates
+    from vio.propagation import propagate_to_timestamp, apply_zupt
+    from vio.vps_integration import apply_vps_update, apply_height_update
+    from vio.output_utils import DebugCSVWriters, print_error_statistics
 """
 
-__version__ = "2.1.0"
+__version__ = "2.2.0"
 
 # Lazy module imports - access as vio.config, vio.math_utils, etc.
 # This avoids importing all dependencies at once
@@ -69,6 +78,15 @@ def __getattr__(name):
     elif name == "msckf":
         from . import msckf
         return msckf
+    elif name == "propagation":
+        from . import propagation
+        return propagation
+    elif name == "vps_integration":
+        from . import vps_integration
+        return vps_integration
+    elif name == "output_utils":
+        from . import output_utils
+        return output_utils
     
     raise AttributeError(f"module 'vio' has no attribute '{name}'")
 
@@ -78,7 +96,8 @@ def __dir__():
     """List available submodules."""
     return [
         "config", "math_utils", "imu_preintegration", "ekf", 
-        "data_loaders", "magnetometer", "camera", "vio_frontend", "msckf"
+        "data_loaders", "magnetometer", "camera", "vio_frontend", "msckf",
+        "propagation", "vps_integration", "output_utils"
     ]
 
 
@@ -87,4 +106,5 @@ __all__ = [
     # Submodules
     "config", "math_utils", "imu_preintegration", "ekf", 
     "data_loaders", "magnetometer", "camera", "vio_frontend", "msckf",
+    "propagation", "vps_integration", "output_utils",
 ]
