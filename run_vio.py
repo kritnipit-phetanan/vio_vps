@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-VIO Lightweight Entry Point (run_vio.py)
+VIO Standalone Entry Point (run_vio.py)
 
-This is a simple wrapper that calls the original vio_vps.py run() function.
-Use this script to run VIO with the modular vio/ package components.
+This script runs the VIO+EKF pipeline using the modular vio/ package.
+It is completely independent of vio_vps.py and uses VIORunner directly.
 
 The modular package provides:
 - vio.config: Configuration loading
-- vio.data_loaders: IMU, MAG, VPS, DEM data loading
+- vio.data_loaders: IMU, MAG, VPS, DEM data loading  
 - vio.ekf: Extended Kalman Filter
-- vio.imu_preintegration: IMU preintegration
+- vio.imu_preintegration: IMU preintegration (Forster et al.)
 - vio.magnetometer: Magnetometer calibration & yaw
 - vio.vio_frontend: Visual front-end (feature tracking)
 - vio.msckf: Multi-State Constraint Kalman Filter
@@ -19,6 +19,7 @@ The modular package provides:
 - vio.state_manager: State initialization
 - vio.measurement_updates: Measurement update functions
 - vio.output_utils: Debug output
+- vio.main_loop: VIORunner orchestrator class
 
 Usage:
     python run_vio.py --config configs/config_bell412_dataset3.yaml \\
@@ -27,6 +28,7 @@ Usage:
         --output output_dir/
 
 Author: VIO project
+Version: 2.5.1 (Standalone - No dependency on vio_vps.py)
 """
 
 import argparse
@@ -101,43 +103,37 @@ def parse_args():
 
 
 def main():
-    """Main entry point."""
+    """Main entry point - uses modular VIORunner directly."""
     args = parse_args()
     
     # Print header
     print("=" * 70)
-    print("VIO+EKF Pipeline - Lightweight Entry Point")
+    print("VIO+EKF Pipeline - Standalone Modular Entry Point")
     print("=" * 70)
     print(f"Config: {args.config}")
     print(f"IMU: {args.imu}")
     print(f"Output: {args.output}")
     print("=" * 70)
     
-    # Import the main run function from vio_vps.py
-    # This maintains backward compatibility while using modular components
+    # Import from modular vio package (no vio_vps.py dependency!)
     try:
-        from vio_vps import run
+        from vio import __version__
+        from vio.main_loop import VIORunner, VIOConfig
         
-        # Load configuration first
-        from vio.config import load_config
-        config = load_config(args.config)
+        print(f"Using vio package version: {__version__}")
         
-        # Apply config to vio_vps globals
-        import vio_vps
-        for key, value in config.items():
-            if hasattr(vio_vps, key):
-                setattr(vio_vps, key, value)
-        
-        # Run VIO pipeline
-        run(
+        # Create VIOConfig from command line arguments
+        vio_config = VIOConfig(
             imu_path=args.imu,
             quarry_path=args.quarry,
             output_dir=args.output,
+            config_yaml=args.config,
             images_dir=args.images_dir,
             images_index_csv=args.images_index,
             vps_csv=args.vps,
             mag_csv=args.mag,
             dem_path=args.dem,
+            ground_truth_path=args.ground_truth,
             downscale_size=(args.img_w, args.img_h),
             z_state=args.z_state,
             camera_view=args.camera_view,
@@ -147,16 +143,22 @@ def main():
             save_debug_data=args.save_debug_data,
             save_keyframe_images=args.save_keyframe_images,
             use_preintegration=True,
-            ground_truth_path=args.ground_truth,
         )
+        
+        # Create and run VIORunner
+        runner = VIORunner(vio_config)
+        runner.run()
         
         print("=" * 70)
         print("✅ VIO pipeline completed successfully")
+        print(f"   Output: {args.output}")
         print("=" * 70)
         
     except ImportError as e:
         print(f"❌ Error importing modules: {e}")
         print("\nMake sure you are in the vio_vps_repo directory.")
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
     except Exception as e:
         print(f"❌ Error running VIO pipeline: {e}")

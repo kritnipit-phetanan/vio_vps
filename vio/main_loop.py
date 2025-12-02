@@ -227,7 +227,7 @@ class VIORunner:
         """Initialize EKF state and covariance."""
         from .ekf import ExtendedKalmanFilter
         from .state_manager import initialize_ekf_state
-        from .vps_integration import ensure_local_proj
+        from .data_loaders import ensure_local_proj
         
         # Ensure local projection is set up
         ensure_local_proj(self.lat0, self.lon0)
@@ -596,10 +596,9 @@ class VIORunner:
             Tuple of (used_vo, vo_data dict)
         """
         from .vio_frontend import VIOFrontEnd
-        from .msckf import (
-            augment_state_with_camera, perform_msckf_updates,
-            compute_plane_constraint_jacobian
-        )
+        from .msckf import perform_msckf_updates
+        from .propagation import augment_state_with_camera
+        from .vps_integration import compute_plane_constraint_jacobian
         from .math_utils import quaternion_to_yaw, skew_symmetric
         from .propagation import propagate_error_state_covariance
         from .loop_closure import get_loop_detector
@@ -786,7 +785,7 @@ class VIORunner:
         Args:
             t: Camera timestamp
         """
-        from .msckf import augment_state_with_camera
+        from .propagation import augment_state_with_camera
         
         p_imu = self.kf.x[0:3, 0].reshape(3,)
         q_imu = self.kf.x[6:10, 0].reshape(4,)

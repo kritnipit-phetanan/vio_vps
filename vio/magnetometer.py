@@ -13,6 +13,14 @@ import numpy as np
 from typing import Tuple, Optional
 from scipy.spatial.transform import Rotation as R_scipy
 
+# Import shared math utilities (avoid duplication)
+from .math_utils import (
+    quaternion_to_yaw as _quaternion_to_yaw_shared,
+    quaternion_multiply as _quaternion_multiply_shared,
+    angle_wrap as _angle_wrap_shared,
+    yaw_to_quaternion_update as _yaw_to_quaternion_update_shared
+)
+
 
 # =============================================================================
 # Default calibration constants (from Bell 412 dataset)
@@ -199,46 +207,16 @@ def compute_yaw_from_mag(mag_body: np.ndarray, q_wxyz: np.ndarray,
     return yaw_enu, quality
 
 
+# Use shared implementations from math_utils
+# These are re-exported for backward compatibility
 def quaternion_to_yaw(q_wxyz: np.ndarray) -> float:
-    """
-    Extract yaw angle from quaternion (ENU frame convention).
-    
-    CRITICAL: Xsens MTi-30 quaternion represents BODY→WORLD rotation.
-    (This is the same convention we use in imu_pose_to_camera_pose)
-    The rotation matrix R is R_body_to_world directly (NO transpose needed).
-    Yaw = arctan2(R[1,0], R[0,0]) where R is the body X axis in world frame.
-    """
-    q_xyzw = np.array([q_wxyz[1], q_wxyz[2], q_wxyz[3], q_wxyz[0]])
-    R_body_to_world = R_scipy.from_quat(q_xyzw).as_matrix()  # Body-to-World directly
-    # Extract yaw from rotation matrix (heading of body X axis in world XY plane)
-    yaw = np.arctan2(R_body_to_world[1, 0], R_body_to_world[0, 0])
-    return yaw  # radians
+    """Extract yaw from quaternion (wrapper to math_utils)."""
+    return _quaternion_to_yaw_shared(q_wxyz)
 
 
 def yaw_to_quaternion_update(yaw_current: float, yaw_measured: float) -> np.ndarray:
-    """
-    Compute quaternion correction for yaw-only update.
-    
-    Args:
-        yaw_current: Current yaw from state (radians)
-        yaw_measured: Measured yaw from magnetometer (radians)
-    
-    Returns: Delta quaternion [w,x,y,z] for multiplicative update
-    """
-    # Compute yaw error (unwrap to [-π, π])
-    dyaw = yaw_measured - yaw_current
-    dyaw = np.arctan2(np.sin(dyaw), np.cos(dyaw))
-    
-    # Convert to quaternion (rotation around Z axis)
-    # q = [cos(θ/2), 0, 0, sin(θ/2)] for Z-axis rotation
-    dq_wxyz = np.array([
-        np.cos(dyaw / 2.0),
-        0.0,
-        0.0,
-        np.sin(dyaw / 2.0)
-    ])
-    
-    return dq_wxyz
+    """Compute quaternion correction for yaw-only update (wrapper to math_utils)."""
+    return _yaw_to_quaternion_update_shared(yaw_current, yaw_measured)
 
 
 # =============================================================================
@@ -246,8 +224,8 @@ def yaw_to_quaternion_update(yaw_current: float, yaw_measured: float) -> np.ndar
 # =============================================================================
 
 def angle_wrap(angle: float) -> float:
-    """Wrap angle to [-π, π]."""
-    return np.arctan2(np.sin(angle), np.cos(angle))
+    """Wrap angle to [-π, π] (wrapper to math_utils)."""
+    return _angle_wrap_shared(angle)
 
 
 def apply_mag_filter(yaw_mag: float, yaw_t: float, gyro_z: float, dt_imu: float, 
@@ -368,23 +346,8 @@ def apply_mag_filter(yaw_mag: float, yaw_t: float, gyro_z: float, dt_imu: float,
 
 
 def quaternion_multiply(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
-    """
-    Multiply two quaternions q1 * q2.
-    
-    Args:
-        q1, q2: Quaternions in [w, x, y, z] format
-        
-    Returns: Result quaternion [w, x, y, z]
-    """
-    w1, x1, y1, z1 = q1
-    w2, x2, y2, z2 = q2
-    
-    return np.array([
-        w1*w2 - x1*x2 - y1*y2 - z1*z2,  # w
-        w1*x2 + x1*w2 + y1*z2 - z1*y2,  # x
-        w1*y2 - x1*z2 + y1*w2 + z1*x2,  # y
-        w1*z2 + x1*y2 - y1*x2 + z1*w2   # z
-    ])
+    """Multiply two quaternions (wrapper to math_utils)."""
+    return _quaternion_multiply_shared(q1, q2)
 
 
 # =============================================================================

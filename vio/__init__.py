@@ -2,11 +2,23 @@
 VIO (Visual-Inertial Odometry) Package
 
 Complete modularized implementation of the VIO+ESKF+MSCKF system
-for helicopter navigation. Version 2.5.0 with full run() integration.
+for helicopter navigation. Version 2.6.0 - Standalone (no vio_vps.py dependency).
 
-Version: 2.5.0 (Full run() integration)
+Version: 2.6.0 (Standalone modular package)
 Modules: 17
-Total Lines: ~8,540
+Total Lines: ~8,900
+
+Changes in v2.6.0:
+- BREAKING: run_vio.py now uses VIORunner directly (no vio_vps.py dependency)
+- Refactored redundant code: math_utils is now single source of truth for:
+  * quaternion_to_yaw, quaternion_multiply, angle_wrap, yaw_to_quaternion_update
+- magnetometer.py and measurement_updates.py now import from math_utils
+- Reduced code duplication by ~100 lines
+- Package is now fully self-contained and independent of vio_vps.py
+
+Changes in v2.5.1:
+- Added comprehensive debug output setup in main_loop.py
+- Added detailed docstrings to config.py, math_utils.py, imu_preintegration.py
 
 Changes in v2.5.0:
 - Added complete VIO processing in main_loop.py (process_vio method)
@@ -70,7 +82,7 @@ Usage:
     from vio.loop_closure import LoopClosureDetector, init_loop_closure
 """
 
-__version__ = "2.5.0"
+__version__ = "2.6.0"
 
 # Lazy module imports - access as vio.config, vio.math_utils, etc.
 # This avoids importing all dependencies at once

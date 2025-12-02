@@ -300,7 +300,50 @@ VO_MIN_INLIERS = 15
 VO_RATIO_TEST = 0.75
 VO_NADIR_ALIGN_DEG = 30.0
 VO_FRONT_ALIGN_DEG = 60.0
-CAMERA_VIEW_CONFIGS = {}
+
+# Camera view configurations with default values
+# These may be overridden by load_config()
+CAMERA_VIEW_CONFIGS = {
+    'nadir': {
+        'extrinsics': 'BODY_T_CAMDOWN',
+        'nadir_threshold': 30.0,
+        'sigma_scale_xy': 2.0,
+        'sigma_scale_z': 1.0,
+        'use_vz_only': True,
+        'min_parallax': 2.0,
+        'max_corners': 150,
+        'align_degrees': 30.0,
+        'vel_obs_type': 'z',
+        'h_vel_idx': [2],
+        'T_body_cam': np.eye(4),
+    },
+    'front': {
+        'extrinsics': 'BODY_T_CAMFRONT',
+        'nadir_threshold': 60.0,
+        'sigma_scale_xy': 2.0,
+        'sigma_scale_z': 2.0,
+        'use_vz_only': False,
+        'min_parallax': 2.0,
+        'max_corners': 200,
+        'align_degrees': 60.0, 
+        'vel_obs_type': 'xyz',
+        'h_vel_idx': [0, 1, 2],
+        'T_body_cam': np.eye(4),
+    },
+    'side': {
+        'extrinsics': 'BODY_T_CAMSIDE',
+        'nadir_threshold': 45.0,
+        'sigma_scale_xy': 2.0,
+        'sigma_scale_z': 2.0,
+        'use_vz_only': False,
+        'min_parallax': 2.0,
+        'max_corners': 150,
+        'align_degrees': 45.0,
+        'vel_obs_type': 'xy',
+        'h_vel_idx': [0, 1],
+        'T_body_cam': np.eye(4),
+    },
+}
 USE_FISHEYE = True
 
 # IMU bias settings

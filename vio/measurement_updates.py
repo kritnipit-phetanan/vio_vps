@@ -17,10 +17,13 @@ from scipy.spatial.transform import Rotation as R_scipy
 from typing import Optional, Tuple, Callable
 import math
 
+# Import shared math utilities (avoid duplication)
+from .math_utils import quaternion_to_yaw, mahalanobis_squared
+
 
 def _mahalanobis2(y: np.ndarray, S: np.ndarray) -> float:
     """
-    Compute squared Mahalanobis distance: y^T * S^{-1} * y.
+    Compute squared Mahalanobis distance (wrapper to math_utils).
     
     Args:
         y: Innovation vector
@@ -29,26 +32,7 @@ def _mahalanobis2(y: np.ndarray, S: np.ndarray) -> float:
     Returns:
         Squared Mahalanobis distance
     """
-    try:
-        S_inv = np.linalg.inv(S)
-        return float(y.T @ S_inv @ y)
-    except np.linalg.LinAlgError:
-        return float('inf')
-
-
-def quaternion_to_yaw(q_wxyz: np.ndarray) -> float:
-    """
-    Extract yaw angle from quaternion [w, x, y, z].
-    
-    Args:
-        q_wxyz: Quaternion as [w, x, y, z]
-        
-    Returns:
-        Yaw angle in radians (ENU frame)
-    """
-    q_xyzw = np.array([q_wxyz[1], q_wxyz[2], q_wxyz[3], q_wxyz[0]])
-    euler = R_scipy.from_quat(q_xyzw).as_euler('ZYX')
-    return euler[0]  # Yaw is first component in ZYX order
+    return mahalanobis_squared(y, S)
 
 
 def apply_zupt_update(kf, 
