@@ -14,6 +14,9 @@ This package contains modularized components of the VIO+EKF system:
 - propagation: IMU propagation, ZUPT, flight phase detection
 - vps_integration: VPS position updates, DEM height updates
 - output_utils: Debug logging, visualization, error statistics
+- state_manager: EKF state initialization, lever arm compensation
+- measurement_updates: MAG, DEM, ZUPT measurement updates
+- main_loop: VIORunner class for complete pipeline
 
 Author: VIO project
 
@@ -31,6 +34,9 @@ Usage:
     from vio import propagation
     from vio import vps_integration
     from vio import output_utils
+    from vio import state_manager
+    from vio import measurement_updates
+    from vio import main_loop
     
     # Or import specific functions
     from vio.config import load_config
@@ -42,69 +48,38 @@ Usage:
     from vio.propagation import propagate_to_timestamp, apply_zupt
     from vio.vps_integration import apply_vps_update, apply_height_update
     from vio.output_utils import DebugCSVWriters, print_error_statistics
+    from vio.state_manager import initialize_ekf_state
+    from vio.main_loop import VIORunner, VIOConfig
 """
 
-__version__ = "2.2.0"
+__version__ = "2.3.0"
 
 # Lazy module imports - access as vio.config, vio.math_utils, etc.
 # This avoids importing all dependencies at once
+import importlib
+
+# Available submodules
+_SUBMODULES = {
+    "config", "math_utils", "imu_preintegration", "ekf", 
+    "data_loaders", "magnetometer", "camera", "vio_frontend", "msckf",
+    "propagation", "vps_integration", "output_utils",
+    "state_manager", "measurement_updates", "main_loop"
+}
 
 def __getattr__(name):
     """Lazy module loading to avoid importing all dependencies at once."""
-    if name == "config":
-        from . import config
-        return config
-    elif name == "math_utils":
-        from . import math_utils
-        return math_utils
-    elif name == "imu_preintegration":
-        from . import imu_preintegration
-        return imu_preintegration
-    elif name == "ekf":
-        from . import ekf
-        return ekf
-    elif name == "data_loaders":
-        from . import data_loaders
-        return data_loaders
-    elif name == "magnetometer":
-        from . import magnetometer
-        return magnetometer
-    elif name == "camera":
-        from . import camera
-        return camera
-    elif name == "vio_frontend":
-        from . import vio_frontend
-        return vio_frontend
-    elif name == "msckf":
-        from . import msckf
-        return msckf
-    elif name == "propagation":
-        from . import propagation
-        return propagation
-    elif name == "vps_integration":
-        from . import vps_integration
-        return vps_integration
-    elif name == "output_utils":
-        from . import output_utils
-        return output_utils
-    
+    if name in _SUBMODULES:
+        module = importlib.import_module(f".{name}", __name__)
+        globals()[name] = module  # Cache in globals to avoid repeated import
+        return module
     raise AttributeError(f"module 'vio' has no attribute '{name}'")
 
 
 # For explicit imports: from vio import load_config, etc.
 def __dir__():
     """List available submodules."""
-    return [
-        "config", "math_utils", "imu_preintegration", "ekf", 
-        "data_loaders", "magnetometer", "camera", "vio_frontend", "msckf",
-        "propagation", "vps_integration", "output_utils"
-    ]
+    return list(_SUBMODULES)
 
 
 # Direct function imports for convenience (loaded on-demand)
-__all__ = [
-    # Submodules
-    "config", "math_utils", "imu_preintegration", "ekf", 
-    "data_loaders", "magnetometer", "camera", "vio_frontend", "msckf",
-    "propagation", "vps_integration", "output_utils",
-]
+__all__ = list(_SUBMODULES)
