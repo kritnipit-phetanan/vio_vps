@@ -438,6 +438,505 @@ class VIORunner:
             else:
                 print(f"[VPS] Rejected: {reason}")
     
+    def process_vio(self, rec, t: float, time_elapsed: float, ongoing_preint=None):
+        """
+        Process VIO (Visual-Inertial Odometry) updates.
+        
+        This handles:
+        1. Image loading and feature tracking
+        2. Loop closure detection (optional)
+        3. Preintegration application at camera frame
+        4. Camera cloning for MSCKF
+        5. MSCKF multi-view updates
+        6. VIO velocity updates with scale recovery
+        7. Plane constraint updates
+        
+        Args:
+            rec: Current IMU record (for rotation rate check)
+            t: Current timestamp
+            time_elapsed: Time since start
+            ongoing_preint: Preintegration buffer (if enabled)
+            
+        Returns:
+            Tuple of (used_vo, vo_data dict)
+        """
+        from .vio_frontend import VIOFrontEnd
+        from .msckf import (
+            augment_state_with_camera, perform_msckf_updates,
+            compute_plane_constraint_jacobian
+        )
+        from .math_utils import quaternion_to_yaw, skew_symmetric
+        from .propagation import propagate_error_state_covariance
+        from .loop_closure import get_loop_detector
+        
+        # Get configuration
+        kb_params = self.global_config.get('KB_PARAMS', {'mu': 600, 'mv': 600})
+        min_parallax = self.global_config.get('MIN_PARALLAX_PX', 2.0)
+        imu_params = self.global_config.get('IMU_PARAMS', {})
+        
+        used_vo = False
+        vo_data = None
+        vo_dx = vo_dy = vo_dz = vo_r = vo_p = vo_y = np.nan
+        
+        if self.vio_fe is None:
+            return used_vo, vo_data
+        
+        # Check for fast rotation - skip VIO during aggressive maneuvers
+        rotation_rate_deg_s = np.linalg.norm(rec.ang) * 180.0 / np.pi
+        is_fast_rotation = rotation_rate_deg_s > 30.0
+        
+        # Process images up to current time
+        while self.state.img_idx < len(self.imgs) and self.imgs[self.state.img_idx].t <= t:
+            img_path = self.imgs[self.state.img_idx].path
+            img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
+            
+            if img is None:
+                self.state.img_idx += 1
+                continue
+            
+            # Resize if needed
+            if (img.shape[1], img.shape[0]) != tuple(self.config.downscale_size):
+                img = cv2.resize(img, self.config.downscale_size, interpolation=cv2.INTER_AREA)
+            
+            if is_fast_rotation:
+                print(f"[VIO] SKIPPING due to fast rotation: {rotation_rate_deg_s:.1f} deg/s")
+                self.state.img_idx += 1
+                continue
+            
+            # Run VIO frontend
+            ok, ninl, r_vo_mat, t_unit, dt_img = self.vio_fe.step(img, self.imgs[self.state.img_idx].t)
+            
+            # Compute average optical flow (parallax)
+            avg_flow_px = getattr(self.vio_fe, 'mean_parallax', 0.0)
+            if avg_flow_px == 0.0 and self.vio_fe.last_matches is not None:
+                focal_px = kb_params.get('mu', 600)
+                pts_prev, pts_cur = self.vio_fe.last_matches
+                if len(pts_prev) > 0:
+                    pts_prev_px = pts_prev * focal_px + np.array([[self.vio_fe.img_w/2, self.vio_fe.img_h/2]])
+                    pts_cur_px = pts_cur * focal_px + np.array([[self.vio_fe.img_w/2, self.vio_fe.img_h/2]])
+                    flows = pts_cur_px - pts_prev_px
+                    avg_flow_px = float(np.median(np.linalg.norm(flows, axis=1)))
+            
+            # Apply preintegration at EVERY camera frame
+            if self.config.use_preintegration and ongoing_preint is not None:
+                self._apply_preintegration_at_camera(ongoing_preint, t, imu_params)
+            
+            # Check parallax for VIO velocity update
+            is_insufficient_parallax = avg_flow_px < min_parallax
+            
+            if is_insufficient_parallax:
+                print(f"[VIO] SKIPPING velocity: parallax={avg_flow_px:.2f}px < {min_parallax}px")
+                self.state.img_idx += 1
+                continue
+            
+            # Camera cloning for MSCKF
+            clone_threshold = min_parallax * 2.0
+            should_clone = avg_flow_px >= clone_threshold and not is_fast_rotation
+            
+            if should_clone:
+                self._clone_camera_for_msckf(t)
+            
+            # VIO velocity update (if frontend succeeded)
+            if ok and r_vo_mat is not None and t_unit is not None:
+                self._apply_vio_velocity_update(
+                    r_vo_mat, t_unit, t, dt_img, 
+                    avg_flow_px, rec
+                )
+                
+                # Increment VIO frame
+                self.state.vio_frame = max(0, self.state.vio_frame + 1)
+                used_vo = True
+                
+                # Store VO data
+                t_norm = t_unit / (np.linalg.norm(t_unit) + 1e-12)
+                vo_dx, vo_dy, vo_dz = float(t_norm[0]), float(t_norm[1]), float(t_norm[2])
+                r_eul = R_scipy.from_matrix(r_vo_mat).as_euler('zyx', degrees=True)
+                vo_y, vo_p, vo_r = float(r_eul[0]), float(r_eul[1]), float(r_eul[2])
+                
+                vo_data = {
+                    'dx': vo_dx, 'dy': vo_dy, 'dz': vo_dz,
+                    'roll': vo_r, 'pitch': vo_p, 'yaw': vo_y
+                }
+            
+            self.state.img_idx += 1
+        
+        return used_vo, vo_data
+    
+    def _apply_preintegration_at_camera(self, ongoing_preint, t: float, imu_params: dict):
+        """
+        Apply accumulated preintegration at camera frame.
+        
+        This is called at EVERY camera frame to prevent IMU accumulation explosion.
+        Following Forster et al. TRO 2017 design.
+        
+        Args:
+            ongoing_preint: IMUPreintegration object
+            t: Current timestamp
+            imu_params: IMU noise parameters
+        """
+        from .propagation import propagate_error_state_covariance
+        from .math_utils import skew_symmetric
+        
+        dt_total = ongoing_preint.dt_sum
+        if dt_total < 1e-6:
+            return
+        
+        # Get deltas
+        delta_R, delta_v, delta_p = ongoing_preint.get_deltas()
+        
+        # Current state
+        p_i = self.kf.x[0:3, 0].reshape(3,)
+        v_i = self.kf.x[3:6, 0].reshape(3,)
+        q_i = self.kf.x[6:10, 0].reshape(4,)  # [w,x,y,z]
+        bg = self.kf.x[10:13, 0].reshape(3,)
+        ba = self.kf.x[13:16, 0].reshape(3,)
+        
+        # Get bias-corrected deltas
+        delta_R_corr, delta_v_corr, delta_p_corr = ongoing_preint.get_deltas_corrected(bg, ba)
+        
+        # R_BW (Body-to-World)
+        q_i_xyzw = np.array([q_i[1], q_i[2], q_i[3], q_i[0]])
+        R_BW = R_scipy.from_quat(q_i_xyzw).as_matrix()
+        
+        # Rotation update
+        R_BW_new = R_BW @ delta_R_corr
+        q_i_new_xyzw = R_scipy.from_matrix(R_BW_new).as_quat()
+        q_i_new = np.array([q_i_new_xyzw[3], q_i_new_xyzw[0], q_i_new_xyzw[1], q_i_new_xyzw[2]])
+        
+        # Position and velocity updates
+        v_i_new = v_i + R_BW @ delta_v_corr
+        p_i_new = p_i + v_i * dt_total + R_BW @ delta_p_corr
+        
+        # Write back to state
+        self.kf.x[0:3, 0] = p_i_new.reshape(3,)
+        self.kf.x[3:6, 0] = v_i_new.reshape(3,)
+        self.kf.x[6:10, 0] = q_i_new.reshape(4,)
+        
+        # Propagate covariance
+        preint_cov = ongoing_preint.get_covariance()
+        J_R_bg, J_v_bg, J_v_ba, J_p_bg, J_p_ba = ongoing_preint.get_jacobians()
+        
+        num_clones = (self.kf.x.shape[0] - 16) // 7
+        
+        # Build state transition matrix
+        Phi_core = np.eye(15, dtype=float)
+        Phi_core[0:3, 3:6] = np.eye(3) * dt_total
+        Phi_core[0:3, 6:9] = -R_BW @ skew_symmetric(delta_p_corr)
+        Phi_core[0:3, 9:12] = R_BW @ J_p_bg
+        Phi_core[0:3, 12:15] = R_BW @ J_p_ba
+        Phi_core[3:6, 6:9] = -R_BW @ skew_symmetric(delta_v_corr)
+        Phi_core[3:6, 9:12] = R_BW @ J_v_bg
+        Phi_core[3:6, 12:15] = R_BW @ J_v_ba
+        Phi_core[6:9, 9:12] = -J_R_bg
+        
+        # Process noise
+        Q_core = np.zeros((15, 15), dtype=float)
+        Q_core[0:3, 0:3] = R_BW @ preint_cov[6:9, 6:9] @ R_BW.T
+        Q_core[3:6, 3:6] = R_BW @ preint_cov[3:6, 3:6] @ R_BW.T
+        Q_core[6:9, 6:9] = R_BW @ preint_cov[0:3, 0:3] @ R_BW.T
+        Q_core[9:12, 9:12] = np.eye(3) * (imu_params.get('gyr_w', 0.0001)**2 * dt_total)
+        Q_core[12:15, 12:15] = np.eye(3) * (imu_params.get('acc_w', 0.001)**2 * dt_total)
+        
+        self.kf.P = propagate_error_state_covariance(self.kf.P, Phi_core, Q_core, num_clones)
+        
+        # Reset preintegration buffer
+        ongoing_preint.reset(bg=bg, ba=ba)
+        
+        print(f"[PREINT] Applied: Δt={dt_total:.3f}s, Δpos={np.linalg.norm(p_i_new - p_i):.4f}m")
+    
+    def _clone_camera_for_msckf(self, t: float):
+        """
+        Clone current IMU pose for MSCKF.
+        
+        Args:
+            t: Camera timestamp
+        """
+        from .msckf import augment_state_with_camera
+        
+        p_imu = self.kf.x[0:3, 0].reshape(3,)
+        q_imu = self.kf.x[6:10, 0].reshape(4,)
+        
+        try:
+            start_idx = augment_state_with_camera(
+                self.kf, q_imu, p_imu,
+                self.state.cam_states, self.state.cam_observations
+            )
+            
+            # Store FEJ linearization points
+            clone_idx = len(self.state.cam_states)
+            err_theta_idx = 15 + 6 * clone_idx
+            err_p_idx = 15 + 6 * clone_idx + 3
+            
+            # Record observations
+            obs_data = []
+            if hasattr(self.vio_fe, 'get_tracks_for_frame'):
+                tracks = self.vio_fe.get_tracks_for_frame(self.vio_fe.frame_idx)
+                for fid, pt in tracks:
+                    pt_array = np.array([[pt[0], pt[1]]], dtype=np.float32)
+                    pt_norm = self.vio_fe._undistort_pts(pt_array).reshape(2,)
+                    obs_data.append({
+                        'fid': int(fid),
+                        'pt_pixel': (float(pt[0]), float(pt[1])),
+                        'pt_norm': (float(pt_norm[0]), float(pt_norm[1])),
+                        'quality': 1.0
+                    })
+            
+            self.state.cam_states.append({
+                'start_idx': start_idx,
+                'q_idx': start_idx,
+                'p_idx': start_idx + 4,
+                'err_q_idx': err_theta_idx,
+                'err_p_idx': err_p_idx,
+                't': t,
+                'timestamp': t,
+                'frame': self.vio_fe.frame_idx,
+                'q_fej': q_imu.copy(),
+                'p_fej': p_imu.copy(),
+                'bg_fej': self.kf.x[10:13, 0].copy(),
+                'ba_fej': self.kf.x[13:16, 0].copy()
+            })
+            
+            self.state.cam_observations.append({
+                'cam_id': clone_idx,
+                'frame': self.vio_fe.frame_idx,
+                't': t,
+                'observations': obs_data
+            })
+            
+            print(f"[CLONE] Created clone {clone_idx} with {len(obs_data)} observations")
+            
+            # Trigger MSCKF update if enough clones
+            if len(self.state.cam_states) >= 3:
+                self._trigger_msckf_update()
+                
+        except Exception as e:
+            print(f"[CLONE] Failed: {e}")
+    
+    def _trigger_msckf_update(self):
+        """Trigger MSCKF multi-view geometric update."""
+        from .msckf import perform_msckf_updates
+        
+        # Count mature features
+        feature_obs_count = {}
+        for obs_set in self.state.cam_observations:
+            for obs in obs_set['observations']:
+                fid = obs['fid']
+                feature_obs_count[fid] = feature_obs_count.get(fid, 0) + 1
+        
+        num_mature = sum(1 for c in feature_obs_count.values() if c >= 2)
+        
+        should_update = (
+            num_mature >= 20 or
+            len(self.state.cam_states) >= 4 or
+            (self.vio_fe.frame_idx % 5 == 0 and len(self.state.cam_states) >= 3)
+        )
+        
+        if should_update:
+            try:
+                num_updates = perform_msckf_updates(
+                    self.vio_fe, 
+                    self.state.cam_observations,
+                    self.state.cam_states, 
+                    self.kf,
+                    min_observations=2,
+                    max_features=50,
+                    msckf_dbg_path=None,
+                    dem_reader=self.dem,
+                    origin_lat=self.lat0,
+                    origin_lon=self.lon0
+                )
+                if num_updates > 0:
+                    print(f"[MSCKF] Updated {num_updates} features")
+            except Exception as e:
+                print(f"[MSCKF] Error: {e}")
+    
+    def _apply_vio_velocity_update(self, r_vo_mat, t_unit, t: float, dt_img: float,
+                                    avg_flow_px: float, rec):
+        """
+        Apply VIO velocity update with scale recovery.
+        
+        Args:
+            r_vo_mat: Relative rotation matrix from Essential matrix
+            t_unit: Unit translation vector from Essential matrix
+            t: Current timestamp
+            dt_img: Time between images
+            avg_flow_px: Average optical flow in pixels
+            rec: Current IMU record
+        """
+        from .math_utils import quaternion_to_yaw
+        from .vps_integration import xy_to_latlon
+        from .config import CAMERA_VIEW_CONFIGS
+        
+        kb_params = self.global_config.get('KB_PARAMS', {'mu': 600})
+        sigma_vo = self.global_config.get('SIGMA_VO_VEL', 0.5)
+        
+        # Get camera extrinsics
+        view_cfg = CAMERA_VIEW_CONFIGS.get(self.config.camera_view, CAMERA_VIEW_CONFIGS['nadir'])
+        extrinsics_name = view_cfg['extrinsics']
+        
+        from .config import BODY_T_CAMDOWN, BODY_T_CAMFRONT, BODY_T_CAMSIDE
+        if extrinsics_name == 'BODY_T_CAMDOWN':
+            body_t_cam = BODY_T_CAMDOWN
+        elif extrinsics_name == 'BODY_T_CAMFRONT':
+            body_t_cam = BODY_T_CAMFRONT
+        else:
+            body_t_cam = BODY_T_CAMDOWN
+        
+        R_cam_to_body = body_t_cam[:3, :3]
+        
+        # Map direction
+        t_norm = t_unit / (np.linalg.norm(t_unit) + 1e-12)
+        t_body = R_cam_to_body @ t_norm
+        
+        # Get rotation from IMU quaternion
+        q_imu = rec.q
+        Rwb = R_scipy.from_quat(q_imu).as_matrix()
+        
+        # Scale recovery using AGL
+        lat_now, lon_now = xy_to_latlon(self.kf.x[0, 0], self.kf.x[1, 0], self.lat0, self.lon0)
+        dem_now = self.dem.sample_m(lat_now, lon_now) if self.dem.ds else 0.0
+        if dem_now is None or np.isnan(dem_now):
+            dem_now = 0.0
+        
+        if self.config.z_state.lower() == "agl":
+            agl = abs(self.kf.x[2, 0])
+        else:
+            agl = abs(self.kf.x[2, 0] - dem_now)
+        agl = max(1.0, agl)
+        
+        # Optical flow-based scale
+        focal_px = kb_params.get('mu', 600)
+        if dt_img > 1e-4 and avg_flow_px > 2.0:
+            scale_flow = agl / focal_px
+            speed_final = (avg_flow_px / dt_img) * scale_flow
+        else:
+            speed_final = 0.0
+        
+        speed_final = min(speed_final, 50.0)  # Clamp to 50 m/s
+        
+        # Compute velocity in world frame
+        if avg_flow_px > 2.0 and self.vio_fe.last_matches is not None:
+            pts_prev, pts_cur = self.vio_fe.last_matches
+            if len(pts_prev) > 0:
+                flows_normalized = pts_cur - pts_prev
+                median_flow = np.median(flows_normalized, axis=0)
+                flow_norm = np.linalg.norm(median_flow)
+                if flow_norm > 1e-6:
+                    flow_dir = median_flow / flow_norm
+                    vel_cam = np.array([-flow_dir[0], -flow_dir[1], 0.0])
+                    vel_cam = vel_cam / np.linalg.norm(vel_cam + 1e-9)
+                    vel_body = R_cam_to_body @ vel_cam * speed_final
+                else:
+                    vel_body = t_body * speed_final
+            else:
+                vel_body = t_body * speed_final
+        else:
+            vel_body = t_body * speed_final
+        
+        vel_world = Rwb @ vel_body
+        
+        # Determine if using VZ only (for nadir cameras)
+        use_only_vz = view_cfg.get('use_vz_only', True)
+        
+        # ESKF velocity update
+        num_clones = (self.kf.x.shape[0] - 16) // 7
+        err_dim = 15 + 6 * num_clones
+        
+        if use_only_vz:
+            h_vel = np.zeros((1, err_dim), dtype=float)
+            h_vel[0, 5] = 1.0
+            vel_meas = np.array([[vel_world[2]]])
+            r_mat = np.array([[(sigma_vo * view_cfg.get('sigma_scale_z', 2.0))**2]])
+        else:
+            h_vel = np.zeros((3, err_dim), dtype=float)
+            h_vel[0, 3] = 1.0
+            h_vel[1, 4] = 1.0
+            h_vel[2, 5] = 1.0
+            vel_meas = vel_world.reshape(-1, 1)
+            scale_xy = view_cfg.get('sigma_scale_xy', 1.0)
+            scale_z = view_cfg.get('sigma_scale_z', 2.0)
+            r_mat = np.diag([(sigma_vo * scale_xy)**2, (sigma_vo * scale_xy)**2, (sigma_vo * scale_z)**2])
+        
+        def h_fun(x, h=h_vel):
+            return h
+        
+        def hx_fun(x, h=h_vel):
+            if use_only_vz:
+                return x[5:6].reshape(1, 1)
+            else:
+                return x[3:6].reshape(3, 1)
+        
+        # Apply update
+        if self.config.use_vio_velocity:
+            self.kf.update(z=vel_meas, HJacobian=h_fun, Hx=hx_fun, R=r_mat)
+            print(f"[VIO] Velocity update: speed={speed_final:.2f}m/s, vz_only={use_only_vz}")
+    
+    def log_error(self, t: float):
+        """
+        Log VIO error vs ground truth.
+        
+        Args:
+            t: Current timestamp
+        """
+        from .vps_integration import xy_to_latlon, latlon_to_xy
+        from .math_utils import quaternion_to_yaw
+        from .state_manager import imu_to_gnss_position
+        
+        gt_df = self.ppk_trajectory if self.ppk_trajectory is not None else self.flight_log_df
+        if gt_df is None or len(gt_df) == 0:
+            return
+        
+        try:
+            # Find closest ground truth
+            gt_idx = np.argmin(np.abs(gt_df['stamp_log'].values - t))
+            gt_row = gt_df.iloc[gt_idx]
+            
+            use_ppk = self.ppk_trajectory is not None
+            
+            if use_ppk:
+                gt_lat = gt_row['lat']
+                gt_lon = gt_row['lon']
+                gt_alt = gt_row['height']
+            else:
+                gt_lat = gt_row['lat_dd']
+                gt_lon = gt_row['lon_dd']
+                gt_alt = gt_row['altitude_MSL_m']
+            
+            gt_E, gt_N = latlon_to_xy(gt_lat, gt_lon, self.lat0, self.lon0)
+            gt_U = gt_alt
+            
+            # VIO prediction
+            vio_E = float(self.kf.x[0, 0])
+            vio_N = float(self.kf.x[1, 0])
+            vio_U = float(self.kf.x[2, 0])
+            
+            # Errors
+            err_E = vio_E - gt_E
+            err_N = vio_N - gt_N
+            err_U = vio_U - gt_U
+            pos_error = np.sqrt(err_E**2 + err_N**2 + err_U**2)
+            
+            # Yaw
+            q_vio = self.kf.x[6:10, 0]
+            yaw_vio = np.rad2deg(quaternion_to_yaw(q_vio))
+            
+            yaw_gt = np.nan
+            yaw_error = np.nan
+            if use_ppk and 'yaw' in gt_row:
+                yaw_gt = 90.0 - np.rad2deg(gt_row['yaw'])
+                yaw_error = ((yaw_vio - yaw_gt + 180) % 360) - 180
+            
+            with open(self.error_csv, "a") as ef:
+                ef.write(
+                    f"{t:.6f},{pos_error:.3f},{err_E:.3f},{err_N:.3f},{err_U:.3f},"
+                    f"0.0,0.0,0.0,0.0,"
+                    f"{err_U:.3f},{yaw_vio:.2f},{yaw_gt:.2f},{yaw_error:.2f},"
+                    f"{gt_lat:.8f},{gt_lon:.8f},{gt_alt:.3f},"
+                    f"{vio_E:.3f},{vio_N:.3f},{vio_U:.3f}\n"
+                )
+        except Exception:
+            pass
+    
     def process_magnetometer(self, t: float, time_elapsed: float):
         """
         Process magnetometer measurements up to current time.
@@ -702,12 +1201,15 @@ class VIORunner:
             if self.config.use_magnetometer:
                 self.process_magnetometer(t, time_elapsed)
             
+            # VIO updates (feature tracking, MSCKF, velocity)
+            used_vo, vo_data = self.process_vio(rec, t, time_elapsed, ongoing_preint)
+            
             # DEM height updates
             self.process_dem_height(t)
             
-            # VIO updates (simplified - full implementation in vio_vps.py)
-            used_vo = False
-            vo_data = None
+            # Log error vs ground truth
+            if i % 100 == 0:  # Log every 100 samples to reduce file size
+                self.log_error(t)
             
             # Log pose
             self.log_pose(t, dt, used_vo, vo_data)

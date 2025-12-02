@@ -1,7 +1,22 @@
 """
 VIO (Visual-Inertial Odometry) Package
 
-This package contains modularized components of the VIO+EKF system:
+Complete modularized implementation of the VIO+ESKF+MSCKF system
+for helicopter navigation. Version 2.5.0 with full run() integration.
+
+Version: 2.5.0 (Full run() integration)
+Modules: 17
+Total Lines: ~8,540
+
+Changes in v2.5.0:
+- Added complete VIO processing in main_loop.py (process_vio method)
+- Added preintegration application at camera frames
+- Added camera cloning for MSCKF
+- Added VIO velocity update with scale recovery
+- Added error logging vs ground truth
+- Full integration of run() logic into VIORunner class
+
+Submodules:
 - config: Configuration loading and global constants
 - math_utils: Quaternion operations, rotation matrices
 - imu_preintegration: IMU preintegration (Forster et al.)
@@ -55,7 +70,7 @@ Usage:
     from vio.loop_closure import LoopClosureDetector, init_loop_closure
 """
 
-__version__ = "2.4.0"
+__version__ = "2.5.0"
 
 # Lazy module imports - access as vio.config, vio.math_utils, etc.
 # This avoids importing all dependencies at once
