@@ -848,9 +848,12 @@ class VIORunner:
             # Run VIO frontend
             ok, ninl, r_vo_mat, t_unit, dt_img = self.vio_fe.step(img, self.imgs[self.state.img_idx].t)
             
-            # Compute average optical flow (parallax)
-            avg_flow_px = getattr(self.vio_fe, 'mean_parallax', 0.0)
-            if avg_flow_px == 0.0 and self.vio_fe.last_matches is not None:
+            # Compute average optical flow (parallax) - use the new attributes
+            # mean_parallax is now computed in step() EVERY frame, even if ok=False
+            avg_flow_px = self.vio_fe.mean_parallax
+            
+            # Fallback to last_matches only if mean_parallax is still ~0 and matches exist
+            if avg_flow_px < 0.01 and self.vio_fe.last_matches is not None:
                 focal_px = kb_params.get('mu', 600)
                 pts_prev, pts_cur = self.vio_fe.last_matches
                 if len(pts_prev) > 0:
@@ -859,9 +862,9 @@ class VIORunner:
                     flows = pts_cur_px - pts_prev_px
                     avg_flow_px = float(np.median(np.linalg.norm(flows, axis=1)))
             
-            # Debug: log feature statistics
-            num_features = len(self.vio_fe.prev_kps) if hasattr(self.vio_fe, 'prev_kps') and self.vio_fe.prev_kps is not None else 0
-            num_inliers = getattr(self.vio_fe, 'last_inliers', 0)
+            # Debug: log feature statistics - use actual tracked features from VIOFrontEnd
+            num_features = self.vio_fe.last_num_tracked
+            num_inliers = self.vio_fe.last_num_inliers
             self._log_debug_feature_stats(
                 frame=self.vio_fe.frame_idx,
                 t=t,

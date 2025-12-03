@@ -96,6 +96,12 @@ class VIOFrontEnd:
         self.epipolar_threshold = 1.0
         self.temporal_threshold = 50.0
         
+        # Flow/parallax statistics (updated EVERY frame regardless of ok status)
+        self.mean_parallax = 0.0      # Mean optical flow magnitude in pixels
+        self.last_flow_px = 0.0       # Same as mean_parallax (alias for compatibility)
+        self.last_num_tracked = 0     # Number of successfully tracked features
+        self.last_num_inliers = 0     # Number of inliers in pose estimation
+        
         # Debug counter
         self._undist_dbg_count = 0
 
@@ -326,6 +332,18 @@ class VIOFrontEnd:
                     good_mask = good_mask & (p1_reshaped[:, 0] >= margin) & (p1_reshaped[:, 0] < self.img_w - margin)
                     good_mask = good_mask & (p1_reshaped[:, 1] >= margin) & (p1_reshaped[:, 1] < self.img_h - margin)
                     
+                    # Compute mean parallax IMMEDIATELY after KLT (before any filtering)
+                    # This ensures we always have a valid flow value even if pose estimation fails
+                    if np.sum(good_mask) > 0:
+                        good_flow_mag = flow_mag[good_mask]
+                        self.mean_parallax = float(np.median(good_flow_mag))
+                        self.last_flow_px = self.mean_parallax
+                        self.last_num_tracked = int(np.sum(good_mask))
+                    else:
+                        self.mean_parallax = 0.0
+                        self.last_flow_px = 0.0
+                        self.last_num_tracked = 0
+                    
                     st = st.reshape(-1) * good_mask
                     p1 = p1.reshape(-1, 2)
                     
@@ -438,6 +456,9 @@ class VIOFrontEnd:
         
         if num_final < VO_MIN_INLIERS:
             return False, num_final, None, None, dt_img
+        
+        # Update inlier count (successful pose estimation)
+        self.last_num_inliers = int(num_final)
         
         # Save inlier matches
         try:
