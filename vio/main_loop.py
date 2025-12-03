@@ -36,6 +36,32 @@ from scipy.spatial.transform import Rotation as R_scipy
 from dataclasses import dataclass, field
 from typing import Optional, Tuple, List, Dict, Any
 
+# Performance-critical imports moved to top-level to avoid per-iteration overhead
+from .config import load_config, CAMERA_VIEW_CONFIGS
+from .config import BODY_T_CAMDOWN, BODY_T_CAMFRONT, BODY_T_CAMSIDE
+from .data_loaders import (
+    load_imu_csv, load_images, load_vps_csv, 
+    load_mag_csv, load_ppk_initial_state, load_ppk_trajectory,
+    load_msl_from_gga, load_quarry_initial,
+    DEMReader, ensure_local_proj
+)
+from .ekf import ExtendedKalmanFilter
+from .state_manager import initialize_ekf_state, imu_to_gnss_position
+from .vio_frontend import VIOFrontEnd
+from .camera import make_KD_for_size
+from .propagation import (
+    process_imu, propagate_error_state_covariance, 
+    augment_state_with_camera, detect_stationary, apply_zupt
+)
+from .vps_integration import apply_vps_update, xy_to_latlon, latlon_to_xy
+from .vps_integration import compute_plane_constraint_jacobian
+from .msckf import perform_msckf_updates, print_msckf_stats
+from .measurement_updates import apply_magnetometer_update, apply_dem_height_update
+from .magnetometer import calibrate_magnetometer
+from .math_utils import quaternion_to_yaw, skew_symmetric
+from .loop_closure import get_loop_detector
+from .imu_preintegration import IMUPreintegration
+
 
 @dataclass
 class VIOConfig:
@@ -154,8 +180,6 @@ class VIORunner:
     
     def load_config(self) -> dict:
         """Load YAML configuration file."""
-        from .config import load_config
-        
         if self.config.config_yaml:
             cfg = load_config(self.config.config_yaml)
             self.global_config = cfg
@@ -164,12 +188,6 @@ class VIORunner:
     
     def load_data(self):
         """Load all input data sources."""
-        from .data_loaders import (
-            load_imu_csv, load_images, load_vps_csv, load_mag_csv,
-            DEMReader, load_ppk_initial_state, load_msl_from_gga,
-            load_quarry_initial, load_ppk_trajectory
-        )
-        
         # Load PPK ground truth if available
         self.ppk_state = None
         if self.config.ground_truth_path:
@@ -225,10 +243,6 @@ class VIORunner:
     
     def initialize_ekf(self):
         """Initialize EKF state and covariance."""
-        from .ekf import ExtendedKalmanFilter
-        from .state_manager import initialize_ekf_state
-        from .data_loaders import ensure_local_proj
-        
         # Ensure local projection is set up
         ensure_local_proj(self.lat0, self.lon0)
         
@@ -281,9 +295,6 @@ class VIORunner:
     
     def initialize_vio_frontend(self):
         """Initialize VIO frontend if images are available."""
-        from .vio_frontend import VIOFrontEnd
-        from .camera import make_KD_for_size
-        
         if len(self.imgs) == 0:
             return
         
@@ -331,13 +342,13 @@ class VIORunner:
         
         # Pose output - main trajectory
         self.pose_csv = os.path.join(self.config.output_dir, "pose.csv")
-        with open(self.pose_csv, "w") as f:
+        with open(self.pose_csv, "w", newline="") as f:
             f.write("Timestamp(s),dt,Frame,PX,PY,PZ_MSL,VX,VY,VZ,lat,lon,AGL(m),"
                     "vo_dx,vo_dy,vo_dz,vo_d_roll,vo_d_pitch,vo_d_yaw\n")
         
         # Error log - comparison with ground truth
         self.error_csv = os.path.join(self.config.output_dir, "error_log.csv")
-        with open(self.error_csv, "w") as f:
+        with open(self.error_csv, "w", newline="") as f:
             f.write("t,pos_error_m,pos_error_E,pos_error_N,pos_error_U,"
                     "vel_error_m_s,vel_error_E,vel_error_N,vel_error_U,"
                     "alt_error_m,yaw_vio_deg,yaw_gps_deg,yaw_error_deg,"
@@ -345,23 +356,23 @@ class VIORunner:
         
         # State debug log - detailed state evolution
         self.state_dbg_csv = os.path.join(self.config.output_dir, "state_debug.csv")
-        with open(self.state_dbg_csv, "w") as f:
+        with open(self.state_dbg_csv, "w", newline="") as f:
             f.write("t,px,py,pz,vx,vy,vz,a_world_x,a_world_y,a_world_z,dem,agl,msl\n")
         
         # Inference timing log
         self.inf_csv = os.path.join(self.config.output_dir, "inference_log.csv")
-        with open(self.inf_csv, "w") as f:
+        with open(self.inf_csv, "w", newline="") as f:
             f.write("Index,Inference Time (s),FPS\n")
         
         # VO debug log
         self.vo_dbg_csv = os.path.join(self.config.output_dir, "vo_debug.csv")
-        with open(self.vo_dbg_csv, "w") as f:
+        with open(self.vo_dbg_csv, "w", newline="") as f:
             f.write("Frame,num_inliers,rot_angle_deg,alignment_deg,rotation_rate_deg_s,"
                     "use_only_vz,skip_vo,vo_dx,vo_dy,vo_dz,vel_vx,vel_vy,vel_vz\n")
         
         # MSCKF debug log
         self.msckf_dbg_csv = os.path.join(self.config.output_dir, "msckf_debug.csv")
-        with open(self.msckf_dbg_csv, "w") as f:
+        with open(self.msckf_dbg_csv, "w", newline="") as f:
             f.write("frame,feature_id,num_observations,triangulation_success,"
                     "reprojection_error_px,innovation_norm,update_applied,chi2_test\n")
         
@@ -378,37 +389,37 @@ class VIORunner:
         if self.config.save_debug_data:
             # Raw IMU data log
             self.imu_raw_csv = os.path.join(self.config.output_dir, "debug_imu_raw.csv")
-            with open(self.imu_raw_csv, "w") as f:
+            with open(self.imu_raw_csv, "w", newline="") as f:
                 f.write("t,ori_x,ori_y,ori_z,ori_w,ang_x,ang_y,ang_z,lin_x,lin_y,lin_z\n")
             
             # State & covariance evolution
             self.state_cov_csv = os.path.join(self.config.output_dir, "debug_state_covariance.csv")
-            with open(self.state_cov_csv, "w") as f:
+            with open(self.state_cov_csv, "w", newline="") as f:
                 f.write("t,frame,P_pos_xx,P_pos_yy,P_pos_zz,P_vel_xx,P_vel_yy,P_vel_zz,"
                         "P_rot_xx,P_rot_yy,P_rot_zz,P_bg_xx,P_bg_yy,P_bg_zz,"
                         "P_ba_xx,P_ba_yy,P_ba_zz,bg_x,bg_y,bg_z,ba_x,ba_y,ba_z\n")
             
             # Residual & innovation log
             self.residual_csv = os.path.join(self.config.output_dir, "debug_residuals.csv")
-            with open(self.residual_csv, "w") as f:
+            with open(self.residual_csv, "w", newline="") as f:
                 f.write("t,frame,update_type,innovation_x,innovation_y,innovation_z,"
                         "mahalanobis_dist,chi2_threshold,accepted,NIS,NEES\n")
             
             # Feature tracking statistics
             self.feature_stats_csv = os.path.join(self.config.output_dir, "debug_feature_stats.csv")
-            with open(self.feature_stats_csv, "w") as f:
+            with open(self.feature_stats_csv, "w", newline="") as f:
                 f.write("frame,t,num_features_detected,num_features_tracked,num_inliers,"
                         "mean_parallax_px,max_parallax_px,tracking_ratio,inlier_ratio\n")
             
             # MSCKF window & marginalization log
             self.msckf_window_csv = os.path.join(self.config.output_dir, "debug_msckf_window.csv")
-            with open(self.msckf_window_csv, "w") as f:
+            with open(self.msckf_window_csv, "w", newline="") as f:
                 f.write("frame,t,num_camera_clones,num_tracked_features,num_mature_features,"
                         "window_start_time,window_duration,marginalized_clone_id\n")
             
             # FEJ consistency log
             self.fej_csv = os.path.join(self.config.output_dir, "debug_fej_consistency.csv")
-            with open(self.fej_csv, "w") as f:
+            with open(self.fej_csv, "w", newline="") as f:
                 f.write("timestamp,frame,clone_idx,pos_fej_drift_m,rot_fej_drift_deg,"
                         "bg_fej_drift_rad_s,ba_fej_drift_m_s2\n")
             
@@ -462,6 +473,217 @@ class VIORunner:
         
         print(f"[DEBUG] Calibration snapshot saved: {cal_path}")
     
+    def _log_debug_state_covariance(self, t: float, rec, i: int):
+        """Log state and covariance to debug CSV (every 10 samples)."""
+        if not self.config.save_debug_data or not hasattr(self, 'state_cov_csv'):
+            return
+        if i % 10 != 0:  # Every 10 samples (~25ms @ 400Hz)
+            return
+        
+        try:
+            bg = self.kf.x[10:13, 0]
+            ba = self.kf.x[13:16, 0]
+            
+            # Extract diagonal elements of covariance blocks
+            P_pos = [self.kf.P[0,0], self.kf.P[1,1], self.kf.P[2,2]]
+            P_vel = [self.kf.P[3,3], self.kf.P[4,4], self.kf.P[5,5]]
+            P_rot = [self.kf.P[6,6], self.kf.P[7,7], self.kf.P[8,8]]
+            P_bg = [self.kf.P[9,9], self.kf.P[10,10], self.kf.P[11,11]]
+            P_ba = [self.kf.P[12,12], self.kf.P[13,13], self.kf.P[14,14]]
+            
+            with open(self.state_cov_csv, "a", newline="") as f:
+                f.write(f"{t:.6f},{self.state.vio_frame},{P_pos[0]:.6e},{P_pos[1]:.6e},{P_pos[2]:.6e},"
+                       f"{P_vel[0]:.6e},{P_vel[1]:.6e},{P_vel[2]:.6e},"
+                       f"{P_rot[0]:.6e},{P_rot[1]:.6e},{P_rot[2]:.6e},"
+                       f"{P_bg[0]:.6e},{P_bg[1]:.6e},{P_bg[2]:.6e},"
+                       f"{P_ba[0]:.6e},{P_ba[1]:.6e},{P_ba[2]:.6e},"
+                       f"{bg[0]:.6f},{bg[1]:.6f},{bg[2]:.6f},"
+                       f"{ba[0]:.6f},{ba[1]:.6f},{ba[2]:.6f}\n")
+        except Exception:
+            pass
+    
+    def _log_debug_imu_raw(self, t: float, rec):
+        """Log raw IMU data to debug CSV."""
+        if not self.config.save_debug_data or not hasattr(self, 'imu_raw_csv'):
+            return
+        
+        try:
+            with open(self.imu_raw_csv, "a", newline="") as f:
+                f.write(f"{t:.6f},{rec.q[0]:.6f},{rec.q[1]:.6f},{rec.q[2]:.6f},{rec.q[3]:.6f},"
+                       f"{rec.ang[0]:.6f},{rec.ang[1]:.6f},{rec.ang[2]:.6f},"
+                       f"{rec.lin[0]:.6f},{rec.lin[1]:.6f},{rec.lin[2]:.6f}\n")
+        except Exception:
+            pass
+    
+    def _log_debug_feature_stats(self, frame: int, t: float, num_features: int, 
+                                  num_tracked: int, num_inliers: int,
+                                  mean_parallax: float, max_parallax: float):
+        """Log feature tracking statistics to debug CSV."""
+        if not self.config.save_debug_data or not hasattr(self, 'feature_stats_csv'):
+            return
+        
+        try:
+            tracking_ratio = 1.0 if num_features > 0 else 0.0
+            inlier_ratio = num_inliers / max(1, num_features)
+            
+            with open(self.feature_stats_csv, "a", newline="") as f:
+                f.write(f"{frame},{t:.6f},{num_features},{num_tracked},{num_inliers},"
+                       f"{mean_parallax:.2f},{max_parallax:.2f},"
+                       f"{tracking_ratio:.3f},{inlier_ratio:.3f}\n")
+        except Exception:
+            pass
+    
+    def _log_debug_msckf_window(self, frame: int, t: float, num_clones: int,
+                                 num_tracked: int, num_mature: int,
+                                 window_start: float, marginalized_clone: int):
+        """Log MSCKF window state to debug CSV."""
+        if not self.config.save_debug_data or not hasattr(self, 'msckf_window_csv'):
+            return
+        
+        try:
+            window_duration = t - window_start if window_start > 0 else 0.0
+            
+            with open(self.msckf_window_csv, "a", newline="") as f:
+                f.write(f"{frame},{t:.6f},{num_clones},{num_tracked},{num_mature},"
+                       f"{window_start:.6f},{window_duration:.3f},{marginalized_clone}\n")
+        except Exception:
+            pass
+
+    def _log_state_debug(self, t: float, dem_now: float, agl_now: float, 
+                         msl_now: float, a_world: np.ndarray):
+        """
+        Log full state debug (every sample, like vio_vps.py state_dbg_csv).
+        
+        Args:
+            t: Current timestamp
+            dem_now: Current DEM height
+            agl_now: Current AGL
+            msl_now: Current MSL
+            a_world: World-frame acceleration [3]
+        """
+        try:
+            px = float(self.kf.x[0, 0])
+            py = float(self.kf.x[1, 0])
+            pz = float(self.kf.x[2, 0])
+            vx = float(self.kf.x[3, 0])
+            vy = float(self.kf.x[4, 0])
+            vz = float(self.kf.x[5, 0])
+        except Exception:
+            px = py = pz = vx = vy = vz = float('nan')
+        
+        try:
+            a_wx = float(a_world[0])
+            a_wy = float(a_world[1])
+            a_wz = float(a_world[2])
+        except Exception:
+            a_wx = a_wy = a_wz = float('nan')
+        
+        dem_val = dem_now if dem_now is not None else float('nan')
+        agl_val = agl_now if agl_now is not None else float('nan')
+        msl_val = msl_now if msl_now is not None else float('nan')
+        
+        try:
+            with open(self.state_dbg_csv, "a", newline="") as f:
+                f.write(f"{t:.6f},{px:.6f},{py:.6f},{pz:.6f},"
+                        f"{vx:.6f},{vy:.6f},{vz:.6f},"
+                        f"{a_wx:.6f},{a_wy:.6f},{a_wz:.6f},"
+                        f"{dem_val:.6f},{agl_val:.6f},{msl_val:.6f}\n")
+        except Exception:
+            pass
+
+    def _log_vo_debug(self, frame: int, num_inliers: int, rot_angle_deg: float,
+                      alignment_deg: float, rotation_rate_deg_s: float,
+                      use_only_vz: bool, skip_vo: bool,
+                      vo_dx: float, vo_dy: float, vo_dz: float,
+                      vel_vx: float, vel_vy: float, vel_vz: float):
+        """
+        Log VO debug info (when VIO processes a frame, like vio_vps.py vo_dbg).
+        
+        Args:
+            frame: Frame index
+            num_inliers: Number of inlier matches
+            rot_angle_deg: Rotation angle from VO (degrees)
+            alignment_deg: Alignment with expected motion (degrees)
+            rotation_rate_deg_s: Rotation rate (degrees/sec)
+            use_only_vz: Whether only vertical velocity is used
+            skip_vo: Whether VO was skipped
+            vo_dx, vo_dy, vo_dz: VO translation
+            vel_vx, vel_vy, vel_vz: VIO velocities
+        """
+        try:
+            with open(self.vo_dbg_csv, "a", newline="") as f:
+                f.write(
+                    f"{max(frame, 0)},{num_inliers},{rot_angle_deg:.3f},"
+                    f"{alignment_deg:.3f},{rotation_rate_deg_s:.3f},"
+                    f"{int(use_only_vz)},{int(skip_vo)},"
+                    f"{vo_dx:.6f},{vo_dy:.6f},{vo_dz:.6f},"
+                    f"{vel_vx:.3f},{vel_vy:.3f},{vel_vz:.3f}\n"
+                )
+        except Exception:
+            pass
+
+    def _log_fej_consistency(self, t: float, frame: int):
+        """
+        Log FEJ consistency metrics (like vio_vps.py log_fej_consistency).
+        
+        Compares FEJ linearization points vs. current state to detect
+        spurious information from unobservable directions.
+        
+        Args:
+            t: Current timestamp
+            frame: Current VIO frame index
+        """
+        if not self.state.cam_states:
+            return
+        
+        if not hasattr(self, 'fej_csv') or not self.fej_csv:
+            return
+        
+        # Current bias estimates from core state
+        bg_current = self.kf.x[10:13, 0]
+        ba_current = self.kf.x[13:16, 0]
+        
+        try:
+            with open(self.fej_csv, "a", newline="") as f:
+                for i, cs in enumerate(self.state.cam_states):
+                    # Skip if no FEJ data
+                    if 'q_fej' not in cs or 'p_fej' not in cs:
+                        continue
+                    
+                    q_fej = cs['q_fej']
+                    p_fej = cs['p_fej']
+                    bg_fej = cs.get('bg_fej', bg_current)
+                    ba_fej = cs.get('ba_fej', ba_current)
+                    
+                    # Get current state estimates (nominal state)
+                    q_idx = cs['q_idx']
+                    p_idx = cs['p_idx']
+                    q_current = self.kf.x[q_idx:q_idx+4, 0]
+                    p_current = self.kf.x[p_idx:p_idx+3, 0]
+                    
+                    # Compute position drift (Euclidean distance)
+                    pos_drift = np.linalg.norm(p_current - p_fej)
+                    
+                    # Compute rotation drift (angle in degrees)
+                    try:
+                        # Quaternion difference: q_diff = q_current * q_fej^-1
+                        r_current = R_scipy.from_quat([q_current[1], q_current[2], 
+                                                       q_current[3], q_current[0]])
+                        r_fej = R_scipy.from_quat([q_fej[1], q_fej[2], q_fej[3], q_fej[0]])
+                        r_diff = r_current * r_fej.inv()
+                        rot_drift = np.linalg.norm(r_diff.as_rotvec()) * 180.0 / np.pi
+                    except Exception:
+                        rot_drift = 0.0
+                    
+                    # Bias drifts
+                    bg_drift = np.linalg.norm(bg_current - bg_fej)
+                    ba_drift = np.linalg.norm(ba_current - ba_fej)
+                    
+                    f.write(f"{t:.6f},{frame},{i},{pos_drift:.6f},{rot_drift:.6f},"
+                            f"{bg_drift:.9f},{ba_drift:.9f}\n")
+        except Exception:
+            pass
+    
     def get_flight_phase(self, time_elapsed: float) -> int:
         """
         Determine current flight phase.
@@ -488,10 +710,6 @@ class VIORunner:
             dt: Time delta since last sample
             time_elapsed: Time since start
         """
-        from .propagation import (
-            propagate_single_imu_step, detect_stationary, apply_zupt
-        )
-        
         imu_params = self.global_config.get('IMU_PARAMS', {'g_norm': 9.803})
         
         # Get current state
@@ -506,7 +724,7 @@ class VIORunner:
         # Propagate state
         if not self.config.use_preintegration:
             # Legacy propagation
-            propagate_single_imu_step(
+            process_imu(
                 self.kf, rec, dt,
                 estimate_imu_bias=self.config.estimate_imu_bias,
                 t=rec.t, t0=self.state.t0,
@@ -514,24 +732,26 @@ class VIORunner:
             )
         
         # Check for stationary (ZUPT)
-        is_stationary = detect_stationary(
-            acc_raw=rec.lin,
-            gyro_corrected=w_corr,
-            g_norm=imu_params.get('g_norm', 9.803)
+        v_mag = np.linalg.norm(x[3:6])
+        is_stationary, _ = detect_stationary(
+            a_raw=rec.lin,
+            w_corr=w_corr,
+            v_mag=v_mag,
+            imu_params=imu_params
         )
         
         if is_stationary:
             self.state.zupt_detected += 1
-            v_mag = np.linalg.norm(x[3:6])
             
-            applied, self.state.consecutive_stationary = apply_zupt(
+            applied, _ = apply_zupt(
                 self.kf,
-                velocity_magnitude=v_mag,
-                consecutive_count=self.state.consecutive_stationary
+                v_mag=v_mag,
+                consecutive_stationary_count=self.state.consecutive_stationary
             )
             
             if applied:
                 self.state.zupt_applied += 1
+                self.state.consecutive_stationary += 1
             else:
                 self.state.zupt_rejected += 1
         else:
@@ -548,8 +768,6 @@ class VIORunner:
         Args:
             t: Current timestamp
         """
-        from .vps_integration import apply_vps_update
-        
         sigma_vps = self.global_config.get('SIGMA_VPS_XY', 1.0)
         
         while (self.state.vps_idx < len(self.vps_list) and 
@@ -558,20 +776,18 @@ class VIORunner:
             vps = self.vps_list[self.state.vps_idx]
             self.state.vps_idx += 1
             
-            applied, reason = apply_vps_update(
+            # Convert VPS lat/lon to local XY
+            vps_x, vps_y = latlon_to_xy(vps.lat, vps.lon, self.lat0, self.lon0)
+            vps_xy = np.array([vps_x, vps_y])
+            
+            applied = apply_vps_update(
                 self.kf,
-                vps_lat=vps.lat,
-                vps_lon=vps.lon,
-                origin_lat=self.lat0,
-                origin_lon=self.lon0,
-                sigma_base=sigma_vps,
-                timestamp=t
+                vps_xy=vps_xy,
+                sigma_vps=sigma_vps
             )
             
             if applied:
                 print(f"[VPS] Applied at t={t:.3f}")
-            else:
-                print(f"[VPS] Rejected: {reason}")
     
     def process_vio(self, rec, t: float, time_elapsed: float, ongoing_preint=None):
         """
@@ -595,14 +811,6 @@ class VIORunner:
         Returns:
             Tuple of (used_vo, vo_data dict)
         """
-        from .vio_frontend import VIOFrontEnd
-        from .msckf import perform_msckf_updates
-        from .propagation import augment_state_with_camera
-        from .vps_integration import compute_plane_constraint_jacobian
-        from .math_utils import quaternion_to_yaw, skew_symmetric
-        from .propagation import propagate_error_state_covariance
-        from .loop_closure import get_loop_detector
-        
         # Get configuration
         kb_params = self.global_config.get('KB_PARAMS', {'mu': 600, 'mv': 600})
         min_parallax = self.global_config.get('MIN_PARALLAX_PX', 2.0)
@@ -651,6 +859,19 @@ class VIORunner:
                     flows = pts_cur_px - pts_prev_px
                     avg_flow_px = float(np.median(np.linalg.norm(flows, axis=1)))
             
+            # Debug: log feature statistics
+            num_features = len(self.vio_fe.prev_kps) if hasattr(self.vio_fe, 'prev_kps') and self.vio_fe.prev_kps is not None else 0
+            num_inliers = getattr(self.vio_fe, 'last_inliers', 0)
+            self._log_debug_feature_stats(
+                frame=self.vio_fe.frame_idx,
+                t=t,
+                num_features=num_features,
+                num_tracked=num_features,
+                num_inliers=num_inliers,
+                mean_parallax=avg_flow_px,
+                max_parallax=avg_flow_px
+            )
+            
             # Apply preintegration at EVERY camera frame
             if self.config.use_preintegration and ongoing_preint is not None:
                 self._apply_preintegration_at_camera(ongoing_preint, t, imu_params)
@@ -691,6 +912,23 @@ class VIORunner:
                     'dx': vo_dx, 'dy': vo_dy, 'dz': vo_dz,
                     'roll': vo_r, 'pitch': vo_p, 'yaw': vo_y
                 }
+                
+                # Log VO debug (like vio_vps.py)
+                rot_angle_deg = np.degrees(np.arccos(np.clip((np.trace(r_vo_mat)-1)/2, -1, 1)))
+                vel_vx = float(self.kf.x[3, 0])
+                vel_vy = float(self.kf.x[4, 0])
+                vel_vz = float(self.kf.x[5, 0])
+                self._log_vo_debug(
+                    frame=self.vio_fe.frame_idx,
+                    num_inliers=num_inliers,
+                    rot_angle_deg=rot_angle_deg,
+                    alignment_deg=0.0,  # TODO: compute alignment with expected motion
+                    rotation_rate_deg_s=rotation_rate_deg_s,
+                    use_only_vz=False,  # Not implemented in modular version
+                    skip_vo=False,
+                    vo_dx=vo_dx, vo_dy=vo_dy, vo_dz=vo_dz,
+                    vel_vx=vel_vx, vel_vy=vel_vy, vel_vz=vel_vz
+                )
             
             self.state.img_idx += 1
         
@@ -708,9 +946,6 @@ class VIORunner:
             t: Current timestamp
             imu_params: IMU noise parameters
         """
-        from .propagation import propagate_error_state_covariance
-        from .math_utils import skew_symmetric
-        
         dt_total = ongoing_preint.dt_sum
         if dt_total < 1e-6:
             return
@@ -785,7 +1020,6 @@ class VIORunner:
         Args:
             t: Camera timestamp
         """
-        from .propagation import augment_state_with_camera
         
         p_imu = self.kf.x[0:3, 0].reshape(3,)
         q_imu = self.kf.x[6:10, 0].reshape(4,)
@@ -839,16 +1073,32 @@ class VIORunner:
             
             print(f"[CLONE] Created clone {clone_idx} with {len(obs_data)} observations")
             
+            # Debug: log MSCKF window state
+            num_tracked = len(obs_data)
+            window_start = self.state.cam_states[0]['t'] if self.state.cam_states else t
+            self._log_debug_msckf_window(
+                frame=self.vio_fe.frame_idx,
+                t=t,
+                num_clones=len(self.state.cam_states),
+                num_tracked=num_tracked,
+                num_mature=0,  # Will be computed in trigger
+                window_start=window_start,
+                marginalized_clone=-1
+            )
+            
             # Trigger MSCKF update if enough clones
             if len(self.state.cam_states) >= 3:
-                self._trigger_msckf_update()
+                self._trigger_msckf_update(t)
                 
         except Exception as e:
             print(f"[CLONE] Failed: {e}")
     
-    def _trigger_msckf_update(self):
-        """Trigger MSCKF multi-view geometric update."""
-        from .msckf import perform_msckf_updates
+    def _trigger_msckf_update(self, t: float = 0.0):
+        """Trigger MSCKF multi-view geometric update.
+        
+        Args:
+            t: Current timestamp for logging
+        """
         
         # Count mature features
         feature_obs_count = {}
@@ -867,6 +1117,9 @@ class VIORunner:
         
         if should_update:
             try:
+                # Pass msckf_dbg_csv path if debug data enabled
+                msckf_dbg_path = self.msckf_dbg_csv if hasattr(self, 'msckf_dbg_csv') else None
+                
                 num_updates = perform_msckf_updates(
                     self.vio_fe, 
                     self.state.cam_observations,
@@ -874,13 +1127,17 @@ class VIORunner:
                     self.kf,
                     min_observations=2,
                     max_features=50,
-                    msckf_dbg_path=None,
+                    msckf_dbg_path=msckf_dbg_path,
                     dem_reader=self.dem,
                     origin_lat=self.lat0,
                     origin_lon=self.lon0
                 )
                 if num_updates > 0:
                     print(f"[MSCKF] Updated {num_updates} features")
+                    
+                    # Log FEJ consistency after MSCKF update
+                    if self.config.save_debug_data and hasattr(self, 'fej_csv') and self.fej_csv:
+                        self._log_fej_consistency(t, self.vio_fe.frame_idx)
             except Exception as e:
                 print(f"[MSCKF] Error: {e}")
     
@@ -897,10 +1154,6 @@ class VIORunner:
             avg_flow_px: Average optical flow in pixels
             rec: Current IMU record
         """
-        from .math_utils import quaternion_to_yaw
-        from .vps_integration import xy_to_latlon
-        from .config import CAMERA_VIEW_CONFIGS
-        
         kb_params = self.global_config.get('KB_PARAMS', {'mu': 600})
         sigma_vo = self.global_config.get('SIGMA_VO_VEL', 0.5)
         
@@ -908,7 +1161,6 @@ class VIORunner:
         view_cfg = CAMERA_VIEW_CONFIGS.get(self.config.camera_view, CAMERA_VIEW_CONFIGS['nadir'])
         extrinsics_name = view_cfg['extrinsics']
         
-        from .config import BODY_T_CAMDOWN, BODY_T_CAMFRONT, BODY_T_CAMSIDE
         if extrinsics_name == 'BODY_T_CAMDOWN':
             body_t_cam = BODY_T_CAMDOWN
         elif extrinsics_name == 'BODY_T_CAMFRONT':
@@ -1002,8 +1254,31 @@ class VIORunner:
         
         # Apply update
         if self.config.use_vio_velocity:
+            # Compute innovation for logging
+            predicted_vel = hx_fun(self.kf.x)
+            innovation = vel_meas - predicted_vel
+            s_mat = h_vel @ self.kf.P @ h_vel.T + r_mat
+            try:
+                m2 = innovation.T @ np.linalg.inv(s_mat) @ innovation
+                mahal_dist = np.sqrt(float(m2))
+            except Exception:
+                mahal_dist = float('nan')
+            
             self.kf.update(z=vel_meas, HJacobian=h_fun, Hx=hx_fun, R=r_mat)
             print(f"[VIO] Velocity update: speed={speed_final:.2f}m/s, vz_only={use_only_vz}")
+            
+            # Log to debug_residuals.csv
+            if self.config.save_debug_data and hasattr(self, 'residual_csv') and self.residual_csv:
+                from .output_utils import log_measurement_update
+                log_measurement_update(
+                    self.residual_csv, t, self.state.vio_frame, 'VIO_VEL',
+                    innovation=innovation.flatten(),
+                    mahalanobis_dist=mahal_dist,
+                    chi2_threshold=9.21,
+                    accepted=True,
+                    s_matrix=s_mat,
+                    p_prior=getattr(self.kf, 'P_prior', self.kf.P)
+                )
     
     def log_error(self, t: float):
         """
@@ -1012,10 +1287,6 @@ class VIORunner:
         Args:
             t: Current timestamp
         """
-        from .vps_integration import xy_to_latlon, latlon_to_xy
-        from .math_utils import quaternion_to_yaw
-        from .state_manager import imu_to_gnss_position
-        
         gt_df = self.ppk_trajectory if self.ppk_trajectory is not None else self.flight_log_df
         if gt_df is None or len(gt_df) == 0:
             return
@@ -1060,7 +1331,7 @@ class VIORunner:
                 yaw_gt = 90.0 - np.rad2deg(gt_row['yaw'])
                 yaw_error = ((yaw_vio - yaw_gt + 180) % 360) - 180
             
-            with open(self.error_csv, "a") as ef:
+            with open(self.error_csv, "a", newline="") as ef:
                 ef.write(
                     f"{t:.6f},{pos_error:.3f},{err_E:.3f},{err_N:.3f},{err_U:.3f},"
                     f"0.0,0.0,0.0,0.0,"
@@ -1079,9 +1350,6 @@ class VIORunner:
             t: Current timestamp
             time_elapsed: Time since start
         """
-        from .measurement_updates import apply_magnetometer_update
-        from .magnetometer import calibrate_magnetometer
-        
         sigma_mag = self.global_config.get('SIGMA_MAG_YAW', 0.15)
         declination = self.global_config.get('MAG_DECLINATION', 0.0)
         use_raw = self.global_config.get('MAG_USE_RAW_HEADING', True)
@@ -1098,11 +1366,16 @@ class VIORunner:
             if (self.state.mag_idx - 1) % rate_limit != 0:
                 continue
             
-            # Calibrate
-            mag_cal = calibrate_magnetometer(mag_rec.mag)
+            # Calibrate using hard-iron and soft-iron from config
+            hard_iron = self.global_config.get('MAG_HARD_IRON_OFFSET', None)
+            soft_iron = self.global_config.get('MAG_SOFT_IRON_MATRIX', None)
+            mag_cal = calibrate_magnetometer(mag_rec.mag, hard_iron=hard_iron, soft_iron=soft_iron)
             
             in_convergence = time_elapsed < convergence_window
             has_ppk = self.ppk_state is not None
+            
+            # Get residual_csv path if debug data is enabled
+            residual_path = self.residual_csv if self.config.save_debug_data and hasattr(self, 'residual_csv') else None
             
             applied, reason = apply_magnetometer_update(
                 self.kf,
@@ -1113,7 +1386,9 @@ class VIORunner:
                 time_elapsed=time_elapsed,
                 in_convergence=in_convergence,
                 has_ppk_yaw=has_ppk,
-                timestamp=t
+                timestamp=t,
+                residual_csv=residual_path,
+                frame=self.state.vio_frame
             )
             
             if applied:
@@ -1128,9 +1403,6 @@ class VIORunner:
         Args:
             t: Current timestamp
         """
-        from .measurement_updates import apply_dem_height_update
-        from .vps_integration import xy_to_latlon
-        
         sigma_height = self.global_config.get('SIGMA_AGL_Z', 2.5)
         
         # Get current position
@@ -1166,6 +1438,9 @@ class VIORunner:
         time_since_correction = t - getattr(self.kf, 'last_absolute_correction_time', t)
         speed = float(np.linalg.norm(self.kf.x[3:6, 0]))
         
+        # Get residual_csv path if debug data is enabled
+        residual_path = self.residual_csv if self.config.save_debug_data and hasattr(self, 'residual_csv') else None
+        
         applied, reason = apply_dem_height_update(
             self.kf,
             height_measurement=height_m,
@@ -1175,11 +1450,17 @@ class VIORunner:
             speed_ms=speed,
             has_valid_dem=True,
             no_vision_corrections=(len(self.imgs) == 0 and len(self.vps_list) == 0),
-            timestamp=t
+            timestamp=t,
+            residual_csv=residual_path,
+            frame=self.state.vio_frame
         )
     
     def log_pose(self, t: float, dt: float, used_vo: bool,
-                 vo_data: Optional[Dict] = None):
+                 vo_data: Optional[Dict] = None,
+                 msl_now: Optional[float] = None,
+                 agl_now: Optional[float] = None,
+                 lat_now: Optional[float] = None,
+                 lon_now: Optional[float] = None):
         """
         Log current pose to CSV.
         
@@ -1188,25 +1469,30 @@ class VIORunner:
             dt: Time delta
             used_vo: Whether VO was used this frame
             vo_data: VO output data (optional)
+            msl_now: Pre-computed MSL altitude (optional, for consistency with vio_vps.py)
+            agl_now: Pre-computed AGL altitude (optional)
+            lat_now: Pre-computed latitude (optional)
+            lon_now: Pre-computed longitude (optional)
         """
-        from .vps_integration import xy_to_latlon
+        # Use pre-computed values if provided, otherwise compute from current state
+        if lat_now is None or lon_now is None:
+            lat_now, lon_now = xy_to_latlon(
+                self.kf.x[0, 0], self.kf.x[1, 0],
+                self.lat0, self.lon0
+            )
         
-        lat_now, lon_now = xy_to_latlon(
-            self.kf.x[0, 0], self.kf.x[1, 0],
-            self.lat0, self.lon0
-        )
-        
-        # Compute MSL/AGL
-        dem_now = self.dem.sample_m(lat_now, lon_now) if self.dem.ds else 0.0
-        if dem_now is None:
-            dem_now = 0.0
-        
-        if self.config.z_state.lower() == "agl":
-            agl_now = self.kf.x[2, 0]
-            msl_now = agl_now + dem_now
-        else:
-            msl_now = self.kf.x[2, 0]
-            agl_now = msl_now - dem_now
+        if msl_now is None or agl_now is None:
+            # Compute MSL/AGL from current state (post-DEM update)
+            dem_now = self.dem.sample_m(lat_now, lon_now) if self.dem.ds else 0.0
+            if dem_now is None:
+                dem_now = 0.0
+            
+            if self.config.z_state.lower() == "agl":
+                agl_now = self.kf.x[2, 0]
+                msl_now = agl_now + dem_now
+            else:
+                msl_now = self.kf.x[2, 0]
+                agl_now = msl_now - dem_now
         
         frame_str = str(self.state.vio_frame) if used_vo else ""
         
@@ -1217,7 +1503,7 @@ class VIORunner:
         vo_p = vo_data.get('pitch', np.nan) if vo_data else np.nan
         vo_y = vo_data.get('yaw', np.nan) if vo_data else np.nan
         
-        with open(self.pose_csv, "a") as f:
+        with open(self.pose_csv, "a", newline="") as f:
             f.write(
                 f"{t - self.state.t0:.6f},{dt:.6f},{frame_str},"
                 f"{self.kf.x[0,0]:.3f},{self.kf.x[1,0]:.3f},{msl_now:.3f},"
@@ -1233,8 +1519,6 @@ class VIORunner:
     
     def print_summary(self):
         """Print final summary statistics."""
-        from .msckf import print_msckf_stats
-        
         print("\n\n--- Done ---")
         print(f"Total IMU samples: {len(self.imu)}")
         print(f"Images used: {max(0, self.state.vio_frame + 1)}")
@@ -1297,8 +1581,6 @@ class VIORunner:
         # Initialize preintegration if enabled
         ongoing_preint = None
         if self.config.use_preintegration:
-            from .imu_preintegration import IMUPreintegration
-            
             imu_params = self.global_config.get('IMU_PARAMS', {})
             ongoing_preint = IMUPreintegration(
                 bg=self.kf.x[10:13, 0].reshape(3,),
@@ -1314,7 +1596,13 @@ class VIORunner:
         print("\n=== Running (IMU-driven) ===")
         tic_all = time.time()
         
+        # Store last a_world for state_debug logging
+        last_a_world = np.array([0.0, 0.0, 0.0])
+        
         for i, rec in enumerate(self.imu):
+            # Start timing for inference_log
+            tic_iter = time.time()
+            
             t = rec.t
             dt = max(0.0, float(t - self.state.last_t)) if i > 0 else 0.0
             self.state.last_t = t
@@ -1328,6 +1616,10 @@ class VIORunner:
             else:
                 self.process_imu_sample(rec, dt, time_elapsed)
             
+            # Debug logging: raw IMU and state covariance
+            self._log_debug_imu_raw(t, rec)
+            self._log_debug_state_covariance(t, rec, i)
+            
             # VPS updates
             self.process_vps(t)
             
@@ -1338,15 +1630,57 @@ class VIORunner:
             # VIO updates (feature tracking, MSCKF, velocity)
             used_vo, vo_data = self.process_vio(rec, t, time_elapsed, ongoing_preint)
             
-            # DEM height updates
+            # Capture current MSL/AGL BEFORE DEM update (matches vio_vps.py behavior)
+            lat_now, lon_now = xy_to_latlon(
+                self.kf.x[0, 0], self.kf.x[1, 0],
+                self.lat0, self.lon0
+            )
+            dem_now = self.dem.sample_m(lat_now, lon_now) if self.dem.ds else 0.0
+            if dem_now is None:
+                dem_now = 0.0
+            if self.config.z_state.lower() == "agl":
+                agl_now = self.kf.x[2, 0]
+                msl_now = agl_now + dem_now
+            else:
+                msl_now = self.kf.x[2, 0]
+                agl_now = msl_now - dem_now
+            
+            # DEM height updates (modifies kf.x[2,0], but we use pre-update values for logging)
             self.process_dem_height(t)
             
-            # Log error vs ground truth
-            if i % 100 == 0:  # Log every 100 samples to reduce file size
-                self.log_error(t)
+            # Log error vs ground truth (every sample, like vio_vps.py)
+            self.log_error(t)
             
-            # Log pose
-            self.log_pose(t, dt, used_vo, vo_data)
+            # Log pose (using pre-DEM-update msl_now/agl_now for consistency with vio_vps.py)
+            self.log_pose(t, dt, used_vo, vo_data, msl_now=msl_now, agl_now=agl_now, 
+                          lat_now=lat_now, lon_now=lon_now)
+            
+            # Log inference timing (every sample, like vio_vps.py)
+            toc_iter = time.time()
+            with open(self.inf_csv, "a", newline="") as f:
+                dt_proc = toc_iter - tic_iter
+                fps = (1.0 / dt_proc) if dt_proc > 0 else 0.0
+                f.write(f"{i},{dt_proc:.6f},{fps:.2f}\n")
+            
+            # Log state debug (every sample, like vio_vps.py)
+            self._log_state_debug(t, dem_now, agl_now, msl_now, last_a_world)
+            
+            # Update last_a_world for next iteration
+            # Get a_world from last IMU sample processing
+            try:
+                # Convert quaternion to rotation matrix (state is [w,x,y,z])
+                q = self.kf.x[6:10, 0].flatten()
+                quat_xyzw = np.array([q[1], q[2], q[3], q[0]])  # scipy uses [x,y,z,w]
+                r_body_to_world = R_scipy.from_quat(quat_xyzw).as_matrix()
+                
+                # Compute world-frame acceleration with gravity subtraction
+                a_body = rec.lin - self.kf.x[13:16, 0].flatten()  # bias-corrected
+                g_norm = self.global_config.get('IMU_PARAMS', {}).get('g_norm', 9.8066)
+                g_world = np.array([0.0, 0.0, -g_norm])  # ENU: gravity points down
+                a_world_raw = r_body_to_world @ a_body
+                last_a_world = a_world_raw + g_world  # Subtract gravity
+            except Exception:
+                pass
             
             # Progress
             if i % 1000 == 0:

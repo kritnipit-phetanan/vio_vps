@@ -248,6 +248,32 @@ def propagate_to_timestamp(kf: ExtendedKalmanFilter, target_time: float,
         return True, None
 
 
+def process_imu(kf: ExtendedKalmanFilter, imu: IMURecord, dt: float,
+                estimate_imu_bias: bool = False, t: float = 0.0, 
+                t0: float = 0.0, imu_params: dict = None):
+    """
+    Public wrapper for single IMU step propagation.
+    
+    This is the main entry point for legacy (non-preintegration) IMU propagation.
+    
+    Args:
+        kf: Extended Kalman Filter
+        imu: IMU measurement record
+        dt: Time step since last sample
+        estimate_imu_bias: Whether bias was pre-estimated
+        t: Current timestamp
+        t0: Initial timestamp (for process noise time-varying)
+        imu_params: IMU noise parameters dict
+    """
+    if imu_params is None:
+        imu_params = {'g_norm': 9.80665}
+    
+    if dt <= 0:
+        return
+    
+    _propagate_single_imu_step(kf, imu, dt, estimate_imu_bias, t, imu_params)
+
+
 def _propagate_single_imu_step(kf: ExtendedKalmanFilter, imu: IMURecord, dt: float,
                                 estimate_imu_bias: bool, t: float, imu_params: dict):
     """

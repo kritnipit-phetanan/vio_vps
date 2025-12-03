@@ -19,6 +19,7 @@ import math
 
 # Import shared math utilities (avoid duplication)
 from .math_utils import quaternion_to_yaw, mahalanobis_squared
+from .output_utils import log_measurement_update
 
 
 def _mahalanobis2(y: np.ndarray, S: np.ndarray) -> float:
@@ -264,6 +265,22 @@ def apply_magnetometer_update(kf,
             residual=angle_residual
         )
         kf.last_mag_time = timestamp
+        
+        # Log measurement update for debug_residuals.csv
+        if residual_csv:
+            innovation = np.array([yaw_innov])
+            s_mat = np.array([[S_yaw]])
+            m2 = mahalanobis_squared(innovation, s_mat)
+            log_measurement_update(
+                residual_csv, timestamp, frame, 'MAG',
+                innovation=innovation,
+                mahalanobis_dist=np.sqrt(m2),
+                chi2_threshold=np.inf,  # MAG always accepted if it passes above checks
+                accepted=True,
+                s_matrix=s_mat,
+                p_prior=getattr(kf, 'P_prior', kf.P)
+            )
+        
         return True, ""
     except Exception as e:
         return False, f"Update failed: {e}"
@@ -367,6 +384,16 @@ def apply_dem_height_update(kf,
         threshold = 6.63
     
     if m2_test >= threshold:
+        # Log rejected update
+        if residual_csv:
+            log_measurement_update(
+                residual_csv, timestamp, frame, 'DEM',
+                innovation=innovation.flatten(),
+                mahalanobis_dist=np.sqrt(m2_test),
+                chi2_threshold=threshold,
+                accepted=False,
+                s_matrix=S_mat
+            )
         return False, f"Chi-square test failed ({m2_test:.2f} >= {threshold:.1f})"
     
     # Apply update
@@ -376,6 +403,18 @@ def apply_dem_height_update(kf,
         Hx=hx_fun,
         R=r_mat
     )
+    
+    # Log accepted update
+    if residual_csv:
+        log_measurement_update(
+            residual_csv, timestamp, frame, 'DEM',
+            innovation=innovation.flatten(),
+            mahalanobis_dist=np.sqrt(m2_test),
+            chi2_threshold=threshold,
+            accepted=True,
+            s_matrix=S_mat,
+            p_prior=getattr(kf, 'P_prior', kf.P)
+        )
     
     return True, ""
 
@@ -470,6 +509,16 @@ def apply_velocity_update(kf,
         m2_test = float('inf')
     
     if m2_test >= chi2_threshold:
+        # Log rejected update
+        if residual_csv:
+            log_measurement_update(
+                residual_csv, timestamp, frame, 'VIO_VEL',
+                innovation=innovation.flatten(),
+                mahalanobis_dist=np.sqrt(m2_test),
+                chi2_threshold=chi2_threshold,
+                accepted=False,
+                s_matrix=S_mat
+            )
         return False, f"Chi-square test failed ({m2_test:.2f} >= {chi2_threshold:.1f})"
     
     # Apply update
@@ -479,6 +528,18 @@ def apply_velocity_update(kf,
         Hx=hx_fun,
         R=r_mat
     )
+    
+    # Log accepted update
+    if residual_csv:
+        log_measurement_update(
+            residual_csv, timestamp, frame, 'VIO_VEL',
+            innovation=innovation.flatten(),
+            mahalanobis_dist=np.sqrt(m2_test),
+            chi2_threshold=chi2_threshold,
+            accepted=True,
+            s_matrix=S_mat,
+            p_prior=getattr(kf, 'P_prior', kf.P)
+        )
     
     return True, ""
 
