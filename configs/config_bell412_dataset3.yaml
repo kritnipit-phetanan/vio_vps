@@ -168,7 +168,9 @@ process_noise:
 # (observed baseline ~0.026m was failing the 0.03m threshold)
 vio:
   # Parallax thresholds
-  min_parallax_px: 1.0       # Minimum optical flow [pixels] - increased for quality filter
+  # CRITICAL FIX: was 1.0px but actual parallax ~0.3-0.9px during hover/slow motion
+  # VIO velocity was ALWAYS SKIPPED because parallax < threshold
+  min_parallax_px: 0.3       # Minimum optical flow [pixels] - REDUCED for slow Bell 412 flight
   min_msckf_baseline: 0.01   # CRITICAL FIX: was 0.03 (baseline ~0.026m was failing) → now 0.01
   
   # MSCKF parameters (PERMISSIVE for noisy/slow motion)

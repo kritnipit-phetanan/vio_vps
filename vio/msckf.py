@@ -19,6 +19,7 @@ from scipy.spatial.transform import Rotation as R_scipy
 
 from .math_utils import quat_to_rot, quaternion_to_yaw, skew_symmetric
 from .ekf import ExtendedKalmanFilter, ensure_covariance_valid
+from .camera import normalized_to_unit_ray
 
 
 # Default extrinsics (will be overridden when used)
@@ -430,13 +431,20 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
     q1_xyzw = np.array([q1[1], q1[2], q1[3], q1[0]])
     R1_cw = R_scipy.from_quat(q1_xyzw).as_matrix()
     
+    # CRITICAL FIX: For fisheye cameras, normalized coords can be very large (|x| > 1)
+    # Using [x,y,1]/norm gives WRONG direction! Must use arctan to get proper ray angle.
     x0, y0 = obs0['pt_norm']
-    ray0_c = np.array([x0, y0, 1.0])
-    ray0_c = ray0_c / np.linalg.norm(ray0_c)
-    
     x1, y1 = obs1['pt_norm']
-    ray1_c = np.array([x1, y1, 1.0])
-    ray1_c = ray1_c / np.linalg.norm(ray1_c)
+    
+    # Filter extreme fisheye angles: |norm| > 2 corresponds to angle > 63 degrees
+    # For nadir camera, extreme angles give near-horizontal rays that fail triangulation
+    MAX_NORM_COORD = 1.5  # ~56 degrees from optical axis
+    if np.sqrt(x0*x0 + y0*y0) > MAX_NORM_COORD or np.sqrt(x1*x1 + y1*y1) > MAX_NORM_COORD:
+        MSCKF_STATS['fail_other'] += 1  # Use 'other' for now, can add specific counter later
+        return None
+    
+    ray0_c = normalized_to_unit_ray(x0, y0)
+    ray1_c = normalized_to_unit_ray(x1, y1)
     
     ray0_w = R0_cw @ ray0_c
     ray0_w = ray0_w / np.linalg.norm(ray0_w)
