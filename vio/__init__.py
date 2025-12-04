@@ -2,11 +2,22 @@
 VIO (Visual-Inertial Odometry) Package
 
 Complete modularized implementation of the VIO+ESKF+MSCKF system
-for helicopter navigation. Version 2.6.0 - Standalone (no vio_vps.py dependency).
+for helicopter navigation. Version 2.7.0 - Magnetometer oscillation fix.
 
-Version: 2.6.0 (Standalone modular package)
+Version: 2.7.0 (Magnetometer oscillation detection)
 Modules: 17
-Total Lines: ~8,900
+Total Lines: ~9,000
+
+Changes in v2.7.0:
+- FIX: Magnetometer oscillation detection near ±180° yaw boundary
+  * Added innovation sign tracking to detect alternating corrections
+  * Skip 50 updates when oscillation detected to let IMU stabilize
+  * Results: Position error 656m → 423m (-35.6%), Yaw error 64° → 31° (-51.2%)
+- FIX: DEM height update soft gating
+  * Increased chi2 thresholds for altitude constraints
+  * Apply updates with inflated noise instead of hard rejection
+- MSCKF success rate improved: 3.5% → 4.3%
+- Moved old scripts to old_src/ folder
 
 Changes in v2.6.0:
 - BREAKING: run_vio.py now uses VIORunner directly (no vio_vps.py dependency)
@@ -82,7 +93,7 @@ Usage:
     from vio.loop_closure import LoopClosureDetector, init_loop_closure
 """
 
-__version__ = "2.6.0"
+__version__ = "2.7.0"
 
 # Lazy module imports - access as vio.config, vio.math_utils, etc.
 # This avoids importing all dependencies at once

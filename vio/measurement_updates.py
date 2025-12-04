@@ -124,6 +124,15 @@ def apply_zupt_update(kf,
     return True, consecutive_stationary
 
 
+# Global state for magnetometer oscillation detection
+_MAG_STATE = {
+    'innovation_history': [],  # Recent innovation signs
+    'oscillation_count': 0,    # Consecutive sign flips
+    'skip_count': 0,           # How many updates to skip
+    'last_yaw_mag': None,      # For smoothing
+}
+
+
 def apply_magnetometer_update(kf,
                               mag_calibrated: np.ndarray,
                               mag_declination: float,
@@ -145,6 +154,7 @@ def apply_magnetometer_update(kf,
     - Adaptive Kalman gain with phase-based K_MIN
     - Yaw correction limiting to prevent attitude destabilization
     - Cross-covariance decoupling to prevent altitude drift
+    - Oscillation detection to prevent yaw bouncing near ±180°
     
     Args:
         kf: ExtendedKalmanFilter instance
@@ -164,11 +174,17 @@ def apply_magnetometer_update(kf,
     Returns:
         Tuple of (update_applied: bool, rejection_reason: str)
     """
+    global _MAG_STATE
     from .magnetometer import compute_yaw_from_mag
     
     # Skip during convergence if PPK provided initial yaw
     if in_convergence and has_ppk_yaw:
         return False, "PPK convergence period"
+    
+    # Check if we're in oscillation skip mode
+    if _MAG_STATE['skip_count'] > 0:
+        _MAG_STATE['skip_count'] -= 1
+        return False, f"Skipping due to oscillation ({_MAG_STATE['skip_count']} remaining)"
     
     # Check field strength
     mag_norm = np.linalg.norm(mag_calibrated)
@@ -190,6 +206,36 @@ def apply_magnetometer_update(kf,
     # Compute innovation with angle wrapping
     yaw_innov = yaw_mag - yaw_state
     yaw_innov = np.arctan2(np.sin(yaw_innov), np.cos(yaw_innov))
+    
+    # =========================================================================
+    # OSCILLATION DETECTION: Prevent yaw bouncing near ±180° boundary
+    # =========================================================================
+    innov_sign = 1 if yaw_innov > 0 else -1
+    _MAG_STATE['innovation_history'].append(innov_sign)
+    
+    # Keep only last 10 innovations
+    if len(_MAG_STATE['innovation_history']) > 10:
+        _MAG_STATE['innovation_history'] = _MAG_STATE['innovation_history'][-10:]
+    
+    # Detect oscillation: alternating signs with large innovations
+    if len(_MAG_STATE['innovation_history']) >= 4 and abs(yaw_innov) > np.radians(90.0):
+        recent = _MAG_STATE['innovation_history'][-4:]
+        # Check for alternating pattern: [+, -, +, -] or [-, +, -, +]
+        is_alternating = all(recent[i] != recent[i+1] for i in range(3))
+        
+        if is_alternating:
+            _MAG_STATE['oscillation_count'] += 1
+            if _MAG_STATE['oscillation_count'] >= 3:
+                # Skip next 50 updates to let IMU stabilize
+                _MAG_STATE['skip_count'] = 50
+                _MAG_STATE['oscillation_count'] = 0
+                _MAG_STATE['innovation_history'] = []
+                print(f"[MAG-OSC] Detected oscillation, skipping 50 updates")
+                return False, "Oscillation detected, skipping"
+        else:
+            _MAG_STATE['oscillation_count'] = 0
+    else:
+        _MAG_STATE['oscillation_count'] = 0
     
     # Innovation threshold (very permissive - mag is absolute reference)
     if in_convergence:
@@ -373,30 +419,44 @@ def apply_dem_height_update(kf,
     except:
         m2_test = float('inf')
     
-    # Adaptive threshold
+    # Adaptive threshold - IMPORTANT: We use higher threshold for altitude
+    # since nadir camera MSCKF cannot properly constrain vertical direction
+    # and we need DEM updates to bound altitude drift
     if no_vision_corrections:
         threshold = 100.0
     elif xy_std > 10.0:
-        threshold = 15.0
+        threshold = 50.0  # Increased from 15.0 - trust DEM more
     elif xy_std > 5.0:
-        threshold = 9.21
+        threshold = 25.0  # Increased from 9.21
     else:
-        threshold = 6.63
+        threshold = 15.0  # Increased from 6.63 - chi2(1, 0.999) ≈ 10.83
     
+    # ALTITUDE FIX: For large innovations, apply update with increased noise
+    # This prevents runaway drift while still allowing large corrections
     if m2_test >= threshold:
-        # Log rejected update
+        # Apply update anyway but with inflated noise (soft gating)
+        inflation_factor = m2_test / threshold
+        r_mat_inflated = r_mat * inflation_factor
+        
+        kf.update(
+            z=np.array([[height_measurement]]),
+            HJacobian=h_fun,
+            Hx=hx_fun,
+            R=r_mat_inflated
+        )
+        
         if residual_csv:
             log_measurement_update(
                 residual_csv, timestamp, frame, 'DEM',
                 innovation=innovation.flatten(),
                 mahalanobis_dist=np.sqrt(m2_test),
                 chi2_threshold=threshold,
-                accepted=False,
+                accepted=True,  # Still accepted but with inflated noise
                 s_matrix=S_mat
             )
-        return False, f"Chi-square test failed ({m2_test:.2f} >= {threshold:.1f})"
+        return True, f"Soft gating (m2={m2_test:.2f}, inflated R by {inflation_factor:.1f}x)"
     
-    # Apply update
+    # Normal update
     kf.update(
         z=np.array([[height_measurement]]),
         HJacobian=h_fun,
