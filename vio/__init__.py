@@ -2,11 +2,25 @@
 VIO (Visual-Inertial Odometry) Package
 
 Complete modularized implementation of the VIO+ESKF+MSCKF system
-for helicopter navigation. Version 2.8.0 - Feature integration.
+for helicopter navigation. Version 2.9.0 - Magnetometer filtering + MSCKF validation.
 
-Version: 2.8.0 (Feature integration)
+Version: 2.9.0 (Magnetometer filtering + MSCKF reprojection validation)
 Modules: 17
 Total Lines: ~10,000
+
+Changes in v2.9.0:
+- NEW: Magnetometer filtering integration (reset_mag_filter_state, set_mag_constants, apply_mag_filter)
+  * EMA smoothing with configurable alpha (default 0.3)
+  * Gyro consistency check - inflate R when mag deviates from gyro integration
+  * Rate-of-change detection for fast rotation rejection
+  * Config params: ema_alpha, max_yaw_rate_deg, gyro_consistency_threshold_deg, r_inflate
+- NEW: MSCKF reprojection validation using kannala_brandt_project
+  * Pixel-level error validation (3px threshold) for triangulated points
+  * Uses accurate Kannala-Brandt fisheye projection model
+  * Falls back to normalized coordinate method if K,D unavailable
+  * Stores max_pixel_reproj_error in triangulation results
+- IMPROVED: apply_magnetometer_update() accepts yaw_override for filtered yaw
+- IMPROVED: Gyro state tracking (last_gyro_z, last_imu_dt) for mag filtering
 
 Changes in v2.8.0:
 - NEW: Fisheye rectifier integration (USE_RECTIFIER config)
@@ -110,7 +124,7 @@ Usage:
     from vio.propagation import VibrationDetector
 """
 
-__version__ = "2.8.0"
+__version__ = "2.9.0"
 
 # Lazy module imports - access as vio.config, vio.math_utils, etc.
 # This avoids importing all dependencies at once
