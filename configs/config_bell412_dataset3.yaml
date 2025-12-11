@@ -152,12 +152,13 @@ magnetometer:
   # The IMU initial orientation is more reliable for this dataset
   apply_initial_correction: false
   
-  # ===== NEW: Enhanced Magnetometer Filtering (v2.9.0) =====
+  # ===== NEW: Enhanced Magnetometer Filtering (v2.9.1) =====
   # EMA (Exponential Moving Average) smoothing and gyro consistency check
+  # TUNED 2025-12-11: Relaxed parameters for helicopter dynamics
   ema_alpha: 0.3                # Smoothing factor: 0.3 = 30% new, 70% old
-  max_yaw_rate_deg: 30.0        # Maximum expected yaw rate [deg/s]
-  gyro_consistency_threshold_deg: 10.0  # Max deviation from gyro integration [deg]
-  r_inflate: 5.0                # R inflation factor for inconsistent measurements
+  max_yaw_rate_deg: 150.0       # Maximum expected yaw rate [deg/s] (was 30.0, too low for helicopter)
+  gyro_consistency_threshold_deg: 30.0  # Max deviation from gyro integration [deg] (was 10.0)
+  r_inflate: 2.0                # R inflation factor for inconsistent measurements (was 5.0)
 
 # EKF Process Noise
 # RECALIBRATED 2025-02-07: Magnetometer now GPS-calibrated with std~16°

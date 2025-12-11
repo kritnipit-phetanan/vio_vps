@@ -181,6 +181,12 @@ def load_config(config_path: str) -> Dict[str, Any]:
     result['MAG_APPLY_INITIAL_CORRECTION'] = mag.get('apply_initial_correction', True)
     result['MAG_INITIAL_CONVERGENCE_WINDOW'] = mag.get('convergence_window', 30.0)
     
+    # Enhanced Magnetometer Filtering Parameters (v2.9.0+)
+    result['MAG_EMA_ALPHA'] = mag.get('ema_alpha', 0.3)
+    result['MAG_MAX_YAW_RATE_DEG'] = mag.get('max_yaw_rate_deg', 30.0)
+    result['MAG_GYRO_THRESHOLD_DEG'] = mag.get('gyro_consistency_threshold_deg', 10.0)
+    result['MAG_R_INFLATE'] = mag.get('r_inflate', 5.0)
+    
     # Process noise
     pn = config['process_noise']
     result['SIGMA_ACCEL'] = pn['sigma_accel']
