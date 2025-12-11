@@ -59,8 +59,11 @@ from .msckf import perform_msckf_updates, print_msckf_stats
 from .measurement_updates import apply_magnetometer_update, apply_dem_height_update
 from .magnetometer import calibrate_magnetometer
 from .math_utils import quaternion_to_yaw, skew_symmetric
-from .loop_closure import get_loop_detector
+from .loop_closure import get_loop_detector, init_loop_closure, LoopClosureDetector
 from .imu_preintegration import IMUPreintegration
+from .fisheye_rectifier import FisheyeRectifier, create_rectifier_from_config
+from .propagation import VibrationDetector
+from .output_utils import save_calibration_log, save_keyframe_image_with_overlay
 
 
 @dataclass
@@ -177,6 +180,15 @@ class VIORunner:
         self.pose_csv = None
         self.error_csv = None
         self.state_dbg_csv = None
+        
+        # Fisheye rectifier (optional)
+        self.rectifier: Optional[FisheyeRectifier] = None
+        
+        # Loop closure detector (optional)
+        self.loop_detector: Optional[LoopClosureDetector] = None
+        
+        # Vibration detector (optional)
+        self.vibration_detector: Optional[VibrationDetector] = None
     
     def load_config(self) -> dict:
         """Load YAML configuration file."""
@@ -315,6 +327,62 @@ class VIORunner:
         
         print(f"[VIO] Camera view mode: {self.config.camera_view}")
     
+    def _initialize_rectifier(self):
+        """
+        Initialize fisheye rectifier for converting fisheye images to pinhole.
+        
+        This is optional and can improve feature tracking by removing 
+        fisheye distortion before processing. The rectified images use
+        a virtual pinhole camera with specified FOV.
+        """
+        # Check if rectification is enabled in config
+        use_rectifier = self.global_config.get('USE_RECTIFIER', False)
+        if not use_rectifier:
+            print("[RECTIFY] Fisheye rectification disabled")
+            return
+        
+        if len(self.imgs) == 0:
+            return
+        
+        try:
+            rectify_fov = self.global_config.get('RECTIFY_FOV_DEG', 90.0)
+            self.rectifier = create_rectifier_from_config(
+                self.global_config,
+                src_size=self.config.downscale_size,
+                fov_deg=rectify_fov,
+                dst_size=self.config.downscale_size
+            )
+            print(f"[RECTIFY] Fisheye rectifier initialized (FOV={rectify_fov}°)")
+        except Exception as e:
+            print(f"[RECTIFY] WARNING: Failed to initialize rectifier: {e}")
+            self.rectifier = None
+    
+    def _initialize_loop_closure(self):
+        """
+        Initialize loop closure detector for yaw drift correction.
+        
+        Loop closure detects when the vehicle returns to a previously
+        visited location and corrects accumulated yaw drift by matching
+        visual features.
+        """
+        use_loop_closure = self.global_config.get('USE_LOOP_CLOSURE', True)
+        if not use_loop_closure:
+            print("[LOOP] Loop closure detection disabled")
+            return
+        
+        if len(self.imgs) == 0:
+            print("[LOOP] No images available, loop closure disabled")
+            return
+        
+        try:
+            # Use tuned parameters for helicopter operations
+            position_threshold = self.global_config.get('LOOP_POSITION_THRESHOLD', 30.0)
+            self.loop_detector = init_loop_closure(position_threshold=position_threshold)
+            print(f"[LOOP] Loop closure detector initialized (threshold={position_threshold}m)")
+        except Exception as e:
+            print(f"[LOOP] WARNING: Failed to initialize loop closure: {e}")
+            self.loop_detector = None
+    
     def setup_output_files(self):
         """
         Create output directory and all CSV files.
@@ -430,46 +498,71 @@ class VIORunner:
             os.makedirs(self.keyframe_dir, exist_ok=True)
             print(f"[DEBUG] Keyframe images will be saved to: {self.keyframe_dir}")
         
-        # Save calibration snapshot
+        # Save calibration snapshot using output_utils
         if self.config.save_debug_data:
             self._save_calibration_snapshot()
     
     def _save_calibration_snapshot(self):
-        """Save calibration parameters for reproducibility."""
+        """Save calibration parameters for reproducibility using output_utils."""
         cal_path = os.path.join(self.config.output_dir, "debug_calibration.txt")
-        with open(cal_path, "w") as f:
-            f.write("=== VIO System Calibration & Configuration ===\n\n")
-            f.write(f"[Camera View]\n")
-            f.write(f"  Mode: {self.config.camera_view}\n\n")
-            
-            f.write(f"[Image Processing]\n")
-            f.write(f"  Downscale size: {self.config.downscale_size[0]}x{self.config.downscale_size[1]}\n\n")
-            
-            f.write(f"[Camera Intrinsics - Kannala-Brandt]\n")
-            kb_params = self.global_config.get('KB_PARAMS', {})
-            for key, val in kb_params.items():
-                f.write(f"  {key}: {val}\n")
-            f.write(f"\n")
-            
-            f.write(f"[IMU Parameters]\n")
-            imu_params = self.global_config.get('IMU_PARAMS', {})
-            for key, val in imu_params.items():
-                f.write(f"  {key}: {val}\n")
-            f.write(f"\n")
-            
-            f.write(f"[EKF Configuration]\n")
-            f.write(f"  z_state: {self.config.z_state}\n")
-            f.write(f"  estimate_imu_bias: {self.config.estimate_imu_bias}\n")
-            f.write(f"  use_preintegration: {self.config.use_preintegration}\n")
-            f.write(f"  use_magnetometer: {self.config.use_magnetometer}\n")
-            f.write(f"  use_vio_velocity: {self.config.use_vio_velocity}\n\n")
-            
-            f.write(f"[Initial State]\n")
-            f.write(f"  Origin: ({self.lat0:.8f}°, {self.lon0:.8f}°)\n")
-            f.write(f"  MSL altitude: {self.msl0:.2f} m\n")
-            if self.dem0 is not None:
-                f.write(f"  DEM elevation: {self.dem0:.2f} m\n")
-            f.write(f"  Initial velocity: {self.v_init} m/s\n")
+        
+        # Gather all parameters for save_calibration_log
+        kb_params = self.global_config.get('KB_PARAMS', {})
+        imu_params = self.global_config.get('IMU_PARAMS', {})
+        
+        # Camera view config
+        view_cfg = CAMERA_VIEW_CONFIGS.get(self.config.camera_view, {})
+        
+        # Magnetometer params
+        mag_params = {
+            'hard_iron': str(self.global_config.get('MAG_HARD_IRON_OFFSET', np.zeros(3))),
+            'soft_iron': 'calibrated',
+            'declination': self.global_config.get('MAG_DECLINATION', 0.0),
+        }
+        
+        # Process noise params
+        noise_params = {
+            'sigma_accel': self.global_config.get('SIGMA_ACCEL', 0.8),
+            'sigma_vo_vel': self.global_config.get('SIGMA_VO_VEL', 2.0),
+            'sigma_vps_xy': self.global_config.get('SIGMA_VPS_XY', 1.0),
+            'sigma_agl_z': self.global_config.get('SIGMA_AGL_Z', 2.5),
+            'sigma_mag_yaw': self.global_config.get('SIGMA_MAG_YAW', 0.15),
+        }
+        
+        # VIO quality control params  
+        vio_params = {
+            'min_parallax_px': self.global_config.get('MIN_PARALLAX_PX', 2.0),
+            'use_preintegration': self.config.use_preintegration,
+            'use_magnetometer': self.config.use_magnetometer,
+            'use_vio_velocity': self.config.use_vio_velocity,
+            'use_rectifier': self.rectifier is not None,
+            'use_loop_closure': self.loop_detector is not None,
+        }
+        
+        # Initial state
+        initial_state = {
+            'origin_lat': f"{self.lat0:.8f}°",
+            'origin_lon': f"{self.lon0:.8f}°",
+            'msl_altitude': f"{self.msl0:.2f} m",
+            'dem_elevation': f"{self.dem0:.2f} m" if self.dem0 else "N/A",
+            'initial_velocity': str(self.v_init) + " m/s",
+            'z_state': self.config.z_state,
+            'downscale_size': f"{self.config.downscale_size[0]}x{self.config.downscale_size[1]}",
+        }
+        
+        # Call the modular save function
+        save_calibration_log(
+            output_path=cal_path,
+            camera_view=self.config.camera_view,
+            view_cfg=view_cfg,
+            kb_params=kb_params,
+            imu_params=imu_params,
+            mag_params=mag_params,
+            noise_params=noise_params,
+            vio_params=vio_params,
+            initial_state=initial_state,
+            estimate_imu_bias=self.config.estimate_imu_bias
+        )
         
         print(f"[DEBUG] Calibration snapshot saved: {cal_path}")
     
@@ -840,13 +933,21 @@ class VIORunner:
             if (img.shape[1], img.shape[0]) != tuple(self.config.downscale_size):
                 img = cv2.resize(img, self.config.downscale_size, interpolation=cv2.INTER_AREA)
             
+            # Apply fisheye rectification if enabled
+            img_for_tracking = img
+            if self.rectifier is not None:
+                img_for_tracking = self.rectifier.rectify(img)
+            
             if is_fast_rotation:
                 print(f"[VIO] SKIPPING due to fast rotation: {rotation_rate_deg_s:.1f} deg/s")
                 self.state.img_idx += 1
                 continue
             
             # Run VIO frontend
-            ok, ninl, r_vo_mat, t_unit, dt_img = self.vio_fe.step(img, self.imgs[self.state.img_idx].t)
+            ok, ninl, r_vo_mat, t_unit, dt_img = self.vio_fe.step(img_for_tracking, self.imgs[self.state.img_idx].t)
+            
+            # Loop closure detection - check when we have sufficient position estimate
+            self._check_loop_closure(img, t)
             
             # Compute average optical flow (parallax) - use the new attributes
             # mean_parallax is now computed in step() EVERY frame, even if ok=False
@@ -932,10 +1033,60 @@ class VIORunner:
                     vo_dx=vo_dx, vo_dy=vo_dy, vo_dz=vo_dz,
                     vel_vx=vel_vx, vel_vy=vel_vy, vel_vz=vel_vz
                 )
+                
+                # Save keyframe image with visualization overlay
+                if self.config.save_keyframe_images and hasattr(self, 'keyframe_dir'):
+                    self._save_keyframe_with_overlay(img, self.vio_fe.frame_idx)
             
             self.state.img_idx += 1
         
         return used_vo, vo_data
+    
+    def _save_keyframe_with_overlay(self, img_gray: np.ndarray, frame_id: int):
+        """
+        Save keyframe image with feature tracking overlay.
+        
+        Uses save_keyframe_image_with_overlay from output_utils for consistent
+        visualization across the codebase.
+        
+        Args:
+            img_gray: Grayscale image
+            frame_id: Frame index
+        """
+        try:
+            # Get current tracked features from frontend
+            features = None
+            inliers = None
+            reprojections = None
+            
+            if self.vio_fe is not None:
+                # Get current features
+                if hasattr(self.vio_fe, 'prev_pts') and self.vio_fe.prev_pts is not None:
+                    features = self.vio_fe.prev_pts.copy()
+                
+                # Get tracking stats
+                tracking_stats = {
+                    'num_tracked': self.vio_fe.last_num_tracked,
+                    'num_inliers': self.vio_fe.last_num_inliers,
+                    'mean_parallax': self.vio_fe.mean_parallax,
+                }
+            else:
+                tracking_stats = None
+            
+            output_path = os.path.join(self.keyframe_dir, f"keyframe_{frame_id:06d}.jpg")
+            
+            save_keyframe_image_with_overlay(
+                image=img_gray,
+                features=features,
+                inliers=inliers,
+                reprojections=reprojections,
+                output_path=output_path,
+                frame_id=frame_id,
+                tracking_stats=tracking_stats
+            )
+            
+        except Exception as e:
+            print(f"[KEYFRAME] Failed to save keyframe {frame_id}: {e}")
     
     def _apply_preintegration_at_camera(self, ongoing_preint, t: float, imu_params: dict):
         """
@@ -1095,6 +1246,129 @@ class VIORunner:
                 
         except Exception as e:
             print(f"[CLONE] Failed: {e}")
+    
+    def _check_loop_closure(self, img_gray: np.ndarray, t: float):
+        """
+        Check for loop closure and apply yaw correction if detected.
+        
+        This method:
+        1. Gets current position and yaw from EKF state
+        2. Checks if we should add current frame as keyframe
+        3. Searches for loop closure candidates
+        4. If match found, applies yaw correction to EKF
+        
+        Args:
+            img_gray: Current grayscale image
+            t: Current timestamp
+        """
+        if self.loop_detector is None:
+            return
+        
+        try:
+            # Get current state
+            position = self.kf.x[0:3, 0].flatten()[:2]  # XY position only
+            yaw = quaternion_to_yaw(self.kf.x[6:10, 0].flatten())
+            frame_idx = self.vio_fe.frame_idx if self.vio_fe else 0
+            
+            # Check if we should add keyframe
+            if self.loop_detector.should_add_keyframe(position, yaw, frame_idx):
+                self.loop_detector.add_keyframe(frame_idx, position, yaw, img_gray)
+            
+            # Try to find and match loop closure
+            candidates = self.loop_detector.find_loop_candidates(position, frame_idx)
+            
+            if len(candidates) > 0:
+                # Get camera intrinsics for matching
+                kb_params = self.global_config.get('KB_PARAMS', {})
+                K = np.array([
+                    [kb_params.get('mu', 600), 0, img_gray.shape[1] / 2],
+                    [0, kb_params.get('mv', 600), img_gray.shape[0] / 2],
+                    [0, 0, 1]
+                ], dtype=np.float64)
+                
+                # Try to match with each candidate
+                for kf_idx in candidates:
+                    result = self.loop_detector.match_keyframe(img_gray, kf_idx, K)
+                    
+                    if result is not None:
+                        relative_yaw, num_inliers = result
+                        
+                        # Apply yaw correction via EKF update
+                        self._apply_loop_closure_correction(relative_yaw, kf_idx, num_inliers, t)
+                        break  # Only apply one correction per frame
+                        
+        except Exception as e:
+            print(f"[LOOP] Error in loop closure check: {e}")
+    
+    def _apply_loop_closure_correction(self, relative_yaw: float, kf_idx: int, 
+                                        num_inliers: int, t: float):
+        """
+        Apply yaw correction from loop closure detection.
+        
+        Args:
+            relative_yaw: Measured yaw difference from loop closure
+            kf_idx: Index of matched keyframe
+            num_inliers: Number of feature match inliers
+            t: Current timestamp
+        """
+        if self.loop_detector is None:
+            return
+        
+        try:
+            # Get expected yaw difference from stored keyframe
+            kf = self.loop_detector.keyframes[kf_idx]
+            current_yaw = quaternion_to_yaw(self.kf.x[6:10, 0].flatten())
+            expected_yaw_diff = current_yaw - kf['yaw']
+            
+            # Yaw correction (innovation)
+            yaw_error = relative_yaw - expected_yaw_diff
+            
+            # Wrap to [-π, π]
+            while yaw_error > np.pi:
+                yaw_error -= 2 * np.pi
+            while yaw_error < -np.pi:
+                yaw_error += 2 * np.pi
+            
+            # Only apply if correction is significant but not too large
+            if np.abs(yaw_error) < np.radians(2.0):  # < 2° skip
+                return
+            if np.abs(yaw_error) > np.radians(30.0):  # > 30° suspicious
+                print(f"[LOOP] REJECT: yaw_error={np.degrees(yaw_error):.1f}° too large")
+                return
+            
+            # Build EKF update for yaw
+            num_clones = len(self.state.cam_states)
+            err_dim = 15 + 6 * num_clones
+            
+            H_loop = np.zeros((1, err_dim), dtype=float)
+            H_loop[0, 8] = 1.0  # Yaw error index
+            
+            z_loop = np.array([[yaw_error]])
+            
+            # Measurement noise (inversely proportional to inliers)
+            base_sigma = np.radians(5.0)  # 5° base uncertainty
+            sigma_loop = base_sigma / np.sqrt(max(num_inliers, 1) / 15.0)
+            R_loop = np.array([[sigma_loop**2]])
+            
+            # Apply EKF update
+            def h_loop_jacobian(x, h=H_loop):
+                return h
+            
+            def hx_loop_fun(x, h=H_loop):
+                return np.zeros((1, 1))  # Zero residual (error is already computed)
+            
+            self.kf.update(
+                z=z_loop,
+                HJacobian=h_loop_jacobian,
+                Hx=hx_loop_fun,
+                R=R_loop
+            )
+            
+            print(f"[LOOP] CORRECTION at t={t:.2f}s: Δyaw={np.degrees(yaw_error):.2f}° "
+                  f"(kf={kf_idx}, inliers={num_inliers})")
+            
+        except Exception as e:
+            print(f"[LOOP] Failed to apply correction: {e}")
     
     def _trigger_msckf_update(self, t: float = 0.0):
         """Trigger MSCKF multi-view geometric update.
@@ -1573,6 +1847,21 @@ class VIORunner:
         
         # Initialize VIO frontend
         self.initialize_vio_frontend()
+        
+        # Initialize fisheye rectifier (optional - for converting fisheye to pinhole)
+        self._initialize_rectifier()
+        
+        # Initialize loop closure detector (for yaw drift correction)
+        self._initialize_loop_closure()
+        
+        # Initialize vibration detector
+        imu_params = self.global_config.get('IMU_PARAMS', {})
+        vib_buffer_size = self.global_config.get('VIBRATION_WINDOW_SIZE', 50)
+        vib_threshold_mult = self.global_config.get('VIBRATION_THRESHOLD_MULT', 5.0)
+        self.vibration_detector = VibrationDetector(
+            buffer_size=vib_buffer_size,
+            threshold=imu_params.get('acc_n', 0.1) * vib_threshold_mult
+        )
         
         # Setup output files
         self.setup_output_files()

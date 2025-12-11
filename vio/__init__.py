@@ -2,11 +2,26 @@
 VIO (Visual-Inertial Odometry) Package
 
 Complete modularized implementation of the VIO+ESKF+MSCKF system
-for helicopter navigation. Version 2.7.0 - Magnetometer oscillation fix.
+for helicopter navigation. Version 2.8.0 - Feature integration.
 
-Version: 2.7.0 (Magnetometer oscillation detection)
+Version: 2.8.0 (Feature integration)
 Modules: 17
-Total Lines: ~9,000
+Total Lines: ~10,000
+
+Changes in v2.8.0:
+- NEW: Fisheye rectifier integration (USE_RECTIFIER config)
+  * Optional fisheye→pinhole conversion before feature tracking
+  * Configurable output FOV via RECTIFY_FOV_DEG
+- NEW: Loop closure detection integration (USE_LOOP_CLOSURE config)
+  * Detects return to previously visited locations
+  * Applies yaw drift correction via EKF update
+  * Configurable thresholds: position, keyframe distance, frame gap
+- NEW: Vibration detector integration (USE_VIBRATION_DETECTOR config)
+  * Monitors IMU acceleration variance
+  * Can adjust measurement uncertainties during high vibration
+- IMPROVED: _save_calibration_snapshot now uses save_calibration_log from output_utils
+- IMPROVED: _save_keyframe_with_overlay uses save_keyframe_image_with_overlay
+- Added YAML config parsing for all new features
 
 Changes in v2.7.0:
 - FIX: Magnetometer oscillation detection near ±180° yaw boundary
@@ -91,9 +106,11 @@ Usage:
     from vio.state_manager import initialize_ekf_state
     from vio.main_loop import VIORunner, VIOConfig
     from vio.loop_closure import LoopClosureDetector, init_loop_closure
+    from vio.fisheye_rectifier import FisheyeRectifier, create_rectifier_from_config
+    from vio.propagation import VibrationDetector
 """
 
-__version__ = "2.7.0"
+__version__ = "2.8.0"
 
 # Lazy module imports - access as vio.config, vio.math_utils, etc.
 # This avoids importing all dependencies at once
@@ -103,7 +120,7 @@ import importlib
 _SUBMODULES = {
     "config", "math_utils", "imu_preintegration", "ekf", 
     "data_loaders", "magnetometer", "camera", "vio_frontend", "msckf",
-    "propagation", "vps_integration", "output_utils",
+    "propagation", "vps_integration", "output_utils", "fisheye_rectifier",
     "state_manager", "measurement_updates", "main_loop", "loop_closure"
 }
 

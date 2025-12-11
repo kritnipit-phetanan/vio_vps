@@ -216,3 +216,37 @@ default_camera_view: "nadir"
 
 # Use fisheye undistortion backend
 use_fisheye: true
+
+# ============================================================================
+# NEW: Fisheye Rectification (v2.8.0)
+# ============================================================================
+# Converts fisheye images to pinhole for better feature tracking.
+# DISABLED: Bell412 dataset already uses calibrated Kannala-Brandt model.
+# Enabling causes parallax scale errors due to rectification.
+# Only enable for uncalibrated or severely distorted fisheye cameras.
+rectification:
+  use_rectifier: false       # DISABLED: VIO already handles fisheye correctly
+  rectify_fov_deg: 90.0      # Output field of view for virtual pinhole camera
+
+# ============================================================================
+# NEW: Loop Closure Detection (v2.8.0)
+# ============================================================================
+# Detects when vehicle returns to previously visited location.
+# Corrects accumulated yaw drift using visual feature matching.
+loop_closure:
+  use_loop_closure: true      # Enable loop closure detection
+  position_threshold: 30.0    # Distance threshold to consider loop candidate [m]
+  min_keyframe_dist: 15.0     # Minimum distance between keyframes [m]
+  min_keyframe_yaw: 20.0      # Minimum yaw change between keyframes [deg]
+  min_frame_gap: 50           # Minimum frame gap for loop detection
+  min_inliers: 15             # Minimum feature match inliers
+
+# ============================================================================
+# NEW: Vibration Detection (v2.8.0)
+# ============================================================================
+# Detects high vibration periods (helicopter rotor effects).
+# Can be used to adjust measurement uncertainties.
+vibration:
+  use_vibration_detector: true
+  window_size: 50             # Number of samples for vibration detection
+  threshold_multiplier: 5.0   # Multiplier of acc_n for vibration threshold

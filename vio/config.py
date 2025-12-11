@@ -244,6 +244,49 @@ def load_config(config_path: str) -> Dict[str, Any]:
         result['BODY_T_GNSS'] = np.eye(4, dtype=np.float64)
         result['IMU_GNSS_LEVER_ARM'] = np.zeros(3, dtype=np.float64)
     
+    # =========================================================================
+    # NEW: Fisheye Rectification (v2.8.0)
+    # =========================================================================
+    if 'rectification' in config:
+        rect = config['rectification']
+        result['USE_RECTIFIER'] = rect.get('use_rectifier', False)
+        result['RECTIFY_FOV_DEG'] = rect.get('rectify_fov_deg', 90.0)
+    else:
+        result['USE_RECTIFIER'] = False
+        result['RECTIFY_FOV_DEG'] = 90.0
+    
+    # =========================================================================
+    # NEW: Loop Closure Detection (v2.8.0)
+    # =========================================================================
+    if 'loop_closure' in config:
+        lc = config['loop_closure']
+        result['USE_LOOP_CLOSURE'] = lc.get('use_loop_closure', True)
+        result['LOOP_POSITION_THRESHOLD'] = lc.get('position_threshold', 30.0)
+        result['LOOP_MIN_KEYFRAME_DIST'] = lc.get('min_keyframe_dist', 15.0)
+        result['LOOP_MIN_KEYFRAME_YAW'] = lc.get('min_keyframe_yaw', 20.0)
+        result['LOOP_MIN_FRAME_GAP'] = lc.get('min_frame_gap', 50)
+        result['LOOP_MIN_INLIERS'] = lc.get('min_inliers', 15)
+    else:
+        result['USE_LOOP_CLOSURE'] = True
+        result['LOOP_POSITION_THRESHOLD'] = 30.0
+        result['LOOP_MIN_KEYFRAME_DIST'] = 15.0
+        result['LOOP_MIN_KEYFRAME_YAW'] = 20.0
+        result['LOOP_MIN_FRAME_GAP'] = 50
+        result['LOOP_MIN_INLIERS'] = 15
+    
+    # =========================================================================
+    # NEW: Vibration Detection (v2.8.0)
+    # =========================================================================
+    if 'vibration' in config:
+        vib = config['vibration']
+        result['USE_VIBRATION_DETECTOR'] = vib.get('use_vibration_detector', True)
+        result['VIBRATION_WINDOW_SIZE'] = vib.get('window_size', 50)
+        result['VIBRATION_THRESHOLD_MULT'] = vib.get('threshold_multiplier', 5.0)
+    else:
+        result['USE_VIBRATION_DETECTOR'] = True
+        result['VIBRATION_WINDOW_SIZE'] = 50
+        result['VIBRATION_THRESHOLD_MULT'] = 5.0
+    
     return result
 
 
