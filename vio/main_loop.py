@@ -57,7 +57,10 @@ from .vps_integration import apply_vps_update, xy_to_latlon, latlon_to_xy
 from .vps_integration import compute_plane_constraint_jacobian
 from .msckf import perform_msckf_updates, print_msckf_stats
 from .measurement_updates import apply_magnetometer_update, apply_dem_height_update
-from .magnetometer import calibrate_magnetometer
+from .magnetometer import (
+    calibrate_magnetometer, reset_mag_filter_state, 
+    set_mag_constants, apply_mag_filter
+)
 from .math_utils import quaternion_to_yaw, skew_symmetric
 from .loop_closure import get_loop_detector, init_loop_closure, LoopClosureDetector
 from .imu_preintegration import IMUPreintegration
@@ -189,6 +192,10 @@ class VIORunner:
         
         # Vibration detector (optional)
         self.vibration_detector: Optional[VibrationDetector] = None
+        
+        # Last gyro for mag filtering
+        self.last_gyro_z = 0.0
+        self.last_imu_dt = 0.01
     
     def load_config(self) -> dict:
         """Load YAML configuration file."""
@@ -813,6 +820,10 @@ class VIORunner:
         # Bias-corrected measurements
         a_corr = rec.lin.astype(float) - ba
         w_corr = rec.ang.astype(float) - bg
+        
+        # Store gyro_z and dt for mag filtering
+        self.last_gyro_z = float(w_corr[2])
+        self.last_imu_dt = dt
         
         # Propagate state
         if not self.config.use_preintegration:
@@ -1648,24 +1659,50 @@ class VIORunner:
             soft_iron = self.global_config.get('MAG_SOFT_IRON_MATRIX', None)
             mag_cal = calibrate_magnetometer(mag_rec.mag, hard_iron=hard_iron, soft_iron=soft_iron)
             
+            # Compute raw yaw from calibrated magnetometer
+            from .magnetometer import compute_yaw_from_mag
+            q_current = self.kf.x[6:10, 0].flatten()
+            yaw_mag_raw, quality = compute_yaw_from_mag(
+                mag_body=mag_cal,
+                q_wxyz=q_current,
+                mag_declination=declination,
+                use_raw_heading=use_raw
+            )
+            
+            # Apply magnetometer filter (EMA smoothing + gyro consistency check)
             in_convergence = time_elapsed < convergence_window
+            yaw_mag_filtered, r_scale = apply_mag_filter(
+                yaw_mag=yaw_mag_raw,
+                yaw_t=mag_rec.t,
+                gyro_z=self.last_gyro_z,
+                dt_imu=self.last_imu_dt,
+                in_convergence=in_convergence
+            )
+            
+            # Scale measurement noise based on filter confidence
+            sigma_mag_scaled = sigma_mag * r_scale
+            
+            # Use filtered yaw instead of raw calibrated mag
             has_ppk = self.ppk_state is not None
             
             # Get residual_csv path if debug data is enabled
             residual_path = self.residual_csv if self.config.save_debug_data and hasattr(self, 'residual_csv') else None
             
+            # Apply magnetometer update using FILTERED yaw
+            # CRITICAL: Pass filtered yaw directly instead of raw mag
             applied, reason = apply_magnetometer_update(
                 self.kf,
-                mag_calibrated=mag_cal,
+                mag_calibrated=mag_cal,  # Still needed for compute_yaw_from_mag inside
                 mag_declination=declination,
                 use_raw_heading=use_raw,
-                sigma_mag_yaw=sigma_mag,
+                sigma_mag_yaw=sigma_mag_scaled,  # Use scaled sigma
                 time_elapsed=time_elapsed,
                 in_convergence=in_convergence,
                 has_ppk_yaw=has_ppk,
                 timestamp=t,
                 residual_csv=residual_path,
-                frame=self.state.vio_frame
+                frame=self.state.vio_frame,
+                yaw_override=yaw_mag_filtered  # NEW: pass filtered yaw directly
             )
             
             if applied:
@@ -1853,6 +1890,22 @@ class VIORunner:
         
         # Initialize loop closure detector (for yaw drift correction)
         self._initialize_loop_closure()
+        
+        # Initialize magnetometer filter state
+        reset_mag_filter_state()
+        
+        # Set magnetometer constants from config
+        mag_ema_alpha = self.global_config.get('MAG_EMA_ALPHA', 0.3)
+        mag_max_yaw_rate_deg = self.global_config.get('MAG_MAX_YAW_RATE_DEG', 30.0)
+        mag_gyro_threshold_deg = self.global_config.get('MAG_GYRO_THRESHOLD_DEG', 10.0)
+        mag_r_inflate = self.global_config.get('MAG_R_INFLATE', 5.0)
+        set_mag_constants(
+            ema_alpha=mag_ema_alpha,
+            max_yaw_rate=np.radians(mag_max_yaw_rate_deg),
+            gyro_threshold=np.radians(mag_gyro_threshold_deg),
+            consistency_r_inflate=mag_r_inflate
+        )
+        print(f"[MAG-FILTER] Initialized: EMA_α={mag_ema_alpha:.2f}, max_rate={mag_max_yaw_rate_deg:.1f}°/s, gyro_thresh={mag_gyro_threshold_deg:.1f}°")
         
         # Initialize vibration detector
         imu_params = self.global_config.get('IMU_PARAMS', {})

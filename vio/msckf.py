@@ -502,8 +502,32 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
         MSCKF_STATS['fail_nonlinear'] += 1
         return None
     
-    # Compute reprojection error
+    # =========================================================================
+    # NEW (Phase 2): MSCKF Reprojection Validation using kannala_brandt_project
+    # =========================================================================
+    # Validate triangulated point by reprojecting to all observed frames
+    # This catches errors from incorrect camera model or calibration issues
+    
+    from .camera import kannala_brandt_project, make_KD_for_size
+    
+    # Attempt to get camera intrinsics (K, D) from global config
+    # If not available, fall back to normalized coordinate reprojection
+    use_pixel_reprojection = False
+    try:
+        from .config import KB_PARAMS
+        if KB_PARAMS:
+            # Reconstruct K and D from KB params
+            K, D = make_KD_for_size(KB_PARAMS, 
+                                     int(KB_PARAMS.get('w', 1440)), 
+                                     int(KB_PARAMS.get('h', 1080)))
+            use_pixel_reprojection = True
+    except Exception:
+        pass  # Fall back to normalized coordinate method
+    
+    # Compute reprojection error (ENHANCED with pixel-level validation)
     total_error = 0.0
+    max_pixel_error = 0.0
+    
     for obs in obs_list:
         cam_id = obs['cam_id']
         if cam_id >= len(cam_states):
@@ -517,18 +541,43 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
         q_xyzw = np.array([q_cam[1], q_cam[2], q_cam[3], q_cam[0]])
         R_cw = R_scipy.from_quat(q_xyzw).as_matrix()
         R_wc = R_cw.T
+        
+        # Transform point to camera frame
         p_c = R_wc @ (p_refined - p_cam)
         
         if p_c[2] <= 0.1:
             MSCKF_STATS['fail_depth_sign'] += 1
             return None
         
+        # Compute normalized coordinates (legacy method - always used)
         x_pred = p_c[0] / p_c[2]
         y_pred = p_c[1] / p_c[2]
         
         x_obs, y_obs = obs['pt_norm']
-        error = np.sqrt((x_obs - x_pred)**2 + (y_obs - y_pred)**2)
-        total_error += error
+        norm_error = np.sqrt((x_obs - x_pred)**2 + (y_obs - y_pred)**2)
+        total_error += norm_error
+        
+        # NEW: Pixel-level reprojection validation (if K, D available)
+        if use_pixel_reprojection:
+            # Project 3D point to pixel coordinates
+            pts_reproj = kannala_brandt_project(p_c.reshape(1, 3), K, D)
+            
+            if pts_reproj.size > 0:
+                # Get observed pixel coordinates (if stored in obs)
+                if 'pt_px' in obs:
+                    pt_obs_px = np.array(obs['pt_px'])
+                    pt_pred_px = pts_reproj[0]
+                    
+                    pixel_error = np.linalg.norm(pt_pred_px - pt_obs_px)
+                    max_pixel_error = max(max_pixel_error, pixel_error)
+                    
+                    # Reject if pixel error exceeds threshold
+                    MAX_PIXEL_REPROJ_ERROR = 3.0  # pixels
+                    if pixel_error > MAX_PIXEL_REPROJ_ERROR:
+                        MSCKF_STATS['fail_reproj_error'] += 1
+                        if debug:
+                            print(f"[MSCKF-TRI] REJECT: pixel_error={pixel_error:.2f}px > {MAX_PIXEL_REPROJ_ERROR}px")
+                        return None
     
     avg_error = total_error / len(obs_list)
     
@@ -537,12 +586,18 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
         return None
     
     MSCKF_STATS['success'] += 1
-    return {
+    result = {
         'p_w': p_refined,
         'observations': obs_list,
         'quality': 1.0 / (1.0 + avg_error * 100.0),
         'avg_reproj_error': avg_error
     }
+    
+    # Add pixel-level error if available
+    if use_pixel_reprojection and max_pixel_error > 0:
+        result['max_pixel_reproj_error'] = max_pixel_error
+    
+    return result
 
 
 def compute_huber_weights(normalized_residuals: np.ndarray, 

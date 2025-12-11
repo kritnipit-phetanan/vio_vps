@@ -151,6 +151,13 @@ magnetometer:
   # DISABLED: Initial mag correction caused 173° yaw change which broke DEM fusion
   # The IMU initial orientation is more reliable for this dataset
   apply_initial_correction: false
+  
+  # ===== NEW: Enhanced Magnetometer Filtering (v2.9.0) =====
+  # EMA (Exponential Moving Average) smoothing and gyro consistency check
+  ema_alpha: 0.3                # Smoothing factor: 0.3 = 30% new, 70% old
+  max_yaw_rate_deg: 30.0        # Maximum expected yaw rate [deg/s]
+  gyro_consistency_threshold_deg: 10.0  # Max deviation from gyro integration [deg]
+  r_inflate: 5.0                # R inflation factor for inconsistent measurements
 
 # EKF Process Noise
 # RECALIBRATED 2025-02-07: Magnetometer now GPS-calibrated with std~16°

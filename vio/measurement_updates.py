@@ -145,7 +145,8 @@ def apply_magnetometer_update(kf,
                               save_debug: bool = False,
                               residual_csv: Optional[str] = None,
                               timestamp: float = 0.0,
-                              frame: int = -1) -> Tuple[bool, str]:
+                              frame: int = -1,
+                              yaw_override: Optional[float] = None) -> Tuple[bool, str]:
     """
     Apply magnetometer heading update.
     
@@ -155,13 +156,14 @@ def apply_magnetometer_update(kf,
     - Yaw correction limiting to prevent attitude destabilization
     - Cross-covariance decoupling to prevent altitude drift
     - Oscillation detection to prevent yaw bouncing near ±180°
+    - OPTIONAL: EMA-filtered yaw can be passed via yaw_override
     
     Args:
         kf: ExtendedKalmanFilter instance
         mag_calibrated: Calibrated magnetometer vector [x, y, z]
         mag_declination: Magnetic declination in radians
         use_raw_heading: Use raw body-frame heading (GPS-calibrated)
-        sigma_mag_yaw: Base measurement noise for yaw
+        sigma_mag_yaw: Base measurement noise for yaw (can be scaled by filter)
         time_elapsed: Time since start for flight phase detection
         gyro_z: Current gyro Z for consistency check
         in_convergence: Whether in initial convergence period
@@ -170,6 +172,7 @@ def apply_magnetometer_update(kf,
         residual_csv: Path to residual log
         timestamp: Current timestamp
         frame: Current frame number
+        yaw_override: If provided, use this yaw instead of computing from mag (for filtered yaw)
         
     Returns:
         Tuple of (update_applied: bool, rejection_reason: str)
@@ -189,13 +192,19 @@ def apply_magnetometer_update(kf,
     # Check field strength
     mag_norm = np.linalg.norm(mag_calibrated)
     
-    # Compute yaw from magnetometer
+    # Compute yaw from magnetometer (or use filtered yaw if provided)
     q_state = kf.x[6:10, 0]
-    yaw_mag, quality = compute_yaw_from_mag(
-        mag_calibrated, q_state,
-        mag_declination=mag_declination,
-        use_raw_heading=use_raw_heading
-    )
+    if yaw_override is not None:
+        # Use pre-filtered yaw (EMA smoothed + gyro consistency checked)
+        yaw_mag = yaw_override
+        quality = 1.0  # Filter already handled quality
+    else:
+        # Standard path: compute yaw directly
+        yaw_mag, quality = compute_yaw_from_mag(
+            mag_calibrated, q_state,
+            mag_declination=mag_declination,
+            use_raw_heading=use_raw_heading
+        )
     
     if quality < 0.3:
         return False, f"Low quality ({quality:.3f})"
