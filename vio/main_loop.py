@@ -470,6 +470,10 @@ class VIORunner:
         # Save calibration snapshot using output_utils
         if self.config.save_debug_data:
             cal_path = os.path.join(self.config.output_dir, "debug_calibration.txt")
+            
+            # Get camera view config
+            view_cfg = CAMERA_VIEW_CONFIGS.get(self.config.camera_view, CAMERA_VIEW_CONFIGS['nadir'])
+            
             kb_params = self.global_config.get('KB_PARAMS', {})
             imu_params = self.global_config.get('IMU_PARAMS', {})
             mag_params = {
@@ -495,6 +499,8 @@ class VIORunner:
             }
             save_calibration_log(
                 output_path=cal_path,
+                camera_view=self.config.camera_view,
+                view_cfg=view_cfg,
                 kb_params=kb_params,
                 imu_params=imu_params,
                 mag_params=mag_params,
