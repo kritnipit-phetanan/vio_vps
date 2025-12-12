@@ -489,12 +489,13 @@ class VIORunner:
         Returns:
             Phase index: 0=SPINUP, 1=EARLY, 2=NORMAL
         """
-        if time_elapsed < self.PHASE_SPINUP_END:
-            return 0
-        elif time_elapsed < self.PHASE_EARLY_END:
-            return 1
-        else:
-            return 2
+        from .propagation import get_flight_phase as get_phase_from_module
+        phase_num, _ = get_phase_from_module(
+            time_elapsed,
+            spinup_end=self.PHASE_SPINUP_END,
+            early_flight_end=self.PHASE_EARLY_END
+        )
+        return phase_num
     
     def process_imu_sample(self, rec, dt: float, time_elapsed: float):
         """
@@ -856,10 +857,22 @@ class VIORunner:
             gt_E, gt_N = latlon_to_xy(gt_lat, gt_lon, self.lat0, self.lon0)
             gt_U = gt_alt
             
-            # VIO prediction
+            # VIO prediction (IMU position)
             vio_E = float(self.kf.x[0, 0])
             vio_N = float(self.kf.x[1, 0])
             vio_U = float(self.kf.x[2, 0])
+            
+            # Ground truth is GNSS position - convert VIO (IMU) to GNSS for fair comparison
+            lever_arm = self.global_config.get('IMU_GNSS_LEVER_ARM', np.zeros(3))
+            if np.linalg.norm(lever_arm) > 0.01:
+                from scipy.spatial.transform import Rotation as R_scipy
+                q_vio = self.kf.x[6:10, 0]
+                q_xyzw = np.array([q_vio[1], q_vio[2], q_vio[3], q_vio[0]])
+                R_body_to_world = R_scipy.from_quat(q_xyzw).as_matrix()
+                
+                p_imu_enu = np.array([vio_E, vio_N, vio_U])
+                p_gnss_enu = imu_to_gnss_position(p_imu_enu, R_body_to_world, lever_arm)
+                vio_E, vio_N, vio_U = p_gnss_enu[0], p_gnss_enu[1], p_gnss_enu[2]
             
             # Errors
             err_E = vio_E - gt_E
