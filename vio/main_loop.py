@@ -704,9 +704,9 @@ class VIORunner:
                     relative_yaw=relative_yaw,
                     kf_idx=kf_idx,
                     num_inliers=num_inliers,
-                    timestamp=t,
-                    residual_csv=self.residual_csv if self.config.save_debug_data else None,
-                    frame=self.state.vio_frame
+                    t=t,
+                    cam_states=self.state.cam_states,
+                    loop_detector=self.loop_detector
                 )
             
             # Compute average optical flow (parallax) - use the new attributes
