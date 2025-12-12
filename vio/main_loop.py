@@ -479,24 +479,6 @@ class VIORunner:
             )
             print(f"[DEBUG] Calibration snapshot saved: {cal_path}")
     
-    def get_flight_phase(self, time_elapsed: float) -> int:
-        """
-        Determine current flight phase.
-        
-        Args:
-            time_elapsed: Time since start in seconds
-            
-        Returns:
-            Phase index: 0=SPINUP, 1=EARLY, 2=NORMAL
-        """
-        from .propagation import get_flight_phase as get_phase_from_module
-        phase_num, _ = get_phase_from_module(
-            time_elapsed,
-            spinup_end=self.PHASE_SPINUP_END,
-            early_flight_end=self.PHASE_EARLY_END
-        )
-        return phase_num
-    
     def process_imu_sample(self, rec, dt: float, time_elapsed: float):
         """
         Process single IMU sample (propagation + ZUPT).
@@ -1221,7 +1203,15 @@ class VIORunner:
             self.state.last_t = t
             
             time_elapsed = t - self.state.t0
-            self.state.current_phase = self.get_flight_phase(time_elapsed)
+            
+            # Get flight phase from propagation module
+            from .propagation import get_flight_phase
+            phase_num, _ = get_flight_phase(
+                time_elapsed,
+                spinup_end=self.PHASE_SPINUP_END,
+                early_flight_end=self.PHASE_EARLY_END
+            )
+            self.state.current_phase = phase_num
             
             # IMU propagation
             if self.config.use_preintegration and ongoing_preint is not None:
