@@ -428,38 +428,6 @@ class VIORunner:
         
         self.keyframe_dir = None
         if self.config.save_debug_data:
-            # NOTE: DebugCSVWriters already created all debug CSVs
-            # State & covariance evolution
-            self.state_cov_csv = os.path.join(self.config.output_dir, "debug_state_covariance.csv")
-            with open(self.state_cov_csv, "w", newline="") as f:
-                f.write("t,frame,P_pos_xx,P_pos_yy,P_pos_zz,P_vel_xx,P_vel_yy,P_vel_zz,"
-                        "P_rot_xx,P_rot_yy,P_rot_zz,P_bg_xx,P_bg_yy,P_bg_zz,"
-                        "P_ba_xx,P_ba_yy,P_ba_zz,bg_x,bg_y,bg_z,ba_x,ba_y,ba_z\n")
-            
-            # Residual & innovation log
-            self.residual_csv = os.path.join(self.config.output_dir, "debug_residuals.csv")
-            with open(self.residual_csv, "w", newline="") as f:
-                f.write("t,frame,update_type,innovation_x,innovation_y,innovation_z,"
-                        "mahalanobis_dist,chi2_threshold,accepted,NIS,NEES\n")
-            
-            # Feature tracking statistics
-            self.feature_stats_csv = os.path.join(self.config.output_dir, "debug_feature_stats.csv")
-            with open(self.feature_stats_csv, "w", newline="") as f:
-                f.write("frame,t,num_features_detected,num_features_tracked,num_inliers,"
-                        "mean_parallax_px,max_parallax_px,tracking_ratio,inlier_ratio\n")
-            
-            # MSCKF window & marginalization log
-            self.msckf_window_csv = os.path.join(self.config.output_dir, "debug_msckf_window.csv")
-            with open(self.msckf_window_csv, "w", newline="") as f:
-                f.write("frame,t,num_camera_clones,num_tracked_features,num_mature_features,"
-                        "window_start_time,window_duration,marginalized_clone_id\n")
-            
-            # FEJ consistency log
-            self.fej_csv = os.path.join(self.config.output_dir, "debug_fej_consistency.csv")
-            with open(self.fej_csv, "w", newline="") as f:
-                f.write("timestamp,frame,clone_idx,pos_fej_drift_m,rot_fej_drift_deg,"
-                        "bg_fej_drift_rad_s,ba_fej_drift_m_s2\n")
-            
             print(f"[DEBUG] Debug data logging enabled")
         
         if self.config.save_keyframe_images:
@@ -750,7 +718,7 @@ class VIORunner:
             should_clone = avg_flow_px >= clone_threshold and not is_fast_rotation
             
             if should_clone:
-                clone_camera_for_msckf(
+                clone_idx = clone_camera_for_msckf(
                     kf=self.kf,
                     t=t,
                     cam_states=self.state.cam_states,
@@ -758,6 +726,45 @@ class VIORunner:
                     vio_fe=self.vio_fe,
                     frame_idx=self.vio_fe.frame_idx
                 )
+                
+                # Log MSCKF window state
+                if clone_idx >= 0:
+                    num_tracked = len(self.state.cam_observations[-1]['observations']) if self.state.cam_observations else 0
+                    window_start = self.state.cam_states[0]['t'] if self.state.cam_states else t
+                    log_msckf_window(
+                        msckf_window_csv=self.msckf_window_csv,
+                        frame=self.vio_fe.frame_idx,
+                        t=t,
+                        num_clones=len(self.state.cam_states),
+                        num_tracked=num_tracked,
+                        num_mature=0,
+                        window_start=window_start,
+                        marginalized_clone=-1
+                    )
+                    
+                    # Trigger MSCKF update if enough clones
+                    if len(self.state.cam_states) >= 3:
+                        num_updates = trigger_msckf_update(
+                            kf=self.kf,
+                            cam_states=self.state.cam_states,
+                            cam_observations=self.state.cam_observations,
+                            vio_fe=self.vio_fe,
+                            t=t,
+                            msckf_dbg_csv=self.msckf_dbg_csv if hasattr(self, 'msckf_dbg_csv') else None,
+                            dem_reader=self.dem,
+                            origin_lat=self.lat0,
+                            origin_lon=self.lon0
+                        )
+                        
+                        # Log FEJ consistency after MSCKF update
+                        if num_updates > 0 and self.config.save_debug_data:
+                            log_fej_consistency(
+                                fej_csv=self.fej_csv,
+                                t=t,
+                                frame=self.vio_fe.frame_idx if self.vio_fe else 0,
+                                cam_states=self.state.cam_states,
+                                kf=self.kf
+                            )
             
             # VIO velocity update (if frontend succeeded)
             if ok and r_vo_mat is not None and t_unit is not None:
