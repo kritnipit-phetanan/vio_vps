@@ -37,16 +37,17 @@ fi
 
 # Verify modular package imports work
 echo "=== Verifying VIO Module Imports ==="
-python3 -c "
-from vio import config, ekf, propagation, vps_integration, msckf
-from vio.state_manager import initialize_ekf_state
-from vio.measurement_updates import apply_zupt_update
+python3 << 'EOF'
+import vio
+from vio.main_loop import VIORunner, VIOConfig
 print('✅ All VIO modules imported successfully')
-print(f'   Package version: {__import__(\"vio\").__version__}')
-" || {
+print(f'   Package version: {vio.__version__}')
+EOF
+
+if [ $? -ne 0 ]; then
     echo "❌ Failed to import VIO modules. Check installation."
     exit 1
-}
+fi
 
 echo ""
 
