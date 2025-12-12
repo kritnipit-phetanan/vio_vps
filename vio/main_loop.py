@@ -768,15 +768,18 @@ class VIORunner:
                     t=t,
                     dt_img=dt_img,
                     avg_flow_px=avg_flow_px,
-                    rec=rec,
-                    vio_fe=self.vio_fe,
-                    config=self.config,
+                    imu_rec=rec,
                     global_config=self.global_config,
-                    dem=self.dem,
+                    camera_view=self.config.camera_view,
+                    dem_reader=self.dem,
                     lat0=self.lat0,
                     lon0=self.lon0,
+                    z_state=self.config.z_state,
+                    use_vio_velocity=self.config.use_vio_velocity,
+                    save_debug=self.config.save_debug_data,
+                    residual_csv=self.residual_csv if self.config.save_debug_data else None,
                     vio_frame=self.state.vio_frame,
-                    residual_csv=self.residual_csv if self.config.save_debug_data else None
+                    vio_fe=self.vio_fe
                 )
                 
                 # Increment VIO frame
