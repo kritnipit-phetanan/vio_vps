@@ -1108,17 +1108,9 @@ class VIORunner:
         
         print_msckf_stats()
         
-        # Print error statistics
-        try:
-            error_df = pd.read_csv(self.error_csv)
-            if len(error_df) > 0:
-                print("\n=== Error Statistics ===")
-                print(f"Position Error:")
-                print(f"  Mean: {error_df['pos_error_m'].mean():.2f} m")
-                print(f"  Max: {error_df['pos_error_m'].max():.2f} m")
-                print(f"  Final: {error_df['pos_error_m'].iloc[-1]:.2f} m")
-        except Exception:
-            pass
+        # Print error statistics using dedicated function
+        from .output_utils import print_error_statistics
+        print_error_statistics(self.error_csv)
     
     def run(self):
         """
