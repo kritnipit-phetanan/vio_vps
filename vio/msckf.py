@@ -980,3 +980,77 @@ def perform_msckf_updates(vio_fe, cam_observations: List[dict],
             num_successful += 1
     
     return num_successful
+
+
+# =============================================================================
+# High-level MSCKF Trigger Function
+# =============================================================================
+
+def trigger_msckf_update(kf, cam_states: list, cam_observations: list,
+                         vio_fe, t: float = 0.0,
+                         msckf_dbg_csv: Optional[str] = None,
+                         dem_reader=None, origin_lat: float = 0.0,
+                         origin_lon: float = 0.0) -> int:
+    """
+    Trigger MSCKF multi-view geometric update.
+    
+    This function decides when to perform MSCKF updates based on:
+    - Number of mature features (seen in multiple views)
+    - Number of camera clones in sliding window
+    - Frame intervals
+    
+    Args:
+        kf: ExtendedKalmanFilter instance
+        cam_states: List of camera clone states
+        cam_observations: List of camera observations
+        vio_fe: VIO frontend
+        t: Current timestamp for logging
+        msckf_dbg_csv: Optional debug CSV path
+        dem_reader: Optional DEM reader for ground constraints
+        origin_lat/origin_lon: Local projection origin
+    
+    Returns:
+        Number of successful MSCKF updates
+    """
+    if vio_fe is None or len(cam_states) < 2:
+        return 0
+    
+    # Count mature features
+    feature_obs_count = {}
+    for obs_set in cam_observations:
+        for obs in obs_set['observations']:
+            fid = obs['fid']
+            feature_obs_count[fid] = feature_obs_count.get(fid, 0) + 1
+    
+    num_mature = sum(1 for c in feature_obs_count.values() if c >= 2)
+    
+    # Decide if we should update
+    should_update = (
+        num_mature >= 20 or                                    # Many mature features
+        len(cam_states) >= 4 or                               # Window getting full
+        (vio_fe.frame_idx % 5 == 0 and len(cam_states) >= 3)  # Periodic update
+    )
+    
+    if should_update:
+        try:
+            num_updates = perform_msckf_updates(
+                vio_fe,
+                cam_observations,
+                cam_states,
+                kf,
+                min_observations=2,
+                max_features=50,
+                msckf_dbg_path=msckf_dbg_csv,
+                dem_reader=dem_reader,
+                origin_lat=origin_lat,
+                origin_lon=origin_lon
+            )
+            if num_updates > 0:
+                print(f"[MSCKF] Updated {num_updates} features at t={t:.3f}s")
+            return num_updates
+        except Exception as e:
+            print(f"[MSCKF] Error: {e}")
+            return 0
+    
+    return 0
+

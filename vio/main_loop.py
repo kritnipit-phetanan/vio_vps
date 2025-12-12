@@ -51,22 +51,32 @@ from .vio_frontend import VIOFrontEnd
 from .camera import make_KD_for_size
 from .propagation import (
     process_imu, propagate_error_state_covariance, 
-    augment_state_with_camera, detect_stationary, apply_zupt
+    augment_state_with_camera, detect_stationary, apply_zupt,
+    apply_preintegration_at_camera, clone_camera_for_msckf
 )
 from .vps_integration import apply_vps_update, xy_to_latlon, latlon_to_xy
 from .vps_integration import compute_plane_constraint_jacobian
-from .msckf import perform_msckf_updates, print_msckf_stats
+from .msckf import perform_msckf_updates, print_msckf_stats, trigger_msckf_update
 from .measurement_updates import apply_magnetometer_update, apply_dem_height_update
 from .magnetometer import (
     calibrate_magnetometer, reset_mag_filter_state, 
     set_mag_constants, apply_mag_filter
 )
 from .math_utils import quaternion_to_yaw, skew_symmetric
-from .loop_closure import get_loop_detector, init_loop_closure, LoopClosureDetector
+from .loop_closure import (
+    get_loop_detector, init_loop_closure, LoopClosureDetector,
+    check_loop_closure, apply_loop_closure_correction
+)
 from .imu_preintegration import IMUPreintegration
 from .fisheye_rectifier import FisheyeRectifier, create_rectifier_from_config
 from .propagation import VibrationDetector
-from .output_utils import save_calibration_log, save_keyframe_image_with_overlay
+from .output_utils import (
+    save_calibration_log, save_keyframe_image_with_overlay,
+    save_keyframe_with_overlay,
+    log_state_debug, log_vo_debug, log_msckf_window, log_fej_consistency,
+    DebugCSVWriters, init_output_csvs
+)
+from .vio_processing import apply_vio_velocity_update
 
 
 @dataclass
@@ -394,79 +404,31 @@ class VIORunner:
         """
         Create output directory and all CSV files.
         
-        Creates the following output files:
-        - pose.csv: Main trajectory output (position, velocity, orientation)
-        - error_log.csv: Error comparison vs ground truth
-        - state_debug.csv: Detailed state evolution for debugging
-        - inference_log.csv: Processing time per frame
-        - vo_debug.csv: Visual odometry debug info
-        - msckf_debug.csv: MSCKF update statistics
-        
-        If save_debug_data is enabled, also creates:
-        - debug_imu_raw.csv: Raw IMU measurements
-        - debug_state_covariance.csv: Covariance evolution
-        - debug_residuals.csv: Innovation/residual statistics
-        - debug_feature_stats.csv: Feature tracking quality
-        - debug_msckf_window.csv: MSCKF sliding window state
-        - debug_fej_consistency.csv: First-estimate Jacobian consistency
-        - debug_calibration.txt: Calibration parameters snapshot
+        Uses output_utils.init_output_csvs() and DebugCSVWriters.
         """
         os.makedirs(self.config.output_dir, exist_ok=True)
         
-        # ===== CORE OUTPUT FILES =====
+        # Use output_utils to initialize core CSVs
+        csv_paths = init_output_csvs(self.config.output_dir)
+        self.pose_csv = csv_paths['pose_csv']
+        self.error_csv = csv_paths['error_csv']
+        self.state_dbg_csv = csv_paths['state_dbg_csv']
+        self.inf_csv = csv_paths['inf_csv']
+        self.vo_dbg_csv = csv_paths['vo_dbg']
+        self.msckf_dbg_csv = csv_paths['msckf_dbg']
         
-        # Pose output - main trajectory
-        self.pose_csv = os.path.join(self.config.output_dir, "pose.csv")
-        with open(self.pose_csv, "w", newline="") as f:
-            f.write("Timestamp(s),dt,Frame,PX,PY,PZ_MSL,VX,VY,VZ,lat,lon,AGL(m),"
-                    "vo_dx,vo_dy,vo_dz,vo_d_roll,vo_d_pitch,vo_d_yaw\n")
+        # Use DebugCSVWriters for optional debug files
+        self.debug_writers = DebugCSVWriters(self.config.output_dir, self.config.save_debug_data)
+        self.imu_raw_csv = self.debug_writers.imu_raw_csv
+        self.state_cov_csv = self.debug_writers.state_cov_csv
+        self.residual_csv = self.debug_writers.residual_csv
+        self.feature_stats_csv = self.debug_writers.feature_stats_csv
+        self.msckf_window_csv = self.debug_writers.msckf_window_csv
+        self.fej_csv = self.debug_writers.fej_consistency_csv
         
-        # Error log - comparison with ground truth
-        self.error_csv = os.path.join(self.config.output_dir, "error_log.csv")
-        with open(self.error_csv, "w", newline="") as f:
-            f.write("t,pos_error_m,pos_error_E,pos_error_N,pos_error_U,"
-                    "vel_error_m_s,vel_error_E,vel_error_N,vel_error_U,"
-                    "alt_error_m,yaw_vio_deg,yaw_gps_deg,yaw_error_deg,"
-                    "gps_lat,gps_lon,gps_alt,vio_E,vio_N,vio_U\n")
-        
-        # State debug log - detailed state evolution
-        self.state_dbg_csv = os.path.join(self.config.output_dir, "state_debug.csv")
-        with open(self.state_dbg_csv, "w", newline="") as f:
-            f.write("t,px,py,pz,vx,vy,vz,a_world_x,a_world_y,a_world_z,dem,agl,msl\n")
-        
-        # Inference timing log
-        self.inf_csv = os.path.join(self.config.output_dir, "inference_log.csv")
-        with open(self.inf_csv, "w", newline="") as f:
-            f.write("Index,Inference Time (s),FPS\n")
-        
-        # VO debug log
-        self.vo_dbg_csv = os.path.join(self.config.output_dir, "vo_debug.csv")
-        with open(self.vo_dbg_csv, "w", newline="") as f:
-            f.write("Frame,num_inliers,rot_angle_deg,alignment_deg,rotation_rate_deg_s,"
-                    "use_only_vz,skip_vo,vo_dx,vo_dy,vo_dz,vel_vx,vel_vy,vel_vz\n")
-        
-        # MSCKF debug log
-        self.msckf_dbg_csv = os.path.join(self.config.output_dir, "msckf_debug.csv")
-        with open(self.msckf_dbg_csv, "w", newline="") as f:
-            f.write("frame,feature_id,num_observations,triangulation_success,"
-                    "reprojection_error_px,innovation_norm,update_applied,chi2_test\n")
-        
-        # ===== OPTIONAL DEBUG DATA FILES =====
-        
-        self.imu_raw_csv = None
-        self.state_cov_csv = None
-        self.residual_csv = None
-        self.feature_stats_csv = None
-        self.msckf_window_csv = None
-        self.fej_csv = None
         self.keyframe_dir = None
-        
         if self.config.save_debug_data:
-            # Raw IMU data log
-            self.imu_raw_csv = os.path.join(self.config.output_dir, "debug_imu_raw.csv")
-            with open(self.imu_raw_csv, "w", newline="") as f:
-                f.write("t,ori_x,ori_y,ori_z,ori_w,ang_x,ang_y,ang_z,lin_x,lin_y,lin_z\n")
-            
+            # NOTE: DebugCSVWriters already created all debug CSVs
             # State & covariance evolution
             self.state_cov_csv = os.path.join(self.config.output_dir, "debug_state_covariance.csv")
             with open(self.state_cov_csv, "w", newline="") as f:
@@ -575,214 +537,54 @@ class VIORunner:
     
     def _log_debug_state_covariance(self, t: float, rec, i: int):
         """Log state and covariance to debug CSV (every 10 samples)."""
-        if not self.config.save_debug_data or not hasattr(self, 'state_cov_csv'):
-            return
         if i % 10 != 0:  # Every 10 samples (~25ms @ 400Hz)
             return
         
-        try:
-            bg = self.kf.x[10:13, 0]
-            ba = self.kf.x[13:16, 0]
-            
-            # Extract diagonal elements of covariance blocks
-            P_pos = [self.kf.P[0,0], self.kf.P[1,1], self.kf.P[2,2]]
-            P_vel = [self.kf.P[3,3], self.kf.P[4,4], self.kf.P[5,5]]
-            P_rot = [self.kf.P[6,6], self.kf.P[7,7], self.kf.P[8,8]]
-            P_bg = [self.kf.P[9,9], self.kf.P[10,10], self.kf.P[11,11]]
-            P_ba = [self.kf.P[12,12], self.kf.P[13,13], self.kf.P[14,14]]
-            
-            with open(self.state_cov_csv, "a", newline="") as f:
-                f.write(f"{t:.6f},{self.state.vio_frame},{P_pos[0]:.6e},{P_pos[1]:.6e},{P_pos[2]:.6e},"
-                       f"{P_vel[0]:.6e},{P_vel[1]:.6e},{P_vel[2]:.6e},"
-                       f"{P_rot[0]:.6e},{P_rot[1]:.6e},{P_rot[2]:.6e},"
-                       f"{P_bg[0]:.6e},{P_bg[1]:.6e},{P_bg[2]:.6e},"
-                       f"{P_ba[0]:.6e},{P_ba[1]:.6e},{P_ba[2]:.6e},"
-                       f"{bg[0]:.6f},{bg[1]:.6f},{bg[2]:.6f},"
-                       f"{ba[0]:.6f},{ba[1]:.6f},{ba[2]:.6f}\n")
-        except Exception:
-            pass
+        bg = self.kf.x[10:13, 0]
+        ba = self.kf.x[13:16, 0]
+        self.debug_writers.log_state_covariance(t, self.state.vio_frame, self.kf, bg, ba)
     
     def _log_debug_imu_raw(self, t: float, rec):
         """Log raw IMU data to debug CSV."""
-        if not self.config.save_debug_data or not hasattr(self, 'imu_raw_csv'):
-            return
-        
-        try:
-            with open(self.imu_raw_csv, "a", newline="") as f:
-                f.write(f"{t:.6f},{rec.q[0]:.6f},{rec.q[1]:.6f},{rec.q[2]:.6f},{rec.q[3]:.6f},"
-                       f"{rec.ang[0]:.6f},{rec.ang[1]:.6f},{rec.ang[2]:.6f},"
-                       f"{rec.lin[0]:.6f},{rec.lin[1]:.6f},{rec.lin[2]:.6f}\n")
-        except Exception:
-            pass
+        self.debug_writers.log_imu_raw(t, rec)
     
     def _log_debug_feature_stats(self, frame: int, t: float, num_features: int, 
                                   num_tracked: int, num_inliers: int,
                                   mean_parallax: float, max_parallax: float):
         """Log feature tracking statistics to debug CSV."""
-        if not self.config.save_debug_data or not hasattr(self, 'feature_stats_csv'):
-            return
-        
-        try:
-            tracking_ratio = 1.0 if num_features > 0 else 0.0
-            inlier_ratio = num_inliers / max(1, num_features)
-            
-            with open(self.feature_stats_csv, "a", newline="") as f:
-                f.write(f"{frame},{t:.6f},{num_features},{num_tracked},{num_inliers},"
-                       f"{mean_parallax:.2f},{max_parallax:.2f},"
-                       f"{tracking_ratio:.3f},{inlier_ratio:.3f}\n")
-        except Exception:
-            pass
+        tracking_ratio = 1.0 if num_features > 0 else 0.0
+        inlier_ratio = num_inliers / max(1, num_features)
+        self.debug_writers.log_feature_stats(
+            frame, t, num_features, num_tracked, num_inliers,
+            mean_parallax, max_parallax, tracking_ratio, inlier_ratio
+        )
     
     def _log_debug_msckf_window(self, frame: int, t: float, num_clones: int,
                                  num_tracked: int, num_mature: int,
                                  window_start: float, marginalized_clone: int):
         """Log MSCKF window state to debug CSV."""
-        if not self.config.save_debug_data or not hasattr(self, 'msckf_window_csv'):
-            return
-        
-        try:
-            window_duration = t - window_start if window_start > 0 else 0.0
-            
-            with open(self.msckf_window_csv, "a", newline="") as f:
-                f.write(f"{frame},{t:.6f},{num_clones},{num_tracked},{num_mature},"
-                       f"{window_start:.6f},{window_duration:.3f},{marginalized_clone}\n")
-        except Exception:
-            pass
+        log_msckf_window(self.msckf_window_csv, frame, t, num_clones,
+                        num_tracked, num_mature, window_start, marginalized_clone)
 
     def _log_state_debug(self, t: float, dem_now: float, agl_now: float, 
                          msl_now: float, a_world: np.ndarray):
-        """
-        Log full state debug (every sample, like vio_vps.py state_dbg_csv).
-        
-        Args:
-            t: Current timestamp
-            dem_now: Current DEM height
-            agl_now: Current AGL
-            msl_now: Current MSL
-            a_world: World-frame acceleration [3]
-        """
-        try:
-            px = float(self.kf.x[0, 0])
-            py = float(self.kf.x[1, 0])
-            pz = float(self.kf.x[2, 0])
-            vx = float(self.kf.x[3, 0])
-            vy = float(self.kf.x[4, 0])
-            vz = float(self.kf.x[5, 0])
-        except Exception:
-            px = py = pz = vx = vy = vz = float('nan')
-        
-        try:
-            a_wx = float(a_world[0])
-            a_wy = float(a_world[1])
-            a_wz = float(a_world[2])
-        except Exception:
-            a_wx = a_wy = a_wz = float('nan')
-        
-        dem_val = dem_now if dem_now is not None else float('nan')
-        agl_val = agl_now if agl_now is not None else float('nan')
-        msl_val = msl_now if msl_now is not None else float('nan')
-        
-        try:
-            with open(self.state_dbg_csv, "a", newline="") as f:
-                f.write(f"{t:.6f},{px:.6f},{py:.6f},{pz:.6f},"
-                        f"{vx:.6f},{vy:.6f},{vz:.6f},"
-                        f"{a_wx:.6f},{a_wy:.6f},{a_wz:.6f},"
-                        f"{dem_val:.6f},{agl_val:.6f},{msl_val:.6f}\n")
-        except Exception:
-            pass
+        """Log full state debug."""
+        log_state_debug(self.state_dbg_csv, t, self.kf, dem_now, agl_now, msl_now, a_world)
 
     def _log_vo_debug(self, frame: int, num_inliers: int, rot_angle_deg: float,
                       alignment_deg: float, rotation_rate_deg_s: float,
                       use_only_vz: bool, skip_vo: bool,
                       vo_dx: float, vo_dy: float, vo_dz: float,
                       vel_vx: float, vel_vy: float, vel_vz: float):
-        """
-        Log VO debug info (when VIO processes a frame, like vio_vps.py vo_dbg).
-        
-        Args:
-            frame: Frame index
-            num_inliers: Number of inlier matches
-            rot_angle_deg: Rotation angle from VO (degrees)
-            alignment_deg: Alignment with expected motion (degrees)
-            rotation_rate_deg_s: Rotation rate (degrees/sec)
-            use_only_vz: Whether only vertical velocity is used
-            skip_vo: Whether VO was skipped
-            vo_dx, vo_dy, vo_dz: VO translation
-            vel_vx, vel_vy, vel_vz: VIO velocities
-        """
-        try:
-            with open(self.vo_dbg_csv, "a", newline="") as f:
-                f.write(
-                    f"{max(frame, 0)},{num_inliers},{rot_angle_deg:.3f},"
-                    f"{alignment_deg:.3f},{rotation_rate_deg_s:.3f},"
-                    f"{int(use_only_vz)},{int(skip_vo)},"
-                    f"{vo_dx:.6f},{vo_dy:.6f},{vo_dz:.6f},"
-                    f"{vel_vx:.3f},{vel_vy:.3f},{vel_vz:.3f}\n"
-                )
-        except Exception:
-            pass
+        """Log VO debug info."""
+        log_vo_debug(self.vo_dbg_csv, frame, num_inliers, rot_angle_deg,
+                    alignment_deg, rotation_rate_deg_s, use_only_vz, skip_vo,
+                    vo_dx, vo_dy, vo_dz, vel_vx, vel_vy, vel_vz)
 
     def _log_fej_consistency(self, t: float, frame: int):
-        """
-        Log FEJ consistency metrics (like vio_vps.py log_fej_consistency).
-        
-        Compares FEJ linearization points vs. current state to detect
-        spurious information from unobservable directions.
-        
-        Args:
-            t: Current timestamp
-            frame: Current VIO frame index
-        """
-        if not self.state.cam_states:
-            return
-        
-        if not hasattr(self, 'fej_csv') or not self.fej_csv:
-            return
-        
-        # Current bias estimates from core state
-        bg_current = self.kf.x[10:13, 0]
-        ba_current = self.kf.x[13:16, 0]
-        
-        try:
-            with open(self.fej_csv, "a", newline="") as f:
-                for i, cs in enumerate(self.state.cam_states):
-                    # Skip if no FEJ data
-                    if 'q_fej' not in cs or 'p_fej' not in cs:
-                        continue
-                    
-                    q_fej = cs['q_fej']
-                    p_fej = cs['p_fej']
-                    bg_fej = cs.get('bg_fej', bg_current)
-                    ba_fej = cs.get('ba_fej', ba_current)
-                    
-                    # Get current state estimates (nominal state)
-                    q_idx = cs['q_idx']
-                    p_idx = cs['p_idx']
-                    q_current = self.kf.x[q_idx:q_idx+4, 0]
-                    p_current = self.kf.x[p_idx:p_idx+3, 0]
-                    
-                    # Compute position drift (Euclidean distance)
-                    pos_drift = np.linalg.norm(p_current - p_fej)
-                    
-                    # Compute rotation drift (angle in degrees)
-                    try:
-                        # Quaternion difference: q_diff = q_current * q_fej^-1
-                        r_current = R_scipy.from_quat([q_current[1], q_current[2], 
-                                                       q_current[3], q_current[0]])
-                        r_fej = R_scipy.from_quat([q_fej[1], q_fej[2], q_fej[3], q_fej[0]])
-                        r_diff = r_current * r_fej.inv()
-                        rot_drift = np.linalg.norm(r_diff.as_rotvec()) * 180.0 / np.pi
-                    except Exception:
-                        rot_drift = 0.0
-                    
-                    # Bias drifts
-                    bg_drift = np.linalg.norm(bg_current - bg_fej)
-                    ba_drift = np.linalg.norm(ba_current - ba_fej)
-                    
-                    f.write(f"{t:.6f},{frame},{i},{pos_drift:.6f},{rot_drift:.6f},"
-                            f"{bg_drift:.9f},{ba_drift:.9f}\n")
-        except Exception:
-            pass
+        """Log FEJ consistency metrics (wrapper to output_utils)."""
+        from .output_utils import log_fej_consistency
+        log_fej_consistency(self.fej_csv, t, frame, self.state.cam_states, self.kf)
     
     def get_flight_phase(self, time_elapsed: float) -> int:
         """
@@ -1051,59 +853,16 @@ class VIORunner:
                 
                 # Save keyframe image with visualization overlay
                 if self.config.save_keyframe_images and hasattr(self, 'keyframe_dir'):
-                    self._save_keyframe_with_overlay(img, self.vio_fe.frame_idx)
+                    save_keyframe_with_overlay(img, self.vio_fe.frame_idx, 
+                                              self.keyframe_dir, self.vio_fe)
             
             self.state.img_idx += 1
         
         return used_vo, vo_data
     
-    def _save_keyframe_with_overlay(self, img_gray: np.ndarray, frame_id: int):
-        """
-        Save keyframe image with feature tracking overlay.
-        
-        Uses save_keyframe_image_with_overlay from output_utils for consistent
-        visualization across the codebase.
-        
-        Args:
-            img_gray: Grayscale image
-            frame_id: Frame index
-        """
-        try:
-            # Get current tracked features from frontend
-            features = None
-            inliers = None
-            reprojections = None
-            
-            if self.vio_fe is not None:
-                # Get current features
-                if hasattr(self.vio_fe, 'prev_pts') and self.vio_fe.prev_pts is not None:
-                    features = self.vio_fe.prev_pts.copy()
-                
-                # Get tracking stats
-                tracking_stats = {
-                    'num_tracked': self.vio_fe.last_num_tracked,
-                    'num_inliers': self.vio_fe.last_num_inliers,
-                    'mean_parallax': self.vio_fe.mean_parallax,
-                }
-            else:
-                tracking_stats = None
-            
-            output_path = os.path.join(self.keyframe_dir, f"keyframe_{frame_id:06d}.jpg")
-            
-            save_keyframe_image_with_overlay(
-                image=img_gray,
-                features=features,
-                inliers=inliers,
-                reprojections=reprojections,
-                output_path=output_path,
-                frame_id=frame_id,
-                tracking_stats=tracking_stats
-            )
-            
-        except Exception as e:
-            print(f"[KEYFRAME] Failed to save keyframe {frame_id}: {e}")
-    
     def _apply_preintegration_at_camera(self, ongoing_preint, t: float, imu_params: dict):
+        """Apply accumulated preintegration at camera frame (wrapper to propagation module)."""
+        apply_preintegration_at_camera(self.kf, ongoing_preint, t, imu_params)
         """
         Apply accumulated preintegration at camera frame.
         
@@ -1183,74 +942,22 @@ class VIORunner:
         print(f"[PREINT] Applied: Δt={dt_total:.3f}s, Δpos={np.linalg.norm(p_i_new - p_i):.4f}m")
     
     def _clone_camera_for_msckf(self, t: float):
-        """
-        Clone current IMU pose for MSCKF.
+        """Clone current IMU pose for MSCKF (wrapper to propagation module)."""
+        clone_idx = clone_camera_for_msckf(
+            self.kf, t, self.state.cam_states, self.state.cam_observations,
+            self.vio_fe, self.vio_fe.frame_idx
+        )
         
-        Args:
-            t: Camera timestamp
-        """
-        
-        p_imu = self.kf.x[0:3, 0].reshape(3,)
-        q_imu = self.kf.x[6:10, 0].reshape(4,)
-        
-        try:
-            start_idx = augment_state_with_camera(
-                self.kf, q_imu, p_imu,
-                self.state.cam_states, self.state.cam_observations
-            )
-            
-            # Store FEJ linearization points
-            clone_idx = len(self.state.cam_states)
-            err_theta_idx = 15 + 6 * clone_idx
-            err_p_idx = 15 + 6 * clone_idx + 3
-            
-            # Record observations
-            obs_data = []
-            if hasattr(self.vio_fe, 'get_tracks_for_frame'):
-                tracks = self.vio_fe.get_tracks_for_frame(self.vio_fe.frame_idx)
-                for fid, pt in tracks:
-                    pt_array = np.array([[pt[0], pt[1]]], dtype=np.float32)
-                    pt_norm = self.vio_fe._undistort_pts(pt_array).reshape(2,)
-                    obs_data.append({
-                        'fid': int(fid),
-                        'pt_pixel': (float(pt[0]), float(pt[1])),
-                        'pt_norm': (float(pt_norm[0]), float(pt_norm[1])),
-                        'quality': 1.0
-                    })
-            
-            self.state.cam_states.append({
-                'start_idx': start_idx,
-                'q_idx': start_idx,
-                'p_idx': start_idx + 4,
-                'err_q_idx': err_theta_idx,
-                'err_p_idx': err_p_idx,
-                't': t,
-                'timestamp': t,
-                'frame': self.vio_fe.frame_idx,
-                'q_fej': q_imu.copy(),
-                'p_fej': p_imu.copy(),
-                'bg_fej': self.kf.x[10:13, 0].copy(),
-                'ba_fej': self.kf.x[13:16, 0].copy()
-            })
-            
-            self.state.cam_observations.append({
-                'cam_id': clone_idx,
-                'frame': self.vio_fe.frame_idx,
-                't': t,
-                'observations': obs_data
-            })
-            
-            print(f"[CLONE] Created clone {clone_idx} with {len(obs_data)} observations")
-            
-            # Debug: log MSCKF window state
-            num_tracked = len(obs_data)
+        if clone_idx >= 0:
+            # Log MSCKF window state
+            num_tracked = len(self.state.cam_observations[-1]['observations']) if self.state.cam_observations else 0
             window_start = self.state.cam_states[0]['t'] if self.state.cam_states else t
             self._log_debug_msckf_window(
                 frame=self.vio_fe.frame_idx,
                 t=t,
                 num_clones=len(self.state.cam_states),
                 num_tracked=num_tracked,
-                num_mature=0,  # Will be computed in trigger
+                num_mature=0,
                 window_start=window_start,
                 marginalized_clone=-1
             )
@@ -1258,335 +965,65 @@ class VIORunner:
             # Trigger MSCKF update if enough clones
             if len(self.state.cam_states) >= 3:
                 self._trigger_msckf_update(t)
-                
-        except Exception as e:
-            print(f"[CLONE] Failed: {e}")
     
     def _check_loop_closure(self, img_gray: np.ndarray, t: float):
-        """
-        Check for loop closure and apply yaw correction if detected.
+        """Check for loop closure and apply correction (wrapper to loop_closure module)."""
+        result = check_loop_closure(
+            self.loop_detector, img_gray, t, self.kf,
+            self.global_config, self.vio_fe
+        )
         
-        This method:
-        1. Gets current position and yaw from EKF state
-        2. Checks if we should add current frame as keyframe
-        3. Searches for loop closure candidates
-        4. If match found, applies yaw correction to EKF
-        
-        Args:
-            img_gray: Current grayscale image
-            t: Current timestamp
-        """
-        if self.loop_detector is None:
-            return
-        
-        try:
-            # Get current state
-            position = self.kf.x[0:3, 0].flatten()[:2]  # XY position only
-            yaw = quaternion_to_yaw(self.kf.x[6:10, 0].flatten())
-            frame_idx = self.vio_fe.frame_idx if self.vio_fe else 0
-            
-            # Check if we should add keyframe
-            if self.loop_detector.should_add_keyframe(position, yaw, frame_idx):
-                self.loop_detector.add_keyframe(frame_idx, position, yaw, img_gray)
-            
-            # Try to find and match loop closure
-            candidates = self.loop_detector.find_loop_candidates(position, frame_idx)
-            
-            if len(candidates) > 0:
-                # Get camera intrinsics for matching
-                kb_params = self.global_config.get('KB_PARAMS', {})
-                K = np.array([
-                    [kb_params.get('mu', 600), 0, img_gray.shape[1] / 2],
-                    [0, kb_params.get('mv', 600), img_gray.shape[0] / 2],
-                    [0, 0, 1]
-                ], dtype=np.float64)
-                
-                # Try to match with each candidate
-                for kf_idx in candidates:
-                    result = self.loop_detector.match_keyframe(img_gray, kf_idx, K)
-                    
-                    if result is not None:
-                        relative_yaw, num_inliers = result
-                        
-                        # Apply yaw correction via EKF update
-                        self._apply_loop_closure_correction(relative_yaw, kf_idx, num_inliers, t)
-                        break  # Only apply one correction per frame
-                        
-        except Exception as e:
-            print(f"[LOOP] Error in loop closure check: {e}")
+        if result is not None:
+            relative_yaw, kf_idx, num_inliers = result
+            self._apply_loop_closure_correction(relative_yaw, kf_idx, num_inliers, t)
     
-    def _apply_loop_closure_correction(self, relative_yaw: float, kf_idx: int, 
+    def _apply_loop_closure_correction(self, relative_yaw: float, kf_idx: int,
                                         num_inliers: int, t: float):
-        """
-        Apply yaw correction from loop closure detection.
-        
-        Args:
-            relative_yaw: Measured yaw difference from loop closure
-            kf_idx: Index of matched keyframe
-            num_inliers: Number of feature match inliers
-            t: Current timestamp
-        """
-        if self.loop_detector is None:
-            return
-        
-        try:
-            # Get expected yaw difference from stored keyframe
-            kf = self.loop_detector.keyframes[kf_idx]
-            current_yaw = quaternion_to_yaw(self.kf.x[6:10, 0].flatten())
-            expected_yaw_diff = current_yaw - kf['yaw']
-            
-            # Yaw correction (innovation)
-            yaw_error = relative_yaw - expected_yaw_diff
-            
-            # Wrap to [-π, π]
-            while yaw_error > np.pi:
-                yaw_error -= 2 * np.pi
-            while yaw_error < -np.pi:
-                yaw_error += 2 * np.pi
-            
-            # Only apply if correction is significant but not too large
-            if np.abs(yaw_error) < np.radians(2.0):  # < 2° skip
-                return
-            if np.abs(yaw_error) > np.radians(30.0):  # > 30° suspicious
-                print(f"[LOOP] REJECT: yaw_error={np.degrees(yaw_error):.1f}° too large")
-                return
-            
-            # Build EKF update for yaw
-            num_clones = len(self.state.cam_states)
-            err_dim = 15 + 6 * num_clones
-            
-            H_loop = np.zeros((1, err_dim), dtype=float)
-            H_loop[0, 8] = 1.0  # Yaw error index
-            
-            z_loop = np.array([[yaw_error]])
-            
-            # Measurement noise (inversely proportional to inliers)
-            base_sigma = np.radians(5.0)  # 5° base uncertainty
-            sigma_loop = base_sigma / np.sqrt(max(num_inliers, 1) / 15.0)
-            R_loop = np.array([[sigma_loop**2]])
-            
-            # Apply EKF update
-            def h_loop_jacobian(x, h=H_loop):
-                return h
-            
-            def hx_loop_fun(x, h=H_loop):
-                return np.zeros((1, 1))  # Zero residual (error is already computed)
-            
-            self.kf.update(
-                z=z_loop,
-                HJacobian=h_loop_jacobian,
-                Hx=hx_loop_fun,
-                R=R_loop
-            )
-            
-            print(f"[LOOP] CORRECTION at t={t:.2f}s: Δyaw={np.degrees(yaw_error):.2f}° "
-                  f"(kf={kf_idx}, inliers={num_inliers})")
-            
-        except Exception as e:
-            print(f"[LOOP] Failed to apply correction: {e}")
+        """Apply yaw correction from loop closure (wrapper to loop_closure module)."""
+        apply_loop_closure_correction(
+            self.kf, relative_yaw, kf_idx, num_inliers, t,
+            self.state.cam_states, self.loop_detector
+        )
     
     def _trigger_msckf_update(self, t: float = 0.0):
-        """Trigger MSCKF multi-view geometric update.
+        """Trigger MSCKF multi-view geometric update (wrapper to msckf module).
         
         Args:
             t: Current timestamp for logging
         """
-        
-        # Count mature features
-        feature_obs_count = {}
-        for obs_set in self.state.cam_observations:
-            for obs in obs_set['observations']:
-                fid = obs['fid']
-                feature_obs_count[fid] = feature_obs_count.get(fid, 0) + 1
-        
-        num_mature = sum(1 for c in feature_obs_count.values() if c >= 2)
-        
-        should_update = (
-            num_mature >= 20 or
-            len(self.state.cam_states) >= 4 or
-            (self.vio_fe.frame_idx % 5 == 0 and len(self.state.cam_states) >= 3)
+        num_updates = trigger_msckf_update(
+            self.kf, self.state.cam_states, self.state.cam_observations,
+            self.vio_fe, t,
+            msckf_dbg_csv=self.msckf_dbg_csv if hasattr(self, 'msckf_dbg_csv') else None,
+            dem_reader=self.dem,
+            origin_lat=self.lat0,
+            origin_lon=self.lon0
         )
         
-        if should_update:
-            try:
-                # Pass msckf_dbg_csv path if debug data enabled
-                msckf_dbg_path = self.msckf_dbg_csv if hasattr(self, 'msckf_dbg_csv') else None
-                
-                num_updates = perform_msckf_updates(
-                    self.vio_fe, 
-                    self.state.cam_observations,
-                    self.state.cam_states, 
-                    self.kf,
-                    min_observations=2,
-                    max_features=50,
-                    msckf_dbg_path=msckf_dbg_path,
-                    dem_reader=self.dem,
-                    origin_lat=self.lat0,
-                    origin_lon=self.lon0
-                )
-                if num_updates > 0:
-                    print(f"[MSCKF] Updated {num_updates} features")
-                    
-                    # Log FEJ consistency after MSCKF update
-                    if self.config.save_debug_data and hasattr(self, 'fej_csv') and self.fej_csv:
-                        self._log_fej_consistency(t, self.vio_fe.frame_idx)
-            except Exception as e:
-                print(f"[MSCKF] Error: {e}")
+        # Log FEJ consistency after MSCKF update
+        if num_updates > 0 and self.config.save_debug_data:
+            self._log_fej_consistency(t, self.vio_fe.frame_idx if self.vio_fe else 0)
     
     def _apply_vio_velocity_update(self, r_vo_mat, t_unit, t: float, dt_img: float,
                                     avg_flow_px: float, rec):
-        """
-        Apply VIO velocity update with scale recovery.
-        
-        Args:
-            r_vo_mat: Relative rotation matrix from Essential matrix
-            t_unit: Unit translation vector from Essential matrix
-            t: Current timestamp
-            dt_img: Time between images
-            avg_flow_px: Average optical flow in pixels
-            rec: Current IMU record
-        """
-        kb_params = self.global_config.get('KB_PARAMS', {'mu': 600})
-        sigma_vo = self.global_config.get('SIGMA_VO_VEL', 0.5)
-        
-        # Get camera extrinsics
-        view_cfg = CAMERA_VIEW_CONFIGS.get(self.config.camera_view, CAMERA_VIEW_CONFIGS['nadir'])
-        extrinsics_name = view_cfg['extrinsics']
-        
-        if extrinsics_name == 'BODY_T_CAMDOWN':
-            body_t_cam = BODY_T_CAMDOWN
-        elif extrinsics_name == 'BODY_T_CAMFRONT':
-            body_t_cam = BODY_T_CAMFRONT
-        else:
-            body_t_cam = BODY_T_CAMDOWN
-        
-        R_cam_to_body = body_t_cam[:3, :3]
-        
-        # Map direction
-        t_norm = t_unit / (np.linalg.norm(t_unit) + 1e-12)
-        t_body = R_cam_to_body @ t_norm
-        
-        # Get rotation from IMU quaternion
-        q_imu = rec.q
-        Rwb = R_scipy.from_quat(q_imu).as_matrix()
-        
-        # Scale recovery using AGL
-        lat_now, lon_now = xy_to_latlon(self.kf.x[0, 0], self.kf.x[1, 0], self.lat0, self.lon0)
-        dem_now = self.dem.sample_m(lat_now, lon_now) if self.dem.ds else 0.0
-        if dem_now is None or np.isnan(dem_now):
-            dem_now = 0.0
-        
-        if self.config.z_state.lower() == "agl":
-            agl = abs(self.kf.x[2, 0])
-        else:
-            agl = abs(self.kf.x[2, 0] - dem_now)
-        agl = max(1.0, agl)
-        
-        # Optical flow-based scale
-        focal_px = kb_params.get('mu', 600)
-        if dt_img > 1e-4 and avg_flow_px > 2.0:
-            scale_flow = agl / focal_px
-            speed_final = (avg_flow_px / dt_img) * scale_flow
-        else:
-            speed_final = 0.0
-        
-        speed_final = min(speed_final, 50.0)  # Clamp to 50 m/s
-        
-        # Compute velocity in world frame
-        if avg_flow_px > 2.0 and self.vio_fe.last_matches is not None:
-            pts_prev, pts_cur = self.vio_fe.last_matches
-            if len(pts_prev) > 0:
-                flows_normalized = pts_cur - pts_prev
-                median_flow = np.median(flows_normalized, axis=0)
-                flow_norm = np.linalg.norm(median_flow)
-                if flow_norm > 1e-6:
-                    flow_dir = median_flow / flow_norm
-                    vel_cam = np.array([-flow_dir[0], -flow_dir[1], 0.0])
-                    vel_cam = vel_cam / np.linalg.norm(vel_cam + 1e-9)
-                    vel_body = R_cam_to_body @ vel_cam * speed_final
-                else:
-                    vel_body = t_body * speed_final
-            else:
-                vel_body = t_body * speed_final
-        else:
-            vel_body = t_body * speed_final
-        
-        vel_world = Rwb @ vel_body
-        
-        # Determine if using VZ only (for nadir cameras)
-        use_only_vz = view_cfg.get('use_vz_only', True)
-        
-        # ESKF velocity update
-        num_clones = (self.kf.x.shape[0] - 16) // 7
-        err_dim = 15 + 6 * num_clones
-        
-        if use_only_vz:
-            h_vel = np.zeros((1, err_dim), dtype=float)
-            h_vel[0, 5] = 1.0
-            vel_meas = np.array([[vel_world[2]]])
-            r_mat = np.array([[(sigma_vo * view_cfg.get('sigma_scale_z', 2.0))**2]])
-        else:
-            h_vel = np.zeros((3, err_dim), dtype=float)
-            h_vel[0, 3] = 1.0
-            h_vel[1, 4] = 1.0
-            h_vel[2, 5] = 1.0
-            vel_meas = vel_world.reshape(-1, 1)
-            scale_xy = view_cfg.get('sigma_scale_xy', 1.0)
-            scale_z = view_cfg.get('sigma_scale_z', 2.0)
-            r_mat = np.diag([(sigma_vo * scale_xy)**2, (sigma_vo * scale_xy)**2, (sigma_vo * scale_z)**2])
-        
-        def h_fun(x, h=h_vel):
-            return h
-        
-        def hx_fun(x, h=h_vel):
-            if use_only_vz:
-                return x[5:6].reshape(1, 1)
-            else:
-                return x[3:6].reshape(3, 1)
-        
-        # Apply update with chi-square gating
-        if self.config.use_vio_velocity:
-            # Compute innovation for gating
-            predicted_vel = hx_fun(self.kf.x)
-            innovation = vel_meas - predicted_vel
-            s_mat = h_vel @ self.kf.P @ h_vel.T + r_mat
-            
-            # Chi-square test
-            try:
-                m2 = innovation.T @ np.linalg.inv(s_mat) @ innovation
-                chi2_value = float(m2)
-                mahal_dist = np.sqrt(chi2_value)
-            except Exception:
-                chi2_value = float('inf')
-                mahal_dist = float('nan')
-            
-            # Chi-square thresholds (95% confidence)
-            chi2_threshold = 3.84 if use_only_vz else 7.81  # 1 DOF vs 3 DOF
-            
-            if chi2_value < chi2_threshold:
-                # Accept update
-                self.kf.update(z=vel_meas, HJacobian=h_fun, Hx=hx_fun, R=r_mat)
-                print(f"[VIO] Velocity update: speed={speed_final:.2f}m/s, vz_only={use_only_vz}, "
-                      f"chi2={chi2_value:.2f}")
-                accepted = True
-            else:
-                # Reject outlier
-                print(f"[VIO] Velocity REJECTED: chi2={chi2_value:.2f} > {chi2_threshold:.1f}, "
-                      f"mahal={mahal_dist:.2f}")
-                accepted = False
-            
-            # Log to debug_residuals.csv
-            if self.config.save_debug_data and hasattr(self, 'residual_csv') and self.residual_csv:
-                from .output_utils import log_measurement_update
-                log_measurement_update(
-                    self.residual_csv, t, self.state.vio_frame, 'VIO_VEL',
-                    innovation=innovation.flatten(),
-                    mahalanobis_dist=mahal_dist,
-                    chi2_threshold=chi2_threshold,
-                    accepted=accepted,
-                    s_matrix=s_mat,
-                    p_prior=getattr(self.kf, 'P_prior', self.kf.P)
-                )
+        """Wrapper for VIO velocity update."""
+        apply_vio_velocity_update(
+            kf=self.kf,
+            r_vo_mat=r_vo_mat,
+            t_unit=t_unit,
+            t=t,
+            dt_img=dt_img,
+            avg_flow_px=avg_flow_px,
+            rec=rec,
+            vio_fe=self.vio_fe,
+            config=self.config,
+            global_config=self.global_config,
+            dem=self.dem,
+            lat0=self.lat0,
+            lon0=self.lon0,
+            vio_frame=self.state.vio_frame,
+            residual_csv=self.residual_csv if self.config.save_debug_data else None
+        )
     
     def log_error(self, t: float):
         """

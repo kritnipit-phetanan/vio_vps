@@ -218,6 +218,53 @@ def save_keyframe_image_with_overlay(image: np.ndarray, features: Optional[np.nd
         print(f"[WARNING] Failed to save keyframe image: {e}")
 
 
+def save_keyframe_with_overlay(img_gray: np.ndarray, frame_id: int, keyframe_dir: str,
+                               vio_fe=None):
+    """
+    Save keyframe image with feature tracking overlay (high-level wrapper).
+    
+    Args:
+        img_gray: Grayscale image
+        frame_id: Frame index
+        keyframe_dir: Directory to save keyframe images
+        vio_fe: VIO frontend instance (optional, for feature extraction)
+    """
+    try:
+        # Get current tracked features from frontend
+        features = None
+        inliers = None
+        reprojections = None
+        
+        if vio_fe is not None:
+            # Get current features
+            if hasattr(vio_fe, 'prev_pts') and vio_fe.prev_pts is not None:
+                features = vio_fe.prev_pts.copy()
+            
+            # Get tracking stats
+            tracking_stats = {
+                'num_tracked': vio_fe.last_num_tracked,
+                'num_inliers': vio_fe.last_num_inliers,
+                'mean_parallax': vio_fe.mean_parallax,
+            }
+        else:
+            tracking_stats = None
+        
+        output_path = os.path.join(keyframe_dir, f"keyframe_{frame_id:06d}.jpg")
+        
+        save_keyframe_image_with_overlay(
+            image=img_gray,
+            features=features,
+            inliers=inliers,
+            reprojections=reprojections,
+            output_path=output_path,
+            frame_id=frame_id,
+            tracking_stats=tracking_stats
+        )
+        
+    except Exception as e:
+        print(f"[KEYFRAME] Failed to save keyframe {frame_id}: {e}")
+
+
 # =============================================================================
 # CSV Writers
 # =============================================================================
@@ -471,6 +518,112 @@ def compute_rmse(error_df, column: str) -> float:
         return float(np.sqrt(np.mean(error_df[column].values ** 2)))
     except Exception:
         return float('nan')
+
+
+# =============================================================================
+# Additional Logging Functions (from VIORunner)
+# =============================================================================
+
+def log_state_debug(state_dbg_csv: str, t: float, kf: Any,
+                    dem_now: float, agl_now: float, msl_now: float,
+                    a_world: np.ndarray):
+    """
+    Log full state debug information.
+    
+    Args:
+        state_dbg_csv: Path to state debug CSV
+        t: Current timestamp
+        kf: ExtendedKalmanFilter instance
+        dem_now: Current DEM height
+        agl_now: Current AGL
+        msl_now: Current MSL
+        a_world: World-frame acceleration [3]
+    """
+    try:
+        px = float(kf.x[0, 0])
+        py = float(kf.x[1, 0])
+        pz = float(kf.x[2, 0])
+        vx = float(kf.x[3, 0])
+        vy = float(kf.x[4, 0])
+        vz = float(kf.x[5, 0])
+    except Exception:
+        px = py = pz = vx = vy = vz = float('nan')
+    
+    try:
+        a_wx = float(a_world[0])
+        a_wy = float(a_world[1])
+        a_wz = float(a_world[2])
+    except Exception:
+        a_wx = a_wy = a_wz = float('nan')
+    
+    dem_val = dem_now if dem_now is not None else float('nan')
+    agl_val = agl_now if agl_now is not None else float('nan')
+    msl_val = msl_now if msl_now is not None else float('nan')
+    
+    try:
+        with open(state_dbg_csv, "a", newline="") as f:
+            f.write(f"{t:.6f},{px:.6f},{py:.6f},{pz:.6f},"
+                    f"{vx:.6f},{vy:.6f},{vz:.6f},"
+                    f"{a_wx:.6f},{a_wy:.6f},{a_wz:.6f},"
+                    f"{dem_val:.6f},{agl_val:.6f},{msl_val:.6f}\n")
+    except Exception:
+        pass
+
+
+def log_vo_debug(vo_dbg_csv: str, frame: int, num_inliers: int,
+                 rot_angle_deg: float, alignment_deg: float,
+                 rotation_rate_deg_s: float, use_only_vz: bool,
+                 skip_vo: bool, vo_dx: float, vo_dy: float, vo_dz: float,
+                 vel_vx: float, vel_vy: float, vel_vz: float):
+    """
+    Log visual odometry debug information.
+    
+    Args:
+        vo_dbg_csv: Path to VO debug CSV
+        frame: Frame index
+        num_inliers: Number of inlier matches
+        rot_angle_deg: Rotation angle from VO (degrees)
+        alignment_deg: Alignment with expected motion (degrees)
+        rotation_rate_deg_s: Rotation rate (degrees/sec)
+        use_only_vz: Whether only vertical velocity is used
+        skip_vo: Whether VO was skipped
+        vo_dx, vo_dy, vo_dz: VO translation
+        vel_vx, vel_vy, vel_vz: VIO velocities
+    """
+    try:
+        with open(vo_dbg_csv, "a", newline="") as f:
+            f.write(f"{max(frame, 0)},{num_inliers},{rot_angle_deg:.3f},"
+                    f"{alignment_deg:.3f},{rotation_rate_deg_s:.3f},"
+                    f"{int(use_only_vz)},{int(skip_vo)},"
+                    f"{vo_dx:.6f},{vo_dy:.6f},{vo_dz:.6f},"
+                    f"{vel_vx:.3f},{vel_vy:.3f},{vel_vz:.3f}\n")
+    except Exception:
+        pass
+
+
+def log_msckf_window(msckf_window_csv: str, frame: int, t: float,
+                     num_clones: int, num_tracked: int, num_mature: int,
+                     window_start: float, marginalized_clone: int):
+    """
+    Log MSCKF window state.
+    
+    Args:
+        msckf_window_csv: Path to MSCKF window CSV
+        frame: Frame index
+        t: Current timestamp
+        num_clones: Number of camera clones
+        num_tracked: Number of tracked features
+        num_mature: Number of mature features
+        window_start: Start time of sliding window
+        marginalized_clone: Index of marginalized clone (-1 if none)
+    """
+    try:
+        window_duration = t - window_start if window_start > 0 else 0.0
+        with open(msckf_window_csv, "a", newline="") as f:
+            f.write(f"{frame},{t:.6f},{num_clones},{num_tracked},{num_mature},"
+                    f"{window_start:.6f},{window_duration:.3f},{marginalized_clone}\n")
+    except Exception:
+        pass
 
 
 # =============================================================================

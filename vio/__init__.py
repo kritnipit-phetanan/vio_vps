@@ -193,7 +193,8 @@ _SUBMODULES = {
     "config", "math_utils", "imu_preintegration", "ekf", 
     "data_loaders", "magnetometer", "camera", "vio_frontend", "msckf",
     "propagation", "vps_integration", "output_utils", "fisheye_rectifier",
-    "state_manager", "measurement_updates", "main_loop", "loop_closure"
+    "state_manager", "measurement_updates", "main_loop", "loop_closure",
+    "vio_processing"
 }
 
 def __getattr__(name):

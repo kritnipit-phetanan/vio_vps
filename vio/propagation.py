@@ -710,3 +710,171 @@ def augment_state_with_camera(kf: ExtendedKalmanFilter, cam_q_wxyz: np.ndarray,
     kf.P_post = kf.P.copy()
 
     return old_n_nominal
+
+
+# =============================================================================
+# Preintegration Application at Camera Frame
+# =============================================================================
+
+def apply_preintegration_at_camera(kf: ExtendedKalmanFilter, 
+                                   ongoing_preint,
+                                   t: float, imu_params: dict):
+    """
+    Apply accumulated preintegration at camera frame.
+    
+    This is called at EVERY camera frame to prevent IMU accumulation explosion.
+    Following Forster et al. TRO 2017 design.
+    
+    Args:
+        kf: ExtendedKalmanFilter instance
+        ongoing_preint: IMUPreintegration object
+        t: Current timestamp
+        imu_params: IMU noise parameters
+    """
+    from scipy.spatial.transform import Rotation as R_scipy
+    from .math_utils import skew_symmetric
+    
+    dt_total = ongoing_preint.dt_sum
+    if dt_total < 1e-6:
+        return
+    
+    # Get deltas
+    delta_R, delta_v, delta_p = ongoing_preint.get_deltas()
+    
+    # Current state
+    p_i = kf.x[0:3, 0].reshape(3,)
+    v_i = kf.x[3:6, 0].reshape(3,)
+    q_i = kf.x[6:10, 0].reshape(4,)  # [w,x,y,z]
+    bg = kf.x[10:13, 0].reshape(3,)
+    ba = kf.x[13:16, 0].reshape(3,)
+    
+    # Get bias-corrected deltas
+    delta_R_corr, delta_v_corr, delta_p_corr = ongoing_preint.get_deltas_corrected(bg, ba)
+    
+    # R_BW (Body-to-World)
+    q_i_xyzw = np.array([q_i[1], q_i[2], q_i[3], q_i[0]])
+    R_BW = R_scipy.from_quat(q_i_xyzw).as_matrix()
+    
+    # Rotation update
+    R_BW_new = R_BW @ delta_R_corr
+    q_i_new_xyzw = R_scipy.from_matrix(R_BW_new).as_quat()
+    q_i_new = np.array([q_i_new_xyzw[3], q_i_new_xyzw[0], q_i_new_xyzw[1], q_i_new_xyzw[2]])
+    
+    # Position and velocity updates
+    v_i_new = v_i + R_BW @ delta_v_corr
+    p_i_new = p_i + v_i * dt_total + R_BW @ delta_p_corr
+    
+    # Write back to state
+    kf.x[0:3, 0] = p_i_new.reshape(3,)
+    kf.x[3:6, 0] = v_i_new.reshape(3,)
+    kf.x[6:10, 0] = q_i_new.reshape(4,)
+    
+    # Propagate covariance
+    preint_cov = ongoing_preint.get_covariance()
+    J_R_bg, J_v_bg, J_v_ba, J_p_bg, J_p_ba = ongoing_preint.get_jacobians()
+    
+    num_clones = (kf.x.shape[0] - 16) // 7
+    
+    # Build state transition matrix
+    Phi_core = np.eye(15, dtype=float)
+    Phi_core[0:3, 3:6] = np.eye(3) * dt_total
+    Phi_core[0:3, 6:9] = -R_BW @ skew_symmetric(delta_p_corr)
+    Phi_core[0:3, 9:12] = R_BW @ J_p_bg
+    Phi_core[0:3, 12:15] = R_BW @ J_p_ba
+    Phi_core[3:6, 6:9] = -R_BW @ skew_symmetric(delta_v_corr)
+    Phi_core[3:6, 9:12] = R_BW @ J_v_bg
+    Phi_core[3:6, 12:15] = R_BW @ J_v_ba
+    Phi_core[6:9, 9:12] = -J_R_bg
+    
+    # Process noise
+    Q_core = np.zeros((15, 15), dtype=float)
+    Q_core[0:3, 0:3] = R_BW @ preint_cov[6:9, 6:9] @ R_BW.T
+    Q_core[3:6, 3:6] = R_BW @ preint_cov[3:6, 3:6] @ R_BW.T
+    Q_core[6:9, 6:9] = R_BW @ preint_cov[0:3, 0:3] @ R_BW.T
+    Q_core[9:12, 9:12] = np.eye(3) * (imu_params.get('gyr_w', 0.0001)**2 * dt_total)
+    Q_core[12:15, 12:15] = np.eye(3) * (imu_params.get('acc_w', 0.001)**2 * dt_total)
+    
+    from .ekf import propagate_error_state_covariance
+    kf.P = propagate_error_state_covariance(kf.P, Phi_core, Q_core, num_clones)
+    
+    # Reset preintegration buffer
+    ongoing_preint.reset(bg=bg, ba=ba)
+    
+    print(f"[PREINT] Applied: Δt={dt_total:.3f}s, Δpos={np.linalg.norm(p_i_new - p_i):.4f}m")
+
+
+def clone_camera_for_msckf(kf: ExtendedKalmanFilter, t: float,
+                           cam_states: list, cam_observations: list,
+                           vio_fe, frame_idx: int) -> int:
+    """
+    Clone current IMU pose for MSCKF.
+    
+    Args:
+        kf: ExtendedKalmanFilter instance
+        t: Camera timestamp
+        cam_states: List of camera clone states
+        cam_observations: List of camera observations
+        vio_fe: VIO frontend (for getting feature tracks)
+        frame_idx: Current frame index
+    
+    Returns:
+        Clone index (for FEJ tracking)
+    """
+    p_imu = kf.x[0:3, 0].reshape(3,)
+    q_imu = kf.x[6:10, 0].reshape(4,)
+    
+    try:
+        start_idx = augment_state_with_camera(
+            kf, q_imu, p_imu,
+            cam_states, cam_observations
+        )
+        
+        # Store FEJ linearization points
+        clone_idx = len(cam_states)
+        err_theta_idx = 15 + 6 * clone_idx
+        err_p_idx = 15 + 6 * clone_idx + 3
+        
+        # Record observations
+        obs_data = []
+        if hasattr(vio_fe, 'get_tracks_for_frame'):
+            tracks = vio_fe.get_tracks_for_frame(frame_idx)
+            for fid, pt in tracks:
+                pt_array = np.array([[pt[0], pt[1]]], dtype=np.float32)
+                pt_norm = vio_fe._undistort_pts(pt_array).reshape(2,)
+                obs_data.append({
+                    'fid': int(fid),
+                    'pt_pixel': (float(pt[0]), float(pt[1])),
+                    'pt_norm': (float(pt_norm[0]), float(pt_norm[1])),
+                    'quality': 1.0
+                })
+        
+        cam_states.append({
+            'start_idx': start_idx,
+            'q_idx': start_idx,
+            'p_idx': start_idx + 4,
+            'err_q_idx': err_theta_idx,
+            'err_p_idx': err_p_idx,
+            't': t,
+            'timestamp': t,
+            'frame': frame_idx,
+            'q_fej': q_imu.copy(),
+            'p_fej': p_imu.copy(),
+            'bg_fej': kf.x[10:13, 0].copy(),
+            'ba_fej': kf.x[13:16, 0].copy()
+        })
+        
+        cam_observations.append({
+            'cam_id': clone_idx,
+            'frame': frame_idx,
+            't': t,
+            'observations': obs_data
+        })
+        
+        print(f"[CLONE] Created clone {clone_idx} with {len(obs_data)} observations")
+        
+        return clone_idx
+        
+    except Exception as e:
+        print(f"[CLONE] Failed: {e}")
+        return -1
+

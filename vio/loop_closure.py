@@ -460,3 +460,149 @@ def reset_loop_detector() -> None:
     global _LOOP_DETECTOR
     if _LOOP_DETECTOR is not None:
         _LOOP_DETECTOR.reset()
+
+
+# =============================================================================
+# Loop Closure Processing Functions
+# =============================================================================
+
+def check_loop_closure(loop_detector, img_gray: np.ndarray, t: float, kf,
+                       global_config: dict, vio_fe=None) -> Optional[Tuple[float, int, int]]:
+    """
+    Check for loop closure and return correction if detected.
+    
+    Args:
+        loop_detector: LoopClosureDetector instance
+        img_gray: Current grayscale image
+        t: Current timestamp
+        kf: ExtendedKalmanFilter instance
+        global_config: Global configuration dictionary
+        vio_fe: VIO frontend (for frame_idx)
+    
+    Returns:
+        Tuple of (relative_yaw, kf_idx, num_inliers) if loop detected, else None
+    """
+    if loop_detector is None:
+        return None
+    
+    try:
+        from .math_utils import quaternion_to_yaw
+        
+        # Get current state
+        position = kf.x[0:3, 0].flatten()[:2]  # XY position only
+        yaw = quaternion_to_yaw(kf.x[6:10, 0].flatten())
+        frame_idx = vio_fe.frame_idx if vio_fe else 0
+        
+        # Check if we should add keyframe
+        if loop_detector.should_add_keyframe(position, yaw, frame_idx):
+            loop_detector.add_keyframe(frame_idx, position, yaw, img_gray)
+        
+        # Try to find and match loop closure
+        candidates = loop_detector.find_loop_candidates(position, frame_idx)
+        
+        if len(candidates) > 0:
+            # Get camera intrinsics for matching
+            kb_params = global_config.get('KB_PARAMS', {})
+            K = np.array([
+                [kb_params.get('mu', 600), 0, img_gray.shape[1] / 2],
+                [0, kb_params.get('mv', 600), img_gray.shape[0] / 2],
+                [0, 0, 1]
+            ], dtype=np.float64)
+            
+            # Try to match with each candidate
+            for kf_idx in candidates:
+                result = loop_detector.match_keyframe(img_gray, kf_idx, K)
+                
+                if result is not None:
+                    relative_yaw, num_inliers = result
+                    return (relative_yaw, kf_idx, num_inliers)
+        
+        return None
+        
+    except Exception as e:
+        print(f"[LOOP] Error in loop closure check: {e}")
+        return None
+
+
+def apply_loop_closure_correction(kf, relative_yaw: float, kf_idx: int,
+                                   num_inliers: int, t: float,
+                                   cam_states: list, loop_detector) -> bool:
+    """
+    Apply yaw correction from loop closure detection.
+    
+    Args:
+        kf: ExtendedKalmanFilter instance
+        relative_yaw: Measured yaw difference from loop closure
+        kf_idx: Index of matched keyframe
+        num_inliers: Number of feature match inliers
+        t: Current timestamp
+        cam_states: List of camera clone states
+        loop_detector: LoopClosureDetector instance
+    
+    Returns:
+        True if correction applied, False otherwise
+    """
+    if loop_detector is None:
+        return False
+    
+    try:
+        from .math_utils import quaternion_to_yaw
+        
+        # Get expected yaw difference from stored keyframe
+        kf = loop_detector.keyframes[kf_idx]
+        current_yaw = quaternion_to_yaw(kf.x[6:10, 0].flatten())
+        expected_yaw_diff = current_yaw - kf['yaw']
+        
+        # Yaw correction (innovation)
+        yaw_error = relative_yaw - expected_yaw_diff
+        
+        # Wrap to [-π, π]
+        while yaw_error > np.pi:
+            yaw_error -= 2 * np.pi
+        while yaw_error < -np.pi:
+            yaw_error += 2 * np.pi
+        
+        # Only apply if correction is significant but not too large
+        if np.abs(yaw_error) < np.radians(2.0):  # < 2° skip
+            return False
+        if np.abs(yaw_error) > np.radians(30.0):  # > 30° suspicious
+            print(f"[LOOP] REJECT: yaw_error={np.degrees(yaw_error):.1f}° too large")
+            return False
+        
+        # Build EKF update for yaw
+        num_clones = len(cam_states)
+        err_dim = 15 + 6 * num_clones
+        
+        H_loop = np.zeros((1, err_dim), dtype=float)
+        H_loop[0, 8] = 1.0  # Yaw error index
+        
+        z_loop = np.array([[yaw_error]])
+        
+        # Measurement noise (inversely proportional to inliers)
+        base_sigma = np.radians(5.0)  # 5° base uncertainty
+        sigma_loop = base_sigma / np.sqrt(max(num_inliers, 1) / 15.0)
+        R_loop = np.array([[sigma_loop**2]])
+        
+        # Apply EKF update
+        def h_loop_jacobian(x, h=H_loop):
+            return h
+        
+        def hx_loop_fun(x, h=H_loop):
+            return np.zeros((1, 1))  # Zero residual (error is already computed)
+        
+        kf.update(
+            z=z_loop,
+            HJacobian=h_loop_jacobian,
+            Hx=hx_loop_fun,
+            R=R_loop
+        )
+        
+        print(f"[LOOP] CORRECTION at t={t:.2f}s: Δyaw={np.degrees(yaw_error):.2f}° "
+              f"(kf={kf_idx}, inliers={num_inliers})")
+        
+        return True
+        
+    except Exception as e:
+        print(f"[LOOP] Failed to apply correction: {e}")
+        return False
+
