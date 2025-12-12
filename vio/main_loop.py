@@ -690,11 +690,12 @@ class VIORunner:
             
             # Loop closure detection - check when we have sufficient position estimate
             match_result = check_loop_closure(
-                img_gray=img,
-                kf=self.kf,
                 loop_detector=self.loop_detector,
-                lat0=self.lat0,
-                lon0=self.lon0
+                img_gray=img,
+                t=t,
+                kf=self.kf,
+                global_config=self.global_config,
+                vio_fe=self.vio_fe
             )
             if match_result is not None:
                 relative_yaw, kf_idx, num_inliers = match_result
