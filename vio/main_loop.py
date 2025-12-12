@@ -469,122 +469,41 @@ class VIORunner:
         
         # Save calibration snapshot using output_utils
         if self.config.save_debug_data:
-            self._save_calibration_snapshot()
-    
-    def _save_calibration_snapshot(self):
-        """Save calibration parameters for reproducibility using output_utils."""
-        cal_path = os.path.join(self.config.output_dir, "debug_calibration.txt")
-        
-        # Gather all parameters for save_calibration_log
-        kb_params = self.global_config.get('KB_PARAMS', {})
-        imu_params = self.global_config.get('IMU_PARAMS', {})
-        
-        # Camera view config
-        view_cfg = CAMERA_VIEW_CONFIGS.get(self.config.camera_view, {})
-        
-        # Magnetometer params
-        mag_params = {
-            'hard_iron': str(self.global_config.get('MAG_HARD_IRON_OFFSET', np.zeros(3))),
-            'soft_iron': 'calibrated',
-            'declination': self.global_config.get('MAG_DECLINATION', 0.0),
-        }
-        
-        # Process noise params
-        noise_params = {
-            'sigma_accel': self.global_config.get('SIGMA_ACCEL', 0.8),
-            'sigma_vo_vel': self.global_config.get('SIGMA_VO_VEL', 2.0),
-            'sigma_vps_xy': self.global_config.get('SIGMA_VPS_XY', 1.0),
-            'sigma_agl_z': self.global_config.get('SIGMA_AGL_Z', 2.5),
-            'sigma_mag_yaw': self.global_config.get('SIGMA_MAG_YAW', 0.15),
-        }
-        
-        # VIO quality control params  
-        vio_params = {
-            'min_parallax_px': self.global_config.get('MIN_PARALLAX_PX', 2.0),
-            'use_preintegration': self.config.use_preintegration,
-            'use_magnetometer': self.config.use_magnetometer,
-            'use_vio_velocity': self.config.use_vio_velocity,
-            'use_rectifier': self.rectifier is not None,
-            'use_loop_closure': self.loop_detector is not None,
-        }
-        
-        # Initial state
-        initial_state = {
-            'origin_lat': f"{self.lat0:.8f}°",
-            'origin_lon': f"{self.lon0:.8f}°",
-            'msl_altitude': f"{self.msl0:.2f} m",
-            'dem_elevation': f"{self.dem0:.2f} m" if self.dem0 else "N/A",
-            'initial_velocity': str(self.v_init) + " m/s",
-            'z_state': self.config.z_state,
-            'downscale_size': f"{self.config.downscale_size[0]}x{self.config.downscale_size[1]}",
-        }
-        
-        # Call the modular save function
-        save_calibration_log(
-            output_path=cal_path,
-            camera_view=self.config.camera_view,
-            view_cfg=view_cfg,
-            kb_params=kb_params,
-            imu_params=imu_params,
-            mag_params=mag_params,
-            noise_params=noise_params,
-            vio_params=vio_params,
-            initial_state=initial_state,
-            estimate_imu_bias=self.config.estimate_imu_bias
-        )
-        
-        print(f"[DEBUG] Calibration snapshot saved: {cal_path}")
-    
-    def _log_debug_state_covariance(self, t: float, rec, i: int):
-        """Log state and covariance to debug CSV (every 10 samples)."""
-        if i % 10 != 0:  # Every 10 samples (~25ms @ 400Hz)
-            return
-        
-        bg = self.kf.x[10:13, 0]
-        ba = self.kf.x[13:16, 0]
-        self.debug_writers.log_state_covariance(t, self.state.vio_frame, self.kf, bg, ba)
-    
-    def _log_debug_imu_raw(self, t: float, rec):
-        """Log raw IMU data to debug CSV."""
-        self.debug_writers.log_imu_raw(t, rec)
-    
-    def _log_debug_feature_stats(self, frame: int, t: float, num_features: int, 
-                                  num_tracked: int, num_inliers: int,
-                                  mean_parallax: float, max_parallax: float):
-        """Log feature tracking statistics to debug CSV."""
-        tracking_ratio = 1.0 if num_features > 0 else 0.0
-        inlier_ratio = num_inliers / max(1, num_features)
-        self.debug_writers.log_feature_stats(
-            frame, t, num_features, num_tracked, num_inliers,
-            mean_parallax, max_parallax, tracking_ratio, inlier_ratio
-        )
-    
-    def _log_debug_msckf_window(self, frame: int, t: float, num_clones: int,
-                                 num_tracked: int, num_mature: int,
-                                 window_start: float, marginalized_clone: int):
-        """Log MSCKF window state to debug CSV."""
-        log_msckf_window(self.msckf_window_csv, frame, t, num_clones,
-                        num_tracked, num_mature, window_start, marginalized_clone)
-
-    def _log_state_debug(self, t: float, dem_now: float, agl_now: float, 
-                         msl_now: float, a_world: np.ndarray):
-        """Log full state debug."""
-        log_state_debug(self.state_dbg_csv, t, self.kf, dem_now, agl_now, msl_now, a_world)
-
-    def _log_vo_debug(self, frame: int, num_inliers: int, rot_angle_deg: float,
-                      alignment_deg: float, rotation_rate_deg_s: float,
-                      use_only_vz: bool, skip_vo: bool,
-                      vo_dx: float, vo_dy: float, vo_dz: float,
-                      vel_vx: float, vel_vy: float, vel_vz: float):
-        """Log VO debug info."""
-        log_vo_debug(self.vo_dbg_csv, frame, num_inliers, rot_angle_deg,
-                    alignment_deg, rotation_rate_deg_s, use_only_vz, skip_vo,
-                    vo_dx, vo_dy, vo_dz, vel_vx, vel_vy, vel_vz)
-
-    def _log_fej_consistency(self, t: float, frame: int):
-        """Log FEJ consistency metrics (wrapper to output_utils)."""
-        from .output_utils import log_fej_consistency
-        log_fej_consistency(self.fej_csv, t, frame, self.state.cam_states, self.kf)
+            cal_path = os.path.join(self.config.output_dir, "debug_calibration.txt")
+            kb_params = self.global_config.get('KB_PARAMS', {})
+            imu_params = self.global_config.get('IMU_PARAMS', {})
+            mag_params = {
+                'declination': self.global_config.get('MAG_DECLINATION', 0.0),
+                'hard_iron': self.global_config.get('MAG_HARD_IRON_OFFSET', None),
+                'soft_iron': self.global_config.get('MAG_SOFT_IRON_MATRIX', None),
+            }
+            noise_params = {
+                'sigma_vo_vel': self.global_config.get('SIGMA_VO_VEL', 0.5),
+                'sigma_mag_yaw': self.global_config.get('SIGMA_MAG_YAW', 0.15),
+                'sigma_agl_z': self.global_config.get('SIGMA_AGL_Z', 2.5),
+            }
+            vio_params = {
+                'use_vio_velocity': self.config.use_vio_velocity,
+                'use_magnetometer': self.config.use_magnetometer,
+                'camera_view': self.config.camera_view,
+                'z_state': self.config.z_state,
+            }
+            initial_state = {
+                'lat0': self.lat0,
+                'lon0': self.lon0,
+                'alt0': getattr(self, 'alt0', 0.0),
+            }
+            save_calibration_log(
+                output_path=cal_path,
+                kb_params=kb_params,
+                imu_params=imu_params,
+                mag_params=mag_params,
+                noise_params=noise_params,
+                vio_params=vio_params,
+                initial_state=initial_state,
+                estimate_imu_bias=self.config.estimate_imu_bias
+            )
+            print(f"[DEBUG] Calibration snapshot saved: {cal_path}")
     
     def get_flight_phase(self, time_elapsed: float) -> int:
         """
@@ -764,7 +683,24 @@ class VIORunner:
             ok, ninl, r_vo_mat, t_unit, dt_img = self.vio_fe.step(img_for_tracking, self.imgs[self.state.img_idx].t)
             
             # Loop closure detection - check when we have sufficient position estimate
-            self._check_loop_closure(img, t)
+            match_result = check_loop_closure(
+                img_gray=img,
+                kf=self.kf,
+                loop_detector=self.loop_detector,
+                lat0=self.lat0,
+                lon0=self.lon0
+            )
+            if match_result is not None:
+                relative_yaw, kf_idx, num_inliers = match_result
+                apply_loop_closure_correction(
+                    kf=self.kf,
+                    relative_yaw=relative_yaw,
+                    kf_idx=kf_idx,
+                    num_inliers=num_inliers,
+                    timestamp=t,
+                    residual_csv=self.residual_csv if self.config.save_debug_data else None,
+                    frame=self.state.vio_frame
+                )
             
             # Compute average optical flow (parallax) - use the new attributes
             # mean_parallax is now computed in step() EVERY frame, even if ok=False
@@ -783,19 +719,16 @@ class VIORunner:
             # Debug: log feature statistics - use actual tracked features from VIOFrontEnd
             num_features = self.vio_fe.last_num_tracked
             num_inliers = self.vio_fe.last_num_inliers
-            self._log_debug_feature_stats(
-                frame=self.vio_fe.frame_idx,
-                t=t,
-                num_features=num_features,
-                num_tracked=num_features,
-                num_inliers=num_inliers,
-                mean_parallax=avg_flow_px,
-                max_parallax=avg_flow_px
+            tracking_ratio = 1.0 if num_features > 0 else 0.0
+            inlier_ratio = num_inliers / max(1, num_features)
+            self.debug_writers.log_feature_stats(
+                self.vio_fe.frame_idx, t, num_features, num_features, num_inliers,
+                avg_flow_px, avg_flow_px, tracking_ratio, inlier_ratio
             )
             
             # Apply preintegration at EVERY camera frame
             if self.config.use_preintegration and ongoing_preint is not None:
-                self._apply_preintegration_at_camera(ongoing_preint, t, imu_params)
+                apply_preintegration_at_camera(self.kf, ongoing_preint, t, imu_params)
             
             # Check parallax for VIO velocity update
             is_insufficient_parallax = avg_flow_px < min_parallax
@@ -810,13 +743,29 @@ class VIORunner:
             should_clone = avg_flow_px >= clone_threshold and not is_fast_rotation
             
             if should_clone:
-                self._clone_camera_for_msckf(t)
+                clone_camera_for_msckf(
+                    self.kf, self.state.cam_states, self.state.cam_observations,
+                    self.vio_fe, t
+                )
             
             # VIO velocity update (if frontend succeeded)
             if ok and r_vo_mat is not None and t_unit is not None:
-                self._apply_vio_velocity_update(
-                    r_vo_mat, t_unit, t, dt_img, 
-                    avg_flow_px, rec
+                apply_vio_velocity_update(
+                    kf=self.kf,
+                    r_vo_mat=r_vo_mat,
+                    t_unit=t_unit,
+                    t=t,
+                    dt_img=dt_img,
+                    avg_flow_px=avg_flow_px,
+                    rec=rec,
+                    vio_fe=self.vio_fe,
+                    config=self.config,
+                    global_config=self.global_config,
+                    dem=self.dem,
+                    lat0=self.lat0,
+                    lon0=self.lon0,
+                    vio_frame=self.state.vio_frame,
+                    residual_csv=self.residual_csv if self.config.save_debug_data else None
                 )
                 
                 # Increment VIO frame
@@ -839,16 +788,12 @@ class VIORunner:
                 vel_vx = float(self.kf.x[3, 0])
                 vel_vy = float(self.kf.x[4, 0])
                 vel_vz = float(self.kf.x[5, 0])
-                self._log_vo_debug(
-                    frame=self.vio_fe.frame_idx,
-                    num_inliers=num_inliers,
-                    rot_angle_deg=rot_angle_deg,
-                    alignment_deg=0.0,  # TODO: compute alignment with expected motion
-                    rotation_rate_deg_s=rotation_rate_deg_s,
-                    use_only_vz=False,  # Not implemented in modular version
-                    skip_vo=False,
-                    vo_dx=vo_dx, vo_dy=vo_dy, vo_dz=vo_dz,
-                    vel_vx=vel_vx, vel_vy=vel_vy, vel_vz=vel_vz
+                log_vo_debug(
+                    self.vo_dbg_csv, self.vio_fe.frame_idx, num_inliers, rot_angle_deg,
+                    0.0,  # alignment_deg (TODO: compute alignment with expected motion)
+                    rotation_rate_deg_s, False,  # use_only_vz (not implemented in modular version)
+                    False,  # skip_vo
+                    vo_dx, vo_dy, vo_dz, vel_vx, vel_vy, vel_vz
                 )
                 
                 # Save keyframe image with visualization overlay
@@ -859,171 +804,6 @@ class VIORunner:
             self.state.img_idx += 1
         
         return used_vo, vo_data
-    
-    def _apply_preintegration_at_camera(self, ongoing_preint, t: float, imu_params: dict):
-        """Apply accumulated preintegration at camera frame (wrapper to propagation module)."""
-        apply_preintegration_at_camera(self.kf, ongoing_preint, t, imu_params)
-        """
-        Apply accumulated preintegration at camera frame.
-        
-        This is called at EVERY camera frame to prevent IMU accumulation explosion.
-        Following Forster et al. TRO 2017 design.
-        
-        Args:
-            ongoing_preint: IMUPreintegration object
-            t: Current timestamp
-            imu_params: IMU noise parameters
-        """
-        dt_total = ongoing_preint.dt_sum
-        if dt_total < 1e-6:
-            return
-        
-        # Get deltas
-        delta_R, delta_v, delta_p = ongoing_preint.get_deltas()
-        
-        # Current state
-        p_i = self.kf.x[0:3, 0].reshape(3,)
-        v_i = self.kf.x[3:6, 0].reshape(3,)
-        q_i = self.kf.x[6:10, 0].reshape(4,)  # [w,x,y,z]
-        bg = self.kf.x[10:13, 0].reshape(3,)
-        ba = self.kf.x[13:16, 0].reshape(3,)
-        
-        # Get bias-corrected deltas
-        delta_R_corr, delta_v_corr, delta_p_corr = ongoing_preint.get_deltas_corrected(bg, ba)
-        
-        # R_BW (Body-to-World)
-        q_i_xyzw = np.array([q_i[1], q_i[2], q_i[3], q_i[0]])
-        R_BW = R_scipy.from_quat(q_i_xyzw).as_matrix()
-        
-        # Rotation update
-        R_BW_new = R_BW @ delta_R_corr
-        q_i_new_xyzw = R_scipy.from_matrix(R_BW_new).as_quat()
-        q_i_new = np.array([q_i_new_xyzw[3], q_i_new_xyzw[0], q_i_new_xyzw[1], q_i_new_xyzw[2]])
-        
-        # Position and velocity updates
-        v_i_new = v_i + R_BW @ delta_v_corr
-        p_i_new = p_i + v_i * dt_total + R_BW @ delta_p_corr
-        
-        # Write back to state
-        self.kf.x[0:3, 0] = p_i_new.reshape(3,)
-        self.kf.x[3:6, 0] = v_i_new.reshape(3,)
-        self.kf.x[6:10, 0] = q_i_new.reshape(4,)
-        
-        # Propagate covariance
-        preint_cov = ongoing_preint.get_covariance()
-        J_R_bg, J_v_bg, J_v_ba, J_p_bg, J_p_ba = ongoing_preint.get_jacobians()
-        
-        num_clones = (self.kf.x.shape[0] - 16) // 7
-        
-        # Build state transition matrix
-        Phi_core = np.eye(15, dtype=float)
-        Phi_core[0:3, 3:6] = np.eye(3) * dt_total
-        Phi_core[0:3, 6:9] = -R_BW @ skew_symmetric(delta_p_corr)
-        Phi_core[0:3, 9:12] = R_BW @ J_p_bg
-        Phi_core[0:3, 12:15] = R_BW @ J_p_ba
-        Phi_core[3:6, 6:9] = -R_BW @ skew_symmetric(delta_v_corr)
-        Phi_core[3:6, 9:12] = R_BW @ J_v_bg
-        Phi_core[3:6, 12:15] = R_BW @ J_v_ba
-        Phi_core[6:9, 9:12] = -J_R_bg
-        
-        # Process noise
-        Q_core = np.zeros((15, 15), dtype=float)
-        Q_core[0:3, 0:3] = R_BW @ preint_cov[6:9, 6:9] @ R_BW.T
-        Q_core[3:6, 3:6] = R_BW @ preint_cov[3:6, 3:6] @ R_BW.T
-        Q_core[6:9, 6:9] = R_BW @ preint_cov[0:3, 0:3] @ R_BW.T
-        Q_core[9:12, 9:12] = np.eye(3) * (imu_params.get('gyr_w', 0.0001)**2 * dt_total)
-        Q_core[12:15, 12:15] = np.eye(3) * (imu_params.get('acc_w', 0.001)**2 * dt_total)
-        
-        self.kf.P = propagate_error_state_covariance(self.kf.P, Phi_core, Q_core, num_clones)
-        
-        # Reset preintegration buffer
-        ongoing_preint.reset(bg=bg, ba=ba)
-        
-        print(f"[PREINT] Applied: Δt={dt_total:.3f}s, Δpos={np.linalg.norm(p_i_new - p_i):.4f}m")
-    
-    def _clone_camera_for_msckf(self, t: float):
-        """Clone current IMU pose for MSCKF (wrapper to propagation module)."""
-        clone_idx = clone_camera_for_msckf(
-            self.kf, t, self.state.cam_states, self.state.cam_observations,
-            self.vio_fe, self.vio_fe.frame_idx
-        )
-        
-        if clone_idx >= 0:
-            # Log MSCKF window state
-            num_tracked = len(self.state.cam_observations[-1]['observations']) if self.state.cam_observations else 0
-            window_start = self.state.cam_states[0]['t'] if self.state.cam_states else t
-            self._log_debug_msckf_window(
-                frame=self.vio_fe.frame_idx,
-                t=t,
-                num_clones=len(self.state.cam_states),
-                num_tracked=num_tracked,
-                num_mature=0,
-                window_start=window_start,
-                marginalized_clone=-1
-            )
-            
-            # Trigger MSCKF update if enough clones
-            if len(self.state.cam_states) >= 3:
-                self._trigger_msckf_update(t)
-    
-    def _check_loop_closure(self, img_gray: np.ndarray, t: float):
-        """Check for loop closure and apply correction (wrapper to loop_closure module)."""
-        result = check_loop_closure(
-            self.loop_detector, img_gray, t, self.kf,
-            self.global_config, self.vio_fe
-        )
-        
-        if result is not None:
-            relative_yaw, kf_idx, num_inliers = result
-            self._apply_loop_closure_correction(relative_yaw, kf_idx, num_inliers, t)
-    
-    def _apply_loop_closure_correction(self, relative_yaw: float, kf_idx: int,
-                                        num_inliers: int, t: float):
-        """Apply yaw correction from loop closure (wrapper to loop_closure module)."""
-        apply_loop_closure_correction(
-            self.kf, relative_yaw, kf_idx, num_inliers, t,
-            self.state.cam_states, self.loop_detector
-        )
-    
-    def _trigger_msckf_update(self, t: float = 0.0):
-        """Trigger MSCKF multi-view geometric update (wrapper to msckf module).
-        
-        Args:
-            t: Current timestamp for logging
-        """
-        num_updates = trigger_msckf_update(
-            self.kf, self.state.cam_states, self.state.cam_observations,
-            self.vio_fe, t,
-            msckf_dbg_csv=self.msckf_dbg_csv if hasattr(self, 'msckf_dbg_csv') else None,
-            dem_reader=self.dem,
-            origin_lat=self.lat0,
-            origin_lon=self.lon0
-        )
-        
-        # Log FEJ consistency after MSCKF update
-        if num_updates > 0 and self.config.save_debug_data:
-            self._log_fej_consistency(t, self.vio_fe.frame_idx if self.vio_fe else 0)
-    
-    def _apply_vio_velocity_update(self, r_vo_mat, t_unit, t: float, dt_img: float,
-                                    avg_flow_px: float, rec):
-        """Wrapper for VIO velocity update."""
-        apply_vio_velocity_update(
-            kf=self.kf,
-            r_vo_mat=r_vo_mat,
-            t_unit=t_unit,
-            t=t,
-            dt_img=dt_img,
-            avg_flow_px=avg_flow_px,
-            rec=rec,
-            vio_fe=self.vio_fe,
-            config=self.config,
-            global_config=self.global_config,
-            dem=self.dem,
-            lat0=self.lat0,
-            lon0=self.lon0,
-            vio_frame=self.state.vio_frame,
-            residual_csv=self.residual_csv if self.config.save_debug_data else None
-        )
     
     def log_error(self, t: float):
         """
@@ -1424,8 +1204,11 @@ class VIORunner:
                 self.process_imu_sample(rec, dt, time_elapsed)
             
             # Debug logging: raw IMU and state covariance
-            self._log_debug_imu_raw(t, rec)
-            self._log_debug_state_covariance(t, rec, i)
+            self.debug_writers.log_imu_raw(t, rec)
+            if i % 10 == 0:  # Every 10 samples (~25ms @ 400Hz)
+                bg = self.kf.x[10:13, 0]
+                ba = self.kf.x[13:16, 0]
+                self.debug_writers.log_state_covariance(t, self.state.vio_frame, self.kf, bg, ba)
             
             # VPS updates
             self.process_vps(t)
@@ -1470,7 +1253,7 @@ class VIORunner:
                 f.write(f"{i},{dt_proc:.6f},{fps:.2f}\n")
             
             # Log state debug (every sample, like vio_vps.py)
-            self._log_state_debug(t, dem_now, agl_now, msl_now, last_a_world)
+            log_state_debug(self.state_dbg_csv, t, self.kf, dem_now, agl_now, msl_now, last_a_world)
             
             # Update last_a_world for next iteration
             # Get a_world from last IMU sample processing
