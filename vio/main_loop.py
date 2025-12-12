@@ -751,8 +751,12 @@ class VIORunner:
             
             if should_clone:
                 clone_camera_for_msckf(
-                    self.kf, self.state.cam_states, self.state.cam_observations,
-                    self.vio_fe, t
+                    kf=self.kf,
+                    t=t,
+                    cam_states=self.state.cam_states,
+                    cam_observations=self.state.cam_observations,
+                    vio_fe=self.vio_fe,
+                    frame_idx=self.vio_fe.frame_idx
                 )
             
             # VIO velocity update (if frontend succeeded)
