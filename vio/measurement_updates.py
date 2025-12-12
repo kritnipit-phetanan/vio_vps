@@ -36,100 +36,25 @@ def _mahalanobis2(y: np.ndarray, S: np.ndarray) -> float:
     return mahalanobis_squared(y, S)
 
 
-def apply_zupt_update(kf, 
-                      acc_deviation: float,
-                      gyro_magnitude: float,
-                      velocity_magnitude: float,
-                      consecutive_stationary: int,
-                      zupt_acc_threshold: float = 0.5,
-                      zupt_gyro_threshold: float = 0.05,
-                      save_debug: bool = False,
-                      residual_csv: Optional[str] = None,
-                      timestamp: float = 0.0,
-                      frame: int = -1) -> Tuple[bool, int]:
-    """
-    Apply Zero Velocity Update when stationary is detected.
-    
-    ZUPT constrains velocity to zero when IMU indicates no motion,
-    preventing drift accumulation during hover/stationary periods.
-    
-    Args:
-        kf: ExtendedKalmanFilter instance
-        acc_deviation: Deviation of accelerometer magnitude from gravity
-        gyro_magnitude: Gyroscope measurement magnitude
-        velocity_magnitude: Current estimated velocity magnitude
-        consecutive_stationary: Count of consecutive stationary detections
-        zupt_acc_threshold: Acceleration threshold for stationary detection
-        zupt_gyro_threshold: Gyro threshold for stationary detection
-        save_debug: Whether to log debug data
-        residual_csv: Path to residual log file
-        timestamp: Current timestamp
-        frame: Current frame number
-        
-    Returns:
-        Tuple of (zupt_applied: bool, updated_consecutive_count: int)
-    """
-    # Check if stationary
-    is_stationary = (acc_deviation < zupt_acc_threshold) and (gyro_magnitude < zupt_gyro_threshold)
-    
-    if not is_stationary:
-        return False, 0
-    
-    consecutive_stationary += 1
-    
-    # Build ZUPT measurement
-    num_clones = (kf.x.shape[0] - 16) // 7
-    err_dim = 15 + 6 * num_clones
-    
-    H_zupt = np.zeros((3, err_dim), dtype=float)
-    H_zupt[0:3, 3:6] = np.eye(3)  # Measure velocity error (δv)
-    
-    z_zupt = np.zeros((3, 1), dtype=float)  # Target: zero velocity
-    
-    # Adaptive R based on confidence
-    if velocity_magnitude < 1.0:
-        base_r = 0.0001
-    elif velocity_magnitude < 5.0:
-        base_r = 0.001
-    else:
-        base_r = 0.01
-    
-    consecutive_factor = max(1.0, min(10.0, consecutive_stationary / 100.0))
-    R_zupt = np.diag([base_r / consecutive_factor] * 3)
-    
-    # Reject if velocity too high (might cause instability)
-    if velocity_magnitude > 500.0:
-        return False, consecutive_stationary
-    
-    # Decouple yaw from velocity before ZUPT
-    kf.P[3:6, 8] = 0.0
-    kf.P[8, 3:6] = 0.0
-    kf.P[3:6, 6:8] = 0.0
-    kf.P[6:8, 3:6] = 0.0
-    
-    def h_zupt_jacobian(x, h=H_zupt):
-        return h
-    
-    def hx_zupt_fun(x, h=H_zupt):
-        return x[3:6].reshape(3, 1)
-    
-    # Apply update
-    kf.update(
-        z=z_zupt,
-        HJacobian=h_zupt_jacobian,
-        Hx=hx_zupt_fun,
-        R=R_zupt
-    )
-    
-    return True, consecutive_stationary
+# NOTE: apply_zupt_update() has been REMOVED (v2.9.6)
+# Reason: Redundant - duplicates functionality of apply_zupt() in propagation.py
+# Use detect_stationary() + apply_zupt() instead (more modular approach)
+# See propagation.py for the active ZUPT implementation with debug logging
 
 
-# Global state for magnetometer oscillation detection
+# Global state for magnetometer statistics (v2.9.5: oscillation detection with skip_count=2)
 _MAG_STATE = {
-    'innovation_history': [],  # Recent innovation signs
-    'oscillation_count': 0,    # Consecutive sign flips
-    'skip_count': 0,           # How many updates to skip
-    'last_yaw_mag': None,      # For smoothing
+    # Rejection statistics
+    'reject_quality': 0,
+    'reject_innovation': 0,
+    'reject_high_rate': 0,     # From apply_mag_filter
+    'reject_gyro_inconsistent': 0,  # From apply_mag_filter
+    'total_attempts': 0,
+    'total_accepted': 0,
+    # Oscillation detection (v2.9.5: back with reduced skip)
+    'innovation_history': [],  # Track recent innovation signs
+    'oscillation_count': 0,    # Number of oscillations detected
+    'skip_count': 0,           # Remaining updates to skip
 }
 
 
@@ -146,7 +71,8 @@ def apply_magnetometer_update(kf,
                               residual_csv: Optional[str] = None,
                               timestamp: float = 0.0,
                               frame: int = -1,
-                              yaw_override: Optional[float] = None) -> Tuple[bool, str]:
+                              yaw_override: Optional[float] = None,
+                              filter_info: Optional[dict] = None) -> Tuple[bool, str]:
     """
     Apply magnetometer heading update.
     
@@ -173,6 +99,7 @@ def apply_magnetometer_update(kf,
         timestamp: Current timestamp
         frame: Current frame number
         yaw_override: If provided, use this yaw instead of computing from mag (for filtered yaw)
+        filter_info: Dictionary from apply_mag_filter() with {'high_rate': bool, 'gyro_inconsistent': bool}
         
     Returns:
         Tuple of (update_applied: bool, rejection_reason: str)
@@ -180,14 +107,25 @@ def apply_magnetometer_update(kf,
     global _MAG_STATE
     from .magnetometer import compute_yaw_from_mag
     
+    # Track filter rejection reasons (v2.9.2)
+    if filter_info is not None:
+        if filter_info.get('high_rate', False):
+            _MAG_STATE['reject_high_rate'] += 1
+        if filter_info.get('gyro_inconsistent', False):
+            _MAG_STATE['reject_gyro_inconsistent'] += 1
+    
     # Skip during convergence if PPK provided initial yaw
     if in_convergence and has_ppk_yaw:
         return False, "PPK convergence period"
     
-    # Check if we're in oscillation skip mode
+    # Track total attempts
+    _MAG_STATE['total_attempts'] += 1
+    
+    # v2.9.5: Oscillation detection (skip_count = 2, reduced from 10)
+    # Check if we're in skip period
     if _MAG_STATE['skip_count'] > 0:
         _MAG_STATE['skip_count'] -= 1
-        return False, f"Skipping due to oscillation ({_MAG_STATE['skip_count']} remaining)"
+        return False, f"Oscillation skip (remaining: {_MAG_STATE['skip_count']})"
     
     # Check field strength
     mag_norm = np.linalg.norm(mag_calibrated)
@@ -207,6 +145,9 @@ def apply_magnetometer_update(kf,
         )
     
     if quality < 0.3:
+        _MAG_STATE['reject_quality'] += 1
+        if _MAG_STATE['total_attempts'] % 100 == 0:
+            print(f"[MAG-REJECT] Quality: {_MAG_STATE['reject_quality']}/{_MAG_STATE['total_attempts']} ({_MAG_STATE['reject_quality']/_MAG_STATE['total_attempts']*100:.1f}%)")
         return False, f"Low quality ({quality:.3f})"
     
     # Get current yaw from state
@@ -217,34 +158,42 @@ def apply_magnetometer_update(kf,
     yaw_innov = np.arctan2(np.sin(yaw_innov), np.cos(yaw_innov))
     
     # =========================================================================
-    # OSCILLATION DETECTION: Prevent yaw bouncing near ±180° boundary
+    # v2.9.5: Oscillation Detection (skip_count=2, reduced from v2.9.2's 10)
     # =========================================================================
-    innov_sign = 1 if yaw_innov > 0 else -1
-    _MAG_STATE['innovation_history'].append(innov_sign)
+    # Detect rapid sign alternation in innovation (indicates erratic behavior)
+    # When detected, skip 2 updates (minimal gap ~0.1s) to let system stabilize
     
-    # Keep only last 10 innovations
-    if len(_MAG_STATE['innovation_history']) > 10:
-        _MAG_STATE['innovation_history'] = _MAG_STATE['innovation_history'][-10:]
+    innovation_sign = 1 if yaw_innov > 0 else -1
+    _MAG_STATE['innovation_history'].append(innovation_sign)
     
-    # Detect oscillation: alternating signs with large innovations
-    if len(_MAG_STATE['innovation_history']) >= 4 and abs(yaw_innov) > np.radians(90.0):
-        recent = _MAG_STATE['innovation_history'][-4:]
-        # Check for alternating pattern: [+, -, +, -] or [-, +, -, +]
-        is_alternating = all(recent[i] != recent[i+1] for i in range(3))
-        
-        if is_alternating:
+    # Keep only recent history (last 3 innovations)
+    if len(_MAG_STATE['innovation_history']) > 3:
+        _MAG_STATE['innovation_history'].pop(0)
+    
+    # Detect oscillation: alternating signs in recent history
+    if len(_MAG_STATE['innovation_history']) >= 3:
+        h = _MAG_STATE['innovation_history']
+        if (h[-1] != h[-2]) and (h[-2] != h[-3]):
+            # Oscillation detected: skip next 2 updates (reduced from 10)
+            _MAG_STATE['skip_count'] = 2  # CRITICAL: 2 instead of 10!
             _MAG_STATE['oscillation_count'] += 1
-            if _MAG_STATE['oscillation_count'] >= 3:
-                # Skip next 50 updates to let IMU stabilize
-                _MAG_STATE['skip_count'] = 50
-                _MAG_STATE['oscillation_count'] = 0
-                _MAG_STATE['innovation_history'] = []
-                print(f"[MAG-OSC] Detected oscillation, skipping 50 updates")
-                return False, "Oscillation detected, skipping"
-        else:
-            _MAG_STATE['oscillation_count'] = 0
-    else:
-        _MAG_STATE['oscillation_count'] = 0
+            
+            if _MAG_STATE['total_attempts'] % 100 == 0:
+                print(f"[MAG-OSC] Detected oscillation #{_MAG_STATE['oscillation_count']}, skipping next 2 updates")
+            
+            return False, "Oscillation detected (skip=2)"
+    
+    # Adaptive R-scaling during oscillation buildup (v2.9.2 logic)
+    # Apply progressive R-inflation if oscillation pattern developing
+    oscillation_r_scale = 1.0
+    if len(_MAG_STATE['innovation_history']) >= 2:
+        h = _MAG_STATE['innovation_history']
+        if h[-1] != h[-2]:
+            # One alternation: light R-scaling
+            oscillation_r_scale = 1.0 + 2.0  # R = 3.0
+        if len(_MAG_STATE['innovation_history']) >= 3 and h[-2] != h[-3]:
+            # Two alternations: heavier R-scaling
+            oscillation_r_scale = 1.0 + 4.0  # R = 5.0
     
     # Innovation threshold (very permissive - mag is absolute reference)
     if in_convergence:
@@ -253,7 +202,23 @@ def apply_magnetometer_update(kf,
         innovation_threshold = np.radians(179.0)
     
     if abs(yaw_innov) > innovation_threshold:
+        _MAG_STATE['reject_innovation'] += 1
+        if _MAG_STATE['total_attempts'] % 100 == 0:
+            print(f"[MAG-REJECT] Innovation: {_MAG_STATE['reject_innovation']}/{_MAG_STATE['total_attempts']} ({_MAG_STATE['reject_innovation']/_MAG_STATE['total_attempts']*100:.1f}%)")
         return False, f"Innovation too large ({np.degrees(yaw_innov):.1f}°)"
+    
+    # Apply oscillation R-scaling to measurement noise (v2.9.5)
+    sigma_mag_yaw_scaled = sigma_mag_yaw * oscillation_r_scale
+    
+    # Build measurement model
+    _MAG_STATE['total_accepted'] += 1
+    
+    # Print summary statistics periodically
+    if _MAG_STATE['total_attempts'] % 500 == 0:
+        acc_rate = _MAG_STATE['total_accepted'] / _MAG_STATE['total_attempts'] * 100
+        print(f"[MAG-STATS] Accepted: {_MAG_STATE['total_accepted']}/{_MAG_STATE['total_attempts']} ({acc_rate:.1f}%), osc={_MAG_STATE['oscillation_count']}")
+        print(f"[MAG-STATS] Reject reasons: qual={_MAG_STATE['reject_quality']}, "
+              f"innov={_MAG_STATE['reject_innovation']}, high_rate={_MAG_STATE['reject_high_rate']}, gyro_incons={_MAG_STATE['reject_gyro_inconsistent']}")
     
     # Build measurement model
     num_clones = (kf.x.shape[0] - 16) // 7
@@ -270,8 +235,8 @@ def apply_magnetometer_update(kf,
         yaw_x = quaternion_to_yaw(q_x)
         return np.array([[yaw_x]])
     
-    # Measurement covariance
-    r_yaw = np.array([[sigma_mag_yaw**2]])
+    # Measurement covariance (use scaled sigma from oscillation detection)
+    r_yaw = np.array([[sigma_mag_yaw_scaled**2]])
     
     # Phase-based Kalman gain tuning
     if time_elapsed < 15.0:  # Spinup phase
@@ -283,12 +248,12 @@ def apply_magnetometer_update(kf,
     
     # Compute current Kalman gain
     P_yaw = kf.P[theta_cov_idx, theta_cov_idx]
-    S_yaw = P_yaw + sigma_mag_yaw**2
+    S_yaw = P_yaw + sigma_mag_yaw_scaled**2  # BUG FIX: Use scaled sigma!
     K_yaw = P_yaw / S_yaw
     
     # Enforce minimum K
     if K_yaw < K_MIN and K_MIN > 0.01:
-        P_yaw_min = K_MIN * sigma_mag_yaw**2 / (1.0 - K_MIN)
+        P_yaw_min = K_MIN * sigma_mag_yaw_scaled**2 / (1.0 - K_MIN)  # BUG FIX: Use scaled sigma!
         if kf.P[theta_cov_idx, theta_cov_idx] < P_yaw_min:
             kf.P[theta_cov_idx, theta_cov_idx] = P_yaw_min
             P_yaw = P_yaw_min

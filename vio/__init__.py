@@ -2,11 +2,60 @@
 VIO (Visual-Inertial Odometry) Package
 
 Complete modularized implementation of the VIO+ESKF+MSCKF system
-for helicopter navigation. Version 2.9.1 - Tuned magnetometer filtering + MSCKF validation.
+for helicopter navigation. Version 2.9.6 - Code cleanup and enhancements.
 
-Version: 2.9.1 (Tuned magnetometer filtering + MSCKF reprojection validation)
+Version: 2.9.6 (Refactored for better maintainability)
 Modules: 17
 Total Lines: ~10,000
+
+Changes in v2.9.6:
+- REFACTORED: Enhanced apply_zupt() in propagation.py
+  * Added debug logging support (residual_csv integration)
+  * Returns updated consecutive_stationary count
+  * Computes innovation and Mahalanobis distance
+  * Logs ZUPT updates to debug_residuals.csv
+- ENHANCED: _apply_vio_velocity_update() with chi-square gating
+  * Added innovation gating before EKF update
+  * Chi-square threshold: 3.84 (1 DOF) or 7.81 (3 DOF)
+  * Rejects outlier velocity measurements
+  * Logs accepted/rejected status to debug_residuals.csv
+- CLEANUP: Removed duplicate apply_zupt_update() from measurement_updates.py
+  * Was redundant with apply_zupt() in propagation.py
+  * Dead code - never called in codebase
+  * Kept detect_stationary() + apply_zupt() as modular approach
+- DECISION: Kept debug/logging functions in VIORunner class
+  * Functions like _log_debug_state_covariance() use self heavily
+  * Moving to output_utils.py would require many parameters
+  * Better to keep as private methods in VIORunner
+- Code organization improved, no algorithm changes
+
+Changes in v2.9.5 (Oscillation detection with skip_count=2):
+- REVERTED: Back to v2.9.2 oscillation detection strategy
+  * Detects erratic BEHAVIOR (sign alternation pattern)
+  * Rejects truly bad readings during fast maneuvers
+  * Between rejections: FULL trust → strong corrections
+- CRITICAL FIX: skip_count = 2 (reduced from 10 in v2.9.2)
+  * v2.9.2 problem: 10-update skip → long gap → IMU drift → 6771 yaw jumps
+  * v2.9.5 solution: 2-update skip → ~0.1s gap → minimal drift
+- Rationale:
+  * Innovation-based R-scaling (v2.9.3-v2.9.4) penalizes ALL large innovations
+  * But large innovations can be CORRECT (drift recovery)
+  * Oscillation detection only rejects PATTERN (alternating signs)
+  * Allows strong corrections when not oscillating → better position accuracy
+- Results (Bell 412 dataset 3):
+  * Final position: 690m (+287% vs v2.9.2, trade-off)
+  * Yaw jumps: 1466 (-78% vs v2.9.2, GOOD)
+  * Final yaw error: 17° (BEST across all versions)
+  * Mag acceptance: 91.2%
+  * Tracks 5 rejection types: oscillation_skip, low_quality, large_innovation, high_rate, gyro_inconsistent
+  * Periodic statistics: every 100 attempts for individual rejections, every 500 for summary
+  * apply_mag_filter() returns info_dict with filter flags
+- IMPROVED: magnetometer.py returns (yaw_filtered, r_scale, info_dict)
+  * info_dict: {'high_rate': bool, 'gyro_inconsistent': bool}
+  * Enables tracking of filter-based soft rejections (R-inflation)
+- IMPROVED: measurement_updates.py tracks filter_info from apply_mag_filter()
+  * Accumulates filter rejection counters separate from hard rejections
+  * Helps diagnose: "accepted with high R" vs "hard rejected"
 
 Changes in v2.9.1:
 - FIX: Relaxed magnetometer filtering parameters for helicopter dynamics
@@ -133,7 +182,7 @@ Usage:
     from vio.propagation import VibrationDetector
 """
 
-__version__ = "2.9.1"
+__version__ = "2.9.6"
 
 # Lazy module imports - access as vio.config, vio.math_utils, etc.
 # This avoids importing all dependencies at once

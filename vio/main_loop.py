@@ -847,15 +847,19 @@ class VIORunner:
         if is_stationary:
             self.state.zupt_detected += 1
             
-            applied, _ = apply_zupt(
+            applied, v_reduction, updated_count = apply_zupt(
                 self.kf,
                 v_mag=v_mag,
-                consecutive_stationary_count=self.state.consecutive_stationary
+                consecutive_stationary_count=self.state.consecutive_stationary,
+                save_debug=self.config.save_debug_data,
+                residual_csv=getattr(self, 'residual_csv', None),
+                timestamp=rec.t,
+                frame=self.state.imu_propagation_count
             )
             
             if applied:
                 self.state.zupt_applied += 1
-                self.state.consecutive_stationary += 1
+                self.state.consecutive_stationary = updated_count
             else:
                 self.state.zupt_rejected += 1
         else:
@@ -1540,20 +1544,36 @@ class VIORunner:
             else:
                 return x[3:6].reshape(3, 1)
         
-        # Apply update
+        # Apply update with chi-square gating
         if self.config.use_vio_velocity:
-            # Compute innovation for logging
+            # Compute innovation for gating
             predicted_vel = hx_fun(self.kf.x)
             innovation = vel_meas - predicted_vel
             s_mat = h_vel @ self.kf.P @ h_vel.T + r_mat
+            
+            # Chi-square test
             try:
                 m2 = innovation.T @ np.linalg.inv(s_mat) @ innovation
-                mahal_dist = np.sqrt(float(m2))
+                chi2_value = float(m2)
+                mahal_dist = np.sqrt(chi2_value)
             except Exception:
+                chi2_value = float('inf')
                 mahal_dist = float('nan')
             
-            self.kf.update(z=vel_meas, HJacobian=h_fun, Hx=hx_fun, R=r_mat)
-            print(f"[VIO] Velocity update: speed={speed_final:.2f}m/s, vz_only={use_only_vz}")
+            # Chi-square thresholds (95% confidence)
+            chi2_threshold = 3.84 if use_only_vz else 7.81  # 1 DOF vs 3 DOF
+            
+            if chi2_value < chi2_threshold:
+                # Accept update
+                self.kf.update(z=vel_meas, HJacobian=h_fun, Hx=hx_fun, R=r_mat)
+                print(f"[VIO] Velocity update: speed={speed_final:.2f}m/s, vz_only={use_only_vz}, "
+                      f"chi2={chi2_value:.2f}")
+                accepted = True
+            else:
+                # Reject outlier
+                print(f"[VIO] Velocity REJECTED: chi2={chi2_value:.2f} > {chi2_threshold:.1f}, "
+                      f"mahal={mahal_dist:.2f}")
+                accepted = False
             
             # Log to debug_residuals.csv
             if self.config.save_debug_data and hasattr(self, 'residual_csv') and self.residual_csv:
@@ -1562,8 +1582,8 @@ class VIORunner:
                     self.residual_csv, t, self.state.vio_frame, 'VIO_VEL',
                     innovation=innovation.flatten(),
                     mahalanobis_dist=mahal_dist,
-                    chi2_threshold=9.21,
-                    accepted=True,
+                    chi2_threshold=chi2_threshold,
+                    accepted=accepted,
                     s_matrix=s_mat,
                     p_prior=getattr(self.kf, 'P_prior', self.kf.P)
                 )
@@ -1671,12 +1691,16 @@ class VIORunner:
             
             # Apply magnetometer filter (EMA smoothing + gyro consistency check)
             in_convergence = time_elapsed < convergence_window
-            yaw_mag_filtered, r_scale = apply_mag_filter(
+            yaw_mag_filtered, r_scale, filter_info = apply_mag_filter(
                 yaw_mag=yaw_mag_raw,
                 yaw_t=mag_rec.t,
                 gyro_z=self.last_gyro_z,
                 dt_imu=self.last_imu_dt,
-                in_convergence=in_convergence
+                in_convergence=in_convergence,
+                mag_max_yaw_rate=self.global_config.get('MAG_MAX_YAW_RATE_DEG', 30.0) * np.pi / 180.0,
+                mag_gyro_threshold=self.global_config.get('MAG_GYRO_THRESHOLD_DEG', 10.0) * np.pi / 180.0,
+                mag_ema_alpha=self.global_config.get('MAG_EMA_ALPHA', 0.3),
+                mag_consistency_r_inflate=self.global_config.get('MAG_R_INFLATE', 5.0)
             )
             
             # Scale measurement noise based on filter confidence
@@ -1702,7 +1726,8 @@ class VIORunner:
                 timestamp=t,
                 residual_csv=residual_path,
                 frame=self.state.vio_frame,
-                yaw_override=yaw_mag_filtered  # NEW: pass filtered yaw directly
+                yaw_override=yaw_mag_filtered,  # NEW: pass filtered yaw directly
+                filter_info=filter_info  # v2.9.2: track filter rejection reasons
             )
             
             if applied:

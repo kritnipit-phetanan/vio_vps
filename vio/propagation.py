@@ -402,22 +402,35 @@ def detect_stationary(a_raw: np.ndarray, w_corr: np.ndarray, v_mag: float,
 
 def apply_zupt(kf: ExtendedKalmanFilter, v_mag: float,
                consecutive_stationary_count: int,
-               max_v_for_zupt: float = 500.0) -> Tuple[bool, float]:
+               max_v_for_zupt: float = 500.0,
+               save_debug: bool = False,
+               residual_csv: Optional[str] = None,
+               timestamp: float = 0.0,
+               frame: int = -1) -> Tuple[bool, float, int]:
     """
     Apply Zero Velocity Update to constrain velocity to zero.
     
+    ZUPT prevents IMU drift during stationary/hover periods by constraining
+    the velocity estimate to zero when the vehicle is detected as stationary.
+    
     Args:
         kf: Extended Kalman Filter
-        v_mag: Current velocity magnitude
+        v_mag: Current velocity magnitude [m/s]
         consecutive_stationary_count: Number of consecutive stationary samples
-        max_v_for_zupt: Maximum velocity for ZUPT (safety check)
+        max_v_for_zupt: Maximum velocity for ZUPT (safety check) [m/s]
+        save_debug: Enable debug logging to residual CSV
+        residual_csv: Path to residual log file
+        timestamp: Current timestamp [s]
+        frame: Current frame number
     
     Returns:
-        applied: True if ZUPT was applied
-        v_reduction: Velocity reduction magnitude
+        Tuple of:
+            - applied: True if ZUPT was applied
+            - v_reduction: Velocity reduction magnitude [m/s]
+            - updated_consecutive_count: Updated stationary count
     """
     if v_mag >= max_v_for_zupt:
-        return False, 0.0
+        return False, 0.0, 0
     
     # Calculate dimensions
     num_clones = (kf.x.shape[0] - 16) // 7
@@ -448,6 +461,17 @@ def apply_zupt(kf: ExtendedKalmanFilter, v_mag: float,
     consecutive_factor = max(1.0, min(10.0, consecutive_stationary_count / 100.0))
     R_zupt = np.diag([base_r / consecutive_factor] * 3)
     
+    # Compute innovation and Mahalanobis distance for logging
+    predicted_vel = kf.x[3:6, 0].reshape(3, 1)
+    innovation = z_zupt - predicted_vel
+    S_zupt = H_zupt @ kf.P @ H_zupt.T + R_zupt
+    
+    try:
+        mahal_squared = float(innovation.T @ np.linalg.inv(S_zupt) @ innovation)
+        mahal_dist = np.sqrt(mahal_squared)
+    except:
+        mahal_dist = float('nan')
+    
     # Decouple yaw from velocity before ZUPT
     kf.P[3:6, 8] = 0.0
     kf.P[8, 3:6] = 0.0
@@ -466,7 +490,25 @@ def apply_zupt(kf: ExtendedKalmanFilter, v_mag: float,
     v_after = kf.x[3:6, 0].copy()
     v_reduction = np.linalg.norm(v_before) - np.linalg.norm(v_after)
     
-    return True, v_reduction
+    # Log to residual CSV if debug enabled
+    if save_debug and residual_csv:
+        try:
+            from .output_utils import log_measurement_update
+            log_measurement_update(
+                residual_csv, timestamp, frame, 'ZUPT',
+                innovation=innovation.flatten(),
+                mahalanobis_dist=mahal_dist,
+                chi2_threshold=7.81,  # Chi-square 3 DOF, 95% confidence
+                accepted=True,
+                s_matrix=S_zupt,
+                p_prior=kf.P
+            )
+        except Exception as e:
+            pass  # Don't fail ZUPT if logging fails
+    
+    updated_count = consecutive_stationary_count + 1
+    
+    return True, v_reduction, updated_count
 
 
 # =============================================================================

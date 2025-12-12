@@ -233,7 +233,7 @@ def apply_mag_filter(yaw_mag: float, yaw_t: float, gyro_z: float, dt_imu: float,
                      mag_max_yaw_rate: float = None,
                      mag_gyro_threshold: float = None,
                      mag_ema_alpha: float = None,
-                     mag_consistency_r_inflate: float = None) -> Tuple[float, float]:
+                     mag_consistency_r_inflate: float = None) -> Tuple[float, float, dict]:
     """
     Apply enhanced magnetometer filtering with EMA smoothing.
     
@@ -256,9 +256,10 @@ def apply_mag_filter(yaw_mag: float, yaw_t: float, gyro_z: float, dt_imu: float,
         mag_consistency_r_inflate: Override for MAG_CONSISTENCY_R_INFLATE constant
         
     Returns:
-        (yaw_filtered, r_scale_factor)
+        (yaw_filtered, r_scale_factor, info_dict)
         yaw_filtered: EMA-smoothed yaw measurement [rad]
         r_scale_factor: Multiplier for measurement noise R (1.0 during convergence)
+        info_dict: {'high_rate': bool, 'gyro_inconsistent': bool} for logging
     """
     global _MAG_FILTER_STATE
     
@@ -270,6 +271,7 @@ def apply_mag_filter(yaw_mag: float, yaw_t: float, gyro_z: float, dt_imu: float,
     
     state = _MAG_FILTER_STATE
     r_scale = 1.0
+    info = {'high_rate': False, 'gyro_inconsistent': False}  # v2.9.2 logging
     
     # Accumulate gyro integration between mag updates
     state['integrated_gyro_dz'] += gyro_z * dt_imu
@@ -281,7 +283,8 @@ def apply_mag_filter(yaw_mag: float, yaw_t: float, gyro_z: float, dt_imu: float,
         state['last_yaw_t'] = yaw_t
         state['integrated_gyro_dz'] = 0.0
         state['n_updates'] = 1
-        return yaw_mag, 1.0
+        # v2.9.2: Must return 3 values (yaw, r_scale, info_dict)
+        return yaw_mag, 1.0, {'high_rate': False, 'gyro_inconsistent': False}
     
     # =========================================================================
     # Step 1: Rate-of-change check (fast rotation detection)
@@ -300,6 +303,7 @@ def apply_mag_filter(yaw_mag: float, yaw_t: float, gyro_z: float, dt_imu: float,
     if not in_convergence and yaw_rate_mag > max_yaw_rate * 1.5:
         # Mag is changing faster than gyro max rate - likely noise/interference
         r_scale = max(r_scale, 2.0)
+        info['high_rate'] = True
         if state['n_updates'] % 50 == 0:
             print(f"[MAG-FILTER] High rate: {np.degrees(yaw_rate_mag):.1f}°/s > {np.degrees(max_yaw_rate*1.5):.1f}°/s limit → R×{r_scale:.1f}")
     
@@ -318,6 +322,7 @@ def apply_mag_filter(yaw_mag: float, yaw_t: float, gyro_z: float, dt_imu: float,
         r_scale_consistency = 1.0 + (consistency_error / gyro_threshold - 1.0) * (consistency_r_inflate - 1.0)
         r_scale_consistency = np.clip(r_scale_consistency, 1.0, consistency_r_inflate)
         r_scale = max(r_scale, r_scale_consistency)
+        info['gyro_inconsistent'] = True
         
         if state['n_updates'] % 50 == 0:
             print(f"[MAG-FILTER] Gyro inconsistent: |d_yaw_mag({np.degrees(dyaw_mag):.1f}°) - d_yaw_gyro({np.degrees(expected_dyaw_gyro):.1f}°)| = {np.degrees(consistency_error):.1f}° → R×{r_scale:.1f}")
@@ -342,7 +347,7 @@ def apply_mag_filter(yaw_mag: float, yaw_t: float, gyro_z: float, dt_imu: float,
     state['last_yaw_t'] = yaw_t
     state['n_updates'] += 1
     
-    return yaw_ema_new, r_scale
+    return yaw_ema_new, r_scale, info
 
 
 def quaternion_multiply(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
