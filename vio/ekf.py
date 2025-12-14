@@ -370,6 +370,15 @@ class ExtendedKalmanFilter:
         I_KH = I_err - dot(self.K, H)
         self.P = dot(I_KH, self.P).dot(I_KH.T) + dot(self.K, R).dot(self.K.T)
         
+        # Ensure covariance validity after update
+        self.P = ensure_covariance_valid(
+            self.P,
+            label="EKF-Update",
+            symmetrize=True,
+            check_psd=True,
+            min_eigenvalue=1e-9
+        )
+        
         # Covariance floor
         p_pos_min = 1.0**2
         p_vel_min = 0.5**2

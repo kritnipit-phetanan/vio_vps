@@ -27,10 +27,12 @@ State Update:
 -------------
 Given state at i: (R_i, v_i, p_i) and preintegrated quantities, the state at j:
     R_j = R_i * ΔR_ij
-    v_j = v_i + g*Δt + R_i * Δv_ij
-    p_j = p_i + v_i*Δt + 0.5*g*Δt² + R_i * Δp_ij
+    v_j = v_i + R_i * Δv_ij
+    p_j = p_i + v_i*Δt + R_i * Δp_ij
 
-Note: Gravity is handled during state update, NOT in preintegration!
+Note: Gravity is compensated DURING preintegration (line 197: a_hat += g_body),
+so state update does NOT add gravity separately. This follows the convention
+where preintegrated quantities already account for gravity compensation.
 
 Covariance Propagation:
 -----------------------
@@ -231,6 +233,8 @@ class IMUPreintegration:
                      0.5 * self.delta_R @ a_hat * (dt ** 2)
         
         # --- Step 4: Update Jacobians w.r.t. biases ---
+        # Forster et al. TRO 2017, Eq. (24-28)
+        # Note: Negative signs come from ∂(a_meas - ba)/∂ba = -I and ∂(w_meas - bg)/∂bg = -I
         j_r_bg_k1 = self.J_R_bg - j_r * dt
         j_v_bg_k1 = self.J_v_bg - self.delta_R @ skew_symmetric(a_hat) @ self.J_R_bg * dt
         j_v_ba_k1 = self.J_v_ba - self.delta_R * dt
@@ -239,11 +243,19 @@ class IMUPreintegration:
         j_p_ba_k1 = self.J_p_ba + self.J_v_ba * dt - 0.5 * self.delta_R * (dt ** 2)
         
         # --- Step 5: Update covariance (discrete-time propagation) ---
-        # State transition matrix A (9x9)
+        # State transition matrix A (9x9) for error-state [δθ_R, δv, δp]^T
+        # Forster et al. TRO 2017, Eq. (48)
         A = np.eye(9, dtype=float)
-        A[0:3, 0:3] = delta_R_k1 @ self.delta_R.T
+        
+        # Rotation error: δθ_{k+1} ≈ δθ_k (simplified, assumes small rotation errors)
+        # Alternatively: A[0:3, 0:3] = I - skew_symmetric(w_hat * dt) for more accuracy
+        A[0:3, 0:3] = np.eye(3)
+        
+        # Velocity error coupling
         A[3:6, 0:3] = -self.delta_R @ skew_symmetric(a_hat) * dt
         A[3:6, 3:6] = np.eye(3)
+        
+        # Position error coupling
         A[6:9, 0:3] = -0.5 * self.delta_R @ skew_symmetric(a_hat) * (dt ** 2)
         A[6:9, 3:6] = np.eye(3) * dt
         A[6:9, 6:9] = np.eye(3)
