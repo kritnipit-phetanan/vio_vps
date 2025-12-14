@@ -696,13 +696,17 @@ def augment_state_with_camera(kf: ExtendedKalmanFilter, cam_q_wxyz: np.ndarray,
     new_P[old_n_error:old_n_error+3, old_n_error:old_n_error+3] = np.eye(3) * p_quat
     new_P[old_n_error+3:old_n_error+6, old_n_error+3:old_n_error+6] = np.eye(3) * p_pos
 
-    # Update filter
+    # Update filter (ESKF fix: separate nominal and error dimensions)
     kf.x = new_x
     kf.P = new_P
-    kf.dim_x = new_n_nominal
+    kf.dim_x = new_n_nominal    # Nominal state: 16 + 7*N
+    kf.dim_err = new_n_error    # Error state: 15 + 6*N
+    
+    # Update error-state matrices
     kf.F = np.eye(new_n_error, dtype=float)
     kf.Q = np.eye(new_n_error, dtype=float)
     kf._I = np.eye(new_n_error, dtype=float)
+    kf.K = np.zeros((new_n_error, kf.dim_z), dtype=float)
 
     kf.x_prior = kf.x.copy()
     kf.P_prior = kf.P.copy()

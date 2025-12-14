@@ -55,9 +55,10 @@ from .propagation import (
     apply_preintegration_at_camera, clone_camera_for_msckf
 )
 from .vps_integration import apply_vps_update, xy_to_latlon, latlon_to_xy
-from .vps_integration import compute_plane_constraint_jacobian
 from .msckf import perform_msckf_updates, print_msckf_stats, trigger_msckf_update
-from .measurement_updates import apply_magnetometer_update, apply_dem_height_update
+from .measurement_updates import (
+    apply_magnetometer_update, apply_dem_height_update, apply_vio_velocity_update
+)
 from .magnetometer import (
     calibrate_magnetometer, reset_mag_filter_state, 
     set_mag_constants, apply_mag_filter
@@ -76,7 +77,6 @@ from .output_utils import (
     log_state_debug, log_vo_debug, log_msckf_window, log_fej_consistency,
     DebugCSVWriters, init_output_csvs
 )
-from .vio_processing import apply_vio_velocity_update
 
 
 @dataclass
@@ -549,11 +549,15 @@ class VIORunner:
     
     def process_vps(self, t: float):
         """
-        Process VPS measurements up to current time.
+        Process VPS measurements up to current time with innovation gating.
         
         Args:
             t: Current timestamp
         """
+        from .vps_integration import (
+            compute_vps_innovation, compute_vps_acceptance_threshold
+        )
+        
         sigma_vps = self.global_config.get('SIGMA_VPS_XY', 1.0)
         
         while (self.state.vps_idx < len(self.vps_list) and 
@@ -562,18 +566,44 @@ class VIORunner:
             vps = self.vps_list[self.state.vps_idx]
             self.state.vps_idx += 1
             
-            # Convert VPS lat/lon to local XY
-            vps_x, vps_y = latlon_to_xy(vps.lat, vps.lon, self.lat0, self.lon0)
-            vps_xy = np.array([vps_x, vps_y])
+            # Compute innovation and Mahalanobis distance
+            vps_xy, innovation, m2_test = compute_vps_innovation(
+                vps, self.kf, self.lat0, self.lon0
+            )
             
+            # Compute adaptive acceptance threshold
+            time_since_correction = t - getattr(self.kf, 'last_absolute_correction_time', t)
+            innovation_mag = float(np.linalg.norm(innovation))
+            max_innovation_m, r_scale, tier_name = compute_vps_acceptance_threshold(
+                time_since_correction, innovation_mag
+            )
+            
+            # Chi-square threshold (2 DOF)
+            chi2_threshold = 5.99  # 95% confidence
+            
+            # Gate by innovation magnitude OR chi-square test
+            if innovation_mag > max_innovation_m:
+                print(f"[VPS] REJECTED: innovation {innovation_mag:.1f}m > {max_innovation_m:.1f}m "
+                      f"({tier_name}, drift={time_since_correction:.1f}s)")
+                continue
+            
+            if m2_test > chi2_threshold * 10:  # Very permissive for first VPS
+                print(f"[VPS] REJECTED: chi2={m2_test:.1f} >> {chi2_threshold} "
+                      f"(innovation={innovation_mag:.1f}m)")
+                continue
+            
+            # Apply update with adaptive R scaling
             applied = apply_vps_update(
                 self.kf,
                 vps_xy=vps_xy,
-                sigma_vps=sigma_vps
+                sigma_vps=sigma_vps,
+                r_scale=r_scale
             )
             
             if applied:
-                print(f"[VPS] Applied at t={t:.3f}")
+                self.kf.last_absolute_correction_time = t
+                print(f"[VPS] Applied at t={t:.3f}, innovation={innovation_mag:.1f}m, "
+                      f"tier={tier_name}, R_scale={r_scale:.1f}x")
     
     def process_vio(self, rec, t: float, time_elapsed: float, ongoing_preint=None):
         """
