@@ -668,13 +668,41 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
     
     speed_final = min(speed_final, 50.0)  # Clamp to 50 m/s
     
-    # Compute velocity in world frame
+    # Compute velocity in world frame with rotational flow compensation
     if avg_flow_px > 2.0 and vio_fe is not None and vio_fe.last_matches is not None:
         pts_prev, pts_cur = vio_fe.last_matches
         if len(pts_prev) > 0:
-            flows_normalized = pts_cur - pts_prev
-            median_flow = np.median(flows_normalized, axis=0)
+            # Get gyro angular velocity in body frame
+            omega_body = imu_rec.ang  # [wx, wy, wz] in rad/s
+            omega_cam = R_cam_to_body.T @ omega_body  # Transform to camera frame
+            
+            # Compensate for rotational flow on each feature
+            flows_compensated = []
+            for i in range(len(pts_prev)):
+                pt_prev = pts_prev[i]
+                pt_cur = pts_cur[i]
+                
+                # Measured flow
+                flow_measured = pt_cur - pt_prev
+                
+                # Predict rotational flow: flow_rot = omega_cam × [u, v, f]
+                # For small rotations: flow_rot_u ≈ -omega_z * v + omega_y * f
+                #                       flow_rot_v ≈  omega_z * u - omega_x * f
+                # Simplified for typical nadir camera: mainly omega_z (yaw rotation)
+                u_prev, v_prev = pt_prev[0], pt_prev[1]
+                flow_rot_u = -omega_cam[2] * v_prev * dt_img
+                flow_rot_v = omega_cam[2] * u_prev * dt_img
+                flow_rot = np.array([flow_rot_u, flow_rot_v])
+                
+                # Remove rotational component
+                flow_translational = flow_measured - flow_rot
+                flows_compensated.append(flow_translational)
+            
+            # Use compensated flows
+            flows_compensated = np.array(flows_compensated)
+            median_flow = np.median(flows_compensated, axis=0)
             flow_norm = np.linalg.norm(median_flow)
+            
             if flow_norm > 1e-6:
                 flow_dir = median_flow / flow_norm
                 vel_cam = np.array([-flow_dir[0], -flow_dir[1], 0.0])

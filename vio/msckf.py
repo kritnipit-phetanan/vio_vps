@@ -489,18 +489,14 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
     depth0 = np.dot(p_init - c0, ray0_w)
     depth1 = np.dot(p_init - c1, ray1_w)
     
-    # FIXED v2.9.8: Separate sign check from magnitude check
+    # FIXED v2.9.8.2: Only check sign (depth > 0), no minimum magnitude
+    # Previous v2.9.8.1 had depth < 0.1 check which caused fail_nonlinear spike (1.7% → 14%)
     # Sign check: Depth must be positive (feature in front of camera)
     if depth0 <= 0.0 or depth1 <= 0.0:
         MSCKF_STATS['fail_depth_sign'] += 1
         return None
     
-    # Magnitude check: Allow 0.1m to 500m (relaxed minimum for close features)
-    # Note: 0.1m minimum catches numerical errors, real features start at ~0.5m
-    if depth0 < 0.1 or depth1 < 0.1:
-        MSCKF_STATS['fail_depth_sign'] += 1
-        return None
-    
+    # Maximum depth check
     if depth0 > 500.0 or depth1 > 500.0:
         MSCKF_STATS['fail_depth_large'] += 1
         return None
