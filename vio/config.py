@@ -222,6 +222,10 @@ def load_config(config_path: str) -> Dict[str, Any]:
     result['VO_NADIR_ALIGN_DEG'] = vio['views']['nadir']['nadir_threshold_deg']
     result['VO_FRONT_ALIGN_DEG'] = vio['views']['front']['nadir_threshold_deg']
     
+    # v2.9.10.5: Store raw vio config dict for access to all parameters
+    # This includes new parameters like initial_agl_override
+    result['vio'] = vio
+    
     # Camera view configs - convert to expected format
     result['CAMERA_VIEW_CONFIGS'] = {
         'nadir': {

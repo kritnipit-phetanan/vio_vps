@@ -290,10 +290,20 @@ class VIORunner:
         # Sample DEM at origin
         self.dem0 = self.dem.sample_m(self.lat0, self.lon0) if self.dem.ds else None
         
-        # v2.9.10.4: Compute initial AGL for VIO velocity scale (GPS-denied compliant)
-        # Uses only t=0 values: msl0 - dem0
-        # This prevents feedback loop: z_drift -> wrong_AGL -> wrong_VIO_scale -> more_drift
-        if self.dem0 is not None:
+        # v2.9.10.5: Check for manual AGL override in config (for helicopter flights)
+        # Problem: DEM/GPS datum mismatch causes wrong AGL (e.g., 6m instead of 100m)
+        # Solution: Allow config to override with reasonable helicopter cruise AGL
+        vio_cfg = self.global_config.get('vio', {})
+        agl_override = vio_cfg.get('initial_agl_override', None)
+        
+        if agl_override is not None and agl_override > 0:
+            # Use manual override (GPS-denied compliant: fixed value from config)
+            self.initial_agl = agl_override
+            computed_agl = abs(self.msl0 - self.dem0) if self.dem0 is not None else 0.0
+            print(f"[VIO] Initial AGL = {self.initial_agl:.1f}m (OVERRIDE, computed was {computed_agl:.1f}m)")
+        elif self.dem0 is not None:
+            # v2.9.10.4: Compute initial AGL for VIO velocity scale (GPS-denied compliant)
+            # Uses only t=0 values: msl0 - dem0
             self.initial_agl = abs(self.msl0 - self.dem0)
             print(f"[VIO] Initial AGL = {self.initial_agl:.1f}m (MSL={self.msl0:.1f}, DEM={self.dem0:.1f})")
         else:

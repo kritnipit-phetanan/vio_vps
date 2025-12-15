@@ -202,6 +202,14 @@ vio:
   # Helps reduce XY drift in outdoor long-range flights without VPS
   use_vio_velocity: true     # Enable optical flow → velocity → EKF updates
   
+  # v2.9.10.5: Fixed AGL for VIO velocity scale (GPS-denied compliant)
+  # Problem: DEM elevation (110.5m) vs GPS MSL (116.7m) have ~6m offset
+  #          This gives AGL=6.2m but helicopter actually flies at ~100-200m AGL
+  #          Wrong AGL → wrong VIO velocity scale (100/6.2 = 16x error!)
+  # Solution: Override with reasonable helicopter cruise AGL
+  # Analysis: GPS altitude varies 116-232m, so max AGL ~120m, typical ~80m
+  initial_agl_override: 100.0  # Fixed AGL [m] for VIO scale (overrides DEM-computed)
+  
   # Parallax thresholds
   # CRITICAL FIX: was 1.0px but actual parallax ~0.3-0.9px during hover/slow motion
   # VIO velocity was ALWAYS SKIPPED because parallax < threshold
