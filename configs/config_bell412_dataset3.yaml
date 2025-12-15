@@ -75,14 +75,15 @@ imu:
   # Enable bias estimation from initial static samples
   estimate_bias: true
   
-  # Preintegration-specific (RELAXED: allow filter to accept VIO/VPS/DEM corrections)
-  # Higher noise = more uncertainty in IMU = filter trusts VIO/VPS/DEM more
-  # Analysis: IMU drift caused 60 m/s velocity error - need faster bias adaptation
+  # Preintegration-specific (v2.9.9.7: INFLATED 4× to prevent filter overconfidence)
+  # CRITICAL: Diagnosis showed 11.8σ velocity error (filter too confident)
+  # Root cause: P matrix grows too slowly → filter believes estimates are more accurate than reality
+  # Solution: Increase IMU noise → faster P growth → more trust in measurements
   preintegration:
-    acc_n: 0.20        # HIGHER than standard (allow VIO corrections)
-    gyr_n: 0.010       # HIGHER than standard (allow orientation corrections)  
-    acc_w: 0.0005      # 5× HIGHER (MUCH faster accel bias adaptation for altitude)
-    gyr_w: 0.0005      # 5× HIGHER (faster gyro bias adaptation)
+    acc_n: 0.80        # INCREASED 4× (was 0.20) - more IMU accel noise
+    gyr_n: 0.040       # INCREASED 4× (was 0.010) - more IMU gyro noise
+    acc_w: 0.002       # INCREASED 4× (was 0.0005) - faster accel bias random walk
+    gyr_w: 0.002       # INCREASED 4× (was 0.0005) - faster gyro bias random walk
 
 # IMU-GNSS Lever Arm (Body frame to GNSS antenna)
 # Source: https://mun-frl-vil-dataset.readthedocs.io/en/latest/Calibration.html#imu-gnss-extrinsic-calibration
@@ -175,10 +176,12 @@ magnetometer:
   r_inflate: 2.0                # R inflation factor for inconsistent measurements (was 5.0)
 
 # EKF Process Noise
-# RECALIBRATED 2025-02-07: Magnetometer now GPS-calibrated with std~16°
-# Re-enabled magnetometer updates with appropriate uncertainty
+# v2.9.9.7: INFLATED 4× to prevent filter overconfidence
+# DIAGNOSIS: At t=19.3s, filter showed 11.8σ velocity error (actual=5.9m/s, σ=0.5m/s)
+#   → Filter too confident → rejects valid VIO_VEL updates → velocity diverges
+# SOLUTION: Increase process noise → larger P → trust measurements more
 process_noise:
-  sigma_accel: 0.5           # Process accel noise
+  sigma_accel: 2.0           # INCREASED 4× (was 0.5) - more accel process uncertainty
   # NOTE: sigma_vo removed - use vio.sigma_vo instead (line 211)
   sigma_vps_xy: 0.8          # VPS position measurement [m]
   sigma_agl_z: 1.0           # Height/DEM constraint

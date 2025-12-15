@@ -816,8 +816,10 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
             chi2_value = float('inf')
             mahal_dist = float('nan')
         
-        # Chi-square thresholds (95% confidence)
-        chi2_threshold = 3.84 if use_vz_only else 7.81  # 1 DOF vs 3 DOF
+        # Chi-square thresholds
+        # v2.9.9.7: RELAXED from 95% to 99.5% to accept more valid updates
+        # Analysis: Filter overconfident (11.8σ vel error) → rejects valid VIO_VEL → divergence
+        chi2_threshold = 6.63 if use_vz_only else 11.34  # 1-DOF: 99%, 3-DOF: 99.5% (was 3.84/7.81)
         
         if chi2_value < chi2_threshold:
             # Accept update

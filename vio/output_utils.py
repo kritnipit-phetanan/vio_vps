@@ -39,6 +39,31 @@ def log_measurement_update(residual_csv: Optional[str], t: float, frame: int,
         accepted: Whether update was accepted
         s_matrix: Innovation covariance (optional, for NIS computation)
         p_prior: Prior covariance (optional)
+        state_error: Ground truth error (x_true - x_est) for NEES calculation (optional)
+        state_cov: State covariance matrix P for NEES calculation (optional)
+    
+    NEES (Normalized Estimation Error Squared):
+        NEES = (x_true - x_est)ᵀ P⁻¹ (x_true - x_est)
+        
+        - Checks filter consistency: Does uncertainty P match actual error?
+        - Should follow chi-square distribution with n degrees of freedom
+        - If NEES >> n: Filter OVERCONFIDENT (P too small, underestimates uncertainty)
+        - If NEES << n: Filter UNDERCONFIDENT (P too large, overestimates uncertainty)
+        - Ideal: NEES ≈ n (e.g., 3.0 for 3D velocity, within [0.35, 9.35] at 95% CI)
+        
+        To enable NEES logging:
+            1. Load ground truth trajectory (PPK/GPS)
+            2. Compute state_error = ground_truth - vio_estimate at timestamp
+            3. Extract relevant state_cov submatrix (e.g., P[3:6,3:6] for velocity)
+            4. Pass both to log_measurement_update()
+        
+        Example:
+            # In main_loop.py after VIO_VEL update
+            gt_vel = get_ground_truth_velocity(t)  # [vx, vy, vz]
+            vio_vel = kf.x[3:6, 0]
+            state_error = (gt_vel - vio_vel).reshape(-1, 1)
+            state_cov = kf.P[3:6, 3:6]
+            log_measurement_update(..., state_error=state_error, state_cov=state_cov)
     """
     if residual_csv is None:
         return
