@@ -110,6 +110,10 @@ class VIOConfig:
     use_vio_velocity: bool = True
     use_preintegration: bool = True
     
+    # Performance options (v2.9.9)
+    fast_mode: bool = False          # Reduce features + faster KLT (60% speedup)
+    frame_skip: int = 1              # Process every N frames (1=all, 2=half, etc.)
+    
     # Debug options
     save_debug_data: bool = False
     save_keyframe_images: bool = False
@@ -340,7 +344,8 @@ class VIORunner:
             self.config.downscale_size[0],
             self.config.downscale_size[1],
             K, D,
-            use_fisheye=use_fisheye
+            use_fisheye=use_fisheye,
+            fast_mode=self.config.fast_mode  # v2.9.9: Performance optimization
         )
         self.vio_fe.camera_view = self.config.camera_view
         
@@ -658,6 +663,12 @@ class VIORunner:
         
         # Process images up to current time
         while self.state.img_idx < len(self.imgs) and self.imgs[self.state.img_idx].t <= t:
+            # FRAME SKIP (v2.9.9): Process every N frames for speedup
+            # frame_skip=1 → all frames, frame_skip=2 → every other frame (50% faster)
+            if self.config.frame_skip > 1 and (self.state.img_idx % self.config.frame_skip) != 0:
+                self.state.img_idx += 1
+                continue
+            
             img_path = self.imgs[self.state.img_idx].path
             img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
             

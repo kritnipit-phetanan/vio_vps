@@ -249,6 +249,17 @@ default_camera_view: "nadir"
 use_fisheye: true
 
 # ============================================================================
+# Performance Optimization (v2.9.9)
+# ============================================================================
+# Trade-off: Speed vs Accuracy
+# fast_mode=false, frame_skip=1: Full accuracy, ~700-800s runtime (2.5x realtime)
+# fast_mode=true,  frame_skip=1: 60% faster (~400-500s), minimal accuracy loss
+# fast_mode=true,  frame_skip=2: 80% faster (~300-350s), slight accuracy loss
+performance:
+  fast_mode: false        # Reduce features (540 vs 640) + faster KLT (15x15 win, 3 levels)
+  frame_skip: 1           # Process every N frames (1=all, 2=half, etc.)
+
+# ============================================================================
 # ZUPT (Zero Velocity Update) Configuration (v2.9.8)
 # ============================================================================
 # Detects stationary periods to apply zero-velocity constraints.

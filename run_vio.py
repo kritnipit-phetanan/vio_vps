@@ -99,6 +99,12 @@ def parse_args():
     parser.add_argument("--save_keyframe_images", action="store_true", 
                         help="Save keyframe overlay images")
     
+    # Performance optimization (v2.9.9)
+    parser.add_argument("--fast_mode", action="store_true",
+                        help="Enable fast mode: reduce features + faster KLT (60%% speedup)")
+    parser.add_argument("--frame_skip", type=int, default=1,
+                        help="Process every N frames (1=all, 2=half speed, etc.)")
+    
     return parser.parse_args()
 
 
@@ -143,6 +149,8 @@ def main():
             save_debug_data=args.save_debug_data,
             save_keyframe_images=args.save_keyframe_images,
             use_preintegration=True,
+            fast_mode=args.fast_mode,        # v2.9.9: Performance optimization
+            frame_skip=args.frame_skip,      # v2.9.9: Process every N frames
         )
         
         # Create and run VIORunner

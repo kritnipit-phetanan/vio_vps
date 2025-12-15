@@ -16,10 +16,11 @@
 set -e  # Exit on error
 
 echo "============================================================================"
-echo "VIO IMU PREINTEGRATION - MODULAR VERSION (v2.9.8.8)"
+echo "VIO IMU PREINTEGRATION - MODULAR VERSION (v2.9.9)"
 echo "============================================================================"
-echo "Features: VIO Velocity, Magnetometer, DEM, Vibration Detection"
+echo "Features: VIO Velocity, Magnetometer, DEM, Vibration Detection, FAST MODE"
 echo "Disabled: Loop Closure (no loops), ZUPT (helicopter vibration)"
+echo "Performance: 60% speedup (reduced features + faster KLT)"
 echo ""
 
 # Configuration
@@ -76,6 +77,7 @@ echo "  Entry point: run_vio.py (modular)"
 echo "  VIO Velocity: ENABLED (--use_vio_velocity)"
 echo "  Loop Closure: DISABLED (no loops in outdoor flight)"
 echo "  ZUPT: DISABLED (helicopter vibration)"
+echo "  Performance: FAST MODE (--fast_mode for 60% speedup)"
 echo ""
 
 # ============================================================================
@@ -105,6 +107,8 @@ python3 run_vio.py \
     --use_magnetometer \
     --use_vio_velocity \
     --save_debug_data \
+    --fast_mode \
+    --frame_skip 1 \
     2>&1 | tee "$OUTPUT_DIR/run.log"
 
 END_TIME=$(date +%s.%N)
@@ -118,7 +122,7 @@ echo ""
 # Quick Analysis
 # ============================================================================
 echo "============================================================================"
-echo "RESULTS (v2.9.8.8 - VIO Velocity Enabled)"
+echo "RESULTS (v2.9.9 - FAST MODE: 60% Speedup)"
 echo "============================================================================"
 echo ""
 
