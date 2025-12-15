@@ -913,6 +913,44 @@ class VIORunner:
             err_U = vio_U - gt_U
             pos_error = np.sqrt(err_E**2 + err_N**2 + err_U**2)
             
+            # Velocity error (compute from consecutive GPS positions)
+            vel_error = 0.0
+            vel_err_E = vel_err_N = vel_err_U = 0.0
+            
+            if gt_idx > 0 and gt_idx < len(gt_df) - 1:
+                # Use central difference for velocity
+                gt_row_prev = gt_df.iloc[gt_idx - 1]
+                gt_row_next = gt_df.iloc[gt_idx + 1]
+                
+                dt = gt_row_next['stamp_log'] - gt_row_prev['stamp_log']
+                if dt > 0.01:  # Avoid division by zero
+                    if use_ppk:
+                        gt_E_prev, gt_N_prev = latlon_to_xy(gt_row_prev['lat'], gt_row_prev['lon'], self.lat0, self.lon0)
+                        gt_E_next, gt_N_next = latlon_to_xy(gt_row_next['lat'], gt_row_next['lon'], self.lat0, self.lon0)
+                        gt_U_prev = gt_row_prev['height']
+                        gt_U_next = gt_row_next['height']
+                    else:
+                        gt_E_prev, gt_N_prev = latlon_to_xy(gt_row_prev['lat_dd'], gt_row_prev['lon_dd'], self.lat0, self.lon0)
+                        gt_E_next, gt_N_next = latlon_to_xy(gt_row_next['lat_dd'], gt_row_next['lon_dd'], self.lat0, self.lon0)
+                        gt_U_prev = gt_row_prev['altitude_MSL_m']
+                        gt_U_next = gt_row_next['altitude_MSL_m']
+                    
+                    # Ground truth velocity
+                    gt_vel_E = (gt_E_next - gt_E_prev) / dt
+                    gt_vel_N = (gt_N_next - gt_N_prev) / dt
+                    gt_vel_U = (gt_U_next - gt_U_prev) / dt
+                    
+                    # VIO velocity
+                    vio_vel_E = float(self.kf.x[3, 0])
+                    vio_vel_N = float(self.kf.x[4, 0])
+                    vio_vel_U = float(self.kf.x[5, 0])
+                    
+                    # Velocity error
+                    vel_err_E = vio_vel_E - gt_vel_E
+                    vel_err_N = vio_vel_N - gt_vel_N
+                    vel_err_U = vio_vel_U - gt_vel_U
+                    vel_error = np.sqrt(vel_err_E**2 + vel_err_N**2 + vel_err_U**2)
+            
             # Yaw
             q_vio = self.kf.x[6:10, 0]
             yaw_vio = np.rad2deg(quaternion_to_yaw(q_vio))
@@ -926,7 +964,7 @@ class VIORunner:
             with open(self.error_csv, "a", newline="") as ef:
                 ef.write(
                     f"{t:.6f},{pos_error:.3f},{err_E:.3f},{err_N:.3f},{err_U:.3f},"
-                    f"0.0,0.0,0.0,0.0,"
+                    f"{vel_error:.3f},{vel_err_E:.3f},{vel_err_N:.3f},{vel_err_U:.3f},"
                     f"{err_U:.3f},{yaw_vio:.2f},{yaw_gt:.2f},{yaw_error:.2f},"
                     f"{gt_lat:.8f},{gt_lon:.8f},{gt_alt:.3f},"
                     f"{vio_E:.3f},{vio_N:.3f},{vio_U:.3f}\n"

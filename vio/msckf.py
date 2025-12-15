@@ -438,7 +438,9 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
     
     # Filter extreme fisheye angles: |norm| > 2 corresponds to angle > 63 degrees
     # For nadir camera, extreme angles give near-horizontal rays that fail triangulation
-    MAX_NORM_COORD = 1.5  # ~56 degrees from optical axis
+    # RELAXED v2.9.8: 1.5 → 2.5 (~68°) to allow more edge features
+    # Rationale: Calibrated Kannala-Brandt handles distortion well, was rejecting 32% as fail_other
+    MAX_NORM_COORD = 2.5  # ~68 degrees from optical axis (was 1.5/56°)
     if np.sqrt(x0*x0 + y0*y0) > MAX_NORM_COORD or np.sqrt(x1*x1 + y1*y1) > MAX_NORM_COORD:
         MSCKF_STATS['fail_other'] += 1  # Use 'other' for now, can add specific counter later
         return None
@@ -487,7 +489,9 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
     depth0 = np.dot(p_init - c0, ray0_w)
     depth1 = np.dot(p_init - c1, ray1_w)
     
-    if depth0 < 5.0 or depth1 < 5.0:
+    # LOWERED v2.9.8: 5m → 1m for nadir hovering (helicopter altitude 3-4m)
+    # Old threshold rejected valid triangulations during low-altitude operations
+    if depth0 < 1.0 or depth1 < 1.0:
         MSCKF_STATS['fail_depth_sign'] += 1
         return None
     

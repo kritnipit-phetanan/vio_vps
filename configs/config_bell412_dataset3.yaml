@@ -240,6 +240,19 @@ default_camera_view: "nadir"
 use_fisheye: true
 
 # ============================================================================
+# ZUPT (Zero Velocity Update) Configuration (v2.9.8)
+# ============================================================================
+# Detects stationary periods to apply zero-velocity constraints.
+# Tuned for helicopter with high vibration (rotor effects).
+zupt:
+  enabled: true                   # Enable ZUPT detection
+  accel_threshold: 0.5            # Acceleration threshold [m/s²] (reduced for helicopter vibration)
+  gyro_threshold: 0.05            # Gyroscope threshold [rad/s] (~3°/s)
+  min_duration: 2.0               # Minimum stationary duration [seconds]
+  velocity_threshold: 0.2         # Velocity magnitude threshold [m/s]
+  consecutive_required: 5         # Consecutive stationary samples required
+
+# ============================================================================
 # NEW: Fisheye Rectification (v2.8.0)
 # ============================================================================
 # Converts fisheye images to pinhole for better feature tracking.
