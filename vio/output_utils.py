@@ -22,7 +22,9 @@ def log_measurement_update(residual_csv: Optional[str], t: float, frame: int,
                            update_type: str, innovation: np.ndarray,
                            mahalanobis_dist: float, chi2_threshold: float,
                            accepted: bool, s_matrix: Optional[np.ndarray] = None,
-                           p_prior: Optional[np.ndarray] = None):
+                           p_prior: Optional[np.ndarray] = None,
+                           state_error: Optional[np.ndarray] = None,
+                           state_cov: Optional[np.ndarray] = None):
     """
     Log measurement update residuals and statistics for debugging.
     
@@ -81,7 +83,18 @@ def log_measurement_update(residual_csv: Optional[str], t: float, frame: int,
             innov_y = float(innov_flat[1])
             innov_z = float(innov_flat[2])
         
-        nees = float('nan')  # Would need ground truth
+        # Compute NEES (Normalized Estimation Error Squared) if ground truth available
+        # NEES = (x_true - x_est)ᵀ P⁻¹ (x_true - x_est)
+        # For consistency check: NEES should follow chi-square distribution
+        nees = float('nan')
+        if state_error is not None and state_cov is not None:
+            try:
+                # Invert covariance matrix
+                P_inv = np.linalg.inv(state_cov)
+                # Compute NEES (scalar)
+                nees = float(state_error.T @ P_inv @ state_error)
+            except (np.linalg.LinAlgError, ValueError):
+                nees = float('nan')
         
         with open(residual_csv, "a", newline="") as f:
             f.write(f"{t:.6f},{frame},{update_type},{innov_x:.6f},{innov_y:.6f},"

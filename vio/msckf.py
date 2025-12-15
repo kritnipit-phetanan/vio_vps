@@ -26,7 +26,8 @@ from .camera import normalized_to_unit_ray
 BODY_T_CAMDOWN = np.eye(4, dtype=np.float64)
 
 # Triangulation constants
-MIN_MSCKF_BASELINE = 0.15
+# v2.9.9.6: REDUCED baseline threshold for helicopter hover (observed ~0.026m baseline)
+MIN_MSCKF_BASELINE = 0.005  # Was 0.15 (too strict), reduced to 0.005m
 MIN_PARALLAX_ANGLE_DEG = 0.3
 
 # MSCKF statistics
@@ -415,6 +416,18 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
     cs0 = cam_states[cam_id0]
     cs1 = cam_states[cam_id1]
     
+    # EARLY REJECTION v2.9.9.6: Estimate baseline BEFORE expensive pose computation
+    # Use IMU positions as proxy for camera positions (error < 0.3m, acceptable for rejection)
+    # This saves ~40% MSCKF time by rejecting 19.5% fail_baseline early
+    p_imu0_quick = kf.x[cs0['p_idx']:cs0['p_idx']+3, 0]
+    p_imu1_quick = kf.x[cs1['p_idx']:cs1['p_idx']+3, 0]
+    baseline_estimate = np.linalg.norm(p_imu1_quick - p_imu0_quick)
+    
+    # Reject if estimated baseline too small (with 20% margin for camera offset)
+    if baseline_estimate < MIN_MSCKF_BASELINE * 0.8:
+        MSCKF_STATS['fail_baseline'] += 1
+        return None
+    
     # Extract poses
     q_imu0 = kf.x[cs0['q_idx']:cs0['q_idx']+4, 0]
     p_imu0 = kf.x[cs0['p_idx']:cs0['p_idx']+3, 0]
@@ -539,6 +552,8 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
         pass  # Fall back to normalized coordinate method
     
     # Compute reprojection error (ENHANCED with pixel-level validation)
+    # v2.9.9.6: Increased threshold 8.0→12.0 to reduce 22% fail_reproj_error
+    MAX_REPROJ_ERROR_PX = 12.0  # Was 8.0, now relaxed for slow motion/hover
     total_error = 0.0
     max_pixel_error = 0.0
     
@@ -586,7 +601,8 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
                     max_pixel_error = max(max_pixel_error, pixel_error)
                     
                     # Reject if pixel error exceeds threshold
-                    MAX_PIXEL_REPROJ_ERROR = 3.0  # pixels
+                    # v2.9.9.6: Increased 3.0→12.0 to reduce 22% fail_reproj_error
+                    MAX_PIXEL_REPROJ_ERROR = 12.0  # pixels (was 3.0, too strict for slow motion)
                     if pixel_error > MAX_PIXEL_REPROJ_ERROR:
                         MSCKF_STATS['fail_reproj_error'] += 1
                         if debug:

@@ -145,7 +145,24 @@ class VIOFrontEnd:
         if len(all_features) == 0:
             return np.empty((0, 2), dtype=np.float32)
         
-        return np.array(all_features, dtype=np.float32)
+        features_array = np.array(all_features, dtype=np.float32)
+        
+        # v2.9.9.6: Filter features near image edges to reduce fail_depth_sign (40%)
+        # Features near edges often have extreme angles that fail triangulation
+        # Edge margin: 10% of image dimensions (144px horizontal, 108px vertical)
+        margin_x = int(self.img_w * 0.10)  # 10% margin
+        margin_y = int(self.img_h * 0.10)
+        
+        valid_mask = (
+            (features_array[:, 0] > margin_x) &
+            (features_array[:, 0] < self.img_w - margin_x) &
+            (features_array[:, 1] > margin_y) &
+            (features_array[:, 1] < self.img_h - margin_y)
+        )
+        
+        features_filtered = features_array[valid_mask]
+        
+        return features_filtered
     
     def _compute_epipolar_error(self, pts_prev: np.ndarray, pts_curr: np.ndarray, 
                                  E: np.ndarray) -> np.ndarray:
