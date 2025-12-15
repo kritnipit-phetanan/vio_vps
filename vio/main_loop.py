@@ -350,11 +350,11 @@ class VIORunner:
         if self.global_config.get('USE_PLANE_MSCKF', False):
             self.plane_detector = PlaneDetector(
                 min_points_per_plane=self.global_config.get('PLANE_MIN_POINTS', 10),
-                angle_threshold=self.global_config.get('PLANE_ANGLE_THRESHOLD', np.radians(15.0)),
+                normal_angle_threshold=self.global_config.get('PLANE_ANGLE_THRESHOLD', np.radians(15.0)),
                 distance_threshold=self.global_config.get('PLANE_DISTANCE_THRESHOLD', 0.15),
-                min_area=self.global_config.get('PLANE_MIN_AREA', 0.5)
+                min_plane_area=self.global_config.get('PLANE_MIN_AREA', 0.5)
             )
-            print(f"[Plane-MSCKF] Enabled with min_points={self.plane_detector.min_points_per_plane}, "
+            print(f"[Plane-MSCKF] Enabled with min_points={self.plane_detector.min_points}, "
                   f"angle_thresh={np.degrees(self.plane_detector.angle_threshold):.1f}°")
     
     def _initialize_rectifier(self):
