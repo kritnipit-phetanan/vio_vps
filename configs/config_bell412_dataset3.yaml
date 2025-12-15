@@ -75,14 +75,14 @@ imu:
   # Enable bias estimation from initial static samples
   estimate_bias: true
   
-  # Preintegration-specific (v2.9.9.10: AGGRESSIVE 3× increase)
-  # v2.9.9.9 with 2× still showed 13.1σ overconfidence
-  # Strategy: Increase to 3× to reach target velocity σ of 2-3 m/s
+  # Preintegration-specific (v2.9.9.11: MAXIMUM 4× increase)
+  # v2.9.9.10 with 3× showed 6.8σ overconfidence (better, but still > 3σ target)
+  # Strategy: Increase to 4× to reach target velocity σ of 2-3 m/s (< 3σ)
   preintegration:
-    acc_n: 0.60        # INCREASED 3× (was 0.20) - aggressive IMU accel noise
-    gyr_n: 0.030       # INCREASED 3× (was 0.010) - aggressive IMU gyro noise
-    acc_w: 0.0015      # INCREASED 3× (was 0.0005) - aggressive accel bias random walk
-    gyr_w: 0.0015      # INCREASED 3× (was 0.0005) - aggressive gyro bias random walk
+    acc_n: 0.80        # INCREASED 4× (was 0.20) - maximum IMU accel noise
+    gyr_n: 0.040       # INCREASED 4× (was 0.010) - maximum IMU gyro noise
+    acc_w: 0.0020      # INCREASED 4× (was 0.0005) - maximum accel bias random walk
+    gyr_w: 0.0020      # INCREASED 4× (was 0.0005) - maximum gyro bias random walk
 
 # IMU-GNSS Lever Arm (Body frame to GNSS antenna)
 # Source: https://mun-frl-vil-dataset.readthedocs.io/en/latest/Calibration.html#imu-gnss-extrinsic-calibration
@@ -175,12 +175,12 @@ magnetometer:
   r_inflate: 2.0                # R inflation factor for inconsistent measurements (was 5.0)
 
 # EKF Process Noise
-# v2.9.9.10: AGGRESSIVE 3× increase (v2.9.9.9's 2× still showed 13.1σ overconfidence)
-# DIAGNOSIS: v2.9.9.9 velocity σ = 0.5 m/s, but actual error = 6.5 m/s
-#   → Filter severely overconfident, NEES = 1903 (should be ~3.0)
-# SOLUTION: 3× increase to reach target velocity σ of 2-3 m/s
+# v2.9.9.11: MAXIMUM 4× increase (v2.9.9.10's 3× showed 6.8σ overconfidence)
+# DIAGNOSIS: v2.9.9.10 velocity σ still too small, NEES = 1353 (should be ~3.0)
+#   → Filter still overconfident, need more aggressive process noise
+# SOLUTION: 4× increase to reach target velocity σ of 2-3 m/s (< 3σ)
 process_noise:
-  sigma_accel: 1.5           # INCREASED 3× (was 0.5) - aggressive increase
+  sigma_accel: 2.0           # INCREASED 4× (was 0.5) - maximum increase
   # NOTE: sigma_vo removed - use vio.sigma_vo instead (line 211)
   sigma_vps_xy: 0.8          # VPS position measurement [m]
   sigma_agl_z: 1.0           # Height/DEM constraint

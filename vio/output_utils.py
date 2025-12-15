@@ -200,7 +200,8 @@ def log_measurement_update(residual_csv: Optional[str], t: float, frame: int,
         # NEES = (x_true - x_est)ᵀ P⁻¹ (x_true - x_est)
         # For consistency check: NEES should follow chi-square distribution
         nees = float('nan')
-        if state_error is not None and state_cov is not None:
+        # v2.9.9.11: Skip NEES during initialization (frame < 100) to avoid NaN from unaligned GT
+        if frame >= 100 and state_error is not None and state_cov is not None:
             try:
                 # Invert covariance matrix
                 P_inv = np.linalg.inv(state_cov)
