@@ -320,14 +320,9 @@ def triangulate_point_nonlinear(observations: List[dict], cam_states: List[dict]
             
             p_c = R_wc @ (p - p_cam)
             
-            # v2.9.9.9: More lenient depth check during optimization
-            # Allow negative depths temporarily - optimizer will fix
-            if p_c[2] < -1.0:
+            # v2.9.9.10: REVERT to v2.9.9.8 stricter check
+            if p_c[2] <= 0.1:
                 return None
-            
-            # Handle near-zero depth gracefully
-            if abs(p_c[2]) < 0.01:
-                p_c[2] = 0.01 if p_c[2] >= 0 else -0.01
             
             # Project to normalized plane
             x_pred = p_c[0] / p_c[2]
@@ -519,12 +514,10 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
     depth0 = np.dot(p_init - c0, ray0_w)
     depth1 = np.dot(p_init - c1, ray1_w)
     
-    # v2.9.9.9: RELAXED depth check to reduce 48.4% fail_depth_sign
-    # Allow small negative depths from numerical errors in triangulation
-    # Only reject if depth clearly behind camera (< -0.5m)
-    # This handles edge cases where midpoint method gives slightly negative depth
-    # but nonlinear refinement will fix it
-    if depth0 < -0.5 or depth1 < -0.5:
+    # v2.9.9.10: REVERT to v2.9.9.8 stricter check (v2.9.9.9's -0.5m was too permissive)
+    # Quality over quantity: Reject features with negative or very small depth
+    # Analysis showed relaxation increased fail_reproj_error (27.6% → 38.2%)
+    if depth0 <= 0.0 or depth1 <= 0.0:
         MSCKF_STATS['fail_depth_sign'] += 1
         return None
     
@@ -563,9 +556,9 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
         pass  # Fall back to normalized coordinate method
     
     # Compute reprojection error (ENHANCED with pixel-level validation)
-    # v2.9.9.9: Increased threshold 12.0→20.0 to reduce 27.6% fail_reproj_error
-    # Helicopter/drone motion has inherent jitter, vibration, rolling shutter
-    MAX_REPROJ_ERROR_PX = 20.0  # Was 12.0, now relaxed for realistic conditions
+    # v2.9.9.10: REVERT to v2.9.9.8 (12.0px) - v2.9.9.9's 20.0px was too permissive
+    # Analysis: 20px threshold increased fail_reproj_error from 27.6% → 38.2%
+    MAX_REPROJ_ERROR_PX = 12.0  # Quality over quantity
     total_error = 0.0
     max_pixel_error = 0.0
     
@@ -586,9 +579,8 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
         # Transform point to camera frame
         p_c = R_wc @ (p_refined - p_cam)
         
-        # v2.9.9.9: Relax depth check (was 0.1, now -0.2)
-        # Allow slightly behind camera if close to image plane
-        if p_c[2] < -0.2:
+        # v2.9.9.10: REVERT to v2.9.9.8 stricter check
+        if p_c[2] <= 0.1:
             MSCKF_STATS['fail_depth_sign'] += 1
             return None
         
@@ -615,8 +607,8 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
                     max_pixel_error = max(max_pixel_error, pixel_error)
                     
                     # Reject if pixel error exceeds threshold
-                    # v2.9.9.9: Increased 12.0→20.0 to reduce 27.6% fail_reproj_error
-                    MAX_PIXEL_REPROJ_ERROR = 20.0  # pixels (was 12.0, still too strict)
+                    # v2.9.9.10: REVERT to v2.9.9.8 (12.0px)
+                    MAX_PIXEL_REPROJ_ERROR = 12.0  # pixels
                     if pixel_error > MAX_PIXEL_REPROJ_ERROR:
                         MSCKF_STATS['fail_reproj_error'] += 1
                         if debug:
@@ -625,8 +617,8 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
     
     avg_error = total_error / len(obs_list)
     
-    # v2.9.9.9: Increased 0.10→0.15 to reduce fail_reproj_error
-    if avg_error > 0.15:
+    # v2.9.9.10: REVERT to v2.9.9.8 (0.10)
+    if avg_error > 0.10:
         MSCKF_STATS['fail_reproj_error'] += 1
         return None
     

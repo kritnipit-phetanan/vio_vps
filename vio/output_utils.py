@@ -204,8 +204,11 @@ def log_measurement_update(residual_csv: Optional[str], t: float, frame: int,
             try:
                 # Invert covariance matrix
                 P_inv = np.linalg.inv(state_cov)
-                # Compute NEES (scalar)
-                nees = float(state_error.T @ P_inv @ state_error)
+                # v2.9.9.10: FIX NaN issue - ensure correct matrix dimensions
+                # state_error might be (3,1) or (3,), need to flatten for proper multiplication
+                err_flat = state_error.flatten()  # Shape (n,)
+                # Compute NEES: scalar = (n,) @ (n,n) @ (n,) 
+                nees = float(err_flat @ P_inv @ err_flat)
             except (np.linalg.LinAlgError, ValueError):
                 nees = float('nan')
         

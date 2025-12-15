@@ -75,14 +75,14 @@ imu:
   # Enable bias estimation from initial static samples
   estimate_bias: true
   
-  # Preintegration-specific (v2.9.9.8: MODERATE 2× increase)
-  # v2.9.9.7's 4× was too aggressive → VIO_VEL acceptance dropped to 42%
-  # Strategy: Gradual increase to balance P growth with measurement gating
+  # Preintegration-specific (v2.9.9.10: AGGRESSIVE 3× increase)
+  # v2.9.9.9 with 2× still showed 13.1σ overconfidence
+  # Strategy: Increase to 3× to reach target velocity σ of 2-3 m/s
   preintegration:
-    acc_n: 0.40        # INCREASED 2× (was 0.20) - moderate IMU accel noise
-    gyr_n: 0.020       # INCREASED 2× (was 0.010) - moderate IMU gyro noise
-    acc_w: 0.001       # INCREASED 2× (was 0.0005) - moderate accel bias random walk
-    gyr_w: 0.001       # INCREASED 2× (was 0.0005) - moderate gyro bias random walk
+    acc_n: 0.60        # INCREASED 3× (was 0.20) - aggressive IMU accel noise
+    gyr_n: 0.030       # INCREASED 3× (was 0.010) - aggressive IMU gyro noise
+    acc_w: 0.0015      # INCREASED 3× (was 0.0005) - aggressive accel bias random walk
+    gyr_w: 0.0015      # INCREASED 3× (was 0.0005) - aggressive gyro bias random walk
 
 # IMU-GNSS Lever Arm (Body frame to GNSS antenna)
 # Source: https://mun-frl-vil-dataset.readthedocs.io/en/latest/Calibration.html#imu-gnss-extrinsic-calibration
@@ -175,12 +175,12 @@ magnetometer:
   r_inflate: 2.0                # R inflation factor for inconsistent measurements (was 5.0)
 
 # EKF Process Noise
-# v2.9.9.8: MODERATE 2× increase (v2.9.9.7's 4× was too aggressive)
-# DIAGNOSIS: 4× caused VIO_VEL acceptance to drop from 90% → 42%
-#   → Innovation covariance S too large → valid updates rejected
-# SOLUTION: 2× increase balances filter confidence with measurement acceptance
+# v2.9.9.10: AGGRESSIVE 3× increase (v2.9.9.9's 2× still showed 13.1σ overconfidence)
+# DIAGNOSIS: v2.9.9.9 velocity σ = 0.5 m/s, but actual error = 6.5 m/s
+#   → Filter severely overconfident, NEES = 1903 (should be ~3.0)
+# SOLUTION: 3× increase to reach target velocity σ of 2-3 m/s
 process_noise:
-  sigma_accel: 1.0           # INCREASED 2× (was 0.5) - moderate increase
+  sigma_accel: 1.5           # INCREASED 3× (was 0.5) - aggressive increase
   # NOTE: sigma_vo removed - use vio.sigma_vo instead (line 211)
   sigma_vps_xy: 0.8          # VPS position measurement [m]
   sigma_agl_z: 1.0           # Height/DEM constraint
@@ -209,8 +209,9 @@ vio:
   min_inliers: 6             # Minimum RANSAC inliers
   ratio_test: 0.80           # Lowe's ratio test threshold (more permissive)
   
-  # Optical flow velocity parameters (v2.9.8.2)
-  sigma_vo: 0.5              # Velocity measurement uncertainty [m/s]
+  # Optical flow velocity parameters (v2.9.9.10: Increased measurement noise)
+  # v2.9.9.9 innovation mean = 6.57 m/s → need larger R to match reality
+  sigma_vo: 1.5              # INCREASED 3× (was 0.5) - realistic measurement uncertainty
   min_tracked_features: 50   # Minimum features for velocity update
   fast_rotation_threshold: 0.5236  # Skip if rotation > 30°/s (rad/s)
   
