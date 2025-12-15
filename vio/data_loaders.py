@@ -320,13 +320,16 @@ def load_ppk_initial_state(path: str) -> Optional[PPKInitialState]:
 def get_ppk_initial_heading(ppk_trajectory: Optional[pd.DataFrame], 
                             lat0: float, lon0: float, 
                             duration: float = 0.0) -> Optional[float]:
-    """Extract initial heading from PPK trajectory (GPS-denied: 2 samples only).
+    """Extract initial heading from PPK trajectory (GPS-denied: single value at t=0).
     
-    v2.9.10.1 FIX: Use ONLY first 2 samples (t=0 and t=0.05s) to compute initial velocity.
-    Previous v2.9.10.0 used 30s trajectory which violated GPS-denied constraints.
+    v2.9.10.2 FIX: If vehicle is stationary at t=0, return None and let caller
+    use PPK attitude yaw instead (which is also a single value at t=0).
     
-    GPS-denied compliant: Computes heading from velocity at t=0 using minimal samples.
-    This is equivalent to using initial velocity (single state value).
+    STRATEGY:
+    - Priority 1: Velocity heading from first 2 samples (if moving)
+    - Priority 2: Fall back to None → caller uses PPK attitude yaw (single value)
+    
+    GPS-denied compliant: Uses only t=0 state (velocity or attitude).
     
     Args:
         ppk_trajectory: PPK ground truth DataFrame
@@ -335,7 +338,7 @@ def get_ppk_initial_heading(ppk_trajectory: Optional[pd.DataFrame],
         duration: DEPRECATED - now always uses 2 samples
     
     Returns:
-        Initial heading in radians (ENU frame), or None if unavailable
+        Initial heading in radians (ENU frame), or None if stationary
     """
     if ppk_trajectory is None or len(ppk_trajectory) < 2:
         return None
@@ -367,7 +370,8 @@ def get_ppk_initial_heading(ppk_trajectory: Optional[pd.DataFrame],
         
         # Check if moving (velocity > 0.5 m/s)
         if vel_mag < 0.5:
-            print(f"[PPK Init Heading] Warning: Vehicle stationary at t=0 (vel={vel_mag:.2f} m/s)")
+            print(f"[PPK Init Heading] Vehicle stationary at t=0 (vel={vel_mag:.2f} m/s < 0.5 m/s)")
+            print(f"[PPK Init Heading] → Will use PPK attitude yaw instead (also single t=0 value)")
             return None
         
         # Compute heading from velocity vector at t=0

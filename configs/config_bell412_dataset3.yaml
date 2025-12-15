@@ -175,16 +175,15 @@ magnetometer:
   r_inflate: 2.0                # R inflation factor for inconsistent measurements (was 5.0)
 
 # EKF Process Noise
-# v2.9.9.11: MAXIMUM 4× increase (v2.9.9.10's 3× showed 6.8σ overconfidence)
-# DIAGNOSIS: v2.9.9.10 velocity σ still too small, NEES = 1353 (should be ~3.0)
-#   → Filter still overconfident, need more aggressive process noise
-# SOLUTION: 4× increase to reach target velocity σ of 2-3 m/s (< 3σ)
+# v2.9.10.2: Reduced magnetometer influence due to unreliable readings
+# DIAGNOSIS: v2.9.10.1 showed mag yaw causing +30°/-30° oscillations
+#   → Mag is not trustworthy, increase sigma to reduce weight
 process_noise:
   sigma_accel: 2.0           # INCREASED 4× (was 0.5) - maximum increase
   # NOTE: sigma_vo removed - use vio.sigma_vo instead (line 211)
   sigma_vps_xy: 0.8          # VPS position measurement [m]
   sigma_agl_z: 1.0           # Height/DEM constraint
-  sigma_mag_yaw: 0.15        # RE-ENABLED: ~17° (std from GPS calibration = 16°, add margin)
+  sigma_mag_yaw: 0.50        # v2.9.10.2: INCREASED to ~29° (was 0.15=9°) - mag unreliable
 
 # VIO/VO Parameters
 # TUNED FOR SLOW MOTION / HOVERING (Bell 412 dataset characteristics)

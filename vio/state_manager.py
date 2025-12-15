@@ -404,19 +404,28 @@ def initialize_ekf_state(kf,
     kf.x[3:6, 0] = v_init_enu
     
     # Initialize quaternion
-    # v2.9.10.1 FIX: Use PPK initial heading if available (GPS-denied: 2 samples only)
+    # v2.9.10.2 FIX: PPK heading priority order (all are single t=0 values, GPS-denied compliant)
+    #   1. PPK velocity heading (if moving at t=0) - computed from 2 samples
+    #   2. PPK attitude yaw (if stationary at t=0) - single t=0 value, SKIP MAG CORRECTION!
+    #   3. IMU quaternion (if no PPK available)
+    
+    use_ppk_attitude = False  # Flag to skip magnetometer correction
+    
     if ppk_initial_heading is not None:
-        # Use PPK heading (ENU frame) with zero roll/pitch
-        # GPS-denied compliant: Computed from t=0 velocity (2 samples: t=0, t=0.05s)
+        # Use PPK heading from velocity (moving at t=0)
         from scipy.spatial.transform import Rotation as R_scipy
         R_init = R_scipy.from_euler('ZYX', [ppk_initial_heading, 0.0, 0.0])
         q_xyzw = R_init.as_quat()  # [x, y, z, w]
         q_init = np.array([q_xyzw[3], q_xyzw[0], q_xyzw[1], q_xyzw[2]])  # [w, x, y, z]
-        print(f"[INIT][PPK HEADING] Using PPK initial heading from t=0 velocity: {np.degrees(ppk_initial_heading):.1f}° (ENU)")
-        print(f"[INIT][PPK HEADING] Quaternion: w={q_init[0]:.4f}, x={q_init[1]:.4f}, y={q_init[2]:.4f}, z={q_init[3]:.4f}")
+        print(f"[INIT][PPK VELOCITY] Using PPK initial heading from t=0 velocity: {np.degrees(ppk_initial_heading):.1f}° (ENU)")
+        use_ppk_attitude = True  # Skip magnetometer correction
     elif ppk_state is not None:
+        # v2.9.10.2: Use PPK attitude yaw (stationary at t=0)
+        # This is ALSO a single t=0 value, GPS-denied compliant!
         q_init, _ = initialize_quaternion_from_ppk(ppk_state)
-        print(f"[INIT][PPK] Using full PPK attitude")
+        print(f"[INIT][PPK ATTITUDE] Using PPK attitude yaw at t=0 (stationary case)")
+        print(f"[INIT][PPK ATTITUDE] PPK yaw (NED): {np.degrees(ppk_state.yaw):.1f}° → ENU: {90 - np.degrees(ppk_state.yaw):.1f}°")
+        use_ppk_attitude = True  # CRITICAL: Skip magnetometer correction!
     else:
         q_init = initialize_quaternion_from_imu(imu_records[0].q)
         print(f"[INIT][IMU] Using IMU quaternion")
@@ -426,8 +435,9 @@ def initialize_ekf_state(kf,
     kf.x[8, 0] = q_init[2]  # y
     kf.x[9, 0] = q_init[3]  # z
     
-    # Apply magnetometer yaw correction if available (only if PPK heading not used)
-    if ppk_initial_heading is None and mag_records is not None and mag_params is not None and len(mag_records) > 0:
+    # Apply magnetometer yaw correction if available 
+    # v2.9.10.2 FIX: SKIP if using PPK attitude (either velocity or attitude yaw)
+    if not use_ppk_attitude and mag_records is not None and mag_params is not None and len(mag_records) > 0:
         from .magnetometer import calibrate_magnetometer
         
         for mag_rec in mag_records[:50]:
@@ -444,10 +454,10 @@ def initialize_ekf_state(kf,
                 
                 if applied:
                     kf.x[6:10, 0] = q_corrected
-                    print(f"[INIT][MAG] Applied magnetometer yaw correction (PPK heading not available)")
+                    print(f"[INIT][MAG] Applied magnetometer yaw correction (no PPK available)")
                 break
-    elif ppk_initial_heading is not None:
-        print(f"[INIT][MAG] Skipping magnetometer correction (using PPK heading)")
+    elif use_ppk_attitude:
+        print(f"[INIT][MAG] Skipping magnetometer correction (using PPK yaw at t=0)")
     
     # Initialize biases
     has_static_calibration = False
