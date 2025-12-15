@@ -69,7 +69,8 @@ def print_msckf_stats():
 
 
 def imu_pose_to_camera_pose(q_imu: np.ndarray, p_imu: np.ndarray, 
-                            T_body_cam: np.ndarray = None) -> Tuple[np.ndarray, np.ndarray]:
+                            T_body_cam: np.ndarray = None,
+                            global_config: dict = None) -> Tuple[np.ndarray, np.ndarray]:
     """
     Convert IMU/Body pose to camera pose using extrinsics.
     
@@ -77,13 +78,19 @@ def imu_pose_to_camera_pose(q_imu: np.ndarray, p_imu: np.ndarray,
         q_imu: IMU quaternion [w,x,y,z] representing R_WB (body-to-world)
         p_imu: IMU position [x,y,z] in world frame
         T_body_cam: Body→Camera extrinsics T_BC (4x4 matrix)
+        global_config: Global config dict (for loading BODY_T_CAMDOWN from YAML)
     
     Returns:
         q_cam: Camera quaternion [w,x,y,z] representing R_WC (camera-to-world)
         p_cam: Camera position [x,y,z] in world frame
     """
     if T_body_cam is None:
-        T_body_cam = BODY_T_CAMDOWN
+        if global_config is not None:
+            T_body_cam = global_config.get('BODY_T_CAMDOWN', np.eye(4))
+        else:
+            # Fallback: import from config (will use hardcoded default if not loaded)
+            from .config import BODY_T_CAMDOWN
+            T_body_cam = BODY_T_CAMDOWN
     
     # Extract Body→Camera transform
     R_BC = T_body_cam[:3, :3]
@@ -369,7 +376,8 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
                         kf: ExtendedKalmanFilter, use_plane_constraint: bool = True,
                         ground_altitude: float = 0.0, debug: bool = False,
                         dem_reader = None,
-                        origin_lat: float = 0.0, origin_lon: float = 0.0) -> Optional[dict]:
+                        origin_lat: float = 0.0, origin_lon: float = 0.0,
+                        global_config: dict = None) -> Optional[dict]:
     """
     Triangulate a feature using multi-view observations.
     
@@ -410,11 +418,11 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
     # Extract poses
     q_imu0 = kf.x[cs0['q_idx']:cs0['q_idx']+4, 0]
     p_imu0 = kf.x[cs0['p_idx']:cs0['p_idx']+3, 0]
-    q0, p0 = imu_pose_to_camera_pose(q_imu0, p_imu0)
+    q0, p0 = imu_pose_to_camera_pose(q_imu0, p_imu0, global_config=global_config)
     
     q_imu1 = kf.x[cs1['q_idx']:cs1['q_idx']+4, 0]
     p_imu1 = kf.x[cs1['p_idx']:cs1['p_idx']+3, 0]
-    q1, p1 = imu_pose_to_camera_pose(q_imu1, p_imu1)
+    q1, p1 = imu_pose_to_camera_pose(q_imu1, p_imu1, global_config=global_config)
     
     c0, c1 = p0, p1
     
@@ -622,7 +630,8 @@ def compute_measurement_jacobian(p_w: np.ndarray, cam_state: dict,
                                  kf: ExtendedKalmanFilter,
                                  err_state_size: int, 
                                  use_preint_jacobians: bool = True,
-                                 T_cam_imu: np.ndarray = None) -> Tuple[np.ndarray, np.ndarray]:
+                                 T_cam_imu: np.ndarray = None,
+                                 global_config: dict = None) -> Tuple[np.ndarray, np.ndarray]:
     """
     Compute measurement Jacobian for one camera observation.
     
@@ -633,11 +642,16 @@ def compute_measurement_jacobian(p_w: np.ndarray, cam_state: dict,
         err_state_size: Error state dimension
         use_preint_jacobians: Add IMU preintegration terms
         T_cam_imu: Camera-to-IMU extrinsics
+        global_config: Global config dict (for loading BODY_T_CAMDOWN from YAML)
     
     Returns: (H_cam, H_feat)
     """
     if T_cam_imu is None:
-        T_cam_imu = BODY_T_CAMDOWN
+        if global_config is not None:
+            T_cam_imu = global_config.get('BODY_T_CAMDOWN', np.eye(4))
+        else:
+            from .config import BODY_T_CAMDOWN
+            T_cam_imu = BODY_T_CAMDOWN
     
     R_cam_imu = T_cam_imu[:3, :3]
     t_cam_imu = T_cam_imu[:3, 3]
@@ -777,7 +791,8 @@ def msckf_measurement_update(fid: int, triangulated: dict, cam_observations: Lis
                              cam_states: List[dict], kf: ExtendedKalmanFilter,
                              measurement_noise: float = 1e-4,
                              huber_threshold: float = 1.345,
-                             chi2_max_dof: float = 15.36) -> Tuple[bool, float, float]:
+                             chi2_max_dof: float = 15.36,
+                             global_config: dict = None) -> Tuple[bool, float, float]:
     """
     MSCKF measurement update with observability constraints.
     
@@ -832,7 +847,8 @@ def msckf_measurement_update(fid: int, triangulated: dict, cam_observations: Lis
         r = z_obs - z_pred
         residuals.append(r)
         
-        h_cam, h_feat = compute_measurement_jacobian(p_w, cs, kf, err_state_size)
+        h_cam, h_feat = compute_measurement_jacobian(p_w, cs, kf, err_state_size, 
+                                                      global_config=global_config)
         h_x_stack.append(h_cam)
         h_f_stack.append(h_feat)
     
@@ -923,7 +939,8 @@ def msckf_measurement_update_with_plane(fid: int, triangulated: dict,
                                        cam_states: List[dict], 
                                        kf: ExtendedKalmanFilter,
                                        plane,
-                                       plane_config: dict) -> Tuple[bool, float, float]:
+                                       plane_config: dict,
+                                       global_config: dict = None) -> Tuple[bool, float, float]:
     """
     MSCKF measurement update with stacked plane constraint.
     
@@ -1211,7 +1228,8 @@ def perform_msckf_updates(vio_fe, cam_observations: List[dict],
                           dem_reader = None,
                           origin_lat: float = 0.0, origin_lon: float = 0.0,
                           plane_detector = None,
-                          plane_config: dict = None) -> int:
+                          plane_config: dict = None,
+                          global_config: dict = None) -> int:
     """
     Perform MSCKF updates for mature features.
     
@@ -1283,7 +1301,8 @@ def perform_msckf_updates(vio_fe, cam_observations: List[dict],
                                           use_plane_constraint=True, ground_altitude=0.0,
                                           debug=enable_debug,
                                           dem_reader=dem_reader,
-                                          origin_lat=origin_lat, origin_lon=origin_lon)
+                                          origin_lat=origin_lat, origin_lon=origin_lon,
+                                          global_config=global_config)
         
         if triangulated is None:
             if msckf_dbg_path:
@@ -1312,11 +1331,11 @@ def perform_msckf_updates(vio_fe, cam_observations: List[dict],
         if associated_plane is not None and plane_config.get('PLANE_USE_CONSTRAINTS', True):
             # Stacked measurement: bearing (2D per obs) + plane constraint (1D)
             success, innovation_norm, chi2_test = msckf_measurement_update_with_plane(
-                fid, triangulated, cam_observations, cam_states, kf, associated_plane, plane_config)
+                fid, triangulated, cam_observations, cam_states, kf, associated_plane, plane_config, global_config)
         else:
             # Standard MSCKF update (bearing only)
             success, innovation_norm, chi2_test = msckf_measurement_update(
-                fid, triangulated, cam_observations, cam_states, kf)
+                fid, triangulated, cam_observations, cam_states, kf, global_config=global_config)
         
         if msckf_dbg_path:
             num_obs = sum(1 for cam_obs in cam_observations 
@@ -1343,7 +1362,8 @@ def trigger_msckf_update(kf, cam_states: list, cam_observations: list,
                          dem_reader=None, origin_lat: float = 0.0,
                          origin_lon: float = 0.0,
                          plane_detector=None,
-                         plane_config: dict = None) -> int:
+                         plane_config: dict = None,
+                         global_config: dict = None) -> int:
     """
     Trigger MSCKF multi-view geometric update.
     
@@ -1398,7 +1418,8 @@ def trigger_msckf_update(kf, cam_states: list, cam_observations: list,
                 origin_lat=origin_lat,
                 origin_lon=origin_lon,
                 plane_detector=plane_detector,
-                plane_config=plane_config
+                plane_config=plane_config,
+                global_config=global_config
             )
             if num_updates > 0:
                 print(f"[MSCKF] Updated {num_updates} features at t={t:.3f}s")

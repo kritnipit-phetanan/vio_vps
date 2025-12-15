@@ -619,7 +619,7 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
         True if update was accepted, False otherwise
     """
     from scipy.spatial.transform import Rotation as R_scipy
-    from .config import CAMERA_VIEW_CONFIGS, BODY_T_CAMDOWN, BODY_T_CAMFRONT
+    from .config import CAMERA_VIEW_CONFIGS
     from .vps_integration import xy_to_latlon
     
     kb_params = global_config.get('KB_PARAMS', {'mu': 600})
@@ -632,12 +632,15 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
     )
     extrinsics_name = view_cfg['extrinsics']
     
+    # Get extrinsics from global_config (loaded from YAML) not hardcoded
     if extrinsics_name == 'BODY_T_CAMDOWN':
-        body_t_cam = BODY_T_CAMDOWN
+        body_t_cam = global_config.get('BODY_T_CAMDOWN', np.eye(4))
     elif extrinsics_name == 'BODY_T_CAMFRONT':
-        body_t_cam = BODY_T_CAMFRONT
+        body_t_cam = global_config.get('BODY_T_CAMFRONT', np.eye(4))
+    elif extrinsics_name == 'BODY_T_CAMSIDE':
+        body_t_cam = global_config.get('BODY_T_CAMSIDE', np.eye(4))
     else:
-        body_t_cam = BODY_T_CAMDOWN
+        body_t_cam = global_config.get('BODY_T_CAMDOWN', np.eye(4))
     
     R_cam_to_body = body_t_cam[:3, :3]
     

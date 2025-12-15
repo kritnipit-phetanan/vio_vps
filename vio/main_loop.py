@@ -38,7 +38,6 @@ from typing import Optional, Tuple, List, Dict, Any
 
 # Performance-critical imports moved to top-level to avoid per-iteration overhead
 from .config import load_config, CAMERA_VIEW_CONFIGS
-from .config import BODY_T_CAMDOWN, BODY_T_CAMFRONT, BODY_T_CAMSIDE
 from .data_loaders import (
     load_imu_csv, load_images, load_vps_csv, 
     load_mag_csv, load_ppk_initial_state, load_ppk_trajectory,
@@ -798,7 +797,8 @@ class VIORunner:
                             origin_lat=self.lat0,
                             origin_lon=self.lon0,
                             plane_detector=self.plane_detector,
-                            plane_config=self.global_config if self.plane_detector else None
+                            plane_config=self.global_config if self.plane_detector else None,
+                            global_config=self.global_config
                         )
                         
                         # Log FEJ consistency after MSCKF update
