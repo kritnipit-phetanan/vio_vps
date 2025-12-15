@@ -102,6 +102,20 @@ imu_gnss_extrinsics:
     - [0.0, 0.0, 1.0, -0.53470]
     - [0.0, 0.0, 0.0,  1.0]
 
+# Plane-Aided MSCKF Configuration
+# Detects planar surfaces to constrain triangulation depth
+# Helps reduce fail_depth_sign failures (43.2% in baseline)
+plane:
+  enabled: false  # Set to true to enable plane-aided MSCKF
+  min_points_per_plane: 10  # Minimum 3D points needed to fit a plane
+  angle_threshold_deg: 15.0  # Max angle difference (°) for normal clustering
+  distance_threshold_m: 0.15  # Max point-to-plane distance (m) for inliers
+  min_area_m2: 0.5  # Minimum plane area (m²) to be considered valid
+  measurement_noise_m: 0.05  # Plane constraint measurement noise (m)
+  use_aided_triangulation: true  # Project triangulated points onto detected planes
+  use_constraints: true  # Apply plane constraints as EKF updates
+  max_planes: 10  # Maximum number of planes to track simultaneously
+
 # Magnetometer Calibration
 # Data is pre-normalized (unit vectors), not in standard µT
 # Calibration recomputed using PPK GPS ground truth heading

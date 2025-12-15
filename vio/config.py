@@ -101,6 +101,20 @@ def load_config(config_path: str) -> Dict[str, Any]:
     }
     
     # ========================================
+    # Plane-Aided MSCKF Configuration
+    # ========================================
+    plane_config = config.get('plane', {})
+    result['USE_PLANE_MSCKF'] = plane_config.get('enabled', False)
+    result['PLANE_MIN_POINTS'] = plane_config.get('min_points_per_plane', 10)
+    result['PLANE_ANGLE_THRESHOLD'] = np.radians(plane_config.get('angle_threshold_deg', 15.0))
+    result['PLANE_DISTANCE_THRESHOLD'] = plane_config.get('distance_threshold_m', 0.15)
+    result['PLANE_MIN_AREA'] = plane_config.get('min_area_m2', 0.5)
+    result['PLANE_SIGMA'] = plane_config.get('measurement_noise_m', 0.05)
+    result['PLANE_USE_AIDED_TRIANGULATION'] = plane_config.get('use_aided_triangulation', True)
+    result['PLANE_USE_CONSTRAINTS'] = plane_config.get('use_constraints', True)
+    result['PLANE_MAX_PLANES'] = plane_config.get('max_planes', 10)
+    
+    # ========================================
     # Extrinsics (Camera-to-Body Transforms)
     # ========================================
     extr = config['extrinsics']

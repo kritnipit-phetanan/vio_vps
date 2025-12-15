@@ -56,6 +56,7 @@ from .propagation import (
 )
 from .vps_integration import apply_vps_update, xy_to_latlon, latlon_to_xy
 from .msckf import perform_msckf_updates, print_msckf_stats, trigger_msckf_update
+from .plane_detection import PlaneDetector
 from .measurement_updates import (
     apply_magnetometer_update, apply_dem_height_update, apply_vio_velocity_update
 )
@@ -179,6 +180,7 @@ class VIORunner:
         self.mag_list = None
         self.dem = None
         self.vio_fe = None
+        self.plane_detector = None  # Plane detection for plane-aided MSCKF
         
         # Origin coordinates
         self.lat0 = 0.0
@@ -343,6 +345,17 @@ class VIORunner:
         self.vio_fe.camera_view = self.config.camera_view
         
         print(f"[VIO] Camera view mode: {self.config.camera_view}")
+        
+        # Initialize plane detector if enabled
+        if self.global_config.get('USE_PLANE_MSCKF', False):
+            self.plane_detector = PlaneDetector(
+                min_points_per_plane=self.global_config.get('PLANE_MIN_POINTS', 10),
+                angle_threshold=self.global_config.get('PLANE_ANGLE_THRESHOLD', np.radians(15.0)),
+                distance_threshold=self.global_config.get('PLANE_DISTANCE_THRESHOLD', 0.15),
+                min_area=self.global_config.get('PLANE_MIN_AREA', 0.5)
+            )
+            print(f"[Plane-MSCKF] Enabled with min_points={self.plane_detector.min_points_per_plane}, "
+                  f"angle_thresh={np.degrees(self.plane_detector.angle_threshold):.1f}°")
     
     def _initialize_rectifier(self):
         """
@@ -777,6 +790,19 @@ class VIORunner:
                                 frame=self.vio_fe.frame_idx if self.vio_fe else 0,
                                 cam_states=self.state.cam_states,
                                 kf=self.kf
+                            )
+                        
+                        # Plane detection and plane-aided MSCKF (if enabled)
+                        if self.plane_detector is not None and num_updates > 0:
+                            from .plane_msckf import compute_msckf_with_plane_constraints
+                            compute_msckf_with_plane_constraints(
+                                kf=self.kf,
+                                cam_states=self.state.cam_states,
+                                cam_observations=self.state.cam_observations,
+                                vio_fe=self.vio_fe,
+                                plane_detector=self.plane_detector,
+                                config=self.global_config,
+                                t=t
                             )
             
             # VIO velocity update (if frontend succeeded)
