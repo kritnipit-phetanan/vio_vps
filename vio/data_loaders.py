@@ -319,84 +319,66 @@ def load_ppk_initial_state(path: str) -> Optional[PPKInitialState]:
 
 def get_ppk_initial_heading(ppk_trajectory: Optional[pd.DataFrame], 
                             lat0: float, lon0: float, 
-                            duration: float = 30.0) -> Optional[float]:
-    """Extract initial heading from PPK trajectory (first 30s).
+                            duration: float = 0.0) -> Optional[float]:
+    """Extract initial heading from PPK trajectory (GPS-denied: 2 samples only).
     
-    v2.9.10.0: Use ONLY initial heading from ground truth for initialization.
-    This complies with GPS-denied constraints - we use GT only as initializer,
-    not for continuous updates.
+    v2.9.10.1 FIX: Use ONLY first 2 samples (t=0 and t=0.05s) to compute initial velocity.
+    Previous v2.9.10.0 used 30s trajectory which violated GPS-denied constraints.
+    
+    GPS-denied compliant: Computes heading from velocity at t=0 using minimal samples.
+    This is equivalent to using initial velocity (single state value).
     
     Args:
         ppk_trajectory: PPK ground truth DataFrame
         lat0: Origin latitude (degrees)
         lon0: Origin longitude (degrees)
-        duration: Duration to extract heading from (seconds)
+        duration: DEPRECATED - now always uses 2 samples
     
     Returns:
-        Median heading in radians (ENU frame), or None if unavailable
+        Initial heading in radians (ENU frame), or None if unavailable
     """
-    if ppk_trajectory is None or len(ppk_trajectory) == 0:
+    if ppk_trajectory is None or len(ppk_trajectory) < 2:
         return None
     
     try:
-        # Extract first 30s of trajectory
-        t_start = ppk_trajectory['stamp_log'].min()
-        ppk_30s = ppk_trajectory[
-            ppk_trajectory['stamp_log'] <= t_start + duration
-        ].copy()
-        
-        if len(ppk_30s) < 5:  # Need at least 5 samples
-            return None
+        # GPS-DENIED FIX: Use ONLY first 2 samples (t=0 and t≈0.05s)
+        ppk_2samples = ppk_trajectory.iloc[:2].copy()
         
         # Convert lat/lon to local ENU coordinates
-        lats = ppk_30s['lat'].values
-        lons = ppk_30s['lon'].values
+        lats = ppk_2samples['lat'].values
+        lons = ppk_2samples['lon'].values
+        times = ppk_2samples['stamp_log'].values
         
-        x_vals = []
-        y_vals = []
-        for lat, lon in zip(lats, lons):
-            xy = latlon_to_xy(lat, lon, lat0, lon0)
-            x_vals.append(xy[0])
-            y_vals.append(xy[1])
+        xy0 = latlon_to_xy(lats[0], lons[0], lat0, lon0)
+        xy1 = latlon_to_xy(lats[1], lons[1], lat0, lon0)
         
-        x_vals = np.array(x_vals)
-        y_vals = np.array(y_vals)
+        # Compute velocity from first 2 samples only
+        dx = xy1[0] - xy0[0]
+        dy = xy1[1] - xy0[1]
+        dt = times[1] - times[0]
         
-        # Compute heading from velocity vector
-        dx = np.diff(x_vals)
-        dy = np.diff(y_vals)
-        dt = np.diff(ppk_30s['stamp_log'].values)
-        
-        # Avoid division by zero
-        valid_idx = dt > 1e-6
-        if not np.any(valid_idx):
+        if dt < 1e-6:
+            print(f"[PPK Init Heading] Error: dt too small ({dt:.6f}s)")
             return None
         
-        vx = dx[valid_idx] / dt[valid_idx]
-        vy = dy[valid_idx] / dt[valid_idx]
-        
-        # Filter out stationary periods (velocity < 0.5 m/s)
+        vx = dx / dt
+        vy = dy / dt
         vel_mag = np.sqrt(vx**2 + vy**2)
-        moving_idx = vel_mag > 0.5
         
-        if not np.any(moving_idx):
+        # Check if moving (velocity > 0.5 m/s)
+        if vel_mag < 0.5:
+            print(f"[PPK Init Heading] Warning: Vehicle stationary at t=0 (vel={vel_mag:.2f} m/s)")
             return None
         
-        vx = vx[moving_idx]
-        vy = vy[moving_idx]
+        # Compute heading from velocity vector at t=0
+        heading = np.arctan2(vy, vx)
         
-        # Compute heading: atan2(vy, vx) in ENU frame
-        headings = np.arctan2(vy, vx)
+        print(f"[PPK Init Heading] Extracted from t=0 velocity (GPS-denied compliant):")
+        print(f"  Samples: 2 (t=0 and t={dt:.3f}s)")
+        print(f"  Velocity: vx={vx:.2f}, vy={vy:.2f}, |v|={vel_mag:.2f} m/s")
+        print(f"  Heading: {np.degrees(heading):.1f}° (ENU)")
         
-        # Use median to avoid outliers
-        median_heading = np.median(headings)
-        
-        print(f"[PPK Init Heading] Extracted from first {duration}s:")
-        print(f"  Samples: {len(headings)} moving periods")
-        print(f"  Heading: {np.degrees(median_heading):.1f}° (ENU)")
-        print(f"  Std: {np.degrees(np.std(headings)):.1f}°")
-        
-        return float(median_heading)
+        return float(heading)
         
     except Exception as e:
         print(f"[WARN] Failed to extract PPK initial heading: {e}")

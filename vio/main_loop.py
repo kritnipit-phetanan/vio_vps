@@ -297,13 +297,13 @@ class VIORunner:
         })
         lever_arm = self.global_config.get('IMU_GNSS_LEVER_ARM', np.zeros(3))
         
-        # v2.9.10.0 Priority 1: Extract PPK initial heading (first 30s only)
-        # This complies with GPS-denied constraints - use GT only as initializer
+        # v2.9.10.1 FIX: Extract PPK initial heading (GPS-denied: 2 samples only)
+        # FIXED: Now uses only first 2 samples (t=0 velocity) instead of 30s trajectory
         ppk_initial_heading = None
         if self.ppk_trajectory is not None:
             from .data_loaders import get_ppk_initial_heading
             ppk_initial_heading = get_ppk_initial_heading(
-                self.ppk_trajectory, self.lat0, self.lon0, duration=30.0
+                self.ppk_trajectory, self.lat0, self.lon0
             )
         
         # MAG params for initial correction

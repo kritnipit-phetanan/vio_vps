@@ -238,7 +238,7 @@ Usage:
     from vio.propagation import VibrationDetector
 """
 
-__version__ = "2.9.10.0"
+__version__ = "2.9.10.1"
 
 # Lazy module imports - access as vio.config, vio.math_utils, etc.
 # This avoids importing all dependencies at once
