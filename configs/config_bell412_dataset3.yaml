@@ -75,15 +75,14 @@ imu:
   # Enable bias estimation from initial static samples
   estimate_bias: true
   
-  # Preintegration-specific (v2.9.9.7: INFLATED 4× to prevent filter overconfidence)
-  # CRITICAL: Diagnosis showed 11.8σ velocity error (filter too confident)
-  # Root cause: P matrix grows too slowly → filter believes estimates are more accurate than reality
-  # Solution: Increase IMU noise → faster P growth → more trust in measurements
+  # Preintegration-specific (v2.9.9.8: MODERATE 2× increase)
+  # v2.9.9.7's 4× was too aggressive → VIO_VEL acceptance dropped to 42%
+  # Strategy: Gradual increase to balance P growth with measurement gating
   preintegration:
-    acc_n: 0.80        # INCREASED 4× (was 0.20) - more IMU accel noise
-    gyr_n: 0.040       # INCREASED 4× (was 0.010) - more IMU gyro noise
-    acc_w: 0.002       # INCREASED 4× (was 0.0005) - faster accel bias random walk
-    gyr_w: 0.002       # INCREASED 4× (was 0.0005) - faster gyro bias random walk
+    acc_n: 0.40        # INCREASED 2× (was 0.20) - moderate IMU accel noise
+    gyr_n: 0.020       # INCREASED 2× (was 0.010) - moderate IMU gyro noise
+    acc_w: 0.001       # INCREASED 2× (was 0.0005) - moderate accel bias random walk
+    gyr_w: 0.001       # INCREASED 2× (was 0.0005) - moderate gyro bias random walk
 
 # IMU-GNSS Lever Arm (Body frame to GNSS antenna)
 # Source: https://mun-frl-vil-dataset.readthedocs.io/en/latest/Calibration.html#imu-gnss-extrinsic-calibration
@@ -176,12 +175,12 @@ magnetometer:
   r_inflate: 2.0                # R inflation factor for inconsistent measurements (was 5.0)
 
 # EKF Process Noise
-# v2.9.9.7: INFLATED 4× to prevent filter overconfidence
-# DIAGNOSIS: At t=19.3s, filter showed 11.8σ velocity error (actual=5.9m/s, σ=0.5m/s)
-#   → Filter too confident → rejects valid VIO_VEL updates → velocity diverges
-# SOLUTION: Increase process noise → larger P → trust measurements more
+# v2.9.9.8: MODERATE 2× increase (v2.9.9.7's 4× was too aggressive)
+# DIAGNOSIS: 4× caused VIO_VEL acceptance to drop from 90% → 42%
+#   → Innovation covariance S too large → valid updates rejected
+# SOLUTION: 2× increase balances filter confidence with measurement acceptance
 process_noise:
-  sigma_accel: 2.0           # INCREASED 4× (was 0.5) - more accel process uncertainty
+  sigma_accel: 1.0           # INCREASED 2× (was 0.5) - moderate increase
   # NOTE: sigma_vo removed - use vio.sigma_vo instead (line 211)
   sigma_vps_xy: 0.8          # VPS position measurement [m]
   sigma_agl_z: 1.0           # Height/DEM constraint

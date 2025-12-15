@@ -815,6 +815,9 @@ class VIORunner:
             # This is independent of VO (Essential matrix) success and works even with low parallax
             # Key for outdoor flights: reduce XY drift when VPS unavailable
             if self.config.use_vio_velocity and avg_flow_px > 0.5:  # Very low threshold: any motion
+                # Get ground truth error for NEES calculation (v2.9.9.8)
+                vel_error, vel_cov = self.get_ground_truth_error(t, 'velocity')
+                
                 apply_vio_velocity_update(
                     kf=self.kf,
                     r_vo_mat=r_vo_mat if ok else None,  # Can be None - will use optical flow direction
@@ -833,7 +836,9 @@ class VIORunner:
                     save_debug=self.config.save_debug_data,
                     residual_csv=self.residual_csv if self.config.save_debug_data else None,
                     vio_frame=self.state.vio_frame,
-                    vio_fe=self.vio_fe
+                    vio_fe=self.vio_fe,
+                    state_error=vel_error,  # For NEES calculation
+                    state_cov=vel_cov       # For NEES calculation
                 )
                 
                 # Increment VIO frame
@@ -888,6 +893,78 @@ class VIORunner:
             self.state.img_idx += 1
         
         return used_vo, vo_data
+    
+    def get_ground_truth_error(self, t: float, error_type: str = 'position') -> tuple:
+        """
+        Get ground truth error for NEES calculation.
+        
+        Args:
+            t: Current timestamp
+            error_type: 'position', 'velocity', or 'both'
+            
+        Returns:
+            Tuple of (state_error, state_cov) or (None, None) if unavailable
+        """
+        gt_df = self.ppk_trajectory if self.ppk_trajectory is not None else self.flight_log_df
+        if gt_df is None or len(gt_df) == 0:
+            return None, None
+        
+        try:
+            gt_idx = np.argmin(np.abs(gt_df['stamp_log'].values - t))
+            gt_row = gt_df.iloc[gt_idx]
+            use_ppk = self.ppk_trajectory is not None
+            
+            if error_type in ['position', 'both']:
+                # Position error
+                if use_ppk:
+                    gt_lat, gt_lon, gt_alt = gt_row['lat'], gt_row['lon'], gt_row['height']
+                else:
+                    gt_lat, gt_lon = gt_row['lat_dd'], gt_row['lon_dd']
+                    gt_alt = gt_row['altitude_MSL_m']
+                
+                gt_E, gt_N = latlon_to_xy(gt_lat, gt_lon, self.lat0, self.lon0)
+                gt_pos = np.array([[gt_E], [gt_N], [gt_alt]])
+                vio_pos = self.kf.x[0:3, 0:1]
+                pos_error = gt_pos - vio_pos
+                pos_cov = self.kf.P[0:3, 0:3]
+                
+                if error_type == 'position':
+                    return pos_error, pos_cov
+            
+            if error_type in ['velocity', 'both']:
+                # Velocity error (from finite difference)
+                if gt_idx > 0 and gt_idx < len(gt_df) - 1:
+                    gt_row_prev = gt_df.iloc[gt_idx - 1]
+                    gt_row_next = gt_df.iloc[gt_idx + 1]
+                    dt = gt_row_next['stamp_log'] - gt_row_prev['stamp_log']
+                    
+                    if dt > 0.01:
+                        if use_ppk:
+                            gt_E_prev, gt_N_prev = latlon_to_xy(gt_row_prev['lat'], gt_row_prev['lon'], self.lat0, self.lon0)
+                            gt_E_next, gt_N_next = latlon_to_xy(gt_row_next['lat'], gt_row_next['lon'], self.lat0, self.lon0)
+                            gt_U_prev, gt_U_next = gt_row_prev['height'], gt_row_next['height']
+                        else:
+                            gt_E_prev, gt_N_prev = latlon_to_xy(gt_row_prev['lat_dd'], gt_row_prev['lon_dd'], self.lat0, self.lon0)
+                            gt_E_next, gt_N_next = latlon_to_xy(gt_row_next['lat_dd'], gt_row_next['lon_dd'], self.lat0, self.lon0)
+                            gt_U_prev, gt_U_next = gt_row_prev['altitude_MSL_m'], gt_row_next['altitude_MSL_m']
+                        
+                        gt_vel = np.array([[(gt_E_next - gt_E_prev) / dt],
+                                          [(gt_N_next - gt_N_prev) / dt],
+                                          [(gt_U_next - gt_U_prev) / dt]])
+                        vio_vel = self.kf.x[3:6, 0:1]
+                        vel_error = gt_vel - vio_vel
+                        vel_cov = self.kf.P[3:6, 3:6]
+                        
+                        if error_type == 'velocity':
+                            return vel_error, vel_cov
+                        elif error_type == 'both':
+                            combined_error = np.vstack([pos_error, vel_error])
+                            combined_cov = self.kf.P[0:6, 0:6]
+                            return combined_error, combined_cov
+        except Exception:
+            pass
+        
+        return None, None
     
     def log_error(self, t: float):
         """

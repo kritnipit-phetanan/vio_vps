@@ -586,7 +586,9 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
                                save_debug: bool = False,
                                residual_csv: Optional[str] = None,
                                vio_frame: int = -1,
-                               vio_fe=None) -> bool:
+                               vio_fe=None,
+                               state_error: Optional[np.ndarray] = None,
+                               state_cov: Optional[np.ndarray] = None) -> bool:
     """
     Apply VIO velocity update with scale recovery and chi-square gating.
     
@@ -834,7 +836,7 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
                   f"flow={avg_flow_px:.1f}px, speed={speed_final:.2f}m/s")
             accepted = False
         
-        # Log to debug_residuals.csv
+        # Log to debug_residuals.csv (v2.9.9.8: with NEES)
         if save_debug and residual_csv:
             log_measurement_update(
                 residual_csv, t, vio_frame, 'VIO_VEL',
@@ -843,7 +845,9 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
                 chi2_threshold=chi2_threshold,
                 accepted=accepted,
                 s_matrix=s_mat,
-                p_prior=getattr(kf, 'P_prior', kf.P)
+                p_prior=getattr(kf, 'P_prior', kf.P),
+                state_error=state_error,  # Ground truth error for NEES
+                state_cov=state_cov       # Velocity covariance for NEES
             )
         
         return accepted
