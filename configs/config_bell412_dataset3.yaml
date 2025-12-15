@@ -208,7 +208,10 @@ vio:
   #          Wrong AGL → wrong VIO velocity scale (100/6.2 = 16x error!)
   # Solution: Override with reasonable helicopter cruise AGL
   # Analysis: GPS altitude varies 116-232m, so max AGL ~120m, typical ~80m
-  initial_agl_override: 100.0  # Fixed AGL [m] for VIO scale (overrides DEM-computed)
+  # initial_agl_override: 100.0  # DISABLED - v2.9.10.5 showed AGL=100m makes things WORSE
+  # v2.9.10.4 with computed AGL=6.2m: 746m error
+  # v2.9.10.5 with override AGL=100m: 1495m error (2x worse!)
+  # The computed AGL from DEM/GPS MSL difference actually works better for VIO scale
   
   # Parallax thresholds
   # CRITICAL FIX: was 1.0px but actual parallax ~0.3-0.9px during hover/slow motion
