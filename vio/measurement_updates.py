@@ -638,9 +638,33 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
     
     R_cam_to_body = body_t_cam[:3, :3]
     
-    # Map direction
-    t_norm = t_unit / (np.linalg.norm(t_unit) + 1e-12)
-    t_body = R_cam_to_body @ t_norm
+    # Map direction (from VO if available, else from optical flow)
+    if t_unit is not None and np.linalg.norm(t_unit) > 1e-6:
+        t_norm = t_unit / (np.linalg.norm(t_unit) + 1e-12)
+        t_body = R_cam_to_body @ t_norm
+    else:
+        # Fallback: use median optical flow direction (no VO available)
+        # This is the KEY for XY drift reduction when VO fails
+        if vio_fe is not None and vio_fe.last_matches is not None:
+            pts_prev, pts_cur = vio_fe.last_matches
+            if len(pts_prev) > 5:  # Need minimum features
+                flows = pts_cur - pts_prev
+                median_flow = np.median(flows, axis=0)
+                flow_norm = np.linalg.norm(median_flow)
+                if flow_norm > 1e-6:
+                    # Flow direction in normalized camera coordinates
+                    flow_dir = median_flow / flow_norm
+                    # Convert to 3D camera direction (assume small angle)
+                    t_cam_fallback = np.array([-flow_dir[0], -flow_dir[1], 0.0])
+                    t_cam_fallback = t_cam_fallback / (np.linalg.norm(t_cam_fallback) + 1e-9)
+                    t_body = R_cam_to_body @ t_cam_fallback
+                else:
+                    # No motion detected
+                    t_body = np.array([0.0, 0.0, 1.0])  # Default: forward
+            else:
+                t_body = np.array([0.0, 0.0, 1.0])
+        else:
+            t_body = np.array([0.0, 0.0, 1.0])
     
     # Get rotation from IMU quaternion
     q_imu = imu_rec.q
@@ -718,7 +742,10 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
     vel_world = Rwb @ vel_body
     
     # Determine if using VZ only (for nadir cameras)
-    use_only_vz = view_cfg.get('use_vz_only', True)
+    # Allow config override for OF-velocity drift reduction
+    use_only_vz_default = view_cfg.get('use_vz_only', True)
+    vio_config = global_config.get('vio', {})
+    use_only_vz = vio_config.get('use_only_vz', use_only_vz_default)
     
     # ESKF velocity update
     num_clones = (kf.x.shape[0] - 16) // 7

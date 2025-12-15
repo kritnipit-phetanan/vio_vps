@@ -793,19 +793,14 @@ class VIORunner:
                                 kf=self.kf
                             )
             
-            # Check if we should skip velocity update due to low parallax
-            # MOVED: This check now happens AFTER cloning/MSCKF to allow plane-aided updates
-            if is_insufficient_parallax_for_velocity:
-                print(f"[VIO] SKIPPING velocity: parallax={avg_flow_px:.2f}px < {min_parallax}px (MSCKF/plane still active)")
-                self.state.img_idx += 1
-                continue
-            
-            # VIO velocity update (if frontend succeeded AND sufficient parallax)
-            if ok and r_vo_mat is not None and t_unit is not None:
+            # Optical Flow Velocity Update - run EVERY camera frame as XY drift reduction fallback
+            # This is independent of VO (Essential matrix) success and works even with low parallax
+            # Key for outdoor flights: reduce XY drift when VPS unavailable
+            if self.config.use_vio_velocity and avg_flow_px > 0.5:  # Very low threshold: any motion
                 apply_vio_velocity_update(
                     kf=self.kf,
-                    r_vo_mat=r_vo_mat,
-                    t_unit=t_unit,
+                    r_vo_mat=r_vo_mat if ok else None,  # Can be None - will use optical flow direction
+                    t_unit=t_unit if ok else None,      # Can be None - will use optical flow direction
                     t=t,
                     dt_img=dt_img,
                     avg_flow_px=avg_flow_px,
@@ -816,7 +811,7 @@ class VIORunner:
                     lat0=self.lat0,
                     lon0=self.lon0,
                     z_state=self.config.z_state,
-                    use_vio_velocity=self.config.use_vio_velocity,
+                    use_vio_velocity=True,  # Always True when entering this block
                     save_debug=self.config.save_debug_data,
                     residual_csv=self.residual_csv if self.config.save_debug_data else None,
                     vio_frame=self.state.vio_frame,
@@ -825,29 +820,45 @@ class VIORunner:
                 
                 # Increment VIO frame
                 self.state.vio_frame = max(0, self.state.vio_frame + 1)
-                used_vo = True
+                used_vo = (ok and r_vo_mat is not None)  # Only True if VO succeeded
                 
-                # Store VO data
-                t_norm = t_unit / (np.linalg.norm(t_unit) + 1e-12)
-                vo_dx, vo_dy, vo_dz = float(t_norm[0]), float(t_norm[1]), float(t_norm[2])
-                r_eul = R_scipy.from_matrix(r_vo_mat).as_euler('zyx', degrees=True)
-                vo_y, vo_p, vo_r = float(r_eul[0]), float(r_eul[1]), float(r_eul[2])
+                # Store VO data (if available)
+                if ok and r_vo_mat is not None and t_unit is not None:
+                    t_norm = t_unit / (np.linalg.norm(t_unit) + 1e-12)
+                    vo_dx, vo_dy, vo_dz = float(t_norm[0]), float(t_norm[1]), float(t_norm[2])
+                    r_eul = R_scipy.from_matrix(r_vo_mat).as_euler('zyx', degrees=True)
+                    vo_y, vo_p, vo_r = float(r_eul[0]), float(r_eul[1]), float(r_eul[2])
+                    
+                    vo_data = {
+                        'dx': vo_dx, 'dy': vo_dy, 'dz': vo_dz,
+                        'roll': vo_r, 'pitch': vo_p, 'yaw': vo_y
+                    }
+                    
+                    rot_angle_deg = np.degrees(np.arccos(np.clip((np.trace(r_vo_mat)-1)/2, -1, 1)))
+                else:
+                    # OF-velocity fallback mode (no VO)
+                    vo_dx = vo_dy = vo_dz = 0.0
+                    vo_r = vo_p = vo_y = 0.0
+                    vo_data = None
+                    rot_angle_deg = 0.0
                 
-                vo_data = {
-                    'dx': vo_dx, 'dy': vo_dy, 'dz': vo_dz,
-                    'roll': vo_r, 'pitch': vo_p, 'yaw': vo_y
-                }
-                
-                # Log VO debug (like vio_vps.py)
-                rot_angle_deg = np.degrees(np.arccos(np.clip((np.trace(r_vo_mat)-1)/2, -1, 1)))
+                # Log VO debug
                 vel_vx = float(self.kf.x[3, 0])
                 vel_vy = float(self.kf.x[4, 0])
                 vel_vz = float(self.kf.x[5, 0])
+                
+                # Determine use_only_vz from config (for logging)
+                view_cfg = CAMERA_VIEW_CONFIGS.get(self.config.camera_view, CAMERA_VIEW_CONFIGS['nadir'])
+                use_only_vz_for_nadir = view_cfg.get('use_vz_only', True)
+                # Check if overridden by config
+                vio_config = self.global_config.get('vio', {})
+                use_only_vz = vio_config.get('use_only_vz', use_only_vz_for_nadir)
+                
                 log_vo_debug(
                     self.vo_dbg_csv, self.vio_fe.frame_idx, num_inliers, rot_angle_deg,
-                    0.0,  # alignment_deg (TODO: compute alignment with expected motion)
-                    rotation_rate_deg_s, False,  # use_only_vz (not implemented in modular version)
-                    False,  # skip_vo
+                    0.0,  # alignment_deg
+                    rotation_rate_deg_s, use_only_vz,
+                    not used_vo,  # skip_vo (True if using OF-velocity fallback)
                     vo_dx, vo_dy, vo_dz, vel_vx, vel_vy, vel_vz
                 )
                 
