@@ -98,6 +98,7 @@ python3 run_vio.py \
     --z_state msl \
     --camera_view nadir \
     --use_magnetometer \
+    --use_vio_velocity \
     --save_debug_data \
     2>&1 | tee "$OUTPUT_DIR/run.log"
 

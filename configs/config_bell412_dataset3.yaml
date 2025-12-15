@@ -252,9 +252,10 @@ use_fisheye: true
 # ZUPT (Zero Velocity Update) Configuration (v2.9.8)
 # ============================================================================
 # Detects stationary periods to apply zero-velocity constraints.
-# Tuned for helicopter with high vibration (rotor effects).
+# DISABLED for helicopters: continuous vibration prevents true zero-velocity state.
+# Use vibration detection instead for adaptive measurement uncertainty.
 zupt:
-  enabled: true                   # Enable ZUPT detection
+  enabled: false                  # DISABLED: Helicopters never truly stationary (rotor vibration)
   accel_threshold: 0.5            # Acceleration threshold [m/s²] (reduced for helicopter vibration)
   gyro_threshold: 0.05            # Gyroscope threshold [rad/s] (~3°/s)
   min_duration: 2.0               # Minimum stationary duration [seconds]
@@ -277,8 +278,9 @@ rectification:
 # ============================================================================
 # Detects when vehicle returns to previously visited location.
 # Corrects accumulated yaw drift using visual feature matching.
+# DISABLED for long-range outdoor flights without loops (CPU-intensive, low benefit)
 loop_closure:
-  use_loop_closure: true      # Enable loop closure detection
+  use_loop_closure: false     # DISABLED: No loops in long-range flight, saves 0.3-0.5s/keyframe
   position_threshold: 30.0    # Distance threshold to consider loop candidate [m]
   min_keyframe_dist: 15.0     # Minimum distance between keyframes [m]
   min_keyframe_yaw: 20.0      # Minimum yaw change between keyframes [deg]
