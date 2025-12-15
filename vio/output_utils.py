@@ -11,7 +11,95 @@ Author: VIO project
 
 import os
 import numpy as np
-from typing import Optional, Dict, List, Any
+from typing import Optional, Dict, List, Any, Tuple, Tuple
+
+
+# =============================================================================
+# Ground Truth Error Computation
+# =============================================================================
+
+def get_ground_truth_error(t: float, kf, ppk_trajectory, flight_log_df, 
+                           lat0: float, lon0: float, error_type: str = 'position') -> Tuple:
+    """
+    Get ground truth error for NEES calculation.
+    
+    Args:
+        t: Current timestamp
+        kf: Kalman filter (for state and covariance)
+        ppk_trajectory: PPK trajectory DataFrame (higher priority)
+        flight_log_df: Flight log DataFrame (fallback)
+        lat0, lon0: Reference origin for coordinate conversion
+        error_type: 'position', 'velocity', or 'both'
+        
+    Returns:
+        Tuple of (state_error, state_cov) or (None, None) if unavailable
+        
+    Note:
+        Returns (None, None) gracefully if no ground truth is available.
+        This ensures the system continues to work without GT data.
+    """
+    from .math_utils import latlon_to_xy
+    
+    gt_df = ppk_trajectory if ppk_trajectory is not None else flight_log_df
+    if gt_df is None or len(gt_df) == 0:
+        return None, None
+    
+    try:
+        gt_idx = np.argmin(np.abs(gt_df['stamp_log'].values - t))
+        gt_row = gt_df.iloc[gt_idx]
+        use_ppk = ppk_trajectory is not None
+        
+        if error_type in ['position', 'both']:
+            # Position error
+            if use_ppk:
+                gt_lat, gt_lon, gt_alt = gt_row['lat'], gt_row['lon'], gt_row['height']
+            else:
+                gt_lat, gt_lon = gt_row['lat_dd'], gt_row['lon_dd']
+                gt_alt = gt_row['altitude_MSL_m']
+            
+            gt_E, gt_N = latlon_to_xy(gt_lat, gt_lon, lat0, lon0)
+            gt_pos = np.array([[gt_E], [gt_N], [gt_alt]])
+            vio_pos = kf.x[0:3, 0:1]
+            pos_error = gt_pos - vio_pos
+            pos_cov = kf.P[0:3, 0:3]
+            
+            if error_type == 'position':
+                return pos_error, pos_cov
+        
+        if error_type in ['velocity', 'both']:
+            # Velocity error (from finite difference)
+            if gt_idx > 0 and gt_idx < len(gt_df) - 1:
+                gt_row_prev = gt_df.iloc[gt_idx - 1]
+                gt_row_next = gt_df.iloc[gt_idx + 1]
+                dt = gt_row_next['stamp_log'] - gt_row_prev['stamp_log']
+                
+                if dt > 0.01:
+                    if use_ppk:
+                        gt_E_prev, gt_N_prev = latlon_to_xy(gt_row_prev['lat'], gt_row_prev['lon'], lat0, lon0)
+                        gt_E_next, gt_N_next = latlon_to_xy(gt_row_next['lat'], gt_row_next['lon'], lat0, lon0)
+                        gt_U_prev, gt_U_next = gt_row_prev['height'], gt_row_next['height']
+                    else:
+                        gt_E_prev, gt_N_prev = latlon_to_xy(gt_row_prev['lat_dd'], gt_row_prev['lon_dd'], lat0, lon0)
+                        gt_E_next, gt_N_next = latlon_to_xy(gt_row_next['lat_dd'], gt_row_next['lon_dd'], lat0, lon0)
+                        gt_U_prev, gt_U_next = gt_row_prev['altitude_MSL_m'], gt_row_next['altitude_MSL_m']
+                    
+                    gt_vel = np.array([[(gt_E_next - gt_E_prev) / dt],
+                                      [(gt_N_next - gt_N_prev) / dt],
+                                      [(gt_U_next - gt_U_prev) / dt]])
+                    vio_vel = kf.x[3:6, 0:1]
+                    vel_error = gt_vel - vio_vel
+                    vel_cov = kf.P[3:6, 3:6]
+                    
+                    if error_type == 'velocity':
+                        return vel_error, vel_cov
+                    elif error_type == 'both':
+                        combined_error = np.vstack([pos_error, vel_error])
+                        combined_cov = kf.P[0:6, 0:6]
+                        return combined_error, combined_cov
+    except Exception:
+        pass
+    
+    return None, None
 
 
 # =============================================================================
