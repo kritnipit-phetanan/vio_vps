@@ -104,6 +104,7 @@ python3 run_vio.py \
     --img_h 1080 \
     --z_state msl \
     --camera_view nadir \
+    --estimate_imu_bias \
     --use_magnetometer \
     --use_vio_velocity \
     --save_debug_data 2>&1 | tee "$OUTPUT_DIR/run.log"
