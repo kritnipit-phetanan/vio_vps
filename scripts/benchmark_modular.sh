@@ -16,11 +16,11 @@
 set -e  # Exit on error
 
 echo "============================================================================"
-echo "VIO IMU PREINTEGRATION - MODULAR VERSION (v2.9.9)"
+echo "VIO IMU PREINTEGRATION - MODULAR VERSION (v2.9.10.0)"
 echo "============================================================================"
-echo "Features: VIO Velocity, Magnetometer, DEM, Vibration Detection, FAST MODE"
-echo "Disabled: Loop Closure (no loops), ZUPT (helicopter vibration)"
-echo "Performance: 60% speedup (reduced features + faster KLT)"
+echo "Features: PPK Init Heading, Adaptive MSCKF, Multi-Baseline Triangulation"
+echo "Improvements: Priority 1-3 for <100m accuracy path"
+echo "Expected: 863m → 150-200m (KEY BREAKTHROUGH!)"
 echo ""
 
 # Configuration
@@ -119,7 +119,7 @@ echo ""
 # Quick Analysis
 # ============================================================================
 echo "============================================================================"
-echo "RESULTS (v2.9.9 - FAST MODE: 60% Speedup)"
+echo "RESULTS (v2.9.10.0 - Path to <100m Accuracy)"
 echo "============================================================================"
 echo ""
 

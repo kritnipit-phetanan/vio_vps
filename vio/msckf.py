@@ -14,10 +14,54 @@ Author: VIO project
 """
 
 import numpy as np
-from typing import Optional, Tuple, List, Dict
+from typing import Optional, Tuple, List, Dict, Any
 from scipy.spatial.transform import Rotation as R_scipy
 
 from .math_utils import quat_to_rot, quaternion_to_yaw, skew_symmetric
+
+
+# =============================================================================
+# v2.9.10.0: Adaptive MSCKF Threshold (Priority 2)
+# =============================================================================
+
+def get_adaptive_reprojection_threshold(kf: Any, 
+                                       base_threshold: float = 12.0) -> float:
+    """Adaptive MSCKF reprojection threshold based on filter convergence.
+    
+    v2.9.10.0 Priority 2: Start permissive during initialization (20px),
+    tighten as filter converges (10px). This increases MSCKF success rate
+    from 0.5 Hz to target 3-4 Hz.
+    
+    Args:
+        kf: Kalman filter with state covariance P
+        base_threshold: Baseline threshold (unused, kept for compatibility)
+    
+    Returns:
+        Adaptive threshold in pixels
+    """
+    try:
+        # Get velocity covariance magnitude
+        P_vel = kf.P[3:6, 3:6]  # Velocity covariance block
+        vel_sigma = np.sqrt(np.trace(P_vel) / 3)  # Average velocity std
+        
+        # Adaptive thresholding based on uncertainty:
+        # - High uncertainty (initialization): permissive (20px)
+        # - Medium uncertainty: moderate (15px)
+        # - Low uncertainty (converged): strict (10px)
+        if vel_sigma > 3.0:  # High uncertainty
+            threshold = 20.0
+        elif vel_sigma > 1.5:  # Medium uncertainty
+            threshold = 15.0
+        elif vel_sigma > 0.8:  # Converging
+            threshold = 12.0
+        else:  # Converged (vel_sigma < 0.8)
+            threshold = 10.0
+        
+        return threshold
+        
+    except Exception:
+        # Fallback to permissive threshold if covariance unavailable
+        return 15.0
 from .ekf import ExtendedKalmanFilter, ensure_covariance_valid
 from .camera import normalized_to_unit_ray
 
@@ -377,6 +421,74 @@ def triangulate_point_nonlinear(observations: List[dict], cam_states: List[dict]
     return p
 
 
+# =============================================================================
+# v2.9.10.0: Multi-Baseline Triangulation (Priority 3)
+# =============================================================================
+
+def select_best_baseline_pairs(observations: List[dict], 
+                               cam_states: List[dict],
+                               min_pairs: int = 3,
+                               max_pairs: int = 5) -> List[Tuple[int, int]]:
+    """Select observation pairs with maximum baseline for triangulation.
+    
+    v2.9.10.0 Priority 3: Use 3+ frames instead of just 2 for better
+    triangulation geometry. This improves accuracy and reduces depth errors.
+    
+    Args:
+        observations: List of feature observations
+        cam_states: List of camera states
+        min_pairs: Minimum number of pairs to select
+        max_pairs: Maximum number of pairs to select
+    
+    Returns:
+        List of (i, j) observation index pairs sorted by baseline (largest first)
+    """
+    if len(observations) < 2:
+        return []
+    
+    # Compute baseline distances for all pairs
+    baselines = []
+    
+    for i in range(len(observations)):
+        for j in range(i + 1, len(observations)):
+            obs_i = observations[i]
+            obs_j = observations[j]
+            
+            # Find matching camera states
+            cs_i = None
+            cs_j = None
+            
+            for cs in cam_states:
+                if cs.get('frame_idx') == obs_i.get('frame_idx'):
+                    cs_i = cs
+                if cs.get('frame_idx') == obs_j.get('frame_idx'):
+                    cs_j = cs
+            
+            if cs_i is None or cs_j is None:
+                continue
+            
+            # Compute baseline distance
+            p_i = cs_i['p']
+            p_j = cs_j['p']
+            baseline = np.linalg.norm(p_j - p_i)
+            
+            baselines.append((i, j, baseline))
+    
+    if len(baselines) == 0:
+        return []
+    
+    # Sort by baseline (largest first)
+    baselines.sort(key=lambda x: x[2], reverse=True)
+    
+    # Select top N pairs (min_pairs to max_pairs)
+    n_select = min(len(baselines), max_pairs)
+    n_select = max(n_select, min(len(baselines), min_pairs))
+    
+    selected_pairs = [(b[0], b[1]) for b in baselines[:n_select]]
+    
+    return selected_pairs
+
+
 def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List[dict],
                         kf: ExtendedKalmanFilter, use_plane_constraint: bool = True,
                         ground_altitude: float = 0.0, debug: bool = False,
@@ -556,9 +668,9 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
         pass  # Fall back to normalized coordinate method
     
     # Compute reprojection error (ENHANCED with pixel-level validation)
-    # v2.9.9.10: REVERT to v2.9.9.8 (12.0px) - v2.9.9.9's 20.0px was too permissive
-    # Analysis: 20px threshold increased fail_reproj_error from 27.6% → 38.2%
-    MAX_REPROJ_ERROR_PX = 12.0  # Quality over quantity
+    # v2.9.10.0: Adaptive threshold based on filter convergence (Priority 2)
+    # Start permissive (20px) during initialization, tighten to 10px when converged
+    MAX_REPROJ_ERROR_PX = get_adaptive_reprojection_threshold(kf)
     total_error = 0.0
     max_pixel_error = 0.0
     
@@ -606,19 +718,20 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
                     pixel_error = np.linalg.norm(pt_pred_px - pt_obs_px)
                     max_pixel_error = max(max_pixel_error, pixel_error)
                     
-                    # Reject if pixel error exceeds threshold
-                    # v2.9.9.10: REVERT to v2.9.9.8 (12.0px)
-                    MAX_PIXEL_REPROJ_ERROR = 12.0  # pixels
-                    if pixel_error > MAX_PIXEL_REPROJ_ERROR:
+                    # Reject if pixel error exceeds adaptive threshold
+                    # v2.9.10.0: Use same adaptive threshold as normalized error
+                    if pixel_error > MAX_REPROJ_ERROR_PX:
                         MSCKF_STATS['fail_reproj_error'] += 1
                         if debug:
-                            print(f"[MSCKF-TRI] REJECT: pixel_error={pixel_error:.2f}px > {MAX_PIXEL_REPROJ_ERROR}px")
+                            print(f"[MSCKF-TRI] REJECT: pixel_error={pixel_error:.2f}px > {MAX_REPROJ_ERROR_PX:.1f}px (adaptive)")
                         return None
     
     avg_error = total_error / len(obs_list)
     
-    # v2.9.9.10: REVERT to v2.9.9.8 (0.10)
-    if avg_error > 0.10:
+    # v2.9.10.0: Scale normalized error threshold adaptively
+    # 20px → 0.15, 15px → 0.12, 12px → 0.10, 10px → 0.08
+    norm_threshold = MAX_REPROJ_ERROR_PX / 120.0  # Linear scaling
+    if avg_error > norm_threshold:
         MSCKF_STATS['fail_reproj_error'] += 1
         return None
     

@@ -330,7 +330,8 @@ def initialize_ekf_state(kf,
                          initial_gyro_bias: Optional[np.ndarray] = None,
                          initial_accel_bias: Optional[np.ndarray] = None,
                          mag_records: Optional[list] = None,
-                         mag_params: Optional[dict] = None) -> InitialState:
+                         mag_params: Optional[dict] = None,
+                         ppk_initial_heading: Optional[float] = None) -> InitialState:
     """
     Complete EKF state initialization.
     
@@ -403,9 +404,19 @@ def initialize_ekf_state(kf,
     kf.x[3:6, 0] = v_init_enu
     
     # Initialize quaternion
-    if ppk_state is not None:
+    # v2.9.10.0 Priority 1: Use PPK initial heading if available (first 30s only)
+    if ppk_initial_heading is not None:
+        # Use PPK heading (ENU frame) with zero roll/pitch
+        # This complies with GPS-denied constraints - GT only as initializer
+        from scipy.spatial.transform import Rotation as R_scipy
+        R_init = R_scipy.from_euler('ZYX', [ppk_initial_heading, 0.0, 0.0])
+        q_xyzw = R_init.as_quat()  # [x, y, z, w]
+        q_init = np.array([q_xyzw[3], q_xyzw[0], q_xyzw[1], q_xyzw[2]])  # [w, x, y, z]
+        print(f"[INIT][PPK HEADING] Using PPK initial heading: {np.degrees(ppk_initial_heading):.1f}° (ENU)")
+        print(f"[INIT][PPK HEADING] Quaternion: w={q_init[0]:.4f}, x={q_init[1]:.4f}, y={q_init[2]:.4f}, z={q_init[3]:.4f}")
+    elif ppk_state is not None:
         q_init, _ = initialize_quaternion_from_ppk(ppk_state)
-        print(f"[INIT][PPK] Using PPK attitude")
+        print(f"[INIT][PPK] Using full PPK attitude")
     else:
         q_init = initialize_quaternion_from_imu(imu_records[0].q)
         print(f"[INIT][IMU] Using IMU quaternion")
@@ -415,8 +426,8 @@ def initialize_ekf_state(kf,
     kf.x[8, 0] = q_init[2]  # y
     kf.x[9, 0] = q_init[3]  # z
     
-    # Apply magnetometer yaw correction if available
-    if mag_records is not None and mag_params is not None and len(mag_records) > 0:
+    # Apply magnetometer yaw correction if available (only if PPK heading not used)
+    if ppk_initial_heading is None and mag_records is not None and mag_params is not None and len(mag_records) > 0:
         from .magnetometer import calibrate_magnetometer
         
         for mag_rec in mag_records[:50]:
@@ -433,7 +444,10 @@ def initialize_ekf_state(kf,
                 
                 if applied:
                     kf.x[6:10, 0] = q_corrected
+                    print(f"[INIT][MAG] Applied magnetometer yaw correction (PPK heading not available)")
                 break
+    elif ppk_initial_heading is not None:
+        print(f"[INIT][MAG] Skipping magnetometer correction (using PPK heading)")
     
     # Initialize biases
     has_static_calibration = False

@@ -297,6 +297,15 @@ class VIORunner:
         })
         lever_arm = self.global_config.get('IMU_GNSS_LEVER_ARM', np.zeros(3))
         
+        # v2.9.10.0 Priority 1: Extract PPK initial heading (first 30s only)
+        # This complies with GPS-denied constraints - use GT only as initializer
+        ppk_initial_heading = None
+        if self.ppk_trajectory is not None:
+            from .data_loaders import get_ppk_initial_heading
+            ppk_initial_heading = get_ppk_initial_heading(
+                self.ppk_trajectory, self.lat0, self.lon0, duration=30.0
+            )
+        
         # MAG params for initial correction
         mag_params = None
         if self.config.use_magnetometer and len(self.mag_list) > 0:
@@ -322,7 +331,8 @@ class VIORunner:
             initial_gyro_bias=self.global_config.get('INITIAL_GYRO_BIAS'),
             initial_accel_bias=self.global_config.get('INITIAL_ACCEL_BIAS'),
             mag_records=self.mag_list if mag_params else None,
-            mag_params=mag_params
+            mag_params=mag_params,
+            ppk_initial_heading=ppk_initial_heading  # v2.9.10.0 Priority 1
         )
         
         return init_state

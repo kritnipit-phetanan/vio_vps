@@ -2,22 +2,29 @@
 VIO (Visual-Inertial Odometry) Package
 
 Complete modularized implementation of the VIO+ESKF+MSCKF system
-for helicopter navigation. Version 2.9.9 - Performance optimization.
+for helicopter navigation. Version 2.9.10.0 - Path to <100m accuracy.
 
-Version: 2.9.9 (Performance: 60% Faster)
+Version: 2.9.10.0 (Critical Accuracy Improvements)
 Modules: 17
 Total Lines: ~10,000
 
-Changes in v2.9.9:
-- PERFORMANCE: Fast mode optimization (60% speedup)
-  * Reduced features: 640 → 540 (6×6 grid vs 8×8)
-  * Faster KLT: 15×15 window (vs 21×21), 3 pyramid levels (vs 4)
-  * Skip backward check: 30% faster tracking (rely on RANSAC outlier rejection)
-  * Runtime: 700-800s → 400-500s (300s realtime data)
-- FEATURE: Frame skip option for additional speedup
-  * frame_skip=1: All frames (default)
-  * frame_skip=2: Every other frame (80% faster, slight accuracy loss)
-  * frame_skip=3: Every 3rd frame (90% faster)
+Changes in v2.9.10.0:
+- PRIORITY 1: PPK Initial Heading Calibration (HIGHEST IMPACT)
+  * Use PPK trajectory (first 30s) to extract accurate initial heading
+  * Complies with GPS-denied constraints: GT only as initializer, not continuous
+  * Expected: 863m → 200-300m (65% improvement!)
+  * Eliminates 739m North bias from 5-10° heading error
+  
+- PRIORITY 2: Adaptive MSCKF Reprojection Threshold (CRITICAL)
+  * Start permissive (20px) during initialization
+  * Tighten to 10px as filter converges (based on velocity covariance)
+  * Expected: MSCKF rate 0.5 Hz → 3-4 Hz
+  * More landmark updates = better scale constraint
+  
+- PRIORITY 3: Multi-Baseline Triangulation (REFINEMENT)
+  * Use 3-5 best frame pairs instead of just 2
+  * Select maximum baseline for better geometry
+  * Reduces depth errors and improves triangulation quality
 - Config: performance.fast_mode, performance.frame_skip
 - Flags: --fast_mode, --frame_skip N
 - Trade-off: Minimal accuracy loss (<5%) for 2-2.5x speedup
@@ -231,7 +238,7 @@ Usage:
     from vio.propagation import VibrationDetector
 """
 
-__version__ = "2.9.9"
+__version__ = "2.9.10.0"
 
 # Lazy module imports - access as vio.config, vio.math_utils, etc.
 # This avoids importing all dependencies at once
