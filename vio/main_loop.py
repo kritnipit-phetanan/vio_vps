@@ -457,8 +457,11 @@ class VIORunner:
         if self.config.save_debug_data:
             cal_path = os.path.join(self.config.output_dir, "debug_calibration.txt")
             
-            # Get camera view config
-            view_cfg = CAMERA_VIEW_CONFIGS.get(self.config.camera_view, CAMERA_VIEW_CONFIGS['nadir'])
+            # Get camera view config from loaded YAML (not hardcoded defaults)
+            view_cfg = self.global_config.get('CAMERA_VIEW_CONFIGS', {}).get(
+                self.config.camera_view,
+                CAMERA_VIEW_CONFIGS.get(self.config.camera_view, CAMERA_VIEW_CONFIGS['nadir'])
+            )
             
             kb_params = self.global_config.get('KB_PARAMS', {})
             imu_params = self.global_config.get('IMU_PARAMS', {})
