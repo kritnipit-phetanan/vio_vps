@@ -779,7 +779,9 @@ class VIORunner:
                             msckf_dbg_csv=self.msckf_dbg_csv if hasattr(self, 'msckf_dbg_csv') else None,
                             dem_reader=self.dem,
                             origin_lat=self.lat0,
-                            origin_lon=self.lon0
+                            origin_lon=self.lon0,
+                            plane_detector=self.plane_detector,
+                            plane_config=self.global_config if self.plane_detector else None
                         )
                         
                         # Log FEJ consistency after MSCKF update
@@ -790,22 +792,6 @@ class VIORunner:
                                 frame=self.vio_fe.frame_idx if self.vio_fe else 0,
                                 cam_states=self.state.cam_states,
                                 kf=self.kf
-                            )
-                        
-                        # Plane detection and plane-aided MSCKF (if enabled)
-                        if self.plane_detector is not None and num_updates > 0:
-                            from .plane_msckf import compute_msckf_with_plane_constraints
-                            compute_msckf_with_plane_constraints(
-                                kf=self.kf,
-                                cam_states=self.state.cam_states,
-                                cam_observations=self.state.cam_observations,
-                                vio_fe=self.vio_fe,
-                                plane_detector=self.plane_detector,
-                                config=self.global_config,
-                                t=t,
-                                dem_reader=self.dem,
-                                origin_lat=self.lat0,
-                                origin_lon=self.lon0
                             )
             
             # VIO velocity update (if frontend succeeded)

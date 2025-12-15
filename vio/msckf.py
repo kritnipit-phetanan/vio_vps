@@ -912,14 +912,225 @@ def msckf_measurement_update(fid: int, triangulated: dict, cam_observations: Lis
         return (False, innovation_norm, np.nan)
 
 
+def msckf_measurement_update_with_plane(fid: int, triangulated: dict, 
+                                       cam_observations: List[dict],
+                                       cam_states: List[dict], 
+                                       kf: ExtendedKalmanFilter,
+                                       plane,
+                                       plane_config: dict) -> Tuple[bool, float, float]:
+    """
+    MSCKF measurement update with stacked plane constraint.
+    
+    Stacked measurement model (following OpenVINS ov_plane):
+        [z_bearing]   [H_bearing  ]   [0]
+        [z_plane  ] = [H_plane    ] + [ε]
+    
+    where:
+        - z_bearing: 2D bearing measurements (standard MSCKF)
+        - z_plane: 1D point-on-plane constraint (n^T * p + d = 0)
+    
+    Args:
+        fid: Feature ID
+        triangulated: Triangulation result with 'p_w' (3D point)
+        cam_observations: All observations
+        cam_states: Camera states
+        kf: EKF
+        plane: Detected plane (with normal n and distance d)
+        plane_config: Plane configuration dict
+    
+    Returns: (success, innovation_norm, chi2_test)
+    """
+    from .plane_utils import compute_plane_jacobian
+    
+    # =========================================================================
+    # Part 1: Standard MSCKF bearing measurements
+    # =========================================================================
+    point_world = triangulated['p_w']
+    obs_list = triangulated['observations']
+    
+    if len(obs_list) < 2:
+        return (False, 0.0, 0.0)
+    
+    # Build bearing Jacobian (same as standard MSCKF)
+    err_state_size = 15 + 6 * len(cam_states)
+    meas_dim_bearing = 2 * len(obs_list)
+    
+    h_bearing = np.zeros((meas_dim_bearing, err_state_size))
+    r_bearing = np.zeros(meas_dim_bearing)
+    
+    for i, obs_data in enumerate(obs_list):
+        cam_id = obs_data['cam_id']
+        if cam_id >= len(cam_states):
+            continue
+        
+        cs = cam_states[cam_id]
+        q_imu = kf.x[cs['q_idx']:cs['q_idx']+4, 0]
+        p_imu = kf.x[cs['p_idx']:cs['p_idx']+3, 0]
+        
+        q_cam, p_cam = imu_pose_to_camera_pose(q_imu, p_imu)
+        q_xyzw = np.array([q_cam[1], q_cam[2], q_cam[3], q_cam[0]])
+        R_cw = R_scipy.from_quat(q_xyzw).as_matrix()
+        R_wc = R_cw.T
+        
+        p_c = R_wc @ (point_world - p_cam)
+        
+        if p_c[2] < 0.1:
+            return (False, 0.0, 0.0)
+        
+        # Bearing measurement
+        xn_pred = p_c[0] / p_c[2]
+        yn_pred = p_c[1] / p_c[2]
+        
+        xn_obs, yn_obs = obs_data['pt_norm']
+        
+        r_bearing[2*i] = xn_obs - xn_pred
+        r_bearing[2*i+1] = yn_obs - yn_pred
+        
+        # Jacobian (standard MSCKF)
+        z_inv = 1.0 / p_c[2]
+        z_inv2 = z_inv * z_inv
+        
+        J_proj = np.array([
+            [z_inv, 0, -p_c[0]*z_inv2],
+            [0, z_inv, -p_c[1]*z_inv2]
+        ])
+        
+        J_point = J_proj @ R_wc
+        J_q = -J_proj @ R_cw @ skew_symmetric(p_c)
+        J_p = -J_proj @ R_wc
+        
+        clone_idx_err = 15 + 6 * cam_id
+        h_bearing[2*i:2*i+2, clone_idx_err:clone_idx_err+3] = J_q
+        h_bearing[2*i:2*i+2, clone_idx_err+3:clone_idx_err+6] = J_p
+    
+    # =========================================================================
+    # Part 2: Plane constraint measurement
+    # =========================================================================
+    # Measurement: z_plane = n^T * p + d = 0 (ideal)
+    # Residual: r_plane = n^T * p_w + d
+    
+    residual_plane = plane.point_distance(point_world)
+    
+    # Jacobian w.r.t. point (not used here, but for reference)
+    # H_point = n^T (1x3)
+    
+    # Jacobian w.r.t. camera states (through triangulated point)
+    # Since point is not in state, we approximate H_plane from bearing sensitivities
+    # Following ov_plane: use weighted combination of bearing Jacobians
+    
+    # Simplified approach: H_plane ≈ weighted average of bearing contributions
+    # More rigorous: recompute ∂p/∂cam_states from triangulation
+    
+    h_plane = np.zeros((1, err_state_size))
+    n = plane.normal
+    
+    # Approximate: weight bearing Jacobians by point sensitivity
+    for i, obs_data in enumerate(obs_list):
+        cam_id = obs_data['cam_id']
+        if cam_id >= len(cam_states):
+            continue
+        
+        cs = cam_states[cam_id]
+        q_imu = kf.x[cs['q_idx']:cs['q_idx']+4, 0]
+        p_imu = kf.x[cs['p_idx']:cs['p_idx']+3, 0]
+        
+        q_cam, p_cam = imu_pose_to_camera_pose(q_imu, p_imu)
+        q_xyzw = np.array([q_cam[1], q_cam[2], q_cam[3], q_cam[0]])
+        R_cw = R_scipy.from_quat(q_xyzw).as_matrix()
+        R_wc = R_cw.T
+        
+        p_c = R_wc @ (point_world - p_cam)
+        depth = p_c[2]
+        
+        # Sensitivity of point to camera pose (simplified)
+        clone_idx_err = 15 + 6 * cam_id
+        
+        # ∂p_w/∂θ_cam ≈ -R_wc @ [p_c]×
+        J_p_theta = -R_wc @ skew_symmetric(p_c)
+        
+        # ∂p_w/∂p_cam = R_wc @ (-I) = -R_wc
+        J_p_pos = -R_wc
+        
+        # ∂(n^T*p)/∂cam_state
+        h_plane[0, clone_idx_err:clone_idx_err+3] += n @ J_p_theta / len(obs_list)
+        h_plane[0, clone_idx_err+3:clone_idx_err+6] += n @ J_p_pos / len(obs_list)
+    
+    # =========================================================================
+    # Part 3: Stack measurements and update
+    # =========================================================================
+    meas_dim_total = meas_dim_bearing + 1
+    h_stacked = np.vstack([h_bearing, h_plane])
+    r_stacked = np.concatenate([r_bearing, [residual_plane]])
+    
+    # Measurement noise
+    sigma_bearing = 1e-4  # Standard MSCKF bearing noise
+    sigma_plane = plane_config.get('PLANE_SIGMA', 0.05)
+    
+    R_stacked = np.eye(meas_dim_total)
+    R_stacked[:meas_dim_bearing, :meas_dim_bearing] *= sigma_bearing
+    R_stacked[-1, -1] = sigma_plane ** 2
+    
+    # Observability constraint (same as standard MSCKF)
+    U_nullspace = get_msckf_nullspace(kf, len(cam_states))
+    
+    if U_nullspace is not None and U_nullspace.shape[0] == h_stacked.shape[1]:
+        A_proj = np.eye(h_stacked.shape[1]) - U_nullspace @ U_nullspace.T
+        h_weighted = h_stacked @ A_proj
+        r_weighted = r_stacked
+    else:
+        h_weighted = h_stacked
+        r_weighted = r_stacked
+    
+    # Chi-square gating
+    s_mat = h_weighted @ kf.P @ h_weighted.T + R_stacked
+    innovation_norm = float(np.linalg.norm(r_weighted))
+    
+    try:
+        s_inv = np.linalg.inv(s_mat)
+        chi2_test = float(r_weighted.T @ s_inv @ r_weighted)
+        
+        chi2_threshold = 15.36 * meas_dim_total  # Same as standard MSCKF
+        
+        if chi2_test > chi2_threshold:
+            return (False, innovation_norm, chi2_test)
+    except np.linalg.LinAlgError:
+        return (False, innovation_norm, np.nan)
+    
+    # EKF update
+    try:
+        k_gain = kf.P @ h_weighted.T @ s_inv
+        delta_x = k_gain @ r_weighted
+        
+        kf._apply_error_state_correction(delta_x)
+        
+        i_kh = np.eye(err_state_size) - k_gain @ h_weighted
+        kf.P = i_kh @ kf.P @ i_kh.T + k_gain @ R_stacked @ k_gain.T
+        
+        kf.P = ensure_covariance_valid(kf.P, label="MSCKF-Plane-Update", 
+                                        symmetrize=True, check_psd=True)
+        
+        kf.x_post = kf.x.copy()
+        kf.P_post = kf.P.copy()
+        
+        return (True, innovation_norm, chi2_test)
+    except (np.linalg.LinAlgError, ValueError):
+        return (False, innovation_norm, np.nan)
+
+
 def perform_msckf_updates(vio_fe, cam_observations: List[dict],
                           cam_states: List[dict], kf: ExtendedKalmanFilter,
                           min_observations: int = 3, max_features: int = 50,
                           msckf_dbg_path: str = None,
                           dem_reader = None,
-                          origin_lat: float = 0.0, origin_lon: float = 0.0) -> int:
+                          origin_lat: float = 0.0, origin_lon: float = 0.0,
+                          plane_detector = None,
+                          plane_config: dict = None) -> int:
     """
     Perform MSCKF updates for mature features.
+    
+    Optionally uses plane-aided MSCKF with stacked measurements:
+    - Standard bearing measurements (2D per observation)
+    - Point-on-plane constraint (1D per plane-associated feature)
     
     Args:
         vio_fe: VIO frontend
@@ -931,6 +1142,8 @@ def perform_msckf_updates(vio_fe, cam_observations: List[dict],
         msckf_dbg_path: Debug log path
         dem_reader: DEM reader for ground constraint
         origin_lat/origin_lon: Local projection origin
+        plane_detector: PlaneDetector for plane-aided MSCKF (optional)
+        plane_config: Plane configuration dict (optional)
     
     Returns: Number of successful updates
     """
@@ -947,6 +1160,36 @@ def perform_msckf_updates(vio_fe, cam_observations: List[dict],
     
     num_successful = 0
     
+    # =========================================================================
+    # Plane Detection (if enabled)
+    # =========================================================================
+    detected_planes = []
+    triangulated_points = {}
+    
+    if plane_detector is not None and plane_config is not None:
+        # First pass: triangulate all mature features to build point cloud
+        for fid in mature_fids:
+            tri_result = triangulate_feature(fid, cam_observations, cam_states, kf,
+                                            use_plane_constraint=True, ground_altitude=0.0,
+                                            debug=False,
+                                            dem_reader=dem_reader,
+                                            origin_lat=origin_lat, origin_lon=origin_lon)
+            if tri_result is not None:
+                triangulated_points[fid] = tri_result['p_w']
+        
+        # Detect planes from triangulated point cloud
+        if len(triangulated_points) >= 10:
+            points_array = np.array(list(triangulated_points.values()))
+            try:
+                detected_planes = plane_detector.detect_planes(points_array)
+                if len(detected_planes) > 0:
+                    print(f"[MSCKF-PLANE] Detected {len(detected_planes)} planes from {len(points_array)} points")
+            except Exception as e:
+                print(f"[MSCKF-PLANE] Plane detection failed: {e}")
+    
+    # =========================================================================
+    # MSCKF Updates with Optional Plane Constraints
+    # =========================================================================
     for i, fid in enumerate(mature_fids):
         enable_debug = (i < 3)
         triangulated = triangulate_feature(fid, cam_observations, cam_states, kf, 
@@ -964,8 +1207,29 @@ def perform_msckf_updates(vio_fe, cam_observations: List[dict],
                     mf.write(f"{vio_fe.frame_idx},{fid},{num_obs},0,nan,nan,0,nan\n")
             continue
         
-        success, innovation_norm, chi2_test = msckf_measurement_update(
-            fid, triangulated, cam_observations, cam_states, kf)
+        # Check if feature is associated with a plane
+        associated_plane = None
+        if len(detected_planes) > 0 and plane_config is not None:
+            point_3d = triangulated['p_w']
+            distance_threshold = plane_config.get('PLANE_DISTANCE_THRESHOLD', 0.15)
+            
+            # Find nearest plane
+            min_dist = float('inf')
+            for plane in detected_planes:
+                dist = abs(plane.point_distance(point_3d))
+                if dist < min_dist and dist < distance_threshold:
+                    min_dist = dist
+                    associated_plane = plane
+        
+        # MSCKF update with optional plane constraint
+        if associated_plane is not None and plane_config.get('PLANE_USE_CONSTRAINTS', True):
+            # Stacked measurement: bearing (2D per obs) + plane constraint (1D)
+            success, innovation_norm, chi2_test = msckf_measurement_update_with_plane(
+                fid, triangulated, cam_observations, cam_states, kf, associated_plane, plane_config)
+        else:
+            # Standard MSCKF update (bearing only)
+            success, innovation_norm, chi2_test = msckf_measurement_update(
+                fid, triangulated, cam_observations, cam_states, kf)
         
         if msckf_dbg_path:
             num_obs = sum(1 for cam_obs in cam_observations 
@@ -990,7 +1254,9 @@ def trigger_msckf_update(kf, cam_states: list, cam_observations: list,
                          vio_fe, t: float = 0.0,
                          msckf_dbg_csv: Optional[str] = None,
                          dem_reader=None, origin_lat: float = 0.0,
-                         origin_lon: float = 0.0) -> int:
+                         origin_lon: float = 0.0,
+                         plane_detector=None,
+                         plane_config: dict = None) -> int:
     """
     Trigger MSCKF multi-view geometric update.
     
@@ -1043,7 +1309,9 @@ def trigger_msckf_update(kf, cam_states: list, cam_observations: list,
                 msckf_dbg_path=msckf_dbg_csv,
                 dem_reader=dem_reader,
                 origin_lat=origin_lat,
-                origin_lon=origin_lon
+                origin_lon=origin_lon,
+                plane_detector=plane_detector,
+                plane_config=plane_config
             )
             if num_updates > 0:
                 print(f"[MSCKF] Updated {num_updates} features at t={t:.3f}s")
