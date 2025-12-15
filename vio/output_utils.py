@@ -31,7 +31,7 @@ def log_measurement_update(residual_csv: Optional[str], t: float, frame: int,
         t: Current timestamp
         frame: Current VIO frame index (-1 if not applicable)
         update_type: Type of update ('VPS', 'VIO_VEL', 'MAG', 'DEM', 'MSCKF', 'ZUPT')
-        innovation: Innovation vector (residual)
+        innovation: Innovation vector (residual) - can be 1D or 2D (Nx1)
         mahalanobis_dist: Mahalanobis distance (for gating)
         chi2_threshold: Chi-square threshold for acceptance
         accepted: Whether update was accepted
@@ -51,10 +51,13 @@ def log_measurement_update(residual_csv: Optional[str], t: float, frame: int,
             except np.linalg.LinAlgError:
                 pass
         
-        # Format innovation vector
-        innov_x = float(innovation[0]) if len(innovation) > 0 else float('nan')
-        innov_y = float(innovation[1]) if len(innovation) > 1 else float('nan')
-        innov_z = float(innovation[2]) if len(innovation) > 2 else float('nan')
+        # Flatten innovation to 1D array
+        innov_flat = innovation.flatten()
+        
+        # Format innovation vector (handle 1D, 2D, 3D)
+        innov_x = float(innov_flat[0]) if len(innov_flat) > 0 else float('nan')
+        innov_y = float(innov_flat[1]) if len(innov_flat) > 1 else float('nan')
+        innov_z = float(innov_flat[2]) if len(innov_flat) > 2 else float('nan')
         
         nees = float('nan')  # Would need ground truth
         
@@ -400,7 +403,8 @@ class DebugCSVWriters:
 def save_calibration_log(output_path: str, camera_view: str, view_cfg: Dict,
                          kb_params: Dict, imu_params: Dict, mag_params: Dict,
                          noise_params: Dict, vio_params: Dict,
-                         initial_state: Dict, estimate_imu_bias: bool):
+                         initial_state: Dict, estimate_imu_bias: bool,
+                         plane_config: Optional[Dict] = None):
     """
     Save calibration snapshot for reproducibility.
     
@@ -415,6 +419,7 @@ def save_calibration_log(output_path: str, camera_view: str, view_cfg: Dict,
         vio_params: VIO quality control parameters
         initial_state: Initial state values
         estimate_imu_bias: Whether bias estimation was enabled
+        plane_config: Plane-Aided MSCKF configuration (optional)
     """
     try:
         with open(output_path, "w") as f:
@@ -424,6 +429,14 @@ def save_calibration_log(output_path: str, camera_view: str, view_cfg: Dict,
             f.write(f"  Mode: {camera_view}\n")
             f.write(f"  Extrinsics: {view_cfg.get('extrinsics', 'N/A')}\n")
             f.write(f"  Nadir threshold: {view_cfg.get('nadir_threshold', 'N/A')}°\n\n")
+            
+            # VIO parameters from view config
+            f.write("[VIO Parameters]\n")
+            f.write(f"  use_vz_only: {view_cfg.get('use_vz_only', 'N/A')}\n")
+            f.write(f"  sigma_scale_xy: {view_cfg.get('sigma_scale_xy', 'N/A')}\n")
+            f.write(f"  sigma_scale_z: {view_cfg.get('sigma_scale_z', 'N/A')}\n")
+            f.write(f"  min_parallax: {view_cfg.get('min_parallax', 'N/A')}\n")
+            f.write(f"  max_corners: {view_cfg.get('max_corners', 'N/A')}\n\n")
             
             f.write("[Camera Intrinsics - Kannala-Brandt]\n")
             for key, val in kb_params.items():
@@ -444,6 +457,19 @@ def save_calibration_log(output_path: str, camera_view: str, view_cfg: Dict,
             for key, val in vio_params.items():
                 f.write(f"  {key}: {val}\n")
             f.write("\n")
+            
+            # Plane-Aided MSCKF
+            if plane_config:
+                f.write("[Plane-Aided MSCKF]\n")
+                f.write(f"  Enabled: {plane_config.get('enabled', False)}\n")
+                if plane_config.get('enabled', False):
+                    f.write(f"  Min points per plane: {plane_config.get('min_points_per_plane', 10)}\n")
+                    f.write(f"  Angle threshold: {plane_config.get('angle_threshold_deg', 15.0)}°\n")
+                    f.write(f"  Distance threshold: {plane_config.get('distance_threshold_m', 0.15)} m\n")
+                    f.write(f"  Min plane area: {plane_config.get('min_area_m2', 0.5)} m²\n")
+                    f.write(f"  Use aided triangulation: {plane_config.get('use_aided_triangulation', True)}\n")
+                    f.write(f"  Use constraints: {plane_config.get('use_constraints', True)}\n")
+                f.write("\n")
             
             f.write("[Magnetometer Calibration]\n")
             for key, val in mag_params.items():

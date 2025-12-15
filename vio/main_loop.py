@@ -483,6 +483,9 @@ class VIORunner:
                 'lon0': self.lon0,
                 'alt0': getattr(self, 'alt0', 0.0),
             }
+            # Get plane config
+            plane_config = self.global_config.get('plane', None)
+            
             save_calibration_log(
                 output_path=cal_path,
                 camera_view=self.config.camera_view,
@@ -493,7 +496,8 @@ class VIORunner:
                 noise_params=noise_params,
                 vio_params=vio_params,
                 initial_state=initial_state,
-                estimate_imu_bias=self.config.estimate_imu_bias
+                estimate_imu_bias=self.config.estimate_imu_bias,
+                plane_config=plane_config
             )
             print(f"[DEBUG] Calibration snapshot saved: {cal_path}")
     

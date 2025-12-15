@@ -108,8 +108,7 @@ python3 run_vio.py \
     --use_vio_velocity \
     --save_debug_data \
     --fast_mode \
-    --frame_skip 1 \
-    2>&1 | tee "$OUTPUT_DIR/run.log"
+    --frame_skip 1 2>&1 | tee "$OUTPUT_DIR/run.log"
 
 END_TIME=$(date +%s.%N)
 RUNTIME=$(echo "$END_TIME - $START_TIME" | bc)
