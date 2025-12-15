@@ -682,9 +682,14 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
         agl = abs(kf.x[2, 0] - dem_now)
     agl = max(1.0, agl)
     
+    # Get flow threshold from config (default 0.3px for slow motion)
+    vio_config = global_config.get('vio', {})
+    min_flow_px = vio_config.get('min_parallax_px', 0.3)
+    
     # Optical flow-based scale
+    # CRITICAL FIX v2.9.8.4: Use config threshold, not hard-coded 2.0
     focal_px = kb_params.get('mu', 600)
-    if dt_img > 1e-4 and avg_flow_px > 2.0:
+    if dt_img > 1e-4 and avg_flow_px > min_flow_px:
         scale_flow = agl / focal_px
         speed_final = (avg_flow_px / dt_img) * scale_flow
     else:
@@ -692,8 +697,16 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
     
     speed_final = min(speed_final, 50.0)  # Clamp to 50 m/s
     
+    # Adaptive R scaling for low flow - increase uncertainty when flow is small
+    # This prevents low-quality flow from dominating the filter
+    flow_quality_scale = 1.0
+    if avg_flow_px < 1.0:
+        flow_quality_scale = 3.0  # 3x uncertainty for very low flow
+    elif avg_flow_px < 2.0:
+        flow_quality_scale = 1.5 + (2.0 - avg_flow_px)  # Linear scale 1.5-2.5x
+    
     # Compute velocity in world frame with rotational flow compensation
-    if avg_flow_px > 2.0 and vio_fe is not None and vio_fe.last_matches is not None:
+    if avg_flow_px > min_flow_px and vio_fe is not None and vio_fe.last_matches is not None:
         pts_prev, pts_cur = vio_fe.last_matches
         if len(pts_prev) > 0:
             # Get gyro angular velocity in body frame
@@ -755,7 +768,8 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
         h_vel = np.zeros((1, err_dim), dtype=float)
         h_vel[0, 5] = 1.0
         vel_meas = np.array([[vel_world[2]]])
-        r_mat = np.array([[(sigma_vo * view_cfg.get('sigma_scale_z', 2.0))**2]])
+        # Apply flow quality scaling to uncertainty
+        r_mat = np.array([[(sigma_vo * view_cfg.get('sigma_scale_z', 2.0) * flow_quality_scale)**2]])
     else:
         h_vel = np.zeros((3, err_dim), dtype=float)
         h_vel[0, 3] = 1.0
@@ -764,7 +778,12 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
         vel_meas = vel_world.reshape(-1, 1)
         scale_xy = view_cfg.get('sigma_scale_xy', 1.0)
         scale_z = view_cfg.get('sigma_scale_z', 2.0)
-        r_mat = np.diag([(sigma_vo * scale_xy)**2, (sigma_vo * scale_xy)**2, (sigma_vo * scale_z)**2])
+        # Apply flow quality scaling to uncertainty (more for XY since direction is less reliable)
+        r_mat = np.diag([
+            (sigma_vo * scale_xy * flow_quality_scale * 1.5)**2,  # Extra 1.5x for XY
+            (sigma_vo * scale_xy * flow_quality_scale * 1.5)**2,
+            (sigma_vo * scale_z * flow_quality_scale)**2
+        ])
     
     def h_fun(x, h=h_vel):
         return h
@@ -797,13 +816,14 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
         if chi2_value < chi2_threshold:
             # Accept update
             kf.update(z=vel_meas, HJacobian=h_fun, Hx=hx_fun, R=r_mat)
+            vo_mode = "VO" if (t_unit is not None and np.linalg.norm(t_unit) > 1e-6) else "OF-fallback"
             print(f"[VIO] Velocity update: speed={speed_final:.2f}m/s, vz_only={use_only_vz}, "
-                  f"chi2={chi2_value:.2f}")
+                  f"flow={avg_flow_px:.1f}px, R_scale={flow_quality_scale:.1f}x, mode={vo_mode}, chi2={chi2_value:.2f}")
             accepted = True
         else:
             # Reject outlier
             print(f"[VIO] Velocity REJECTED: chi2={chi2_value:.2f} > {chi2_threshold:.1f}, "
-                  f"mahal={mahal_dist:.2f}")
+                  f"flow={avg_flow_px:.1f}px, speed={speed_final:.2f}m/s")
             accepted = False
         
         # Log to debug_residuals.csv

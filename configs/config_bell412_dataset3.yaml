@@ -226,10 +226,10 @@ vio:
   views:
     nadir:
       nadir_threshold_deg: 30.0
-      sigma_scale_xy: 2.0          # INCREASED: trust XY even less when using VZ only
+      sigma_scale_xy: 3.0          # INCREASED: high uncertainty for XY from nadir flow
       sigma_scale_z: 2.0           # Nadir camera has GOOD Z observability actually
-      use_vz_only: true             # CRITICAL FIX: Use only vertical velocity (horizontal direction unknown)
-      min_parallax: 0.5            # Reasonable minimum for quality
+      use_vz_only: false           # CRITICAL FIX v2.9.8.4: Enable XY velocity (was true)
+      min_parallax: 0.3            # LOWERED: accept slow motion flow (was 0.5)
       max_corners: 2500            # More features for stability
     
     front:
