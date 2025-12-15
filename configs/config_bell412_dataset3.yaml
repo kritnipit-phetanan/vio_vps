@@ -75,14 +75,14 @@ imu:
   # Enable bias estimation from initial static samples
   estimate_bias: true
   
-  # Preintegration-specific (v2.9.9.11: MAXIMUM 4× increase)
-  # v2.9.9.10 with 3× showed 6.8σ overconfidence (better, but still > 3σ target)
-  # Strategy: Increase to 4× to reach target velocity σ of 2-3 m/s (< 3σ)
+  # Preintegration-specific (v2.9.9.10: AGGRESSIVE 3× increase)
+  # v2.9.9.9 with 2× still showed 13.1σ overconfidence
+  # Strategy: Increase to 3× to reach target velocity σ of 2-3 m/s
   preintegration:
-    acc_n: 0.80        # INCREASED 4× (was 0.20) - maximum IMU accel noise
-    gyr_n: 0.040       # INCREASED 4× (was 0.010) - maximum IMU gyro noise
-    acc_w: 0.0020      # INCREASED 4× (was 0.0005) - maximum accel bias random walk
-    gyr_w: 0.0020      # INCREASED 4× (was 0.0005) - maximum gyro bias random walk
+    acc_n: 0.60        # INCREASED 3× (was 0.20) - aggressive IMU accel noise
+    gyr_n: 0.030       # INCREASED 3× (was 0.010) - aggressive IMU gyro noise
+    acc_w: 0.0015      # INCREASED 3× (was 0.0005) - aggressive accel bias random walk
+    gyr_w: 0.0015      # INCREASED 3× (was 0.0005) - aggressive gyro bias random walk
 
 # IMU-GNSS Lever Arm (Body frame to GNSS antenna)
 # Source: https://mun-frl-vil-dataset.readthedocs.io/en/latest/Calibration.html#imu-gnss-extrinsic-calibration
@@ -175,15 +175,16 @@ magnetometer:
   r_inflate: 2.0                # R inflation factor for inconsistent measurements (was 5.0)
 
 # EKF Process Noise
-# v2.9.10.2: Reduced magnetometer influence due to unreliable readings
-# DIAGNOSIS: v2.9.10.1 showed mag yaw causing +30°/-30° oscillations
-#   → Mag is not trustworthy, increase sigma to reduce weight
+# v2.9.9.10: AGGRESSIVE 3× increase (v2.9.9.9's 2× still showed 13.1σ overconfidence)
+# DIAGNOSIS: v2.9.9.9 velocity σ = 0.5 m/s, but actual error = 6.5 m/s
+#   → Filter severely overconfident, NEES = 1903 (should be ~3.0)
+# SOLUTION: 3× increase to reach target velocity σ of 2-3 m/s
 process_noise:
-  sigma_accel: 2.0           # INCREASED 4× (was 0.5) - maximum increase
+  sigma_accel: 1.5           # INCREASED 3× (was 0.5) - aggressive increase
   # NOTE: sigma_vo removed - use vio.sigma_vo instead (line 211)
   sigma_vps_xy: 0.8          # VPS position measurement [m]
   sigma_agl_z: 1.0           # Height/DEM constraint
-  sigma_mag_yaw: 0.50        # v2.9.10.2: INCREASED to ~29° (was 0.15=9°) - mag unreliable
+  sigma_mag_yaw: 0.15        # RE-ENABLED: ~17° (std from GPS calibration = 16°, add margin)
 
 # VIO/VO Parameters
 # TUNED FOR SLOW MOTION / HOVERING (Bell 412 dataset characteristics)
