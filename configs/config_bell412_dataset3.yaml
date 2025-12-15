@@ -106,7 +106,7 @@ imu_gnss_extrinsics:
 # Detects planar surfaces to constrain triangulation depth
 # Helps reduce fail_depth_sign failures (43.2% in baseline)
 plane:
-  enabled: false  # Set to true to enable plane-aided MSCKF
+  enabled: true  # ENABLED for Phase 3 testing
   min_points_per_plane: 10  # Minimum 3D points needed to fit a plane
   angle_threshold_deg: 15.0  # Max angle difference (°) for normal clustering
   distance_threshold_m: 0.15  # Max point-to-plane distance (m) for inliers

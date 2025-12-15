@@ -33,15 +33,16 @@ def plane_aided_triangulation(fid: int,
                               cam_states: List[Dict],
                               kf: ExtendedKalmanFilter,
                               plane: Plane,
-                              K: np.ndarray,
-                              body_T_cam: np.ndarray) -> Tuple[Optional[np.ndarray], str]:
+                              dem_reader=None,
+                              origin_lat: float = 0.0,
+                              origin_lon: float = 0.0) -> Tuple[Optional[np.ndarray], str]:
     """
     Triangulate feature with plane constraint.
     
     Strategy:
         1. Do standard triangulation (2-view or multi-view)
         2. Project result onto plane
-        3. Re-refine with plane constraint
+        3. Return projected point with validation
     
     Args:
         fid: Feature ID
@@ -49,23 +50,25 @@ def plane_aided_triangulation(fid: int,
         cam_states: List of camera state dicts
         kf: ExtendedKalmanFilter
         plane: Plane constraint
-        K: Camera intrinsic matrix
-        body_T_cam: Body-to-camera transform
+        dem_reader: Optional DEM reader
+        origin_lat/origin_lon: Local projection origin
     
     Returns:
         point_world: Triangulated 3D point in world frame (or None)
         status: Success/failure reason
     """
-    # Import here to avoid circular dependency
-    from .msckf import triangulate_feature
-    
     # Step 1: Standard triangulation
-    point_world, status = triangulate_feature(
-        fid, cam_observations, cam_states, kf, K, body_T_cam
+    result = triangulate_feature(
+        fid, cam_observations, cam_states, kf,
+        dem_reader=dem_reader,
+        origin_lat=origin_lat,
+        origin_lon=origin_lon
     )
     
-    if point_world is None:
-        return None, f"standard_triangulation_failed: {status}"
+    if result is None:
+        return None, "standard_triangulation_failed"
+    
+    point_world = result['p_w']
     
     # Step 2: Check distance to plane
     dist_to_plane = plane.point_distance(point_world)
@@ -77,7 +80,7 @@ def plane_aided_triangulation(fid: int,
     # Step 3: Project onto plane
     point_on_plane = plane.project_point(point_world)
     
-    # Step 4: Verify reprojection error with projected point
+    # Step 4: Return projected point
     # (Optional: could re-refine here with plane constraint in optimization)
     
     return point_on_plane, f"plane_aided_projected_dist_{abs(dist_to_plane):.3f}m"
@@ -286,7 +289,10 @@ def compute_msckf_with_plane_constraints(kf,
                                          vio_fe,
                                          plane_detector,
                                          config: Dict,
-                                         t: float = 0.0) -> Tuple[int, int, int]:
+                                         t: float = 0.0,
+                                         dem_reader=None,
+                                         origin_lat: float = 0.0,
+                                         origin_lon: float = 0.0) -> Tuple[int, int, int]:
     """
     Enhanced MSCKF with plane constraints.
     
@@ -300,6 +306,8 @@ def compute_msckf_with_plane_constraints(kf,
         plane_detector: PlaneDetector instance
         config: Configuration dict with plane parameters
         t: Current timestamp
+        dem_reader: Optional DEM reader
+        origin_lat/origin_lon: Local projection origin
     
     Returns:
         num_updates: Number of successful MSCKF updates
@@ -312,23 +320,14 @@ def compute_msckf_with_plane_constraints(kf,
     sigma_plane = config.get('PLANE_SIGMA', 0.05)
     distance_threshold = config.get('PLANE_DISTANCE_THRESHOLD', 0.15)
     
-    # Get camera parameters
-    kb_params = config.get('KB_PARAMS', {})
-    body_T_cam = config.get('BODY_T_CAM0', np.eye(4))
-    
-    # Build simple K matrix for triangulation
-    K = np.array([
-        [kb_params['mu'], 0, kb_params['u0']],
-        [0, kb_params['mv'], kb_params['v0']],
-        [0, 0, 1]
-    ], dtype=np.float64)
-    
-    num_updates = 0
     num_plane_aided = 0
     num_plane_constrained = 0
+    num_planes_detected = 0
     
-    # Collect triangulated points from features
-    triangulated_points = {}
+    # =========================================================================
+    # Step 1: Triangulate all mature features to get 3D point cloud
+    # =========================================================================
+    triangulated_points = {}  # fid -> 3D point
     
     # Get all mature features (seen in multiple views)
     feature_obs_count = {}
@@ -339,19 +338,95 @@ def compute_msckf_with_plane_constraints(kf,
     
     mature_features = [fid for fid, count in feature_obs_count.items() if count >= 2]
     
-    # Extract 3D points (need to implement or call from MSCKF)
-    # For now, skip actual triangulation - plane detection needs point cloud
+    if len(mature_features) < 10:
+        # Not enough points for plane detection
+        return 0, 0, 0
     
-    # Detect planes from existing MSCKF triangulated points
-    # This is a placeholder - real implementation would extract points from vio_fe
-    if len(mature_features) > 10:
-        print(f"[PLANE-MSCKF] {len(mature_features)} mature features at t={t:.3f}s")
+    # Triangulate all mature features
+    for fid in mature_features:
+        result = triangulate_feature(
+            fid, cam_observations, cam_states, kf,
+            dem_reader=dem_reader,
+            origin_lat=origin_lat,
+            origin_lon=origin_lon
+        )
         
-        # TODO: Implement full plane-aided MSCKF pipeline:
-        # 1. Extract triangulated 3D points from MSCKF
-        # 2. Run plane_detector.detect_planes()
-        # 3. Associate features to planes
-        # 4. Apply plane-aided triangulation
-        # 5. Apply plane constraint updates
+        if result is not None:
+            triangulated_points[fid] = result['p_w']
     
-    return num_updates, num_plane_aided, num_plane_constrained
+    if len(triangulated_points) < 10:
+        return 0, 0, 0
+    
+    # =========================================================================
+    # Step 2: Detect planes from triangulated point cloud
+    # =========================================================================
+    points_array = np.array(list(triangulated_points.values()))
+    
+    try:
+        planes = plane_detector.detect_planes(points_array)
+        num_planes_detected = len(planes)
+        
+        if num_planes_detected > 0:
+            print(f"[PLANE-MSCKF] Detected {num_planes_detected} planes from {len(points_array)} points at t={t:.3f}s")
+    except Exception as e:
+        print(f"[PLANE-MSCKF] Plane detection failed: {e}")
+        return 0, 0, 0
+    
+    if num_planes_detected == 0:
+        return 0, 0, 0
+    
+    # =========================================================================
+    # Step 3: Associate features to planes
+    # =========================================================================
+    feature_tracks = []
+    for fid in triangulated_points.keys():
+        feature_tracks.append({'fid': fid})
+    
+    associations = associate_features_to_planes(
+        feature_tracks, triangulated_points, planes, distance_threshold
+    )
+    
+    # =========================================================================
+    # Step 4: Apply plane-aided triangulation (re-triangulate with constraint)
+    # =========================================================================
+    if use_aided_triangulation:
+        for fid, plane_id in associations.items():
+            plane = next((p for p in planes if p.id == plane_id), None)
+            if plane is None:
+                continue
+            
+            # Re-triangulate with plane constraint
+            point_aided, status = plane_aided_triangulation(
+                fid, cam_observations, cam_states, kf, plane,
+                dem_reader=dem_reader,
+                origin_lat=origin_lat,
+                origin_lon=origin_lon
+            )
+            
+            if point_aided is not None:
+                triangulated_points[fid] = point_aided
+                num_plane_aided += 1
+    
+    # =========================================================================
+    # Step 5: Apply plane constraint EKF updates
+    # =========================================================================
+    if use_constraints:
+        for fid, plane_id in associations.items():
+            plane = next((p for p in planes if p.id == plane_id), None)
+            if plane is None:
+                continue
+            
+            point = triangulated_points[fid]
+            point_cov = np.eye(3) * 1.0  # Rough covariance estimate
+            
+            success, reason = apply_plane_constraint_update(
+                kf, plane, point, point_cov, fid, sigma_plane, save_debug=False
+            )
+            
+            if success:
+                num_plane_constrained += 1
+    
+    print(f"[PLANE-MSCKF] Summary: {num_planes_detected} planes, "
+          f"{num_plane_aided} aided, {num_plane_constrained} constrained")
+    
+    return num_planes_detected, num_plane_aided, num_plane_constrained

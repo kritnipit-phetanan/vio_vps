@@ -802,7 +802,10 @@ class VIORunner:
                                 vio_fe=self.vio_fe,
                                 plane_detector=self.plane_detector,
                                 config=self.global_config,
-                                t=t
+                                t=t,
+                                dem_reader=self.dem,
+                                origin_lat=self.lat0,
+                                origin_lon=self.lon0
                             )
             
             # VIO velocity update (if frontend succeeded)
