@@ -549,9 +549,9 @@ def apply_loop_closure_correction(kf, relative_yaw: float, kf_idx: int,
         from .math_utils import quaternion_to_yaw
         
         # Get expected yaw difference from stored keyframe
-        kf = loop_detector.keyframes[kf_idx]
+        stored_kf = loop_detector.keyframes[kf_idx]
         current_yaw = quaternion_to_yaw(kf.x[6:10, 0].flatten())
-        expected_yaw_diff = current_yaw - kf['yaw']
+        expected_yaw_diff = current_yaw - stored_kf['yaw']
         
         # Yaw correction (innovation)
         yaw_error = relative_yaw - expected_yaw_diff
