@@ -189,6 +189,10 @@ process_noise:
 # Key fix: min_msckf_baseline reduced from 0.03 → 0.01 to allow more triangulation
 # (observed baseline ~0.026m was failing the 0.03m threshold)
 vio:
+  # Enable optical flow velocity updates (v2.9.8.2: gyro-compensated)
+  # Helps reduce XY drift in outdoor long-range flights without VPS
+  use_vio_velocity: true     # Enable optical flow → velocity → EKF updates
+  
   # Parallax thresholds
   # CRITICAL FIX: was 1.0px but actual parallax ~0.3-0.9px during hover/slow motion
   # VIO velocity was ALWAYS SKIPPED because parallax < threshold
@@ -202,6 +206,11 @@ vio:
   # Feature tracking
   min_inliers: 6             # Minimum RANSAC inliers
   ratio_test: 0.80           # Lowe's ratio test threshold (more permissive)
+  
+  # Optical flow velocity parameters (v2.9.8.2)
+  sigma_vo: 0.5              # Velocity measurement uncertainty [m/s]
+  min_tracked_features: 50   # Minimum features for velocity update
+  fast_rotation_threshold: 0.5236  # Skip if rotation > 30°/s (rad/s)
   
   # Camera view configurations
   # CRITICAL FIX: use_vz_only=true for nadir camera

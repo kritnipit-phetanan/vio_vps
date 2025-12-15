@@ -1214,6 +1214,12 @@ class VIORunner:
         # Load configuration
         if self.config.config_yaml:
             self.load_config()
+            
+            # Override config parameters from YAML if specified
+            vio_config = self.global_config.get('vio', {})
+            if 'use_vio_velocity' in vio_config:
+                self.config.use_vio_velocity = vio_config['use_vio_velocity']
+                print(f"[CONFIG] use_vio_velocity: {self.config.use_vio_velocity}")
         
         # Load data
         self.load_data()
