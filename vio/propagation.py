@@ -504,7 +504,7 @@ def apply_zupt(kf: ExtendedKalmanFilter, v_mag: float,
                 p_prior=kf.P
             )
         except Exception as e:
-            pass  # Don't fail ZUPT if logging fails
+            print(f"[ZUPT] Warning: Failed to log to debug_residuals.csv: {e}")
     
     updated_count = consecutive_stationary_count + 1
     

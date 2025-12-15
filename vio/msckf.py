@@ -489,9 +489,15 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
     depth0 = np.dot(p_init - c0, ray0_w)
     depth1 = np.dot(p_init - c1, ray1_w)
     
-    # LOWERED v2.9.8: 5m → 1m for nadir hovering (helicopter altitude 3-4m)
-    # Old threshold rejected valid triangulations during low-altitude operations
-    if depth0 < 1.0 or depth1 < 1.0:
+    # FIXED v2.9.8: Separate sign check from magnitude check
+    # Sign check: Depth must be positive (feature in front of camera)
+    if depth0 <= 0.0 or depth1 <= 0.0:
+        MSCKF_STATS['fail_depth_sign'] += 1
+        return None
+    
+    # Magnitude check: Allow 0.1m to 500m (relaxed minimum for close features)
+    # Note: 0.1m minimum catches numerical errors, real features start at ~0.5m
+    if depth0 < 0.1 or depth1 < 0.1:
         MSCKF_STATS['fail_depth_sign'] += 1
         return None
     

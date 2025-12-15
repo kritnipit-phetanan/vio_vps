@@ -148,7 +148,7 @@ def apply_plane_constraint_update(kf: ExtendedKalmanFilter,
     
     # Chi-square gating
     m2 = residual**2 / S[0, 0]
-    chi2_threshold = 5.99  # 95% confidence, 1 DOF
+    chi2_threshold = 3.84  # 95% confidence, 1 DOF (corrected from 5.99 which is 2 DOF)
     
     if m2 > chi2_threshold:
         return False, f"plane_constraint_rejected_chi2_{m2:.2f}"
