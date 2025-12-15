@@ -731,16 +731,15 @@ class VIORunner:
             if self.config.use_preintegration and ongoing_preint is not None:
                 apply_preintegration_at_camera(self.kf, ongoing_preint, t, imu_params)
             
-            # Check parallax for VIO velocity update
-            is_insufficient_parallax = avg_flow_px < min_parallax
+            # Check parallax for different purposes
+            # CRITICAL CHANGE: Separate low-parallax handling for velocity vs MSCKF/plane
+            # - Low parallax (<2px): Skip velocity update, but ALLOW cloning/MSCKF
+            # - This lets plane-aided MSCKF help even in nadir scenarios
+            is_insufficient_parallax_for_velocity = avg_flow_px < min_parallax
             
-            if is_insufficient_parallax:
-                print(f"[VIO] SKIPPING velocity: parallax={avg_flow_px:.2f}px < {min_parallax}px")
-                self.state.img_idx += 1
-                continue
-            
-            # Camera cloning for MSCKF
-            clone_threshold = min_parallax * 2.0
+            # Camera cloning for MSCKF (lower threshold than velocity)
+            # Allow cloning even with low parallax to enable plane-aided MSCKF
+            clone_threshold = min_parallax * 0.5  # Much lower: 1px instead of 4px
             should_clone = avg_flow_px >= clone_threshold and not is_fast_rotation
             
             if should_clone:
@@ -794,7 +793,14 @@ class VIORunner:
                                 kf=self.kf
                             )
             
-            # VIO velocity update (if frontend succeeded)
+            # Check if we should skip velocity update due to low parallax
+            # MOVED: This check now happens AFTER cloning/MSCKF to allow plane-aided updates
+            if is_insufficient_parallax_for_velocity:
+                print(f"[VIO] SKIPPING velocity: parallax={avg_flow_px:.2f}px < {min_parallax}px (MSCKF/plane still active)")
+                self.state.img_idx += 1
+                continue
+            
+            # VIO velocity update (if frontend succeeded AND sufficient parallax)
             if ok and r_vo_mat is not None and t_unit is not None:
                 apply_vio_velocity_update(
                     kf=self.kf,
