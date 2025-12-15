@@ -331,7 +331,8 @@ class VIOFrontEnd:
                         good_mask = good_mask & (fb_err < 2.0)
                         good_mask = good_mask & (err.reshape(-1) < 8.0)
                     else:
-                        # Fast mode: forward tracking only
+                        # Fast mode: forward tracking only (no backward check)
+                        fb_err = np.zeros(len(p1))  # No backward error in fast mode
                         flow_mag = np.linalg.norm(p1.reshape(-1, 2) - p0.reshape(-1, 2), axis=1)
                         good_mask = (st.reshape(-1) == 1) & (err.reshape(-1) < 8.0)
                     good_mask = good_mask & (flow_mag < 200.0)

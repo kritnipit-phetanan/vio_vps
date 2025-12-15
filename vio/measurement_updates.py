@@ -625,8 +625,11 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
     kb_params = global_config.get('KB_PARAMS', {'mu': 600})
     sigma_vo = global_config.get('SIGMA_VO', 0.5)
     
-    # Get camera extrinsics
-    view_cfg = CAMERA_VIEW_CONFIGS.get(camera_view, CAMERA_VIEW_CONFIGS['nadir'])
+    # Get camera view config from loaded YAML (not hardcoded defaults)
+    view_cfg = global_config.get('CAMERA_VIEW_CONFIGS', {}).get(
+        camera_view,
+        CAMERA_VIEW_CONFIGS.get(camera_view, CAMERA_VIEW_CONFIGS['nadir'])
+    )
     extrinsics_name = view_cfg['extrinsics']
     
     if extrinsics_name == 'BODY_T_CAMDOWN':
