@@ -179,7 +179,7 @@ magnetometer:
 # Re-enabled magnetometer updates with appropriate uncertainty
 process_noise:
   sigma_accel: 0.5           # Process accel noise
-  sigma_vo_vel: 4.0          # VIO velocity uncertainty (was 8.0, can trust more with mag heading)
+  # NOTE: sigma_vo removed - use vio.sigma_vo instead (line 211)
   sigma_vps_xy: 0.8          # VPS position measurement [m]
   sigma_agl_z: 1.0           # Height/DEM constraint
   sigma_mag_yaw: 0.15        # RE-ENABLED: ~17° (std from GPS calibration = 16°, add margin)
@@ -216,7 +216,8 @@ vio:
   # Default: nadir camera uses VZ only (use_vz_only=True from camera view config)
   # For outdoor long-range flights with gyro-compensated optical flow: set False
   # This enables XY velocity updates that reduce drift when VPS unavailable
-  use_only_vz: false         # Enable XY velocity updates (v2.9.8.2+)
+  # NOTE: This is a GLOBAL OVERRIDE of views.*.use_vz_only settings
+  use_vz_only: false         # Enable XY velocity updates (v2.9.8.4) - overrides view config
   
   # Camera view configurations
   # CRITICAL FIX: use_vz_only=true for nadir camera

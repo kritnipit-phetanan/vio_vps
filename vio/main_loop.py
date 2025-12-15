@@ -847,17 +847,17 @@ class VIORunner:
                 vel_vy = float(self.kf.x[4, 0])
                 vel_vz = float(self.kf.x[5, 0])
                 
-                # Determine use_only_vz from config (for logging)
+                # Determine use_vz_only from config (for logging)
                 view_cfg = CAMERA_VIEW_CONFIGS.get(self.config.camera_view, CAMERA_VIEW_CONFIGS['nadir'])
-                use_only_vz_for_nadir = view_cfg.get('use_vz_only', True)
+                use_vz_only_default = view_cfg.get('use_vz_only', True)
                 # Check if overridden by config
                 vio_config = self.global_config.get('vio', {})
-                use_only_vz = vio_config.get('use_only_vz', use_only_vz_for_nadir)
+                use_vz_only = vio_config.get('use_vz_only', use_vz_only_default)
                 
                 log_vo_debug(
                     self.vo_dbg_csv, self.vio_fe.frame_idx, num_inliers, rot_angle_deg,
                     0.0,  # alignment_deg
-                    rotation_rate_deg_s, use_only_vz,
+                    rotation_rate_deg_s, use_vz_only,
                     not used_vo,  # skip_vo (True if using OF-velocity fallback)
                     vo_dx, vo_dy, vo_dz, vel_vx, vel_vy, vel_vz
                 )

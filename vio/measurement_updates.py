@@ -756,15 +756,15 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
     
     # Determine if using VZ only (for nadir cameras)
     # Allow config override for OF-velocity drift reduction
-    use_only_vz_default = view_cfg.get('use_vz_only', True)
+    use_vz_only_default = view_cfg.get('use_vz_only', True)
     vio_config = global_config.get('vio', {})
-    use_only_vz = vio_config.get('use_only_vz', use_only_vz_default)
+    use_vz_only = vio_config.get('use_vz_only', use_vz_only_default)
     
     # ESKF velocity update
     num_clones = (kf.x.shape[0] - 16) // 7
     err_dim = 15 + 6 * num_clones
     
-    if use_only_vz:
+    if use_vz_only:
         h_vel = np.zeros((1, err_dim), dtype=float)
         h_vel[0, 5] = 1.0
         vel_meas = np.array([[vel_world[2]]])
@@ -789,7 +789,7 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
         return h
     
     def hx_fun(x, h=h_vel):
-        if use_only_vz:
+        if use_vz_only:
             return x[5:6].reshape(1, 1)
         else:
             return x[3:6].reshape(3, 1)
@@ -811,13 +811,13 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
             mahal_dist = float('nan')
         
         # Chi-square thresholds (95% confidence)
-        chi2_threshold = 3.84 if use_only_vz else 7.81  # 1 DOF vs 3 DOF
+        chi2_threshold = 3.84 if use_vz_only else 7.81  # 1 DOF vs 3 DOF
         
         if chi2_value < chi2_threshold:
             # Accept update
             kf.update(z=vel_meas, HJacobian=h_fun, Hx=hx_fun, R=r_mat)
             vo_mode = "VO" if (t_unit is not None and np.linalg.norm(t_unit) > 1e-6) else "OF-fallback"
-            print(f"[VIO] Velocity update: speed={speed_final:.2f}m/s, vz_only={use_only_vz}, "
+            print(f"[VIO] Velocity update: speed={speed_final:.2f}m/s, vz_only={use_vz_only}, "
                   f"flow={avg_flow_px:.1f}px, R_scale={flow_quality_scale:.1f}x, mode={vo_mode}, chi2={chi2_value:.2f}")
             accepted = True
         else:
