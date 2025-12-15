@@ -1071,7 +1071,7 @@ def msckf_measurement_update_with_plane(fid: int, triangulated: dict,
     R_stacked[-1, -1] = sigma_plane ** 2
     
     # Observability constraint (same as standard MSCKF)
-    U_nullspace = get_msckf_nullspace(kf, len(cam_states))
+    U_nullspace = compute_observability_nullspace(kf, len(cam_states))
     
     if U_nullspace is not None and U_nullspace.shape[0] == h_stacked.shape[1]:
         A_proj = np.eye(h_stacked.shape[1]) - U_nullspace @ U_nullspace.T
