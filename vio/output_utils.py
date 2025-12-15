@@ -38,7 +38,7 @@ def get_ground_truth_error(t: float, kf, ppk_trajectory, flight_log_df,
         Returns (None, None) gracefully if no ground truth is available.
         This ensures the system continues to work without GT data.
     """
-    from .math_utils import latlon_to_xy
+    from .data_loaders import latlon_to_xy
     
     gt_df = ppk_trajectory if ppk_trajectory is not None else flight_log_df
     if gt_df is None or len(gt_df) == 0:
