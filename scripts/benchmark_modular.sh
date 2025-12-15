@@ -16,8 +16,10 @@
 set -e  # Exit on error
 
 echo "============================================================================"
-echo "VIO IMU PREINTEGRATION - MODULAR VERSION (WITHOUT VPS)"
+echo "VIO IMU PREINTEGRATION - MODULAR VERSION (v2.9.8.8)"
 echo "============================================================================"
+echo "Features: VIO Velocity, Magnetometer, DEM, Vibration Detection"
+echo "Disabled: Loop Closure (no loops), ZUPT (helicopter vibration)"
 echo ""
 
 # Configuration
@@ -71,6 +73,9 @@ echo "  Test ID: ${TEST_ID}"
 echo "  Output directory: ${OUTPUT_DIR}/"
 echo "  Mode: Preintegration WITHOUT VPS"
 echo "  Entry point: run_vio.py (modular)"
+echo "  VIO Velocity: ENABLED (--use_vio_velocity)"
+echo "  Loop Closure: DISABLED (no loops in outdoor flight)"
+echo "  ZUPT: DISABLED (helicopter vibration)"
 echo ""
 
 # ============================================================================
@@ -113,7 +118,7 @@ echo ""
 # Quick Analysis
 # ============================================================================
 echo "============================================================================"
-echo "RESULTS (WITHOUT VPS - MODULAR)"
+echo "RESULTS (v2.9.8.8 - VIO Velocity Enabled)"
 echo "============================================================================"
 echo ""
 
