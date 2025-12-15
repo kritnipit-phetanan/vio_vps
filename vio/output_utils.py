@@ -54,10 +54,32 @@ def log_measurement_update(residual_csv: Optional[str], t: float, frame: int,
         # Flatten innovation to 1D array
         innov_flat = innovation.flatten()
         
-        # Format innovation vector (handle 1D, 2D, 3D)
-        innov_x = float(innov_flat[0]) if len(innov_flat) > 0 else float('nan')
-        innov_y = float(innov_flat[1]) if len(innov_flat) > 1 else float('nan')
-        innov_z = float(innov_flat[2]) if len(innov_flat) > 2 else float('nan')
+        # Map innovation to correct axes based on update type
+        # DEM: altitude update → Z-axis
+        # MAG: yaw update → Z-axis (rotation around Z)
+        # VIO_VEL: velocity (vx,vy,vz) → X,Y,Z axes
+        # VPS: position (x,y,z) → X,Y,Z axes
+        innov_x = float('nan')
+        innov_y = float('nan')
+        innov_z = float('nan')
+        
+        if len(innov_flat) == 1:
+            # 1D measurement
+            if update_type in ['DEM', 'MAG', 'ZUPT']:
+                # Altitude/Yaw → Z-axis
+                innov_z = float(innov_flat[0])
+            else:
+                # Unknown 1D update → default to X
+                innov_x = float(innov_flat[0])
+        elif len(innov_flat) == 2:
+            # 2D measurement (VPS)
+            innov_x = float(innov_flat[0])
+            innov_y = float(innov_flat[1])
+        elif len(innov_flat) >= 3:
+            # 3D measurement (VIO_VEL)
+            innov_x = float(innov_flat[0])
+            innov_y = float(innov_flat[1])
+            innov_z = float(innov_flat[2])
         
         nees = float('nan')  # Would need ground truth
         
