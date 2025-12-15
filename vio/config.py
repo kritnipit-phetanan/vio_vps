@@ -184,6 +184,8 @@ def load_config(config_path: str) -> Dict[str, Any]:
     
     # Magnetometer calibration
     mag = config['magnetometer']
+    # v2.9.10.4: Add enabled flag to allow disabling mag from config
+    result['MAG_ENABLED'] = mag.get('enabled', True)
     result['MAG_HARD_IRON_OFFSET'] = np.array(mag['hard_iron_offset'], dtype=float)
     result['MAG_SOFT_IRON_MATRIX'] = np.array(mag['soft_iron_matrix'], dtype=float)
     result['MAG_DECLINATION'] = mag['declination']

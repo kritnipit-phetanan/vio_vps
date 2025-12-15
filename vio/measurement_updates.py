@@ -679,15 +679,26 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
     Rwb = R_scipy.from_quat(q_imu).as_matrix()
     
     # Scale recovery using AGL
-    lat_now, lon_now = xy_to_latlon(kf.x[0, 0], kf.x[1, 0], lat0, lon0)
-    dem_now = dem_reader.sample_m(lat_now, lon_now) if dem_reader.ds else 0.0
-    if dem_now is None or np.isnan(dem_now):
-        dem_now = 0.0
+    # v2.9.10.4: Use initial AGL from config to prevent feedback loop
+    # Problem: z_drift -> wrong_dynamic_AGL -> wrong_VIO_scale -> more_drift  
+    # Solution: Use fixed initial_agl from t=0 (GPS-denied compliant)
+    initial_agl = global_config.get('INITIAL_AGL', None)
     
-    if z_state.lower() == "agl":
-        agl = abs(kf.x[2, 0])
+    if initial_agl is not None:
+        # Use fixed initial AGL (GPS-denied compliant: from t=0)
+        agl = initial_agl
     else:
-        agl = abs(kf.x[2, 0] - dem_now)
+        # Fallback: dynamic AGL from current state (original behavior)
+        lat_now, lon_now = xy_to_latlon(kf.x[0, 0], kf.x[1, 0], lat0, lon0)
+        dem_now = dem_reader.sample_m(lat_now, lon_now) if dem_reader.ds else 0.0
+        if dem_now is None or np.isnan(dem_now):
+            dem_now = 0.0
+        
+        if z_state.lower() == "agl":
+            agl = abs(kf.x[2, 0])
+        else:
+            agl = abs(kf.x[2, 0] - dem_now)
+    
     agl = max(1.0, agl)
     
     # Get flow threshold from config (default 0.3px for slow motion)

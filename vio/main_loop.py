@@ -248,7 +248,14 @@ class VIORunner:
         self.imu = load_imu_csv(self.config.imu_path)
         self.imgs = load_images(self.config.images_dir, self.config.images_index_csv)
         self.vps_list = load_vps_csv(self.config.vps_csv)
-        self.mag_list = load_mag_csv(self.config.mag_csv) if self.config.use_magnetometer else []
+        
+        # v2.9.10.4: Check both use_magnetometer flag AND MAG_ENABLED from config
+        mag_enabled = self.global_config.get('MAG_ENABLED', True)
+        if self.config.use_magnetometer and not mag_enabled:
+            print("[MAG] WARNING: Magnetometer disabled in config (magnetometer.enabled=false)")
+        use_mag_final = self.config.use_magnetometer and mag_enabled
+        self.mag_list = load_mag_csv(self.config.mag_csv) if use_mag_final else []
+        
         self.dem = DEMReader.open(self.config.dem_path)
         
         # Load PPK trajectory for error comparison
@@ -282,6 +289,19 @@ class VIORunner:
         
         # Sample DEM at origin
         self.dem0 = self.dem.sample_m(self.lat0, self.lon0) if self.dem.ds else None
+        
+        # v2.9.10.4: Compute initial AGL for VIO velocity scale (GPS-denied compliant)
+        # Uses only t=0 values: msl0 - dem0
+        # This prevents feedback loop: z_drift -> wrong_AGL -> wrong_VIO_scale -> more_drift
+        if self.dem0 is not None:
+            self.initial_agl = abs(self.msl0 - self.dem0)
+            print(f"[VIO] Initial AGL = {self.initial_agl:.1f}m (MSL={self.msl0:.1f}, DEM={self.dem0:.1f})")
+        else:
+            self.initial_agl = 100.0  # Default fallback
+            print(f"[VIO] WARNING: No DEM, using default initial_agl = {self.initial_agl:.1f}m")
+        
+        # Store in global config for VIO velocity update to access
+        self.global_config['INITIAL_AGL'] = self.initial_agl
         
         # Create EKF
         self.kf = ExtendedKalmanFilter(dim_x=16, dim_z=3, dim_u=3)

@@ -120,7 +120,14 @@ plane:
 # Data is pre-normalized (unit vectors), not in standard µT
 # Calibration recomputed using PPK GPS ground truth heading
 # Date: 2025-02-07
+# 
+# DISABLED v2.9.10.4: MAG calibration shows 36° drift by end of flight
+# Analysis: innovation_z grows from -2.5° (early) to +36° (late)
+# Root cause: Hard/soft iron calibration doesn't account for helicopter field distortion
+# Will re-enable after proper in-flight calibration
 magnetometer:
+  enabled: false  # v2.9.10.4: DISABLED due to calibration drift
+  
   # Hard-iron offset (CALIBRATED - normalized units)
   hard_iron_offset: [0.243467, -0.194837, 0.341668]
   
