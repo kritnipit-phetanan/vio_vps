@@ -463,7 +463,7 @@ class VIORunner:
                 'soft_iron': self.global_config.get('MAG_SOFT_IRON_MATRIX', None),
             }
             noise_params = {
-                'sigma_vo_vel': self.global_config.get('SIGMA_VO_VEL', 0.5),
+                'sigma_vo_vel': self.global_config.get('SIGMA_VO', 0.5),
                 'sigma_mag_yaw': self.global_config.get('SIGMA_MAG_YAW', 0.15),
                 'sigma_agl_z': self.global_config.get('SIGMA_AGL_Z', 2.5),
             }

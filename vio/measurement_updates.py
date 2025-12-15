@@ -623,7 +623,7 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
     from .vps_integration import xy_to_latlon
     
     kb_params = global_config.get('KB_PARAMS', {'mu': 600})
-    sigma_vo = global_config.get('SIGMA_VO_VEL', 0.5)
+    sigma_vo = global_config.get('SIGMA_VO', 0.5)
     
     # Get camera extrinsics
     view_cfg = CAMERA_VIEW_CONFIGS.get(camera_view, CAMERA_VIEW_CONFIGS['nadir'])

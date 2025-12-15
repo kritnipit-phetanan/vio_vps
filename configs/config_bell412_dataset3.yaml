@@ -212,13 +212,6 @@ vio:
   min_tracked_features: 50   # Minimum features for velocity update
   fast_rotation_threshold: 0.5236  # Skip if rotation > 30°/s (rad/s)
   
-  # XY velocity update control (CRITICAL for outdoor drift reduction)
-  # Default: nadir camera uses VZ only (use_vz_only=True from camera view config)
-  # For outdoor long-range flights with gyro-compensated optical flow: set False
-  # This enables XY velocity updates that reduce drift when VPS unavailable
-  # NOTE: This is a GLOBAL OVERRIDE of views.*.use_vz_only settings
-  use_vz_only: false         # Enable XY velocity updates (v2.9.8.4) - overrides view config
-  
   # Camera view configurations
   # CRITICAL FIX: use_vz_only=true for nadir camera
   # Reason: Nadir camera has translation direction ambiguity - we don't know

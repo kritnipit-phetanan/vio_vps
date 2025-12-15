@@ -204,13 +204,13 @@ def load_config(config_path: str) -> Dict[str, Any]:
     # Process noise
     pn = config['process_noise']
     result['SIGMA_ACCEL'] = pn['sigma_accel']
-    result['SIGMA_VO_VEL'] = pn['sigma_vo_vel']
     result['SIGMA_VPS_XY'] = pn['sigma_vps_xy']
     result['SIGMA_AGL_Z'] = pn['sigma_agl_z']
     result['SIGMA_MAG_YAW'] = pn['sigma_mag_yaw']
     
     # VIO parameters
     vio = config['vio']
+    result['SIGMA_VO'] = vio['sigma_vo']  # Velocity measurement uncertainty
     result['MIN_PARALLAX_PX'] = vio['min_parallax_px']
     result['MIN_MSCKF_BASELINE'] = vio['min_msckf_baseline']
     result['MSCKF_CHI2_MULTIPLIER'] = vio['msckf_chi2_multiplier']
