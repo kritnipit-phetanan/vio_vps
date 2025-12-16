@@ -37,7 +37,7 @@ from dataclasses import dataclass, field
 from typing import Optional, Tuple, List, Dict, Any
 
 # Performance-critical imports moved to top-level to avoid per-iteration overhead
-from .config import load_config, CAMERA_VIEW_CONFIGS
+from .config import load_config, VIOConfig, CAMERA_VIEW_CONFIGS
 from .data_loaders import (
     load_imu_csv, load_images, load_vps_csv, 
     load_mag_csv, load_ppk_initial_state, load_ppk_trajectory,
@@ -79,43 +79,7 @@ from .output_utils import (
 )
 
 
-@dataclass
-class VIOConfig:
-    """Configuration for VIO runner."""
-    # Required paths
-    imu_path: str
-    quarry_path: str
-    output_dir: str
-    
-    # Optional data paths
-    images_dir: Optional[str] = None
-    images_index_csv: Optional[str] = None
-    vps_csv: Optional[str] = None
-    mag_csv: Optional[str] = None
-    dem_path: Optional[str] = None
-    ground_truth_path: Optional[str] = None
-    config_yaml: Optional[str] = None
-    
-    # Image processing
-    downscale_size: Tuple[int, int] = (1140, 1080)
-    
-    # State options
-    z_state: str = "msl"  # "msl" or "agl"
-    camera_view: str = "nadir"  # "nadir", "front", "side", "multi"
-    
-    # Algorithm options
-    estimate_imu_bias: bool = False
-    use_magnetometer: bool = True
-    use_vio_velocity: bool = True
-    use_preintegration: bool = True
-    
-    # Performance options (v2.9.9)
-    fast_mode: bool = False          # Reduce features + faster KLT (60% speedup)
-    frame_skip: int = 1              # Process every N frames (1=all, 2=half, etc.)
-    
-    # Debug options
-    save_debug_data: bool = False
-    save_keyframe_images: bool = False
+# VIOConfig is imported from config.py (single source of truth)
 
 
 @dataclass
@@ -543,7 +507,7 @@ class VIORunner:
                 initial_state=initial_state,
                 estimate_imu_bias=self.config.estimate_imu_bias,
                 plane_config=plane_config,
-                resolved_config=None  # Simplified config model - no resolver
+                vio_config=self.config  # Pass VIOConfig for full audit
             )
             print(f"[DEBUG] Calibration snapshot saved: {cal_path}")
     
@@ -1291,53 +1255,30 @@ class VIORunner:
         5. Output generation
         """
         print("=" * 80)
-        print("VIO+EKF Pipeline Starting")
+        print("VIO+EKF Pipeline Starting (v3.2.0)")
         print("=" * 80)
         
-        # Load configuration
-        if self.config.config_yaml:
+        # =================================================================
+        # Load configuration from VIOConfig._raw_config (v3.2.0)
+        # =================================================================
+        # VIOConfig already has all settings from YAML
+        # _raw_config contains the parsed YAML dict for backward compatibility
+        if hasattr(self.config, '_raw_config') and self.config._raw_config:
+            self.global_config = self.config._raw_config
+        elif self.config.config_yaml:
+            # Fallback: load from YAML path if _raw_config not set
             self.load_config()
-            
-            # =================================================================
-            # Override VIOConfig parameters from YAML (v3.1.0)
-            # =================================================================
-            # Algorithm toggles - read from YAML
-            vio_config = self.global_config.get('vio', {})
-            if 'use_vio_velocity' in vio_config:
-                self.config.use_vio_velocity = vio_config['use_vio_velocity']
-            # Alternative location in global_config
-            if 'USE_VIO_VELOCITY' in self.global_config:
-                self.config.use_vio_velocity = self.global_config['USE_VIO_VELOCITY']
-            
-            # Magnetometer toggle
-            if 'MAG_ENABLED' in self.global_config:
-                self.config.use_magnetometer = self.global_config['MAG_ENABLED']
-            
-            # IMU bias estimation toggle
-            if 'ESTIMATE_IMU_BIAS' in self.global_config:
-                self.config.estimate_imu_bias = self.global_config['ESTIMATE_IMU_BIAS']
-            
-            # Preintegration toggle
-            if 'USE_PREINTEGRATION' in self.global_config:
-                self.config.use_preintegration = self.global_config['USE_PREINTEGRATION']
-            
-            # Fast mode settings
-            if 'FAST_MODE' in self.global_config:
-                self.config.fast_mode = self.global_config['FAST_MODE']
-            if 'FRAME_SKIP' in self.global_config:
-                self.config.frame_skip = self.global_config['FRAME_SKIP']
-            
-            # Camera view (if not specified via CLI)
-            if not hasattr(self.config, '_camera_view_from_cli') and 'DEFAULT_CAMERA_VIEW' in self.global_config:
-                self.config.camera_view = self.global_config['DEFAULT_CAMERA_VIEW']
-            
-            print(f"[CONFIG] Algorithm settings from YAML:")
-            print(f"  use_vio_velocity: {self.config.use_vio_velocity}")
-            print(f"  use_magnetometer: {self.config.use_magnetometer}")
-            print(f"  estimate_imu_bias: {self.config.estimate_imu_bias}")
-            print(f"  use_preintegration: {self.config.use_preintegration}")
-            print(f"  fast_mode: {self.config.fast_mode}")
-            print(f"  frame_skip: {self.config.frame_skip}")
+        
+        # Print algorithm settings (already set in VIOConfig from YAML)
+        print(f"\n[CONFIG] Algorithm settings (from YAML):")
+        print(f"  config_yaml: {self.config.config_yaml}")
+        print(f"  camera_view: {self.config.camera_view}")
+        print(f"  use_vio_velocity: {self.config.use_vio_velocity}")
+        print(f"  use_magnetometer: {self.config.use_magnetometer}")
+        print(f"  estimate_imu_bias: {self.config.estimate_imu_bias}")
+        print(f"  use_preintegration: {self.config.use_preintegration}")
+        print(f"  fast_mode: {self.config.fast_mode}")
+        print(f"  frame_skip: {self.config.frame_skip}")
         
         # Load data
         self.load_data()

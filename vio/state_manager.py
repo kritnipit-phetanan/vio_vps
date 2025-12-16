@@ -428,7 +428,8 @@ def initialize_ekf_state(kf,
         q_init, _ = initialize_quaternion_from_ppk(ppk_state)
         print(f"[INIT][PPK ATTITUDE] Using PPK attitude yaw at t=0 (stationary case)")
         print(f"[INIT][PPK ATTITUDE] PPK yaw (NED): {np.degrees(ppk_state.yaw):.1f}° → ENU: {90 - np.degrees(ppk_state.yaw):.1f}°")
-        use_ppk_attitude = True  # CRITICAL: Skip magnetometer correction!
+        # v2.9.10.12: NO LONGER skip magnetometer - will be corrected below if mag available
+        use_ppk_attitude = False  # CHANGED: Allow mag correction to align with reference
     else:
         q_init = initialize_quaternion_from_imu(imu_records[0].q)
         print(f"[INIT][IMU] Using IMU quaternion")
@@ -443,8 +444,12 @@ def initialize_ekf_state(kf,
     if not use_ppk_attitude and mag_records is not None and mag_params is not None and len(mag_records) > 0:
         from .magnetometer import calibrate_magnetometer
         
+        # v2.9.10.12: Use calibration params from config
+        hard_iron = mag_params.get('hard_iron', None)
+        soft_iron = mag_params.get('soft_iron', None)
+        
         for mag_rec in mag_records[:50]:
-            mag_cal = calibrate_magnetometer(mag_rec.mag)
+            mag_cal = calibrate_magnetometer(mag_rec.mag, hard_iron=hard_iron, soft_iron=soft_iron)
             mag_norm = np.linalg.norm(mag_cal)
             
             if mag_params.get('min_field', 0.1) <= mag_norm <= mag_params.get('max_field', 100.0):

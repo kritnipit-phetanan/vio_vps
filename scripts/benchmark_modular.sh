@@ -9,9 +9,10 @@
 #   - Uses run_vio.py instead of vio_vps.py directly
 #   - Same command-line interface, but cleaner separation
 #
-# v3.1.0: Simplified Config Model
-#   - YAML is single source of truth for algorithm settings
-#   - CLI provides only: paths, camera_view, save_debug_data, save_keyframe_images
+# v3.2.0: VIOConfig Dataclass Model
+#   - config.py is pure YAML reader, returns VIOConfig dataclass
+#   - CLI provides only: paths, save_debug_data, save_keyframe_images
+#   - camera_view now in YAML only (no CLI override)
 #   - Algorithm toggles (use_magnetometer, etc.) controlled via YAML
 #
 # Usage:
@@ -21,10 +22,10 @@
 set -e  # Exit on error
 
 echo "============================================================================"
-echo "VIO IMU PREINTEGRATION - MODULAR VERSION (v3.1.0)"
+echo "VIO IMU PREINTEGRATION - MODULAR VERSION (v3.2.0)"
 echo "============================================================================"
-echo "Features: Simplified Config System - YAML single source of truth"
-echo "Config: Algorithm settings from YAML, paths from CLI"
+echo "Features: VIOConfig Dataclass - Pure YAML Reader"
+echo "Config: All settings from YAML, only paths from CLI"
 echo ""
 
 # Configuration
@@ -46,11 +47,11 @@ fi
 echo "=== Verifying VIO Module Imports ==="
 python3 << 'EOF'
 import vio
-from vio.main_loop import VIORunner, VIOConfig
-from vio.config import load_config
+from vio.main_loop import VIORunner
+from vio.config import load_config, VIOConfig
 print('✅ All VIO modules imported successfully')
 print(f'   Package version: {vio.__version__}')
-print('   Config model: YAML single source of truth')
+print('   Config model: VIOConfig dataclass from YAML')
 EOF
 
 if [ $? -ne 0 ]; then
@@ -92,9 +93,9 @@ echo ""
 
 START_TIME=$(date +%s.%N)
 
-# v3.1.0: Simplified CLI - YAML is single source of truth
-# Algorithm settings (use_magnetometer, estimate_imu_bias, etc.) are in YAML
-# CLI provides only: paths, camera_view, debug flags
+# v3.2.0: VIOConfig Dataclass - Pure YAML reader
+# All settings (including camera_view) from YAML
+# CLI provides only: paths, debug flags
 python3 run_vio.py \
     --config "$CONFIG" \
     --imu "$IMU_PATH" \
@@ -105,7 +106,6 @@ python3 run_vio.py \
     --dem "$DEM_PATH" \
     --ground_truth "$GROUND_TRUTH" \
     --output "$OUTPUT_DIR" \
-    --camera_view nadir \
     --save_debug_data 2>&1 | tee "$OUTPUT_DIR/run.log"
 
 END_TIME=$(date +%s.%N)
@@ -119,7 +119,7 @@ echo ""
 # Quick Analysis
 # ============================================================================
 echo "============================================================================"
-echo "RESULTS (v3.1.0 - Simplified Config System)"
+echo "RESULTS (v3.2.0 - VIOConfig Dataclass Model)"
 echo "============================================================================"
 echo ""
 

@@ -4,17 +4,23 @@
 VIO Configuration Module
 ========================
 
-Handles YAML configuration loading and defines global constants for the
+Handles YAML configuration loading and defines VIOConfig dataclass for the
 VIO+ESKF+MSCKF system.
 
-Configuration Structure:
-------------------------
-The YAML config file contains:
-- camera: Kannala-Brandt fisheye intrinsics (k2-k5, mu, mv, u0, v0)
-- extrinsics: Camera-to-body transforms (BODY_T_CAMDOWN, etc.)
-- imu: IMU noise parameters (gyro/accel noise densities and random walks)
-- magnetometer: MAG calibration (hard-iron, soft-iron, declination)
-- lever_arm: IMU-GNSS lever arm vector in body frame
+Configuration Model (v3.2.0):
+-----------------------------
+YAML is the single source of truth for ALL settings:
+- Sensor calibration (IMU, Camera, Magnetometer)
+- Algorithm toggles (use_magnetometer, estimate_imu_bias, use_vio_velocity, etc.)
+- Performance tuning (fast_mode, frame_skip)
+- Camera view selection (default_camera_view)
+
+CLI provides ONLY:
+- Data paths (--imu, --quarry, --images_dir, etc.)
+- Output directory (--output)
+- Debug flags (--save_debug_data, --save_keyframe_images)
+
+load_config() returns a VIOConfig dataclass ready for VIORunner.
 
 Frame Conventions:
 ------------------
@@ -23,20 +29,14 @@ Frame Conventions:
 - Camera Frame: OpenCV convention (X-right, Y-down, Z-forward)
 - Quaternion: [w, x, y, z] Hamilton convention
 
-Sensor Noise Parameters:
-------------------------
-- acc_n: Accelerometer noise density [m/s²/√Hz]
-- gyr_n: Gyroscope noise density [rad/s/√Hz]
-- acc_w: Accelerometer random walk [m/s³/√Hz]
-- gyr_w: Gyroscope random walk [rad/s²/√Hz]
-
 Author: VIO project
 """
 
 import os
 import yaml
 import numpy as np
-from typing import Dict, Any
+from dataclasses import dataclass, field
+from typing import Dict, Any, Optional, Tuple
 
 # ========================================
 # Debug verbosity control
@@ -46,33 +46,88 @@ VERBOSE_DEBUG = False  # Per-IMU sample debug
 VERBOSE_DEM = False    # Per-IMU DEM update logs
 
 
-def load_config(config_path: str) -> Dict[str, Any]:
+# =============================================================================
+# VIOConfig Dataclass - Single source of truth for VIO runtime settings
+# =============================================================================
+
+@dataclass
+class VIOConfig:
     """
-    Load YAML configuration file and convert to global variables format.
+    Configuration for VIO runner.
+    
+    This dataclass holds ALL runtime settings for the VIO pipeline.
+    It is populated by load_config() from YAML and can have paths
+    overridden by CLI arguments.
+    
+    Usage:
+        config = load_config("config.yaml")  # Returns VIOConfig
+        config.imu_path = "/path/to/imu.csv"  # Override from CLI
+        runner = VIORunner(config)
+        runner.run()
+    """
+    # Required paths (set by CLI)
+    imu_path: str = ""
+    quarry_path: str = ""
+    output_dir: str = ""
+    
+    # Optional data paths (set by CLI)
+    images_dir: Optional[str] = None
+    images_index_csv: Optional[str] = None
+    vps_csv: Optional[str] = None
+    mag_csv: Optional[str] = None
+    dem_path: Optional[str] = None
+    ground_truth_path: Optional[str] = None
+    config_yaml: Optional[str] = None
+    
+    # Image processing (from YAML camera section)
+    downscale_size: Tuple[int, int] = (1440, 1080)
+    
+    # State options (from YAML)
+    z_state: str = "msl"  # "msl" or "agl"
+    camera_view: str = "nadir"  # "nadir", "front", "side"
+    
+    # Algorithm options (from YAML)
+    estimate_imu_bias: bool = False
+    use_magnetometer: bool = True
+    use_vio_velocity: bool = True
+    use_preintegration: bool = False
+    
+    # Performance options (from YAML fast_mode section)
+    fast_mode: bool = False
+    frame_skip: int = 1
+    
+    # Debug options (set by CLI flags)
+    save_debug_data: bool = False
+    save_keyframe_images: bool = False
+    
+    # Internal: store the raw YAML config dict for advanced access
+    _raw_config: Dict[str, Any] = field(default_factory=dict)
+
+
+def load_config(config_path: str) -> VIOConfig:
+    """
+    Load YAML configuration file and return VIOConfig dataclass.
+    
+    This function reads the YAML config and creates a VIOConfig instance
+    with all algorithm settings populated. CLI should only override
+    paths (imu_path, quarry_path, etc.) and debug flags.
     
     Args:
         config_path: Path to YAML configuration file
         
     Returns:
-        Dictionary with configuration parameters including:
+        VIOConfig dataclass with all settings populated from YAML
+        
+    Also populates module-level globals for backward compatibility:
         - KB_PARAMS: Kannala-Brandt camera intrinsics
         - BODY_T_CAMDOWN: 4x4 transform from body to down camera
-        - BODY_T_CAMFRONT: 4x4 transform from body to front camera
-        - BODY_T_CAMSIDE: 4x4 transform from body to side camera
         - IMU_PARAMS: IMU noise parameters
-        - IMU_GNSS_LEVER_ARM: Lever arm vector [x, y, z] in body frame
-        - MAG_*: Magnetometer calibration parameters
-        - SIGMA_*: Process noise sigmas
-        - CAMERA_VIEW_CONFIGS: Camera view-specific configurations
-        
-    Raises:
-        FileNotFoundError: If config file doesn't exist
-        yaml.YAMLError: If config file is malformed
+        - etc.
         
     Example:
         >>> config = load_config("configs/config_bell412_dataset3.yaml")
-        >>> kb_params = config['KB_PARAMS']
-        >>> print(f"Focal length: {kb_params['mu']:.1f} px")
+        >>> print(f"Use magnetometer: {config.use_magnetometer}")
+        >>> print(f"Camera view: {config.camera_view}")
     """
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
@@ -335,7 +390,43 @@ def load_config(config_path: str) -> Dict[str, Any]:
         result['VIBRATION_WINDOW_SIZE'] = 50
         result['VIBRATION_THRESHOLD_MULT'] = 5.0
     
-    return result
+    # =========================================================================
+    # Create VIOConfig dataclass from parsed YAML (v3.2.0)
+    # =========================================================================
+    cam = config['camera']
+    vio_config = VIOConfig(
+        # Paths will be set by CLI - leave as defaults
+        imu_path="",
+        quarry_path="",
+        output_dir="",
+        config_yaml=config_path,
+        
+        # Image processing from camera section
+        downscale_size=(cam.get('image_width', 1440), cam.get('image_height', 1080)),
+        
+        # State options
+        z_state="msl",  # Default, can be overridden if needed
+        camera_view=result['DEFAULT_CAMERA_VIEW'],
+        
+        # Algorithm options from YAML
+        estimate_imu_bias=result['ESTIMATE_IMU_BIAS'],
+        use_magnetometer=result['MAG_ENABLED'],
+        use_vio_velocity=result['USE_VIO_VELOCITY'],
+        use_preintegration=result['USE_PREINTEGRATION'],
+        
+        # Performance options
+        fast_mode=result['FAST_MODE'],
+        frame_skip=result['FRAME_SKIP'],
+        
+        # Debug options (default off, CLI can enable)
+        save_debug_data=False,
+        save_keyframe_images=False,
+        
+        # Store raw config dict for backward compatibility
+        _raw_config=result
+    )
+    
+    return vio_config
 
 
 # =============================================================================

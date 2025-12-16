@@ -2,11 +2,27 @@
 VIO (Visual-Inertial Odometry) Package
 
 Complete modularized implementation of the VIO+ESKF+MSCKF system
-for helicopter navigation. Version 3.1.0 - Simplified Config System.
+for helicopter navigation. Version 3.2.0 - VIOConfig Dataclass Model.
 
-Version: 3.1.0 (Simplified Config - YAML single source of truth)
+Version: 3.2.0 (VIOConfig Dataclass - Pure YAML Reader)
 Modules: 18
 Total Lines: ~11,000
+
+Changes in v3.2.0:
+- VIOCONFIG DATACLASS: config.py is now pure YAML reader returning VIOConfig
+  * VIOConfig dataclass holds all settings from YAML
+  * load_config() returns VIOConfig directly (not raw dict)
+  * _raw_config Dict preserved for backward compatibility with legacy code
+  
+- CLI SIMPLIFIED: Removed camera_view from CLI
+  * camera_view now configured in YAML only
+  * CLI provides only: paths, save_debug_data, save_keyframe_images
+  * run_vio.py uses VIOConfig throughout
+  
+- CLEANED UP: Removed resolved_config remnants
+  * save_calibration_log now accepts vio_config parameter
+  * main_loop.py imports VIOConfig from config.py (single definition)
+  * No more duplicate VIOConfig definitions
 
 Changes in v3.1.0:
 - SIMPLIFIED CONFIG: YAML is now single source of truth for algorithm settings
@@ -271,7 +287,7 @@ Usage:
     from vio.propagation import VibrationDetector
 """
 
-__version__ = "3.1.0"
+__version__ = "3.2.0"
 
 # Lazy module imports - access as vio.config, vio.math_utils, etc.
 # This avoids importing all dependencies at once

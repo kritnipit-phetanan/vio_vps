@@ -1008,6 +1008,13 @@ def msckf_measurement_update(fid: int, triangulated: dict, cam_observations: Lis
     h_x = np.vstack(h_x_stack)
     h_f = np.vstack(h_f_stack)
     
+    # DEBUG: Check H matrix bias columns before any projection (disabled for performance)
+    # h_bias_raw = np.linalg.norm(h_x[:, 9:15])
+    # if h_bias_raw > 1e-10:
+    #     print(f"[MSCKF-BIAS-RAW] H[:,9:15] norm={h_bias_raw:.6f}")
+    # else:
+    #     print(f"[MSCKF-BIAS-RAW] H[:,9:15] is ZERO!")
+    
     # Nullspace projection
     try:
         u_mat, s_mat, vh_mat = np.linalg.svd(h_f, full_matrices=True)
@@ -1029,6 +1036,12 @@ def msckf_measurement_update(fid: int, triangulated: dict, cam_observations: Lis
         projection_matrix = np.eye(err_state_size) - U_obs @ U_obs.T
         h_constrained = h_proj @ projection_matrix
         r_constrained = r_proj
+        
+        # DEBUG: Check if bias Jacobians are non-zero before/after projection (disabled for performance)
+        # h_bias_before = np.linalg.norm(h_proj[:, 9:15])
+        # h_bias_after = np.linalg.norm(h_constrained[:, 9:15])
+        # if h_bias_before > 1e-10:
+        #     print(f"[MSCKF-BIAS] H_bias before={h_bias_before:.6f}, after={h_bias_after:.6f}, ratio={h_bias_after/h_bias_before:.3f}")
     except (np.linalg.LinAlgError, ValueError):
         h_constrained = h_proj
         r_constrained = r_proj
@@ -1066,6 +1079,14 @@ def msckf_measurement_update(fid: int, triangulated: dict, cam_observations: Lis
     try:
         k_gain = kf.P @ h_weighted.T @ s_inv
         delta_x = k_gain @ r_weighted
+        
+        # DEBUG: Check bias correction magnitude (disabled for performance)
+        # dbg = delta_x[9:12, 0]
+        # dba = delta_x[12:15, 0]
+        # dbg_norm = np.linalg.norm(dbg)
+        # dba_norm = np.linalg.norm(dba)
+        # if dbg_norm > 1e-10 or dba_norm > 1e-10:
+        #     print(f"[MSCKF-BIAS-UPDATE] δb_g={dbg_norm:.2e} rad/s, δb_a={dba_norm:.2e} m/s²")
         
         kf._apply_error_state_correction(delta_x)
         
@@ -1313,7 +1334,8 @@ def msckf_measurement_update_with_plane(fid: int, triangulated: dict,
     # =========================================================================
     meas_dim_total = meas_dim_bearing + 1
     h_stacked = np.vstack([h_bearing, h_plane])
-    r_stacked = np.concatenate([r_bearing, [residual_plane]])
+    # Ensure r_stacked is 2D column vector (same as standard MSCKF)
+    r_stacked = np.concatenate([r_bearing, [residual_plane]]).reshape(-1, 1)
     
     # Measurement noise
     sigma_bearing = 1e-4  # Standard MSCKF bearing noise

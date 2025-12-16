@@ -556,7 +556,8 @@ def save_calibration_log(output_path: str, camera_view: str, view_cfg: Dict,
                          kb_params: Dict, imu_params: Dict, mag_params: Dict,
                          noise_params: Dict, vio_params: Dict,
                          initial_state: Dict, estimate_imu_bias: bool,
-                         plane_config: Optional[Dict] = None):
+                         plane_config: Optional[Dict] = None,
+                         vio_config: Optional[Any] = None):
     """
     Save calibration snapshot for reproducibility.
     
@@ -572,10 +573,55 @@ def save_calibration_log(output_path: str, camera_view: str, view_cfg: Dict,
         initial_state: Initial state values
         estimate_imu_bias: Whether bias estimation was enabled
         plane_config: Plane-Aided MSCKF configuration (optional)
+        vio_config: VIOConfig dataclass (optional, for full audit)
     """
+    from datetime import datetime
+    
     try:
         with open(output_path, "w") as f:
-            f.write("=== VIO System Calibration & Configuration ===\n\n")
+            f.write("=" * 70 + "\n")
+            f.write("VIO System Configuration & Calibration Log\n")
+            f.write("=" * 70 + "\n\n")
+            
+            # === Timestamp ===
+            f.write("[Timestamp]\n")
+            f.write(f"  Generated at: {datetime.now().isoformat()}\n\n")
+            
+            # === Runtime Options (from VIOConfig) ===
+            if vio_config is not None:
+                f.write("[Runtime Options (from VIOConfig)]\n")
+                f.write("-" * 50 + "\n")
+                f.write(f"  config_yaml: {getattr(vio_config, 'config_yaml', 'N/A')}\n")
+                f.write(f"  camera_view: {getattr(vio_config, 'camera_view', camera_view)}\n")
+                f.write(f"  use_magnetometer: {getattr(vio_config, 'use_magnetometer', 'N/A')}\n")
+                f.write(f"  estimate_imu_bias: {getattr(vio_config, 'estimate_imu_bias', estimate_imu_bias)}\n")
+                f.write(f"  use_vio_velocity: {getattr(vio_config, 'use_vio_velocity', 'N/A')}\n")
+                f.write(f"  use_preintegration: {getattr(vio_config, 'use_preintegration', 'N/A')}\n")
+                f.write(f"  fast_mode: {getattr(vio_config, 'fast_mode', 'N/A')}\n")
+                f.write(f"  frame_skip: {getattr(vio_config, 'frame_skip', 'N/A')}\n")
+                f.write(f"  z_state: {getattr(vio_config, 'z_state', 'N/A')}\n")
+                f.write(f"  save_debug_data: {getattr(vio_config, 'save_debug_data', 'N/A')}\n")
+                f.write(f"  save_keyframe_images: {getattr(vio_config, 'save_keyframe_images', 'N/A')}\n")
+                f.write(f"  downscale_size: {getattr(vio_config, 'downscale_size', 'N/A')}\n")
+                f.write("\n")
+                
+                # === Input Paths ===
+                f.write("[Input Paths]\n")
+                f.write("-" * 50 + "\n")
+                f.write(f"  imu_path: {getattr(vio_config, 'imu_path', 'N/A')}\n")
+                f.write(f"  quarry_path: {getattr(vio_config, 'quarry_path', 'N/A')}\n")
+                f.write(f"  images_dir: {getattr(vio_config, 'images_dir', None) or 'None'}\n")
+                f.write(f"  images_index_csv: {getattr(vio_config, 'images_index_csv', None) or 'None'}\n")
+                f.write(f"  vps_csv: {getattr(vio_config, 'vps_csv', None) or 'None'}\n")
+                f.write(f"  mag_csv: {getattr(vio_config, 'mag_csv', None) or 'None'}\n")
+                f.write(f"  dem_path: {getattr(vio_config, 'dem_path', None) or 'None'}\n")
+                f.write(f"  ground_truth_path: {getattr(vio_config, 'ground_truth_path', None) or 'None'}\n")
+                f.write(f"  output_dir: {getattr(vio_config, 'output_dir', 'N/A')}\n")
+                f.write("\n")
+            
+            f.write("=" * 70 + "\n")
+            f.write("Sensor Calibration Parameters (from YAML)\n")
+            f.write("=" * 70 + "\n\n")
             
             f.write("[Camera View]\n")
             f.write(f"  Mode: {camera_view}\n")
@@ -583,7 +629,7 @@ def save_calibration_log(output_path: str, camera_view: str, view_cfg: Dict,
             f.write(f"  Nadir threshold: {view_cfg.get('nadir_threshold', 'N/A')}°\n\n")
             
             # VIO parameters from view config
-            f.write("[VIO Parameters]\n")
+            f.write("[VIO View Parameters]\n")
             f.write(f"  use_vz_only: {view_cfg.get('use_vz_only', 'N/A')}\n")
             f.write(f"  sigma_scale_xy: {view_cfg.get('sigma_scale_xy', 'N/A')}\n")
             f.write(f"  sigma_scale_z: {view_cfg.get('sigma_scale_z', 'N/A')}\n")
@@ -632,6 +678,12 @@ def save_calibration_log(output_path: str, camera_view: str, view_cfg: Dict,
             for key, val in initial_state.items():
                 f.write(f"  {key}: {val}\n")
             f.write(f"  Estimate IMU bias: {estimate_imu_bias}\n")
+            f.write("\n")
+            
+            f.write("=" * 70 + "\n")
+            f.write("END OF CONFIGURATION LOG\n")
+            f.write("=" * 70 + "\n")
+            
     except Exception as e:
         print(f"[WARNING] Failed to save calibration log: {e}")
 

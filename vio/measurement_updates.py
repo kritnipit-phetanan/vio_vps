@@ -121,11 +121,15 @@ def apply_magnetometer_update(kf,
     # Track total attempts
     _MAG_STATE['total_attempts'] += 1
     
+    # v2.9.10.13: Oscillation skip check - DISABLED during spinup!
     # v2.9.5: Oscillation detection (skip_count = 2, reduced from 10)
-    # Check if we're in skip period
-    if _MAG_STATE['skip_count'] > 0:
+    # Check if we're in skip period - BUT NOT during spinup (t<15s)
+    if time_elapsed >= 15.0 and _MAG_STATE['skip_count'] > 0:
         _MAG_STATE['skip_count'] -= 1
         return False, f"Oscillation skip (remaining: {_MAG_STATE['skip_count']})"
+    elif time_elapsed < 15.0:
+        # During spinup: reset skip_count to ensure continuous updates
+        _MAG_STATE['skip_count'] = 0
     
     # Check field strength
     mag_norm = np.linalg.norm(mag_calibrated)
@@ -158,35 +162,46 @@ def apply_magnetometer_update(kf,
     yaw_innov = np.arctan2(np.sin(yaw_innov), np.cos(yaw_innov))
     
     # =========================================================================
-    # v2.9.5: Oscillation Detection (skip_count=2, reduced from v2.9.2's 10)
+    # v2.9.10.13: Oscillation Detection - DISABLED during spinup!
     # =========================================================================
+    # During spinup (t<15s), we do FULL CORRECTION (K=1.0) so oscillation is
+    # expected and normal - gyro drift causes yaw to swing back and forth as
+    # mag corrects it. DON'T skip updates during spinup - that causes drift!
+    
+    # v2.9.5: Oscillation Detection (skip_count=2, reduced from v2.9.2's 10)
     # Detect rapid sign alternation in innovation (indicates erratic behavior)
     # When detected, skip 2 updates (minimal gap ~0.1s) to let system stabilize
     
-    innovation_sign = 1 if yaw_innov > 0 else -1
-    _MAG_STATE['innovation_history'].append(innovation_sign)
-    
-    # Keep only recent history (last 3 innovations)
-    if len(_MAG_STATE['innovation_history']) > 3:
-        _MAG_STATE['innovation_history'].pop(0)
-    
-    # Detect oscillation: alternating signs in recent history
-    if len(_MAG_STATE['innovation_history']) >= 3:
-        h = _MAG_STATE['innovation_history']
-        if (h[-1] != h[-2]) and (h[-2] != h[-3]):
-            # Oscillation detected: skip next 2 updates (reduced from 10)
-            _MAG_STATE['skip_count'] = 2  # CRITICAL: 2 instead of 10!
-            _MAG_STATE['oscillation_count'] += 1
-            
-            if _MAG_STATE['total_attempts'] % 100 == 0:
-                print(f"[MAG-OSC] Detected oscillation #{_MAG_STATE['oscillation_count']}, skipping next 2 updates")
-            
-            return False, "Oscillation detected (skip=2)"
+    # v2.9.10.13: SKIP oscillation detection during spinup phase!
+    if time_elapsed >= 15.0:  # ONLY after spinup phase
+        innovation_sign = 1 if yaw_innov > 0 else -1
+        _MAG_STATE['innovation_history'].append(innovation_sign)
+        
+        # Keep only recent history (last 3 innovations)
+        if len(_MAG_STATE['innovation_history']) > 3:
+            _MAG_STATE['innovation_history'].pop(0)
+        
+        # Detect oscillation: alternating signs in recent history
+        if len(_MAG_STATE['innovation_history']) >= 3:
+            h = _MAG_STATE['innovation_history']
+            if (h[-1] != h[-2]) and (h[-2] != h[-3]):
+                # Oscillation detected: skip next 2 updates (reduced from 10)
+                _MAG_STATE['skip_count'] = 2  # CRITICAL: 2 instead of 10!
+                _MAG_STATE['oscillation_count'] += 1
+                
+                if _MAG_STATE['total_attempts'] % 100 == 0:
+                    print(f"[MAG-OSC] Detected oscillation #{_MAG_STATE['oscillation_count']}, skipping next 2 updates")
+                
+                return False, "Oscillation detected (skip=2)"
+    else:
+        # During spinup: clear history and don't track oscillations
+        _MAG_STATE['innovation_history'] = []
     
     # Adaptive R-scaling during oscillation buildup (v2.9.2 logic)
     # Apply progressive R-inflation if oscillation pattern developing
+    # v2.9.10.13: DISABLED during spinup - always use R_scale=1.0
     oscillation_r_scale = 1.0
-    if len(_MAG_STATE['innovation_history']) >= 2:
+    if time_elapsed >= 15.0 and len(_MAG_STATE['innovation_history']) >= 2:
         h = _MAG_STATE['innovation_history']
         if h[-1] != h[-2]:
             # One alternation: light R-scaling
@@ -225,9 +240,21 @@ def apply_magnetometer_update(kf,
     err_dim = 15 + 6 * num_clones
     theta_cov_idx = 8  # δθ_z in error state
     
+    # v2.9.10.13: Check body Z direction to determine sign for yaw correction
+    # For nadir camera (body Z points DOWN = -world Z), body δθ_z = -world δyaw
+    # This requires H[0,8] = -1.0 to properly map world yaw to body rotation
+    q_current = kf.x[6:10, 0]
+    from scipy.spatial.transform import Rotation as R_scipy_check
+    q_xyzw = np.array([q_current[1], q_current[2], q_current[3], q_current[0]])
+    r_check = R_scipy_check.from_quat(q_xyzw)
+    body_z_world = r_check.apply(np.array([0.0, 0.0, 1.0]))
+    
+    # If body Z points DOWN (negative world Z), flip sign
+    yaw_sign = -1.0 if body_z_world[2] < 0 else 1.0
+    
     def h_mag_fun(x):
         h_yaw = np.zeros((1, err_dim), dtype=float)
-        h_yaw[0, 8] = 1.0  # Yaw depends on δθ_z
+        h_yaw[0, 8] = yaw_sign  # v2.9.10.13: Sign depends on body orientation!
         return h_yaw
     
     def hx_mag_fun(x):
@@ -239,15 +266,17 @@ def apply_magnetometer_update(kf,
     r_yaw = np.array([[sigma_mag_yaw_scaled**2]])
     
     # Phase-based Kalman gain tuning
-    # v2.9.10.10: INCREASED max correction during spinup to prevent drift
-    # Problem: v2.9.10.8 showed 30° clamp couldn't keep up with yaw drift
-    # Innovation grew from 10° to 170° because correction was limited
-    if time_elapsed < 15.0:  # Spinup phase
-        K_MIN = 0.40
-        MAX_YAW_CORRECTION = np.radians(90.0)  # v2.9.10.10: INCREASED from 30° to 90°
-    else:  # Normal flight
-        K_MIN = 0.20
-        MAX_YAW_CORRECTION = np.radians(30.0)  # v2.9.10.10: INCREASED from 15° to 30°
+    # v2.9.10.13: FULL CORRECTION in spinup (K=1.0) to completely prevent drift
+    # Problem: v2.9.10.12 with K=0.90 still allowed 10% drift to accumulate
+    # Root cause: Gyro drift ~0.44°/s accumulates between mag updates (~50ms apart)
+    #             Even K=0.90 leaves 10% residual → exponential drift buildup
+    # Solution: K=1.0 (100% correction) in spinup - trust magnetometer completely
+    if time_elapsed < 15.0:  # Spinup phase - FULL CORRECTION
+        K_MIN = 0.999  # v2.9.10.13: Use 0.999 instead of 1.0 to avoid div by zero!
+        MAX_YAW_CORRECTION = np.radians(180.0)  # v2.9.10.13: NO CLAMP in spinup!
+    else:  # Normal flight - gentler correction
+        K_MIN = 0.40  # v2.9.10.13: Increased from 0.30 for better tracking
+        MAX_YAW_CORRECTION = np.radians(60.0)  # v2.9.10.13: INCREASED from 45° to 60°
     
     # Compute current Kalman gain
     P_yaw = kf.P[theta_cov_idx, theta_cov_idx]
@@ -255,12 +284,21 @@ def apply_magnetometer_update(kf,
     K_yaw = P_yaw / S_yaw
     
     # Enforce minimum K
-    if K_yaw < K_MIN and K_MIN > 0.01:
+    # v2.9.10.13: Handle K_MIN close to 1.0 to avoid division by near-zero
+    if K_yaw < K_MIN and K_MIN > 0.01 and K_MIN < 0.9999:
         P_yaw_min = K_MIN * sigma_mag_yaw_scaled**2 / (1.0 - K_MIN)  # BUG FIX: Use scaled sigma!
         if kf.P[theta_cov_idx, theta_cov_idx] < P_yaw_min:
             kf.P[theta_cov_idx, theta_cov_idx] = P_yaw_min
             P_yaw = P_yaw_min
             K_yaw = K_MIN
+    elif K_MIN >= 0.9999:
+        # v2.9.10.13: For K_MIN ≈ 1.0, set P_yaw very large to achieve K ≈ 1
+        P_yaw_target = 1e6 * sigma_mag_yaw_scaled**2  # Very large P → K → 1
+        if kf.P[theta_cov_idx, theta_cov_idx] < P_yaw_target:
+            kf.P[theta_cov_idx, theta_cov_idx] = P_yaw_target
+            P_yaw = P_yaw_target
+            S_yaw = P_yaw + sigma_mag_yaw_scaled**2
+            K_yaw = P_yaw / S_yaw  # ≈ 0.999999
     
     # Limit maximum correction
     expected_correction = K_yaw * yaw_innov
