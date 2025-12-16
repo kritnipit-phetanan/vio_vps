@@ -292,9 +292,12 @@ def initialize_covariance(imu_params: dict,
     P_theta = 0.1    # Rotation uncertainty (rad²)
     
     # Bias uncertainty depends on calibration state
+    # NOTE: Even with static calibration, keep bias uncertainty high enough
+    # to allow MSCKF to refine bias estimates during flight (for observability)
     if estimate_imu_bias and has_static_calibration:
-        P_bg = (imu_params["gyr_w"] * 10) ** 2
-        P_ba = (imu_params["acc_w"] * 10) ** 2
+        # Increased from 10x to 100x to allow MSCKF bias updates
+        P_bg = (imu_params["gyr_w"] * 100) ** 2  # ~0.01 rad/s std
+        P_ba = (imu_params["acc_w"] * 100) ** 2  # ~0.1 m/s² std
     else:
         P_bg = (imu_params["gyr_w"] * 1000) ** 2
         P_ba = (imu_params["acc_w"] * 1000) ** 2
