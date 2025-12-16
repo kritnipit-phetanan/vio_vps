@@ -9,6 +9,11 @@
 #   - Uses run_vio.py instead of vio_vps.py directly
 #   - Same command-line interface, but cleaner separation
 #
+# v3.1.0: Simplified Config Model
+#   - YAML is single source of truth for algorithm settings
+#   - CLI provides only: paths, camera_view, save_debug_data, save_keyframe_images
+#   - Algorithm toggles (use_magnetometer, etc.) controlled via YAML
+#
 # Usage:
 #   bash scripts/benchmark_modular.sh
 # ============================================================================
@@ -16,11 +21,10 @@
 set -e  # Exit on error
 
 echo "============================================================================"
-echo "VIO IMU PREINTEGRATION - MODULAR VERSION (v2.9.10.0)"
+echo "VIO IMU PREINTEGRATION - MODULAR VERSION (v3.1.0)"
 echo "============================================================================"
-echo "Features: PPK Init Heading, Adaptive MSCKF, Multi-Baseline Triangulation"
-echo "Improvements: Priority 1-3 for <100m accuracy path"
-echo "Expected: 863m → 150-200m (KEY BREAKTHROUGH!)"
+echo "Features: Simplified Config System - YAML single source of truth"
+echo "Config: Algorithm settings from YAML, paths from CLI"
 echo ""
 
 # Configuration
@@ -43,8 +47,10 @@ echo "=== Verifying VIO Module Imports ==="
 python3 << 'EOF'
 import vio
 from vio.main_loop import VIORunner, VIOConfig
+from vio.config import load_config
 print('✅ All VIO modules imported successfully')
 print(f'   Package version: {vio.__version__}')
+print('   Config model: YAML single source of truth')
 EOF
 
 if [ $? -ne 0 ]; then
@@ -74,10 +80,8 @@ echo "  Test ID: ${TEST_ID}"
 echo "  Output directory: ${OUTPUT_DIR}/"
 echo "  Mode: Preintegration WITHOUT VPS"
 echo "  Entry point: run_vio.py (modular)"
-echo "  VIO Velocity: ENABLED (--use_vio_velocity)"
-echo "  Loop Closure: DISABLED (no loops in outdoor flight)"
-echo "  ZUPT: DISABLED (helicopter vibration)"
-echo "  Performance: FAST MODE (--fast_mode for 60% speedup)"
+echo "  Algorithm settings: From YAML config"
+echo "  Performance: From YAML (fast_mode section)"
 echo ""
 
 # ============================================================================
@@ -88,8 +92,9 @@ echo ""
 
 START_TIME=$(date +%s.%N)
 
-# You can use either run_vio.py or vio_vps.py - they produce the same results
-# run_vio.py is cleaner but currently just calls vio_vps.run()
+# v3.1.0: Simplified CLI - YAML is single source of truth
+# Algorithm settings (use_magnetometer, estimate_imu_bias, etc.) are in YAML
+# CLI provides only: paths, camera_view, debug flags
 python3 run_vio.py \
     --config "$CONFIG" \
     --imu "$IMU_PATH" \
@@ -100,13 +105,7 @@ python3 run_vio.py \
     --dem "$DEM_PATH" \
     --ground_truth "$GROUND_TRUTH" \
     --output "$OUTPUT_DIR" \
-    --img_w 1440 \
-    --img_h 1080 \
-    --z_state msl \
     --camera_view nadir \
-    --estimate_imu_bias \
-    --use_magnetometer \
-    --use_vio_velocity \
     --save_debug_data 2>&1 | tee "$OUTPUT_DIR/run.log"
 
 END_TIME=$(date +%s.%N)
@@ -120,7 +119,7 @@ echo ""
 # Quick Analysis
 # ============================================================================
 echo "============================================================================"
-echo "RESULTS (v2.9.10.0 - Path to <100m Accuracy)"
+echo "RESULTS (v3.1.0 - Simplified Config System)"
 echo "============================================================================"
 echo ""
 

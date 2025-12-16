@@ -75,6 +75,10 @@ imu:
   # Enable bias estimation from initial static samples
   estimate_bias: true
   
+  # Enable IMU preintegration (Forster et al.)
+  # Uses preintegrated measurements between keyframes for better motion estimation
+  use_preintegration: false  # Disable for now - still experimental
+  
   # Preintegration-specific (v2.9.9.10: AGGRESSIVE 3× increase)
   # v2.9.9.9 with 2× still showed 13.1σ overconfidence
   # Strategy: Increase to 3× to reach target velocity σ of 2-3 m/s
@@ -127,9 +131,10 @@ plane:
 # v2.9.10.8: RE-ENABLING magnetometer to fix yaw drift
 # Results: v2.9.10.4 (mag off) = 746m, 100°+ yaw drift in first 30s
 # v2.9.10.7 (mag off) = 726m, similar yaw drift
-# v2.9.10.10: Magnetometer causes oscillation! Disabling until root cause found
+# v2.9.10.12: Re-enabling magnetometer to fix yaw drift
+# Without magnetometer, yaw drifts 90° in 51 seconds from gyro bias alone
 magnetometer:
-  enabled: false   # v2.9.10.10: DISABLED - causes yaw oscillation with 90° clamp
+  enabled: true   # v2.9.10.12: RE-ENABLED - required for yaw observability
   
   # Hard-iron offset (CALIBRATED - normalized units)
   hard_iron_offset: [0.243467, -0.194837, 0.341668]
@@ -171,9 +176,9 @@ magnetometer:
   use_raw_heading: true
   
   # Apply initial yaw correction from magnetometer at startup
-  # DISABLED: Initial mag correction caused 173° yaw change which broke DEM fusion
-  # The IMU initial orientation is more reliable for this dataset
-  apply_initial_correction: false
+  # v2.9.10.12: RE-ENABLED to align initial yaw with mag reference
+  # This ensures zero initial innovation and prevents runaway yaw drift
+  apply_initial_correction: true
   
   # ===== NEW: Enhanced Magnetometer Filtering (v2.9.1) =====
   # EMA (Exponential Moving Average) smoothing and gyro consistency check
@@ -272,14 +277,14 @@ default_camera_view: "nadir"
 use_fisheye: true
 
 # ============================================================================
-# Performance Optimization (v2.9.9)
+# Performance Optimization (v3.1.0)
 # ============================================================================
 # Trade-off: Speed vs Accuracy
-# fast_mode=false, frame_skip=1: Full accuracy, ~700-800s runtime (2.5x realtime)
-# fast_mode=true,  frame_skip=1: 60% faster (~400-500s), minimal accuracy loss
-# fast_mode=true,  frame_skip=2: 80% faster (~300-350s), slight accuracy loss
-performance:
-  fast_mode: false        # Reduce features (540 vs 640) + faster KLT (15x15 win, 3 levels)
+# use_fast_mode=false, frame_skip=1: Full accuracy, ~700-800s runtime (2.5x realtime)
+# use_fast_mode=true,  frame_skip=1: 60% faster (~400-500s), minimal accuracy loss
+# use_fast_mode=true,  frame_skip=2: 80% faster (~300-350s), slight accuracy loss
+fast_mode:
+  use_fast_mode: false    # Reduce features (540 vs 640) + faster KLT (15x15 win, 3 levels)
   frame_skip: 1           # Process every N frames (1=all, 2=half, etc.)
 
 # ============================================================================

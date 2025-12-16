@@ -2,11 +2,44 @@
 VIO (Visual-Inertial Odometry) Package
 
 Complete modularized implementation of the VIO+ESKF+MSCKF system
-for helicopter navigation. Version 2.9.10.0 - Path to <100m accuracy.
+for helicopter navigation. Version 3.1.0 - Simplified Config System.
 
-Version: 2.9.10.0 (Critical Accuracy Improvements)
-Modules: 17
-Total Lines: ~10,000
+Version: 3.1.0 (Simplified Config - YAML single source of truth)
+Modules: 18
+Total Lines: ~11,000
+
+Changes in v3.1.0:
+- SIMPLIFIED CONFIG: YAML is now single source of truth for algorithm settings
+  * Removed CLI overrides for: use_magnetometer, estimate_imu_bias, use_vio_velocity, 
+    use_preintegration, fast_mode, frame_skip
+  * CLI now provides only: paths, camera_view, save_debug_data, save_keyframe_images
+  * Algorithm toggles configured in YAML config file only
+  
+- YAML CONFIG CHANGES:
+  * Added imu.use_preintegration toggle
+  * Renamed performance section to fast_mode section
+  * fast_mode: { use_fast_mode: bool, frame_skip: int }
+  
+- REMOVED: config_resolver.py module (merged functionality into config.py)
+- REMOVED: Tri-state boolean flags (BooleanOptionalAction)
+- SIMPLIFIED: run_vio.py entry point
+
+Changes in v3.0.0:
+- PRODUCTION CONFIG: New config_resolver.py module for clean config management
+  * Clear precedence: CODE DEFAULTS → YAML base config → CLI overrides
+  * Tri-state booleans: --flag / --no-flag / (not specified = use YAML)
+  * ResolvedConfig: Single source of truth for runtime configuration
+  * Reproducibility: resolved_config.yaml saved with every run
+  * Full audit: debug_calibration.txt includes CLI command and source tracking
+
+- CLI IMPROVEMENTS: argparse.BooleanOptionalAction for proper override behavior
+  * --use_magnetometer: Explicitly enable (override YAML)
+  * --no-use_magnetometer: Explicitly disable (override YAML)
+  * (not specified): Use YAML value (or code default)
+  
+- DEPRECATED: Global constants in config.py for runtime decisions
+  * Old: Read KB_PARAMS, IMU_PARAMS directly from config.py globals
+  * New: All runtime values flow through ResolvedConfig/VIOConfig
 
 Changes in v2.9.10.0:
 - PRIORITY 1: PPK Initial Heading Calibration (HIGHEST IMPACT)
@@ -238,7 +271,7 @@ Usage:
     from vio.propagation import VibrationDetector
 """
 
-__version__ = "2.9.10.2"
+__version__ = "3.1.0"
 
 # Lazy module imports - access as vio.config, vio.math_utils, etc.
 # This avoids importing all dependencies at once

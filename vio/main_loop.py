@@ -337,6 +337,7 @@ class VIORunner:
             )
         
         # MAG params for initial correction
+        # v2.9.10.12: Include hard_iron and soft_iron for proper initial calibration
         mag_params = None
         if self.config.use_magnetometer and len(self.mag_list) > 0:
             mag_params = {
@@ -344,6 +345,8 @@ class VIORunner:
                 'use_raw_heading': self.global_config.get('MAG_USE_RAW_HEADING', True),
                 'min_field': self.global_config.get('MAG_MIN_FIELD_STRENGTH', 0.1),
                 'max_field': self.global_config.get('MAG_MAX_FIELD_STRENGTH', 100.0),
+                'hard_iron': self.global_config.get('MAG_HARD_IRON_OFFSET', None),
+                'soft_iron': self.global_config.get('MAG_SOFT_IRON_MATRIX', None),
             }
         
         # Initialize state
@@ -539,7 +542,8 @@ class VIORunner:
                 vio_params=vio_params,
                 initial_state=initial_state,
                 estimate_imu_bias=self.config.estimate_imu_bias,
-                plane_config=plane_config
+                plane_config=plane_config,
+                resolved_config=None  # Simplified config model - no resolver
             )
             print(f"[DEBUG] Calibration snapshot saved: {cal_path}")
     
@@ -1294,11 +1298,46 @@ class VIORunner:
         if self.config.config_yaml:
             self.load_config()
             
-            # Override config parameters from YAML if specified
+            # =================================================================
+            # Override VIOConfig parameters from YAML (v3.1.0)
+            # =================================================================
+            # Algorithm toggles - read from YAML
             vio_config = self.global_config.get('vio', {})
             if 'use_vio_velocity' in vio_config:
                 self.config.use_vio_velocity = vio_config['use_vio_velocity']
-                print(f"[CONFIG] use_vio_velocity: {self.config.use_vio_velocity}")
+            # Alternative location in global_config
+            if 'USE_VIO_VELOCITY' in self.global_config:
+                self.config.use_vio_velocity = self.global_config['USE_VIO_VELOCITY']
+            
+            # Magnetometer toggle
+            if 'MAG_ENABLED' in self.global_config:
+                self.config.use_magnetometer = self.global_config['MAG_ENABLED']
+            
+            # IMU bias estimation toggle
+            if 'ESTIMATE_IMU_BIAS' in self.global_config:
+                self.config.estimate_imu_bias = self.global_config['ESTIMATE_IMU_BIAS']
+            
+            # Preintegration toggle
+            if 'USE_PREINTEGRATION' in self.global_config:
+                self.config.use_preintegration = self.global_config['USE_PREINTEGRATION']
+            
+            # Fast mode settings
+            if 'FAST_MODE' in self.global_config:
+                self.config.fast_mode = self.global_config['FAST_MODE']
+            if 'FRAME_SKIP' in self.global_config:
+                self.config.frame_skip = self.global_config['FRAME_SKIP']
+            
+            # Camera view (if not specified via CLI)
+            if not hasattr(self.config, '_camera_view_from_cli') and 'DEFAULT_CAMERA_VIEW' in self.global_config:
+                self.config.camera_view = self.global_config['DEFAULT_CAMERA_VIEW']
+            
+            print(f"[CONFIG] Algorithm settings from YAML:")
+            print(f"  use_vio_velocity: {self.config.use_vio_velocity}")
+            print(f"  use_magnetometer: {self.config.use_magnetometer}")
+            print(f"  estimate_imu_bias: {self.config.estimate_imu_bias}")
+            print(f"  use_preintegration: {self.config.use_preintegration}")
+            print(f"  fast_mode: {self.config.fast_mode}")
+            print(f"  frame_skip: {self.config.frame_skip}")
         
         # Load data
         self.load_data()

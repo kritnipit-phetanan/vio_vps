@@ -182,6 +182,9 @@ def load_config(config_path: str) -> Dict[str, Any]:
     initial_accel_bias = imu.get('initial_accel_bias', [0.0, 0.0, 0.0])
     result['INITIAL_ACCEL_BIAS'] = np.array(initial_accel_bias, dtype=float)
     
+    # IMU preintegration toggle (v3.1.0)
+    result['USE_PREINTEGRATION'] = imu.get('use_preintegration', False)
+    
     # Magnetometer calibration
     mag = config['magnetometer']
     # v2.9.10.4: Add enabled flag to allow disabling mag from config
@@ -222,6 +225,9 @@ def load_config(config_path: str) -> Dict[str, Any]:
     result['VO_NADIR_ALIGN_DEG'] = vio['views']['nadir']['nadir_threshold_deg']
     result['VO_FRONT_ALIGN_DEG'] = vio['views']['front']['nadir_threshold_deg']
     
+    # VIO velocity toggle (v3.1.0)
+    result['USE_VIO_VELOCITY'] = vio.get('use_vio_velocity', True)
+    
     # v2.9.10.5: Store raw vio config dict for access to all parameters
     # This includes new parameters like initial_agl_override
     result['vio'] = vio
@@ -259,6 +265,22 @@ def load_config(config_path: str) -> Dict[str, Any]:
     
     # Undistort backend
     result['USE_FISHEYE'] = config.get('use_fisheye', True)
+    
+    # Default camera view (v3.1.0)
+    result['DEFAULT_CAMERA_VIEW'] = config.get('default_camera_view', 'nadir')
+    
+    # =========================================================================
+    # Fast Mode / Performance (v3.1.0)
+    # =========================================================================
+    if 'fast_mode' in config:
+        fm = config['fast_mode']
+        result['FAST_MODE'] = fm.get('use_fast_mode', False)
+        result['FRAME_SKIP'] = fm.get('frame_skip', 1)
+    else:
+        # Legacy support: check 'performance' section
+        perf = config.get('performance', {})
+        result['FAST_MODE'] = perf.get('fast_mode', False)
+        result['FRAME_SKIP'] = perf.get('frame_skip', 1)
     
     # IMU-GNSS Lever Arm (optional - defaults to zero if not specified)
     if 'imu_gnss_extrinsics' in config:
