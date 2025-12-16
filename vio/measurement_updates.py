@@ -239,12 +239,15 @@ def apply_magnetometer_update(kf,
     r_yaw = np.array([[sigma_mag_yaw_scaled**2]])
     
     # Phase-based Kalman gain tuning
+    # v2.9.10.10: INCREASED max correction during spinup to prevent drift
+    # Problem: v2.9.10.8 showed 30° clamp couldn't keep up with yaw drift
+    # Innovation grew from 10° to 170° because correction was limited
     if time_elapsed < 15.0:  # Spinup phase
         K_MIN = 0.40
-        MAX_YAW_CORRECTION = np.radians(30.0)
+        MAX_YAW_CORRECTION = np.radians(90.0)  # v2.9.10.10: INCREASED from 30° to 90°
     else:  # Normal flight
         K_MIN = 0.20
-        MAX_YAW_CORRECTION = np.radians(15.0)
+        MAX_YAW_CORRECTION = np.radians(30.0)  # v2.9.10.10: INCREASED from 15° to 30°
     
     # Compute current Kalman gain
     P_yaw = kf.P[theta_cov_idx, theta_cov_idx]

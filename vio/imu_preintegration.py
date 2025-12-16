@@ -420,7 +420,10 @@ def compute_error_state_process_noise(dt: float, estimate_imu_bias: bool,
     q_theta = (combined_gyr_noise * dt)**2
     
     # Minimum yaw process noise
-    min_yaw_process_noise = np.radians(8.0)
+    # v2.9.10.10: REDUCED from 8.0 to 3.0 deg/sqrt(Hz)
+    # Problem: 8.0 deg/sqrt(Hz) caused yaw covariance to grow too fast,
+    # leading to runaway drift where mag correction couldn't keep up
+    min_yaw_process_noise = np.radians(3.0)  # Was 8.0
     q_theta_z_min = (min_yaw_process_noise * np.sqrt(dt))**2
     
     # Bias random walk with adaptive tuning

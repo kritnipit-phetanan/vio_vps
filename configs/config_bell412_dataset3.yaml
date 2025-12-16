@@ -144,11 +144,11 @@ magnetometer:
   heading_formula: "atan2(-mag_y, mag_x)"
   
   # Magnetic declination [radians]
-  # v2.9.10.9: Fixed 180° offset issue
-  # v2.9.10.8 log showed innovation ~170° → magnetometer heading flipped
-  # Root cause: Heading formula or axis orientation 180° off
-  # Fix: Add 180° to declination: -11.60° + 180° = 168.40°
-  declination: 2.9391  # 168.40° (was -11.60°, added 180° to fix heading flip)
+  # v2.9.10.10: Reverted to original value - the 180° fix was wrong!
+  # v2.9.10.8 analysis showed initial innovation ~10° (CORRECT!), but drift
+  # to 170° because MAX_YAW_CORRECTION=30° couldn't keep up with drift.
+  # Root cause: NOT declination - it's yaw correction clamp being too small
+  declination: -0.2025  # -11.60° (REVERTED from 168.40°)
   
   # Field strength bounds (normalized units, not µT)
   expected_field_strength: 0.63  # Mean normalized field
