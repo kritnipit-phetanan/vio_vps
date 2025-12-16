@@ -124,9 +124,11 @@ plane:
 # DISABLED v2.9.10.4: MAG calibration shows 36° drift by end of flight
 # Analysis: innovation_z grows from -2.5° (early) to +36° (late)
 # Root cause: Hard/soft iron calibration doesn't account for helicopter field distortion
-# Will re-enable after proper in-flight calibration
+# v2.9.10.8: RE-ENABLING magnetometer to fix yaw drift
+# Results: v2.9.10.4 (mag off) = 746m, 100°+ yaw drift in first 30s
+# v2.9.10.7 (mag off) = 726m, similar yaw drift
 magnetometer:
-  enabled: false  # v2.9.10.4: DISABLED due to calibration drift
+  enabled: true   # v2.9.10.8: RE-ENABLED to fix yaw drift
   
   # Hard-iron offset (CALIBRATED - normalized units)
   hard_iron_offset: [0.243467, -0.194837, 0.341668]
