@@ -127,8 +127,9 @@ plane:
 # v2.9.10.8: RE-ENABLING magnetometer to fix yaw drift
 # Results: v2.9.10.4 (mag off) = 746m, 100°+ yaw drift in first 30s
 # v2.9.10.7 (mag off) = 726m, similar yaw drift
+# v2.9.10.10: Magnetometer causes oscillation! Disabling until root cause found
 magnetometer:
-  enabled: true   # v2.9.10.8: RE-ENABLED to fix yaw drift
+  enabled: false   # v2.9.10.10: DISABLED - causes yaw oscillation with 90° clamp
   
   # Hard-iron offset (CALIBRATED - normalized units)
   hard_iron_offset: [0.243467, -0.194837, 0.341668]
