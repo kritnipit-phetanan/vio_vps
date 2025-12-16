@@ -144,12 +144,11 @@ magnetometer:
   heading_formula: "atan2(-mag_y, mag_x)"
   
   # Magnetic declination [radians]
-  # RECALIBRATED 2025-12-01 from PPK ground truth:
-  #   - PPK yaw (ENU) = 131.55°
-  #   - First attempt with -1.05° gave yaw_mag = 121°
-  #   - Offset needed: 131.55 - 121 = 10.55°
-  #   - New declination = -1.05 - 10.55 = -11.60°
-  declination: -0.2025  # -11.60° to produce yaw=131.6° matching GT
+  # v2.9.10.9: Fixed 180° offset issue
+  # v2.9.10.8 log showed innovation ~170° → magnetometer heading flipped
+  # Root cause: Heading formula or axis orientation 180° off
+  # Fix: Add 180° to declination: -11.60° + 180° = 168.40°
+  declination: 2.9391  # 168.40° (was -11.60°, added 180° to fix heading flip)
   
   # Field strength bounds (normalized units, not µT)
   expected_field_strength: 0.63  # Mean normalized field
