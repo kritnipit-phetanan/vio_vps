@@ -785,8 +785,10 @@ class VIORunner:
             )
             
             # Apply preintegration at EVERY camera frame
+            # Store Jacobians for bias observability in MSCKF
+            preint_jacobians = None
             if self.config.use_preintegration and ongoing_preint is not None:
-                apply_preintegration_at_camera(self.kf, ongoing_preint, t, imu_params)
+                preint_jacobians = apply_preintegration_at_camera(self.kf, ongoing_preint, t, imu_params)
             
             # Check parallax for different purposes
             # CRITICAL CHANGE: Separate low-parallax handling for velocity vs MSCKF/plane
@@ -806,7 +808,8 @@ class VIORunner:
                     cam_states=self.state.cam_states,
                     cam_observations=self.state.cam_observations,
                     vio_fe=self.vio_fe,
-                    frame_idx=self.vio_fe.frame_idx
+                    frame_idx=self.vio_fe.frame_idx,
+                    preint_jacobians=preint_jacobians  # Pass Jacobians for bias observability
                 )
                 
                 # Log MSCKF window state

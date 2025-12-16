@@ -842,9 +842,21 @@ def compute_measurement_jacobian(p_w: np.ndarray, cam_state: dict,
     h_cam[:, err_theta_idx:err_theta_idx+3] = j_rot
     
     # Preintegration Jacobians (bias coupling)
-    if use_preint_jacobians and 'preint' in cam_state and cam_state['preint'] is not None:
-        preint = cam_state['preint']
-        J_R_bg, J_v_bg, J_v_ba, J_p_bg, J_p_ba = preint.get_jacobians()
+    # Try preint object first, then stored jacobians
+    J_R_bg = J_v_bg = J_v_ba = J_p_bg = J_p_ba = None
+    if use_preint_jacobians:
+        if 'preint' in cam_state and cam_state['preint'] is not None:
+            preint = cam_state['preint']
+            J_R_bg, J_v_bg, J_v_ba, J_p_bg, J_p_ba = preint.get_jacobians()
+        elif 'J_R_bg' in cam_state:
+            # Use stored Jacobians from clone time
+            J_R_bg = cam_state['J_R_bg']
+            J_v_bg = cam_state['J_v_bg']
+            J_v_ba = cam_state['J_v_ba']
+            J_p_bg = cam_state['J_p_bg']
+            J_p_ba = cam_state['J_p_ba']
+    
+    if J_R_bg is not None:
         
         R_clone = R_w_imu
         

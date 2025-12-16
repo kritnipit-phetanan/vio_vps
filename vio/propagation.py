@@ -722,7 +722,7 @@ def augment_state_with_camera(kf: ExtendedKalmanFilter, cam_q_wxyz: np.ndarray,
 
 def apply_preintegration_at_camera(kf: ExtendedKalmanFilter, 
                                    ongoing_preint,
-                                   t: float, imu_params: dict):
+                                   t: float, imu_params: dict) -> dict:
     """
     Apply accumulated preintegration at camera frame.
     
@@ -734,13 +734,17 @@ def apply_preintegration_at_camera(kf: ExtendedKalmanFilter,
         ongoing_preint: IMUPreintegration object
         t: Current timestamp
         imu_params: IMU noise parameters
+    
+    Returns:
+        dict: Preintegration Jacobians for bias observability (J_R_bg, etc.)
+              Returns None if dt too small
     """
     from scipy.spatial.transform import Rotation as R_scipy
     from .math_utils import skew_symmetric
     
     dt_total = ongoing_preint.dt_sum
     if dt_total < 1e-6:
-        return
+        return None
     
     # Get deltas
     delta_R, delta_v, delta_p = ongoing_preint.get_deltas()
@@ -801,15 +805,27 @@ def apply_preintegration_at_camera(kf: ExtendedKalmanFilter,
     from .ekf import propagate_error_state_covariance
     kf.P = propagate_error_state_covariance(kf.P, Phi_core, Q_core, num_clones)
     
+    # Store Jacobians BEFORE reset for bias observability in MSCKF
+    preint_jacobians = {
+        'J_R_bg': J_R_bg.copy(),
+        'J_v_bg': J_v_bg.copy(),
+        'J_v_ba': J_v_ba.copy(),
+        'J_p_bg': J_p_bg.copy(),
+        'J_p_ba': J_p_ba.copy()
+    }
+    
     # Reset preintegration buffer
     ongoing_preint.reset(bg=bg, ba=ba)
     
     print(f"[PREINT] Applied: Δt={dt_total:.3f}s, Δpos={np.linalg.norm(p_i_new - p_i):.4f}m")
+    
+    return preint_jacobians
 
 
 def clone_camera_for_msckf(kf: ExtendedKalmanFilter, t: float,
                            cam_states: list, cam_observations: list,
-                           vio_fe, frame_idx: int) -> int:
+                           vio_fe, frame_idx: int,
+                           preint_jacobians: dict = None) -> int:
     """
     Clone current IMU pose for MSCKF.
     
@@ -820,6 +836,8 @@ def clone_camera_for_msckf(kf: ExtendedKalmanFilter, t: float,
         cam_observations: List of camera observations
         vio_fe: VIO frontend (for getting feature tracks)
         frame_idx: Current frame index
+        preint_jacobians: Preintegration Jacobians snapshot for bias observability
+            Contains: J_R_bg, J_v_bg, J_v_ba, J_p_bg, J_p_ba
     
     Returns:
         Clone index (for FEJ tracking)
@@ -852,7 +870,7 @@ def clone_camera_for_msckf(kf: ExtendedKalmanFilter, t: float,
                     'quality': 1.0
                 })
         
-        cam_states.append({
+        cam_state_entry = {
             'start_idx': start_idx,
             'q_idx': start_idx,
             'p_idx': start_idx + 4,
@@ -865,7 +883,17 @@ def clone_camera_for_msckf(kf: ExtendedKalmanFilter, t: float,
             'p_fej': p_imu.copy(),
             'bg_fej': kf.x[10:13, 0].copy(),
             'ba_fej': kf.x[13:16, 0].copy()
-        })
+        }
+        
+        # Add preintegration Jacobians for bias observability
+        if preint_jacobians is not None:
+            cam_state_entry['J_R_bg'] = preint_jacobians.get('J_R_bg')
+            cam_state_entry['J_v_bg'] = preint_jacobians.get('J_v_bg')
+            cam_state_entry['J_v_ba'] = preint_jacobians.get('J_v_ba')
+            cam_state_entry['J_p_bg'] = preint_jacobians.get('J_p_bg')
+            cam_state_entry['J_p_ba'] = preint_jacobians.get('J_p_ba')
+        
+        cam_states.append(cam_state_entry)
         
         cam_observations.append({
             'cam_id': clone_idx,
