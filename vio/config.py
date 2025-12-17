@@ -396,6 +396,26 @@ def load_config(config_path: str) -> VIOConfig:
         result['VIBRATION_THRESHOLD_MULT'] = 5.0
     
     # =========================================================================
+    # NEW: Terrain Referenced Navigation (TRN) v3.3.0
+    # =========================================================================
+    if 'trn' in config:
+        trn_cfg = config['trn']
+        result['TRN_ENABLED'] = trn_cfg.get('enabled', False)
+        result['TRN_PROFILE_WINDOW'] = trn_cfg.get('profile_window_sec', 30.0)
+        result['TRN_MIN_SAMPLES'] = trn_cfg.get('min_samples', 20)
+        result['TRN_SEARCH_RADIUS'] = trn_cfg.get('search_radius_m', 500.0)
+        result['TRN_SEARCH_STEP'] = trn_cfg.get('search_step_m', 30.0)
+        result['TRN_MIN_TERRAIN_VAR'] = trn_cfg.get('min_terrain_variation_m', 10.0)
+        result['TRN_CORR_THRESHOLD'] = trn_cfg.get('max_correlation_threshold', 0.7)
+        result['TRN_MIN_ALT_VAR'] = trn_cfg.get('min_altitude_variation_m', 5.0)
+        result['TRN_UPDATE_INTERVAL'] = trn_cfg.get('update_interval_sec', 10.0)
+        result['TRN_SIGMA_XY'] = trn_cfg.get('sigma_trn_xy', 50.0)
+        result['trn'] = trn_cfg  # Store full config for TRN module
+    else:
+        result['TRN_ENABLED'] = False
+        result['trn'] = {}
+    
+    # =========================================================================
     # Create VIOConfig dataclass from parsed YAML (v3.2.0)
     # =========================================================================
     cam = config['camera']

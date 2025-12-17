@@ -51,7 +51,8 @@ from .camera import make_KD_for_size
 from .propagation import (
     process_imu, propagate_error_state_covariance, 
     augment_state_with_camera, detect_stationary, apply_zupt,
-    apply_preintegration_at_camera, clone_camera_for_msckf
+    apply_preintegration_at_camera, clone_camera_for_msckf,
+    get_flight_phase  # v3.3.0: State-based phase detection
 )
 from .vps_integration import apply_vps_update, xy_to_latlon, latlon_to_xy
 from .msckf import perform_msckf_updates, print_msckf_stats, trigger_msckf_update
@@ -77,6 +78,7 @@ from .output_utils import (
     log_state_debug, log_vo_debug, log_msckf_window, log_fej_consistency,
     DebugCSVWriters, init_output_csvs, get_ground_truth_error
 )
+from .trn import TerrainReferencedNavigation, TRNConfig, create_trn_from_config
 
 # VIOConfig is imported from config.py (single source of truth)
 
@@ -156,6 +158,7 @@ class VIORunner:
         self.lon0 = 0.0
         self.msl0 = 0.0
         self.dem0 = None
+        self.initial_msl = 0.0  # For TRN altitude change tracking
         
         # Global config (loaded from YAML)
         self.global_config = {}
@@ -173,6 +176,9 @@ class VIORunner:
         
         # Vibration detector (optional)
         self.vibration_detector: Optional[VibrationDetector] = None
+        
+        # TRN (Terrain Referenced Navigation) - v3.3.0
+        self.trn: Optional[TerrainReferencedNavigation] = None
         
         # Last gyro for mag filtering
         self.last_gyro_z = 0.0
@@ -1321,6 +1327,20 @@ class VIORunner:
             threshold=imu_params.get('acc_n', 0.1) * vib_threshold_mult
         )
         
+        # Initialize TRN (Terrain Referenced Navigation) - v3.3.0
+        if self.global_config.get('TRN_ENABLED', False):
+            self.trn = create_trn_from_config(self.dem, self.global_config)
+            if self.trn:
+                print(f"[TRN] Initialized: search_radius={self.global_config.get('TRN_SEARCH_RADIUS', 500)}m, "
+                      f"update_interval={self.global_config.get('TRN_UPDATE_INTERVAL', 10)}s")
+            else:
+                print("[TRN] WARNING: Failed to initialize TRN")
+        else:
+            print("[TRN] Disabled in config")
+        
+        # Store initial MSL for altitude change tracking
+        self.initial_msl = self.msl0
+        
         # Setup output files
         self.setup_output_files()
         
@@ -1359,12 +1379,27 @@ class VIORunner:
             
             time_elapsed = t - self.state.t0
             
-            # Get flight phase from propagation module
-            from .propagation import get_flight_phase
+            # Update vibration detector
+            gyro_mag = np.linalg.norm(rec.ang)
+            is_high_vibration, vibration_level = self.vibration_detector.update(gyro_mag)
+            
+            # Get current velocity and uncertainty for state-based phase detection
+            velocity = self.kf.x[3:6, 0].flatten() if self.kf is not None else None
+            velocity_sigma = None
+            if self.kf is not None and self.kf.P.shape[0] > 5:
+                velocity_sigma = np.sqrt(np.mean(np.diag(self.kf.P[3:6, 3:6])))
+            
+            altitude_change = self.kf.x[2, 0] - self.initial_msl if self.kf is not None else 0.0
+            
+            # Get flight phase (v3.3.0: state-based + time fallback)
             phase_num, _ = get_flight_phase(
                 time_elapsed,
                 spinup_end=self.PHASE_SPINUP_END,
-                early_flight_end=self.PHASE_EARLY_END
+                early_flight_end=self.PHASE_EARLY_END,
+                velocity=velocity,
+                velocity_sigma=velocity_sigma,
+                vibration_level=vibration_level,
+                altitude_change=altitude_change
             )
             self.state.current_phase = phase_num
             
@@ -1408,6 +1443,25 @@ class VIORunner:
             
             # DEM height updates (modifies kf.x[2,0], but we use pre-update values for logging)
             self.process_dem_height(t)
+            
+            # TRN (Terrain Referenced Navigation) updates - v3.3.0
+            if self.trn is not None:
+                # Update altitude history for profile matching
+                self.trn.update_altitude_history(
+                    timestamp=t,
+                    msl_altitude=msl_now,
+                    estimated_x=self.kf.x[0, 0],
+                    estimated_y=self.kf.x[1, 0]
+                )
+                
+                # Try TRN position fix
+                if self.trn.check_update_needed(t):
+                    trn_success = self.trn.apply_trn_update(
+                        kf=self.kf,
+                        lat0=self.lat0,
+                        lon0=self.lon0,
+                        current_time=t
+                    )
             
             # Log error vs ground truth (every sample, like vio_vps.py)
             self.log_error(t)

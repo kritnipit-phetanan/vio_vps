@@ -512,29 +512,76 @@ def apply_zupt(kf: ExtendedKalmanFilter, v_mag: float,
 
 
 # =============================================================================
-# Flight Phase Detection
+# Flight Phase Detection (v3.3.0: State-based + Time-based hybrid)
 # =============================================================================
 
 def get_flight_phase(time_elapsed: float, 
                      spinup_end: float = 15.0,
-                     early_flight_end: float = 60.0) -> Tuple[int, str]:
+                     early_flight_end: float = 60.0,
+                     # State-based inputs (optional)
+                     velocity: Optional[np.ndarray] = None,
+                     velocity_sigma: Optional[float] = None,
+                     vibration_level: Optional[float] = None,
+                     altitude_change: Optional[float] = None) -> Tuple[int, str]:
     """
-    Determine current flight phase based on elapsed time.
+    Determine current flight phase based on state AND time.
+    
+    v3.3.0: Hybrid approach - use state when available, fallback to time.
+    
+    State-based detection (GPS-denied realtime compatible):
+      - SPINUP: High vibration + low velocity + small altitude change
+      - EARLY: High velocity uncertainty OR high position uncertainty
+      - NORMAL: Stable state with low uncertainty
+    
+    Time-based fallback:
+      - SPINUP: t < spinup_end
+      - EARLY: spinup_end <= t < early_flight_end
+      - NORMAL: t >= early_flight_end
     
     Phases:
       0: SPINUP - Rotor spin-up (high vibration, don't trust IMU heading)
-      1: EARLY - Early flight (stabilizing)
+      1: EARLY - Early flight (stabilizing, high uncertainty)
       2: NORMAL - Normal flight (full trust in sensors)
     
     Args:
-        time_elapsed: Time since start (seconds)
-        spinup_end: End of spinup phase
-        early_flight_end: End of early flight phase
+        time_elapsed: Time since start (seconds) - fallback only
+        spinup_end: End of spinup phase (seconds)
+        early_flight_end: End of early flight phase (seconds)
+        velocity: Current velocity [vx, vy, vz] (m/s), optional
+        velocity_sigma: Velocity uncertainty (m/s), optional
+        vibration_level: Gyro std from VibrationDetector, optional
+        altitude_change: Change in altitude from start (m), optional
     
     Returns:
         phase: Phase number (0, 1, or 2)
         phase_name: Human-readable phase name
     """
+    # State-based detection thresholds (configurable via YAML in future)
+    SPINUP_VELOCITY_THRESH = 1.0       # m/s - low velocity during spinup
+    SPINUP_VIBRATION_THRESH = 0.3      # rad/s - high vibration during spinup
+    SPINUP_ALT_CHANGE_THRESH = 5.0     # m - minimal altitude change during spinup
+    EARLY_VELOCITY_SIGMA_THRESH = 3.0  # m/s - high velocity uncertainty
+    
+    # Try state-based detection first (GPS-denied compatible)
+    if velocity is not None and vibration_level is not None:
+        vel_mag = np.linalg.norm(velocity[:2]) if velocity is not None else 0.0
+        alt_change = abs(altitude_change) if altitude_change is not None else 0.0
+        
+        # SPINUP: High vibration + low horizontal velocity + small altitude change
+        if vibration_level > SPINUP_VIBRATION_THRESH and vel_mag < SPINUP_VELOCITY_THRESH:
+            if alt_change < SPINUP_ALT_CHANGE_THRESH:
+                return 0, "SPINUP"
+        
+        # EARLY: High velocity uncertainty
+        if velocity_sigma is not None and velocity_sigma > EARLY_VELOCITY_SIGMA_THRESH:
+            return 1, "EARLY"
+        
+        # NORMAL: Stable state
+        if vel_mag > SPINUP_VELOCITY_THRESH or alt_change > SPINUP_ALT_CHANGE_THRESH:
+            if velocity_sigma is None or velocity_sigma < EARLY_VELOCITY_SIGMA_THRESH:
+                return 2, "NORMAL"
+    
+    # Fallback to time-based detection
     if time_elapsed < spinup_end:
         return 0, "SPINUP"
     elif time_elapsed < early_flight_end:

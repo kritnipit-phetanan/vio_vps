@@ -343,3 +343,32 @@ vibration:
   use_vibration_detector: true
   window_size: 50             # Number of samples for vibration detection
   threshold_multiplier: 5.0   # Multiplier of acc_n for vibration threshold
+
+# ============================================================================
+# NEW: Terrain Referenced Navigation (TRN) v3.3.0
+# ============================================================================
+# Provides periodic XY position fixes using terrain profile matching.
+# GPS-denied compliant - uses pre-loaded DSM/DEM terrain data.
+# 
+# How it works:
+# 1. Collects altitude history over a window (30-60 seconds)
+# 2. Searches nearby positions for terrain profile that best matches
+# 3. When good match found, applies position correction to EKF
+#
+# Effectiveness depends on:
+# - Terrain variation (better in hilly areas, worse over flat terrain)
+# - DEM resolution (30m DSM is adequate for regional navigation)
+# - Altitude measurement accuracy (baro + DEM-derived AGL)
+#
+# Expected accuracy: ~50-100m horizontal (depends on terrain)
+trn:
+  enabled: true               # Enable Terrain Referenced Navigation
+  profile_window_sec: 30.0    # Seconds of altitude history for matching
+  min_samples: 20             # Minimum samples for valid profile
+  search_radius_m: 500.0      # Search radius around current estimate [m]
+  search_step_m: 30.0         # Grid step size [m] - match DEM resolution
+  min_terrain_variation_m: 10.0  # Minimum terrain variation for match [m]
+  max_correlation_threshold: 0.7  # Minimum correlation for valid fix
+  min_altitude_variation_m: 5.0   # Minimum altitude variation in profile [m]
+  update_interval_sec: 10.0   # Seconds between TRN updates
+  sigma_trn_xy: 50.0          # Position uncertainty from TRN [m]
