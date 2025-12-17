@@ -79,11 +79,15 @@ imu:
   # Uses preintegrated measurements between keyframes for better motion estimation
   use_preintegration: true
   
-  # Flight phase detection (v3.3.1: Pure state-based for GPS-denied realtime)
+  # Flight phase detection (v3.4.0: State-based with configurable thresholds)
   # - SPINUP (0): High vibration + low velocity (rotor spinup)
   # - EARLY (1): High velocity uncertainty (filter not converged)
   # - NORMAL (2): Stable flight with converged estimates
-  # TODO v3.4.0: Move phase detection thresholds to config (currently in propagation.py)
+  phase_detection:
+    spinup_velocity_thresh: 1.0        # m/s - horizontal velocity below this = stationary
+    spinup_vibration_thresh: 0.3       # rad/s - gyro std above this = high vibration
+    spinup_altitude_change_thresh: 5.0 # m - altitude change below this = still on ground
+    early_velocity_sigma_thresh: 3.0   # m/s - velocity uncertainty above this = unconverged
   
   # Preintegration-specific (v2.9.9.10: AGGRESSIVE 3× increase)
   # v2.9.9.9 with 2× still showed 13.1σ overconfidence

@@ -240,10 +240,12 @@ def load_config(config_path: str) -> VIOConfig:
     # IMU preintegration toggle (v3.1.0)
     result['USE_PREINTEGRATION'] = imu.get('use_preintegration', False)
     
-    # Flight phase timing (v3.2.0)
-    flight_phases = imu.get('flight_phases', {})
-    result['PHASE_SPINUP_END'] = flight_phases.get('spinup_end_sec', 15.0)
-    result['PHASE_EARLY_END'] = flight_phases.get('early_end_sec', 60.0)
+    # Flight phase detection thresholds (v3.4.0: State-based)
+    phase_detection = imu.get('phase_detection', {})
+    result['PHASE_SPINUP_VELOCITY_THRESH'] = phase_detection.get('spinup_velocity_thresh', 1.0)
+    result['PHASE_SPINUP_VIBRATION_THRESH'] = phase_detection.get('spinup_vibration_thresh', 0.3)
+    result['PHASE_SPINUP_ALT_CHANGE_THRESH'] = phase_detection.get('spinup_altitude_change_thresh', 5.0)
+    result['PHASE_EARLY_VELOCITY_SIGMA_THRESH'] = phase_detection.get('early_velocity_sigma_thresh', 3.0)
     
     # Magnetometer calibration
     mag = config['magnetometer']

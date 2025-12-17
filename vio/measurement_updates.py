@@ -63,7 +63,7 @@ def apply_magnetometer_update(kf,
                               mag_declination: float,
                               use_raw_heading: bool,
                               sigma_mag_yaw: float,
-                              time_elapsed: float,
+                              current_phase: int = 2,
                               gyro_z: float = 0.0,
                               in_convergence: bool = False,
                               has_ppk_yaw: bool = False,
@@ -90,7 +90,7 @@ def apply_magnetometer_update(kf,
         mag_declination: Magnetic declination in radians
         use_raw_heading: Use raw body-frame heading (GPS-calibrated)
         sigma_mag_yaw: Base measurement noise for yaw (can be scaled by filter)
-        time_elapsed: Time since start for flight phase detection
+        current_phase: Flight phase (0=SPINUP, 1=EARLY, 2=NORMAL)
         gyro_z: Current gyro Z for consistency check
         in_convergence: Whether in initial convergence period
         has_ppk_yaw: Whether PPK provided initial yaw (skip if in convergence)
@@ -121,14 +121,14 @@ def apply_magnetometer_update(kf,
     # Track total attempts
     _MAG_STATE['total_attempts'] += 1
     
-    # v2.9.10.13: Oscillation skip check - DISABLED during spinup!
+    # v3.4.0: Oscillation skip check - DISABLED during SPINUP phase!
     # v2.9.5: Oscillation detection (skip_count = 2, reduced from 10)
-    # Check if we're in skip period - BUT NOT during spinup (t<15s)
-    if time_elapsed >= 15.0 and _MAG_STATE['skip_count'] > 0:
+    # Check if we're in skip period - BUT NOT during SPINUP (phase 0)
+    if current_phase >= 2 and _MAG_STATE['skip_count'] > 0:
         _MAG_STATE['skip_count'] -= 1
         return False, f"Oscillation skip (remaining: {_MAG_STATE['skip_count']})"
-    elif time_elapsed < 15.0:
-        # During spinup: reset skip_count to ensure continuous updates
+    elif current_phase < 2:
+        # During SPINUP/EARLY: reset skip_count to ensure continuous updates
         _MAG_STATE['skip_count'] = 0
     
     # Check field strength
@@ -172,8 +172,8 @@ def apply_magnetometer_update(kf,
     # Detect rapid sign alternation in innovation (indicates erratic behavior)
     # When detected, skip 2 updates (minimal gap ~0.1s) to let system stabilize
     
-    # v2.9.10.13: SKIP oscillation detection during spinup phase!
-    if time_elapsed >= 15.0:  # ONLY after spinup phase
+    # v3.4.0: SKIP oscillation detection during SPINUP/EARLY phases!
+    if current_phase >= 2:  # ONLY in NORMAL phase
         innovation_sign = 1 if yaw_innov > 0 else -1
         _MAG_STATE['innovation_history'].append(innovation_sign)
         
@@ -199,9 +199,9 @@ def apply_magnetometer_update(kf,
     
     # Adaptive R-scaling during oscillation buildup (v2.9.2 logic)
     # Apply progressive R-inflation if oscillation pattern developing
-    # v2.9.10.13: DISABLED during spinup - always use R_scale=1.0
+    # v3.4.0: DISABLED during SPINUP/EARLY - always use R_scale=1.0
     oscillation_r_scale = 1.0
-    if time_elapsed >= 15.0 and len(_MAG_STATE['innovation_history']) >= 2:
+    if current_phase >= 2 and len(_MAG_STATE['innovation_history']) >= 2:
         h = _MAG_STATE['innovation_history']
         if h[-1] != h[-2]:
             # One alternation: light R-scaling
@@ -265,18 +265,20 @@ def apply_magnetometer_update(kf,
     # Measurement covariance (use scaled sigma from oscillation detection)
     r_yaw = np.array([[sigma_mag_yaw_scaled**2]])
     
-    # Phase-based Kalman gain tuning
-    # v2.9.10.13: FULL CORRECTION in spinup (K=1.0) to completely prevent drift
-    # Problem: v2.9.10.12 with K=0.90 still allowed 10% drift to accumulate
-    # Root cause: Gyro drift ~0.44°/s accumulates between mag updates (~50ms apart)
-    #             Even K=0.90 leaves 10% residual → exponential drift buildup
-    # Solution: K=1.0 (100% correction) in spinup - trust magnetometer completely
-    if time_elapsed < 15.0:  # Spinup phase - FULL CORRECTION
-        K_MIN = 0.999  # v2.9.10.13: Use 0.999 instead of 1.0 to avoid div by zero!
-        MAX_YAW_CORRECTION = np.radians(180.0)  # v2.9.10.13: NO CLAMP in spinup!
-    else:  # Normal flight - gentler correction
-        K_MIN = 0.40  # v2.9.10.13: Increased from 0.30 for better tracking
-        MAX_YAW_CORRECTION = np.radians(60.0)  # v2.9.10.13: INCREASED from 45° to 60°
+    # Phase-based Kalman gain tuning (v3.4.0)
+    # SPINUP (0): FULL CORRECTION (K=1.0) to completely prevent drift
+    # Problem: Gyro drift ~0.44°/s accumulates between mag updates (~50ms apart)
+    #          Even K=0.90 leaves 10% residual → exponential drift buildup
+    # Solution: K=1.0 (100% correction) in SPINUP - trust magnetometer completely
+    if current_phase == 0:  # SPINUP phase - FULL CORRECTION
+        K_MIN = 0.999  # Use 0.999 instead of 1.0 to avoid div by zero!
+        MAX_YAW_CORRECTION = np.radians(180.0)  # NO CLAMP in SPINUP!
+    elif current_phase == 1:  # EARLY phase - moderate correction
+        K_MIN = 0.70  # Higher trust in mag during convergence
+        MAX_YAW_CORRECTION = np.radians(90.0)  # Allow larger corrections
+    else:  # NORMAL phase - gentler correction
+        K_MIN = 0.40  # Standard tracking
+        MAX_YAW_CORRECTION = np.radians(60.0)  # Conservative limit
     
     # Compute current Kalman gain
     P_yaw = kf.P[theta_cov_idx, theta_cov_idx]

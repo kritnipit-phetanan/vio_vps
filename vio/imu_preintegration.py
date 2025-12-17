@@ -426,15 +426,10 @@ def compute_error_state_process_noise(dt: float, estimate_imu_bias: bool,
     min_yaw_process_noise = np.radians(3.0)  # Was 8.0
     q_theta_z_min = (min_yaw_process_noise * np.sqrt(dt))**2
     
-    # Bias random walk with adaptive tuning
-    if not estimate_imu_bias:
-        time_elapsed = t - t0
-        decay_factor = max(0.1, 1.0 - time_elapsed / 60.0)
-        q_bg = (imu_params['gyr_w'] * decay_factor)**2 * dt
-        q_ba = (imu_params['acc_w'] * decay_factor)**2 * dt
-    else:
-        q_bg = (imu_params['gyr_w']**2) * dt
-        q_ba = (imu_params['acc_w']**2) * dt
+    # Bias random walk (v3.4.0: removed time-based decay)
+    # Note: Adaptive tuning removed - use constant bias random walk from config
+    q_bg = (imu_params['gyr_w']**2) * dt
+    q_ba = (imu_params['acc_w']**2) * dt
     
     # Build 15×15 matrix
     Q = np.zeros((15, 15), dtype=float)

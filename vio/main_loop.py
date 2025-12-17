@@ -139,9 +139,11 @@ class VIORunner:
         self.config = config
         self.state = VIOState()
         
-        # Flight phase timing will be loaded from YAML in load_config()
-        self.PHASE_SPINUP_END = 15.0  # Default, overridden by YAML
-        self.PHASE_EARLY_END = 60.0   # Default, overridden by YAML
+        # Flight phase detection thresholds (v3.4.0: State-based)
+        self.PHASE_SPINUP_VELOCITY_THRESH = 1.0
+        self.PHASE_SPINUP_VIBRATION_THRESH = 0.3
+        self.PHASE_SPINUP_ALT_CHANGE_THRESH = 5.0
+        self.PHASE_EARLY_VELOCITY_SIGMA_THRESH = 3.0
         
         # These will be initialized in run()
         self.kf = None
@@ -190,9 +192,11 @@ class VIORunner:
             cfg = load_config(self.config.config_yaml)
             self.global_config = cfg
             
-            # Load flight phase timing from YAML (v3.2.0)
-            self.PHASE_SPINUP_END = cfg.get('PHASE_SPINUP_END', 15.0)
-            self.PHASE_EARLY_END = cfg.get('PHASE_EARLY_END', 60.0)
+            # Load flight phase detection thresholds from YAML (v3.4.0)
+            self.PHASE_SPINUP_VELOCITY_THRESH = cfg.get('PHASE_SPINUP_VELOCITY_THRESH', 1.0)
+            self.PHASE_SPINUP_VIBRATION_THRESH = cfg.get('PHASE_SPINUP_VIBRATION_THRESH', 0.3)
+            self.PHASE_SPINUP_ALT_CHANGE_THRESH = cfg.get('PHASE_SPINUP_ALT_CHANGE_THRESH', 5.0)
+            self.PHASE_EARLY_VELOCITY_SIGMA_THRESH = cfg.get('PHASE_EARLY_VELOCITY_SIGMA_THRESH', 3.0)
             
             return cfg
         return {}
@@ -518,14 +522,13 @@ class VIORunner:
             )
             print(f"[DEBUG] Calibration snapshot saved: {cal_path}")
     
-    def process_imu_sample(self, rec, dt: float, time_elapsed: float):
+    def process_imu_sample(self, rec, dt: float):
         """
         Process single IMU sample (propagation + ZUPT).
         
         Args:
             rec: IMU record
             dt: Time delta since last sample
-            time_elapsed: Time since start
         """
         imu_params = self.global_config.get('IMU_PARAMS', {'g_norm': 9.803})
         
@@ -644,7 +647,7 @@ class VIORunner:
                 print(f"[VPS] Applied at t={t:.3f}, innovation={innovation_mag:.1f}m, "
                       f"tier={tier_name}, R_scale={r_scale:.1f}x")
     
-    def process_vio(self, rec, t: float, time_elapsed: float, ongoing_preint=None):
+    def process_vio(self, rec, t: float, ongoing_preint=None):
         """
         Process VIO (Visual-Inertial Odometry) updates.
         
@@ -660,7 +663,6 @@ class VIORunner:
         Args:
             rec: Current IMU record (for rotation rate check)
             t: Current timestamp
-            time_elapsed: Time since start
             ongoing_preint: Preintegration buffer (if enabled)
             
         Returns:
@@ -1026,19 +1028,17 @@ class VIORunner:
         except Exception:
             pass
     
-    def process_magnetometer(self, t: float, time_elapsed: float):
+    def process_magnetometer(self, t: float):
         """
         Process magnetometer measurements up to current time.
         
         Args:
             t: Current timestamp
-            time_elapsed: Time since start
         """
         sigma_mag = self.global_config.get('SIGMA_MAG_YAW', 0.15)
         declination = self.global_config.get('MAG_DECLINATION', 0.0)
         use_raw = self.global_config.get('MAG_USE_RAW_HEADING', True)
         rate_limit = self.global_config.get('MAG_UPDATE_RATE_LIMIT', 1)
-        convergence_window = self.global_config.get('MAG_INITIAL_CONVERGENCE_WINDOW', 30.0)
         
         while (self.state.mag_idx < len(self.mag_list) and 
                self.mag_list[self.state.mag_idx].t <= t):
@@ -1066,7 +1066,8 @@ class VIORunner:
             )
             
             # Apply magnetometer filter (EMA smoothing + gyro consistency check)
-            in_convergence = time_elapsed < convergence_window
+            # v3.4.0: Use phase-based convergence (state-based, not time-based)
+            in_convergence = self.state.current_phase < 2  # SPINUP or EARLY phase
             yaw_mag_filtered, r_scale, filter_info = apply_mag_filter(
                 yaw_mag=yaw_mag_raw,
                 yaw_t=mag_rec.t,
@@ -1096,7 +1097,7 @@ class VIORunner:
                 mag_declination=declination,
                 use_raw_heading=use_raw,
                 sigma_mag_yaw=sigma_mag_scaled,  # Use scaled sigma
-                time_elapsed=time_elapsed,
+                current_phase=self.state.current_phase,  # v3.4.0: state-based phase
                 in_convergence=in_convergence,
                 has_ppk_yaw=has_ppk,
                 timestamp=t,
@@ -1391,15 +1392,16 @@ class VIORunner:
             
             altitude_change = self.kf.x[2, 0] - self.initial_msl if self.kf is not None else 0.0
             
-            # Get flight phase (v3.3.0: state-based + time fallback)
+            # Get flight phase (v3.4.0: pure state-based with config thresholds)
             phase_num, _ = get_flight_phase(
-                time_elapsed,
-                spinup_end=self.PHASE_SPINUP_END,
-                early_flight_end=self.PHASE_EARLY_END,
                 velocity=velocity,
                 velocity_sigma=velocity_sigma,
                 vibration_level=vibration_level,
-                altitude_change=altitude_change
+                altitude_change=altitude_change,
+                spinup_velocity_thresh=self.PHASE_SPINUP_VELOCITY_THRESH,
+                spinup_vibration_thresh=self.PHASE_SPINUP_VIBRATION_THRESH,
+                spinup_alt_change_thresh=self.PHASE_SPINUP_ALT_CHANGE_THRESH,
+                early_velocity_sigma_thresh=self.PHASE_EARLY_VELOCITY_SIGMA_THRESH
             )
             self.state.current_phase = phase_num
             
@@ -1407,7 +1409,7 @@ class VIORunner:
             if self.config.use_preintegration and ongoing_preint is not None:
                 ongoing_preint.integrate_measurement(rec.ang, rec.lin, dt)
             else:
-                self.process_imu_sample(rec, dt, time_elapsed)
+                self.process_imu_sample(rec, dt)
             
             # Debug logging: raw IMU and state covariance
             self.debug_writers.log_imu_raw(t, rec)
@@ -1421,10 +1423,10 @@ class VIORunner:
             
             # Magnetometer updates
             if self.config.use_magnetometer:
-                self.process_magnetometer(t, time_elapsed)
+                self.process_magnetometer(t)
             
             # VIO updates (feature tracking, MSCKF, velocity)
-            used_vo, vo_data = self.process_vio(rec, t, time_elapsed, ongoing_preint)
+            used_vo, vo_data = self.process_vio(rec, t, ongoing_preint)
             
             # Capture current MSL/AGL BEFORE DEM update (matches vio_vps.py behavior)
             lat_now, lon_now = xy_to_latlon(

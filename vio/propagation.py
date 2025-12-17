@@ -515,18 +515,19 @@ def apply_zupt(kf: ExtendedKalmanFilter, v_mag: float,
 # Flight Phase Detection (v3.3.1: Pure State-based for GPS-denied realtime)
 # =============================================================================
 
-def get_flight_phase(time_elapsed: float = 0.0,  # Deprecated, kept for compatibility
-                     spinup_end: float = 15.0,    # Deprecated
-                     early_flight_end: float = 60.0,  # Deprecated
-                     # State-based inputs (required for GPS-denied realtime)
-                     velocity: Optional[np.ndarray] = None,
+def get_flight_phase(velocity: Optional[np.ndarray] = None,
                      velocity_sigma: Optional[float] = None,
                      vibration_level: Optional[float] = None,
-                     altitude_change: Optional[float] = None) -> Tuple[int, str]:
+                     altitude_change: Optional[float] = None,
+                     # Configurable thresholds (v3.4.0)
+                     spinup_velocity_thresh: float = 1.0,
+                     spinup_vibration_thresh: float = 0.3,
+                     spinup_alt_change_thresh: float = 5.0,
+                     early_velocity_sigma_thresh: float = 3.0) -> Tuple[int, str]:
     """
     Determine current flight phase based on VEHICLE STATE ONLY.
     
-    v3.3.1: Pure state-based detection - NO TIME DEPENDENCY for GPS-denied realtime.
+    v3.4.0: State-based with configurable thresholds - NO TIME DEPENDENCY for GPS-denied realtime.
     
     GPS-denied Realtime Philosophy:
     -------------------------------
@@ -563,13 +564,14 @@ def get_flight_phase(time_elapsed: float = 0.0,  # Deprecated, kept for compatib
       2: NORMAL - Stable flight (low uncertainty, trusted)
     
     Args:
-        time_elapsed: DEPRECATED - Kept for backward compatibility only
-        spinup_end: DEPRECATED - Not used in state-based detection
-        early_flight_end: DEPRECATED - Not used in state-based detection
         velocity: Current velocity [vx, vy, vz] (m/s), REQUIRED
         velocity_sigma: Velocity uncertainty (m/s), REQUIRED
         vibration_level: Gyro std from VibrationDetector (rad/s), REQUIRED
         altitude_change: Change in altitude from start (m), OPTIONAL
+        spinup_velocity_thresh: Velocity threshold for SPINUP detection (m/s)
+        spinup_vibration_thresh: Vibration threshold for SPINUP detection (rad/s)
+        spinup_alt_change_thresh: Altitude change threshold for SPINUP (m)
+        early_velocity_sigma_thresh: Velocity uncertainty threshold for EARLY phase (m/s)
     
     Returns:
         phase: Phase number (0, 1, or 2)
@@ -585,33 +587,27 @@ def get_flight_phase(time_elapsed: float = 0.0,  # Deprecated, kept for compatib
         >>> print(f"Phase: {phase} = {name}")
         Phase: 0 = SPINUP
     """
-    # State-based detection thresholds
-    # TODO v3.4.0: Move these to YAML config
-    SPINUP_VELOCITY_THRESH = 1.0       # m/s - stationary during spinup
-    SPINUP_VIBRATION_THRESH = 0.3      # rad/s - high vibration (rotor effects)
-    SPINUP_ALT_CHANGE_THRESH = 5.0     # m - minimal altitude change (still on ground)
-    EARLY_VELOCITY_SIGMA_THRESH = 3.0  # m/s - high uncertainty (filter converging)
-    
     # GPS-denied Realtime: State-based detection ONLY
+    # Thresholds now passed as parameters (v3.4.0)
     if velocity is not None and vibration_level is not None:
         vel_mag = np.linalg.norm(velocity[:2]) if len(velocity) >= 2 else 0.0
         alt_change = abs(altitude_change) if altitude_change is not None else 0.0
         
         # Phase 0: SPINUP - High vibration + stationary + on ground
         # Typical: Rotors spinning up, vehicle on ground
-        if vibration_level > SPINUP_VIBRATION_THRESH and vel_mag < SPINUP_VELOCITY_THRESH:
-            if alt_change < SPINUP_ALT_CHANGE_THRESH:
+        if vibration_level > spinup_vibration_thresh and vel_mag < spinup_velocity_thresh:
+            if alt_change < spinup_alt_change_thresh:
                 return 0, "SPINUP"
         
         # Phase 1: EARLY - High velocity uncertainty (filter converging)
         # Typical: Just took off, sensors still converging
-        if velocity_sigma is not None and velocity_sigma > EARLY_VELOCITY_SIGMA_THRESH:
+        if velocity_sigma is not None and velocity_sigma > early_velocity_sigma_thresh:
             return 1, "EARLY"
         
         # Phase 2: NORMAL - Stable flight with low uncertainty
         # Typical: Steady flight, good sensor fusion
-        if vel_mag > SPINUP_VELOCITY_THRESH or alt_change > SPINUP_ALT_CHANGE_THRESH:
-            if velocity_sigma is None or velocity_sigma < EARLY_VELOCITY_SIGMA_THRESH:
+        if vel_mag > spinup_velocity_thresh or alt_change > spinup_alt_change_thresh:
+            if velocity_sigma is None or velocity_sigma < early_velocity_sigma_thresh:
                 return 2, "NORMAL"
     
     # Conservative default: If no state data → assume NORMAL (full sensor trust)
