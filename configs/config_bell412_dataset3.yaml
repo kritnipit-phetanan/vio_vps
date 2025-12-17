@@ -77,7 +77,15 @@ imu:
   
   # Enable IMU preintegration (Forster et al.)
   # Uses preintegrated measurements between keyframes for better motion estimation
-  use_preintegration: false  # Disable for now - still experimental
+  use_preintegration: true
+  
+  # Flight phase timing (for adaptive filtering)
+  # NOTE: Time-based phases are NOT suitable for GPS-denied realtime!
+  # TODO v3.3.0: Replace with state-based phase detection (velocity, altitude)
+  flight_phases:
+    spinup_end_sec: 15.0   # End of rotor spinup / initial settling
+    early_end_sec: 60.0    # End of early flight (high uncertainty)
+    # NORMAL phase: t > early_end_sec
   
   # Preintegration-specific (v2.9.9.10: AGGRESSIVE 3× increase)
   # v2.9.9.9 with 2× still showed 13.1σ overconfidence

@@ -78,9 +78,7 @@ from .output_utils import (
     DebugCSVWriters, init_output_csvs, get_ground_truth_error
 )
 
-
 # VIOConfig is imported from config.py (single source of truth)
-
 
 @dataclass
 class VIOState:
@@ -90,7 +88,7 @@ class VIOState:
     img_idx: int = 0
     vps_idx: int = 0
     mag_idx: int = 0
-    vio_frame: int = -1
+    vio_frame: int = 0  # Changed from -1: first frame is 0
     
     # Statistics
     zupt_applied: int = 0
@@ -124,9 +122,9 @@ class VIORunner:
     5. Output logging
     """
     
-    # Flight phase constants
-    PHASE_SPINUP_END = 15.0      # seconds
-    PHASE_EARLY_END = 60.0       # seconds
+    # Flight phase constants (loaded from YAML config in v3.2.0)
+    # NOTE: Time-based phases NOT suitable for GPS-denied realtime!
+    # TODO v3.3.0: Replace with state-based detection (velocity, altitude, vibration)
     PHASE_NAMES = ["SPINUP", "EARLY", "NORMAL"]
     
     def __init__(self, config: VIOConfig):
@@ -138,6 +136,10 @@ class VIORunner:
         """
         self.config = config
         self.state = VIOState()
+        
+        # Flight phase timing will be loaded from YAML in load_config()
+        self.PHASE_SPINUP_END = 15.0  # Default, overridden by YAML
+        self.PHASE_EARLY_END = 60.0   # Default, overridden by YAML
         
         # These will be initialized in run()
         self.kf = None
@@ -181,6 +183,11 @@ class VIORunner:
         if self.config.config_yaml:
             cfg = load_config(self.config.config_yaml)
             self.global_config = cfg
+            
+            # Load flight phase timing from YAML (v3.2.0)
+            self.PHASE_SPINUP_END = cfg.get('PHASE_SPINUP_END', 15.0)
+            self.PHASE_EARLY_END = cfg.get('PHASE_EARLY_END', 60.0)
+            
             return cfg
         return {}
     
@@ -213,12 +220,9 @@ class VIORunner:
         self.imgs = load_images(self.config.images_dir, self.config.images_index_csv)
         self.vps_list = load_vps_csv(self.config.vps_csv)
         
-        # v2.9.10.4: Check both use_magnetometer flag AND MAG_ENABLED from config
-        mag_enabled = self.global_config.get('MAG_ENABLED', True)
-        if self.config.use_magnetometer and not mag_enabled:
-            print("[MAG] WARNING: Magnetometer disabled in config (magnetometer.enabled=false)")
-        use_mag_final = self.config.use_magnetometer and mag_enabled
-        self.mag_list = load_mag_csv(self.config.mag_csv) if use_mag_final else []
+        # v3.2.0: use_magnetometer is already populated from YAML (magnetometer.enabled)
+        # No need for redundant check - VIOConfig.use_magnetometer is the final decision
+        self.mag_list = load_mag_csv(self.config.mag_csv) if self.config.use_magnetometer else []
         
         self.dem = DEMReader.open(self.config.dem_path)
         
@@ -281,14 +285,11 @@ class VIORunner:
         self.kf = ExtendedKalmanFilter(dim_x=16, dim_z=3, dim_u=3)
         self.kf.x = np.zeros((16, 1), dtype=float)
         
-        # Get config parameters
-        imu_params = self.global_config.get('IMU_PARAMS', {
-            'g_norm': 9.803,
-            'gyr_w': 0.0001,
-            'acc_w': 0.001,
-            'gyr_n': 0.01,
-            'acc_n': 0.1
-        })
+        # Get config parameters from YAML (v3.2.0: no fallback - require proper config)
+        imu_params = self.global_config.get('IMU_PARAMS')
+        if imu_params is None:
+            raise RuntimeError("IMU_PARAMS not found in config. Check YAML file.")
+        
         lever_arm = self.global_config.get('IMU_GNSS_LEVER_ARM', np.zeros(3))
         
         # v2.9.10.1 FIX: Extract PPK initial heading (GPS-denied: 2 samples only)
@@ -855,7 +856,7 @@ class VIORunner:
                 )
                 
                 # Increment VIO frame
-                self.state.vio_frame = max(0, self.state.vio_frame + 1)
+                self.state.vio_frame += 1
                 used_vo = (ok and r_vo_mat is not None)  # Only True if VO succeeded
                 
                 # Store VO data (if available)
@@ -1229,7 +1230,7 @@ class VIORunner:
         """Print final summary statistics."""
         print("\n\n--- Done ---")
         print(f"Total IMU samples: {len(self.imu)}")
-        print(f"Images used: {max(0, self.state.vio_frame + 1)}")
+        print(f"Images used: {self.state.vio_frame}")
         print(f"VPS used: {self.state.vps_idx}")
         print(f"Magnetometer: {self.state.mag_updates} updates | "
               f"{self.state.mag_rejects} rejected")

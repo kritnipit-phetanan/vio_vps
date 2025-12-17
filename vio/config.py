@@ -240,6 +240,11 @@ def load_config(config_path: str) -> VIOConfig:
     # IMU preintegration toggle (v3.1.0)
     result['USE_PREINTEGRATION'] = imu.get('use_preintegration', False)
     
+    # Flight phase timing (v3.2.0)
+    flight_phases = imu.get('flight_phases', {})
+    result['PHASE_SPINUP_END'] = flight_phases.get('spinup_end_sec', 15.0)
+    result['PHASE_EARLY_END'] = flight_phases.get('early_end_sec', 60.0)
+    
     # Magnetometer calibration
     mag = config['magnetometer']
     # v2.9.10.4: Add enabled flag to allow disabling mag from config
