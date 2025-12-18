@@ -52,7 +52,8 @@ from .propagation import (
     process_imu, propagate_error_state_covariance, 
     augment_state_with_camera, detect_stationary, apply_zupt,
     apply_preintegration_at_camera, clone_camera_for_msckf,
-    get_flight_phase  # v3.3.0: State-based phase detection
+    get_flight_phase,  # v3.3.0: State-based phase detection
+    propagate_nominal_state  # v3.5.0: OpenVINS-style nominal propagation
 )
 from .vps_integration import apply_vps_update, xy_to_latlon, latlon_to_xy
 from .msckf import perform_msckf_updates, print_msckf_stats, trigger_msckf_update
@@ -1406,10 +1407,18 @@ class VIORunner:
             )
             self.state.current_phase = phase_num
             
-            # IMU propagation
+            # IMU propagation (v3.5.0: OpenVINS-style nominal propagation)
             if self.config.use_preintegration and ongoing_preint is not None:
+                # Step 1: Accumulate IMU for covariance propagation
                 ongoing_preint.integrate_measurement(rec.ang, rec.lin, dt)
+                
+                # Step 2: Lightweight nominal state propagation (keep state fresh)
+                # This ensures measurement updates (VPS/MAG) apply on current state
+                bg = self.kf.x[10:13, 0]
+                ba = self.kf.x[13:16, 0]
+                propagate_nominal_state(self.kf, rec, dt, bg, ba, imu_params)
             else:
+                # Legacy mode: full propagation (state + covariance)
                 self.process_imu_sample(rec, dt)
             
             # Debug logging: raw IMU and state covariance

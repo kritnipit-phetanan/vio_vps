@@ -23,6 +23,75 @@ from .ekf import ExtendedKalmanFilter, ensure_covariance_valid, propagate_error_
 from .data_loaders import IMURecord
 
 
+def propagate_nominal_state(kf: ExtendedKalmanFilter, 
+                            rec: IMURecord, dt: float,
+                            bg: np.ndarray, ba: np.ndarray,
+                            imu_params: dict):
+    """
+    Lightweight nominal state propagation (position, velocity, rotation).
+    Does NOT update covariance (P matrix) - that's done with preintegration.
+    
+    This ensures state is always at current time for measurement updates.
+    Part of OpenVINS-style architecture where:
+    - Nominal state propagates at IMU rate (400 Hz) - LIGHTWEIGHT
+    - Covariance propagates at camera rate (20 Hz) - HEAVY
+    
+    This solves the "stale state" problem where measurement updates were
+    applied on outdated state when using preintegration.
+    
+    Args:
+        kf: Kalman filter
+        rec: IMU record (ang, lin)
+        dt: Time step
+        bg: Gyro bias
+        ba: Accel bias
+        imu_params: IMU parameters (g_norm)
+    
+    References:
+        - OpenVINS: Propagator::propagate_and_clone()
+        - OKVIS: propagateState()
+    """
+    # Bias-corrected measurements
+    w_corr = rec.ang - bg
+    a_corr = rec.lin - ba
+    
+    # Current state
+    p = kf.x[0:3, 0]
+    v = kf.x[3:6, 0]
+    q = kf.x[6:10, 0]  # [w,x,y,z]
+    
+    # Rotation update (discrete integration)
+    q_xyzw = np.array([q[1], q[2], q[3], q[0]])
+    R_BW = R_scipy.from_quat(q_xyzw).as_matrix()
+    
+    # Discrete rotation: exp(w * dt)
+    theta = np.linalg.norm(w_corr) * dt
+    if theta < 1e-8:
+        # Small angle approximation: exp([w×]dt) ≈ I + [w×]dt
+        delta_R = np.eye(3) + skew_symmetric(w_corr * dt)
+    else:
+        # Rodrigues formula
+        axis = w_corr / np.linalg.norm(w_corr)
+        delta_R = R_scipy.from_rotvec(axis * theta).as_matrix()
+    
+    R_BW_new = R_BW @ delta_R
+    q_new_xyzw = R_scipy.from_matrix(R_BW_new).as_quat()
+    q_new = np.array([q_new_xyzw[3], q_new_xyzw[0], q_new_xyzw[1], q_new_xyzw[2]])
+    
+    # Velocity update (world frame acceleration)
+    g_world = np.array([0, 0, imu_params.get('g_norm', 9.803)])
+    a_world = R_BW @ a_corr - g_world
+    v_new = v + a_world * dt
+    
+    # Position update (trapezoidal integration for better accuracy)
+    p_new = p + (v + v_new) / 2.0 * dt
+    
+    # Write back to state (only p, v, q - NOT bias or clones)
+    kf.x[0:3, 0] = p_new
+    kf.x[3:6, 0] = v_new
+    kf.x[6:10, 0] = q_new
+
+
 def propagate_to_timestamp(kf: ExtendedKalmanFilter, target_time: float, 
                            imu_buffer: List[IMURecord], current_time: float,
                            imu_params: dict,
@@ -796,13 +865,18 @@ def apply_preintegration_at_camera(kf: ExtendedKalmanFilter,
                                    ongoing_preint,
                                    t: float, imu_params: dict) -> dict:
     """
-    Apply accumulated preintegration at camera frame.
+    Apply accumulated preintegration covariance at camera frame.
     
-    This is called at EVERY camera frame to prevent IMU accumulation explosion.
-    Following Forster et al. TRO 2017 design.
+    OpenVINS-style architecture (v3.5.0):
+    - Nominal state is ALREADY propagated by propagate_nominal_state() at IMU rate (400Hz)
+    - This function ONLY propagates covariance (P matrix) at camera rate (20Hz)
+    - This separation keeps state fresh for measurement updates while reducing computational cost
+    
+    Called at EVERY camera frame to prevent IMU accumulation explosion.
+    Following Forster et al. TRO 2017 + OpenVINS design.
     
     Args:
-        kf: ExtendedKalmanFilter instance
+        kf: ExtendedKalmanFilter instance (state x already updated!)
         ongoing_preint: IMUPreintegration object
         t: Current timestamp
         imu_params: IMU noise parameters
@@ -828,28 +902,17 @@ def apply_preintegration_at_camera(kf: ExtendedKalmanFilter,
     bg = kf.x[10:13, 0].reshape(3,)
     ba = kf.x[13:16, 0].reshape(3,)
     
-    # Get bias-corrected deltas
-    delta_R_corr, delta_v_corr, delta_p_corr = ongoing_preint.get_deltas_corrected(bg, ba)
+    # NOTE (v3.5.0): State (x) is already propagated by propagate_nominal_state()!
+    # We only need to propagate covariance (P) here using preintegrated Jacobians
     
-    # R_BW (Body-to-World)
+    # Get current rotation for covariance projection
     q_i_xyzw = np.array([q_i[1], q_i[2], q_i[3], q_i[0]])
     R_BW = R_scipy.from_quat(q_i_xyzw).as_matrix()
     
-    # Rotation update
-    R_BW_new = R_BW @ delta_R_corr
-    q_i_new_xyzw = R_scipy.from_matrix(R_BW_new).as_quat()
-    q_i_new = np.array([q_i_new_xyzw[3], q_i_new_xyzw[0], q_i_new_xyzw[1], q_i_new_xyzw[2]])
+    # Get bias-corrected deltas for covariance calculation
+    delta_R_corr, delta_v_corr, delta_p_corr = ongoing_preint.get_deltas_corrected(bg, ba)
     
-    # Position and velocity updates
-    v_i_new = v_i + R_BW @ delta_v_corr
-    p_i_new = p_i + v_i * dt_total + R_BW @ delta_p_corr
-    
-    # Write back to state
-    kf.x[0:3, 0] = p_i_new.reshape(3,)
-    kf.x[3:6, 0] = v_i_new.reshape(3,)
-    kf.x[6:10, 0] = q_i_new.reshape(4,)
-    
-    # Propagate covariance
+    # Covariance propagation (state is already up-to-date from nominal propagation)
     preint_cov = ongoing_preint.get_covariance()
     J_R_bg, J_v_bg, J_v_ba, J_p_bg, J_p_ba = ongoing_preint.get_jacobians()
     
@@ -889,7 +952,7 @@ def apply_preintegration_at_camera(kf: ExtendedKalmanFilter,
     # Reset preintegration buffer
     ongoing_preint.reset(bg=bg, ba=ba)
     
-    print(f"[PREINT] Applied: Δt={dt_total:.3f}s, Δpos={np.linalg.norm(p_i_new - p_i):.4f}m")
+    print(f"[PREINT] Covariance propagated: Δt={dt_total:.3f}s")
     
     return preint_jacobians
 
