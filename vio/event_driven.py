@@ -97,6 +97,153 @@ class SensorEvent:
 
 
 # =============================================================================
+# IMU Interpolation (OpenVINS-style)
+# =============================================================================
+
+def interpolate_imu(imu_before, imu_after, t_target: float):
+    """
+    Linear interpolation of IMU measurement at target time.
+    
+    Following OpenVINS approach:
+    - Linear interpolation for gyro and accel
+    - Timestamp must be within [imu_before.t, imu_after.t]
+    
+    Args:
+        imu_before: IMU record before target time
+        imu_after: IMU record after target time
+        t_target: Target timestamp for interpolation
+    
+    Returns:
+        Interpolated IMU record (namedtuple or dataclass)
+    """
+    if imu_before is None or imu_after is None:
+        raise ValueError("Cannot interpolate with None IMU records")
+    
+    if t_target < imu_before.t or t_target > imu_after.t:
+        raise ValueError(f"Target time {t_target} not in range [{imu_before.t}, {imu_after.t}]")
+    
+    # Linear interpolation factor
+    dt_total = imu_after.t - imu_before.t
+    if dt_total < 1e-10:
+        # Times are equal, return before
+        return imu_before
+    
+    alpha = (t_target - imu_before.t) / dt_total
+    
+    # Interpolate gyro and accel
+    ang_interp = (1.0 - alpha) * imu_before.ang + alpha * imu_after.ang
+    lin_interp = (1.0 - alpha) * imu_before.lin + alpha * imu_after.lin
+    
+    # Create interpolated record (assume same structure as input)
+    from .data_loaders import IMURecord
+    return IMURecord(
+        t=t_target,
+        ang=ang_interp,
+        lin=lin_interp
+    )
+
+
+def select_imu_segment(imu_buffer: 'IMUBuffer', t_start: float, t_end: float,
+                       interpolate_endpoints: bool = True) -> List:
+    """
+    Select IMU segment for propagation with endpoint interpolation.
+    
+    OpenVINS-style IMU selection:
+    1. Find all IMU samples in (t_start, t_end)
+    2. Optionally interpolate IMU at exact t_start and t_end
+    3. Return [imu@t_start, imu_samples..., imu@t_end]
+    
+    This ensures propagation integrates from EXACT start to EXACT end time.
+    
+    Args:
+        imu_buffer: IMU buffer containing measurements
+        t_start: Start time (will interpolate IMU at this time)
+        t_end: End time (will interpolate IMU at this time)
+        interpolate_endpoints: If True, add interpolated IMU at endpoints
+    
+    Returns:
+        List of IMU records for propagation [oldest ... newest]
+    
+    Raises:
+        ValueError: If insufficient IMU data for interpolation
+    """
+    result = []
+    
+    # Find IMU before and after t_start for interpolation
+    imu_before_start = None
+    imu_after_start = None
+    
+    for rec in imu_buffer.buffer:
+        if rec.t <= t_start:
+            imu_before_start = rec
+        elif rec.t > t_start and imu_after_start is None:
+            imu_after_start = rec
+            break
+    
+    # Add interpolated IMU at t_start
+    if interpolate_endpoints:
+        if imu_before_start is None:
+            raise ValueError(f"No IMU data before t_start={t_start:.6f}")
+        
+        if imu_after_start is None or t_start >= imu_after_start.t:
+            # Edge case: t_start is at or after last IMU, use last IMU
+            if imu_before_start.t == t_start:
+                result.append(imu_before_start)
+            else:
+                raise ValueError(f"No IMU data after t_start={t_start:.6f} for interpolation")
+        elif imu_before_start.t == t_start:
+            # Exact match, no interpolation needed
+            result.append(imu_before_start)
+        else:
+            # Interpolate at t_start
+            imu_start = interpolate_imu(imu_before_start, imu_after_start, t_start)
+            result.append(imu_start)
+    
+    # Add all IMU samples strictly between (t_start, t_end)
+    for rec in imu_buffer.buffer:
+        if t_start < rec.t < t_end:
+            result.append(rec)
+    
+    # Find IMU before and after t_end for interpolation
+    imu_before_end = None
+    imu_after_end = None
+    
+    for rec in imu_buffer.buffer:
+        if rec.t <= t_end:
+            imu_before_end = rec
+        elif rec.t > t_end and imu_after_end is None:
+            imu_after_end = rec
+            break
+    
+    # Add interpolated IMU at t_end
+    if interpolate_endpoints:
+        if imu_before_end is None:
+            raise ValueError(f"No IMU data before t_end={t_end:.6f}")
+        
+        if imu_after_end is None:
+            # Edge case: t_end is at or after last IMU
+            if imu_before_end.t == t_end:
+                # Only add if not already added
+                if len(result) == 0 or result[-1].t != t_end:
+                    result.append(imu_before_end)
+            else:
+                # Cannot interpolate, use last IMU (extrapolation warning)
+                print(f"[WARNING] Cannot interpolate at t_end={t_end:.6f}, using last IMU at {imu_before_end.t:.6f}")
+                if len(result) == 0 or result[-1].t != imu_before_end.t:
+                    result.append(imu_before_end)
+        elif imu_before_end.t == t_end:
+            # Exact match
+            if len(result) == 0 or result[-1].t != t_end:
+                result.append(imu_before_end)
+        else:
+            # Interpolate at t_end
+            imu_end = interpolate_imu(imu_before_end, imu_after_end, t_end)
+            result.append(imu_end)
+    
+    return result
+
+
+# =============================================================================
 # IMU Buffer for Propagation
 # =============================================================================
 
@@ -231,25 +378,38 @@ class EventScheduler:
 @dataclass
 class FilterState:
     """
-    Tracks the "reference time" of the filter.
+    Tracks the "reference time" of the filter with delayed fusion horizon.
     
     CRITICAL: kf.x and kf.P are ONLY valid at filter_time!
     Any update must propagate to measurement_time first.
     
+    Delayed Fusion Pattern (PX4 EKF2-style):
+    - fusion_time: Time where filter fuses measurements (delayed)
+    - output_time: Current time for output (ahead of fusion)
+    - fusion_delay: Time lag for handling out-of-order measurements
+    
     Attributes:
-        filter_time: Current time of kf.x/kf.P
+        filter_time: Current fusion time of kf.x/kf.P (delayed)
+        output_time: Current output time (real-time)
+        fusion_delay: Delay in seconds (default 50ms)
         t0: Initial timestamp (for relative time logging)
         imu_buffer: Ring buffer of recent IMU measurements
         ongoing_preint: Preintegration buffer for MSCKF Jacobians
+        measurement_buffer: Buffer for out-of-order measurements
     """
     filter_time: float = 0.0
+    output_time: float = 0.0
+    fusion_delay: float = 0.05  # 50ms delay for out-of-order handling
     t0: float = 0.0
     imu_buffer: IMUBuffer = None
     ongoing_preint: IMUPreintegration = None
+    measurement_buffer: List = None  # Buffer for measurements arriving late
     
     def __post_init__(self):
         if self.imu_buffer is None:
             self.imu_buffer = IMUBuffer()
+        if self.measurement_buffer is None:
+            self.measurement_buffer = []
 
 
 # =============================================================================
@@ -262,18 +422,18 @@ def propagate_to_event(kf: ExtendedKalmanFilter,
                        imu_params: dict,
                        estimate_imu_bias: bool = False) -> bool:
     """
-    Propagate filter state EXACTLY to target timestamp.
+    Propagate filter state EXACTLY to target timestamp (Pure Event-Driven).
     
-    This is the core of event-driven architecture:
-    1. Get IMU measurements in range (filter_time, target_time]
-    2. Integrate each IMU sample to propagate x and P
-    3. Update filter_time to target_time
-    4. Accumulate preintegration for MSCKF Jacobians
+    NEW APPROACH (OpenVINS-style):
+    1. Select IMU segment from buffer: [filter_time, target_time]
+    2. Endpoints are INTERPOLATED for exact times (no fractional steps)
+    3. Integrate each IMU sample sequentially
+    4. Update filter_time to target_time
+    5. Accumulate preintegration for MSCKF Jacobians
     
     After this call: filter_time == target_time EXACTLY.
     
-    CRITICAL: IMU samples used here are "consumed" for propagation.
-    The same samples should NOT be used again (prevents double-counting).
+    CRITICAL: No IMU events needed! IMU buffer is data source only.
     
     Args:
         kf: Extended Kalman Filter
@@ -283,7 +443,10 @@ def propagate_to_event(kf: ExtendedKalmanFilter,
         estimate_imu_bias: Whether bias estimation is enabled
     
     Returns:
-        True if propagation succeeded, False if no IMU data available
+        True if propagation succeeded
+    
+    Raises:
+        ValueError: If insufficient IMU data for propagation
     """
     current_time = filter_state.filter_time
     
@@ -291,48 +454,52 @@ def propagate_to_event(kf: ExtendedKalmanFilter,
         # Already at or past target time
         return True
     
-    # Get IMU samples in range (current_time, target_time]
-    imu_samples = filter_state.imu_buffer.get_range(current_time, target_time)
+    # Select IMU segment with endpoint interpolation
+    try:
+        imu_samples = select_imu_segment(
+            filter_state.imu_buffer,
+            t_start=current_time,
+            t_end=target_time,
+            interpolate_endpoints=True
+        )
+    except ValueError as e:
+        print(f"[PROPAGATE] ERROR: Cannot select IMU segment [{current_time:.6f}, {target_time:.6f}]")
+        print(f"  Reason: {e}")
+        print(f"  Buffer size: {len(filter_state.imu_buffer)}")
+        if len(filter_state.imu_buffer) > 0:
+            print(f"  Buffer range: [{filter_state.imu_buffer.buffer[0].t:.6f}, {filter_state.imu_buffer.buffer[-1].t:.6f}]")
+        raise  # Re-raise to stop execution (no silent fallback)
     
     if len(imu_samples) == 0:
-        # WARNING: No IMU data in range - this indicates scheduling/priority bug!
-        # Should NOT happen if IMU events have higher priority than sensor events.
-        last_imu = filter_state.imu_buffer.get_closest_before(target_time)
-        if last_imu is None:
-            print(f"[PROPAGATE] ERROR: No IMU data before {target_time:.3f}, cannot propagate!")
-            return False
-        
-        # Fallback: Extrapolate using last IMU (NOT RECOMMENDED - indicates bug)
-        print(f"[PROPAGATE] WARNING: Extrapolating from {last_imu.t:.3f} to {target_time:.3f} "
-              f"(dt={target_time - current_time:.4f}s) - missing IMU data!")
-        print(f"  → This suggests sensor event arrived before IMU event at same timestamp.")
-        print(f"  → Check EventType priority: IMU should be highest (processed first).")
-        
-        dt = target_time - current_time
-        _propagate_single_step(kf, last_imu, dt, filter_state, imu_params, estimate_imu_bias, target_time=target_time)
-        filter_state.filter_time = target_time
-        
-        # Track extrapolation count for debugging
-        if not hasattr(filter_state, 'extrapolate_count'):
-            filter_state.extrapolate_count = 0
-        filter_state.extrapolate_count += 1
-        
-        return True
+        # Should not happen after select_imu_segment, but check anyway
+        raise ValueError(f"No IMU samples selected for propagation [{current_time:.6f}, {target_time:.6f}]")
     
     # Propagate through each IMU sample
+    # First sample should be at current_time (interpolated)
+    # Last sample should be at target_time (interpolated)
     t_prev = current_time
-    for imu in imu_samples:
+    
+    for i, imu in enumerate(imu_samples):
         dt = imu.t - t_prev
-        if dt > 1e-6:
-            _propagate_single_step(kf, imu, dt, filter_state, imu_params, estimate_imu_bias, target_time=imu.t)
+        
+        if dt < 0:
+            raise ValueError(f"IMU samples not in chronological order: {t_prev:.6f} -> {imu.t:.6f}")
+        
+        if dt > 1e-9:  # Skip tiny timesteps
+            _propagate_single_step(
+                kf, imu, dt, filter_state,
+                imu_params, estimate_imu_bias,
+                target_time=imu.t
+            )
+        
         t_prev = imu.t
     
-    # Handle fractional timestep if target_time doesn't align with last IMU
-    if t_prev < target_time and len(imu_samples) > 0:
-        last_imu = imu_samples[-1]
-        dt_frac = target_time - t_prev
-        # CRITICAL: Pass target_time for fractional step!
-        _propagate_single_step(kf, last_imu, dt_frac, filter_state, imu_params, estimate_imu_bias, target_time=target_time)
+    # Verify we reached target time
+    if abs(t_prev - target_time) > 1e-6:
+        raise ValueError(
+            f"Propagation ended at {t_prev:.6f}, expected {target_time:.6f} "
+            f"(error: {abs(t_prev - target_time):.9f}s)"
+        )
     
     # Update filter time
     filter_state.filter_time = target_time
@@ -729,18 +896,16 @@ def run_event_driven_loop(runner):
     
     print("\n[EVENT-DRIVEN] Building event queue...")
     
-    # Add IMU events
-    # TODO: REMOVE THIS for pure event-driven!
-    # IMU should be data source (buffer), not event source (queue).
-    # Pure event-driven: propagate_to() selects IMU segment from buffer when needed.
-    # Current approach defeats the purpose of event-driven (still processes all IMU).
-    for i, imu_rec in enumerate(runner.imu):
-        scheduler.add_event(SensorEvent(
-            timestamp=imu_rec.t,
-            event_type=EventType.IMU,
-            data=imu_rec,
-            index=i
-        ))
+    # =========================================================================
+    # PURE EVENT-DRIVEN: IMU is DATA SOURCE, not EVENT SOURCE
+    # =========================================================================
+    # Load all IMU into buffer (no events generated)
+    # propagate_to_event() will select IMU segments from buffer as needed
+    print(f"[EVENT-DRIVEN] Loading {len(runner.imu)} IMU samples into buffer...")
+    for imu_rec in runner.imu:
+        filter_state.imu_buffer.append(imu_rec)
+    print(f"[EVENT-DRIVEN] IMU buffer ready: {len(filter_state.imu_buffer)} samples")
+    print(f"  Time range: [{filter_state.imu_buffer.buffer[0].t:.3f}, {filter_state.imu_buffer.buffer[-1].t:.3f}]")
     
     # Add camera events
     for i, img_rec in enumerate(runner.imgs):
@@ -774,100 +939,105 @@ def run_event_driven_loop(runner):
     # Reason: DEM updates depend on state position, not fixed timestamps
     # Alternative: Could generate periodic DEM events (e.g., every 0.1s)
     
-    print(f"[EVENT-DRIVEN] Total events: {len(scheduler)}")
-    print(f"  IMU: {len(runner.imu)}, Camera: {len(runner.imgs)}, "
-          f"VPS: {len(runner.vps_list)}, MAG: {len(runner.mag_list)}")
-    print(f"  DEM: Polled at IMU events (position-dependent)")
+    print(f"[EVENT-DRIVEN] Total events: {len(scheduler)} (sensors only)")
+    print(f"  Camera: {len(runner.imgs)}, VPS: {len(runner.vps_list)}, MAG: {len(runner.mag_list)}")
+    print(f"  IMU: {len(runner.imu)} samples (data source, not events)")
+    print(f"  DEM: On-demand at sensor events (position-dependent)")
     
     # =========================================================================
-    # Step 4: Main Event Loop
+    # Step 4: Main Event Loop (Pure Event-Driven with Fusion Delay)
     # =========================================================================
-    print("\n=== Running (Event-driven mode) ===")
+    print("\n=== Running (Pure Event-driven mode) ===")
+    print(f"[FUSION] Fusion delay: {filter_state.fusion_delay*1000:.1f}ms")
     tic_all = time.time()
     
     last_a_world = np.array([0.0, 0.0, 0.0])
     last_output_time = filter_state.t0
-    output_interval = 0.0025  # Output at ~400Hz (match IMU rate for logging)
+    output_interval = 0.01  # Output at 100Hz (reduced from 400Hz for efficiency)
     
     event_count = 0
     
+    # Initialize output_time to first IMU time
+    filter_state.output_time = filter_state.t0
+    
     while scheduler.has_events():
         event = scheduler.pop_next()
-        t = event.timestamp
+        t_measurement = event.timestamp
         event_count += 1
         
         tic_iter = time.time()
         
-        # ---------------------------------------------------------------------
-        # Handle event by type
-        # ---------------------------------------------------------------------
-        if event.event_type == EventType.IMU:
-            # IMU event: Add to buffer, propagate state, update helpers
-            imu_rec = event.data
-            filter_state.imu_buffer.append(imu_rec)
-            
-            # Propagate to this IMU time
-            propagate_to_event(
-                runner.kf, filter_state, t,
-                imu_params, runner.config.estimate_imu_bias
-            )
-            
-            # Update vibration detector
-            gyro_mag = np.linalg.norm(imu_rec.ang)
-            is_high_vibration, vibration_level = runner.vibration_detector.update(gyro_mag)
-            
-            # Update flight phase
-            velocity = runner.kf.x[3:6, 0].flatten()
-            velocity_sigma = np.sqrt(np.mean(np.diag(runner.kf.P[3:6, 3:6]))) if runner.kf.P.shape[0] > 5 else None
-            altitude_change = runner.kf.x[2, 0] - runner.initial_msl
-            
-            phase_num, _ = get_flight_phase(
-                velocity=velocity,
-                velocity_sigma=velocity_sigma,
-                vibration_level=vibration_level,
-                altitude_change=altitude_change,
-                spinup_velocity_thresh=runner.PHASE_SPINUP_VELOCITY_THRESH,
-                spinup_vibration_thresh=runner.PHASE_SPINUP_VIBRATION_THRESH,
-                spinup_alt_change_thresh=runner.PHASE_SPINUP_ALT_CHANGE_THRESH,
-                early_velocity_sigma_thresh=runner.PHASE_EARLY_VELOCITY_SIGMA_THRESH
-            )
-            runner.state.current_phase = phase_num
-            
-            # Update IMU helpers (mag filter, ZUPT)
-            dt = t - runner.state.last_t if event.index > 0 else 0.0
-            runner._update_imu_helpers(imu_rec, dt, imu_params)
-            runner.state.last_t = t
-            runner.state.imu_propagation_count += 1
-            
-            # Debug logging
-            runner.debug_writers.log_imu_raw(t, imu_rec)
-            if event.index % 10 == 0:
-                bg = runner.kf.x[10:13, 0]
-                ba = runner.kf.x[13:16, 0]
-                runner.debug_writers.log_state_covariance(t, runner.state.vio_frame, runner.kf, bg, ba)
-            
-        elif event.event_type == EventType.CAMERA:
-            # Camera event: propagate then process VIO
-            runner.state.img_idx = event.index
-            used_vo, vo_data = handle_camera_event(runner, event, filter_state, imu_params)
-            
-        elif event.event_type == EventType.VPS:
-            # VPS event: propagate then apply update
-            handle_vps_event(runner, event, filter_state, imu_params)
-            runner.state.vps_idx = event.index + 1
-            
-        elif event.event_type == EventType.MAG:
-            # Magnetometer event: propagate then apply update
-            handle_magnetometer_event(runner, event, filter_state, imu_params)
-            runner.state.mag_idx = event.index + 1
+        # Update output time to current measurement time
+        filter_state.output_time = t_measurement
+        
+        # Calculate fusion time (delayed by fusion_delay)
+        t_fusion = t_measurement - filter_state.fusion_delay
+        
+        # Skip events before we have enough IMU data
+        if t_fusion < filter_state.t0:
+            continue
         
         # ---------------------------------------------------------------------
-        # Output logging (at regular intervals)
+        # Process Fusion (at delayed time)
         # ---------------------------------------------------------------------
-        if t - last_output_time >= output_interval or event.event_type == EventType.IMU:
-            # Get current position for logging
+        # Propagate filter to fusion time (if needed)
+        if t_fusion > filter_state.filter_time:
+            try:
+                propagate_to_event(
+                    runner.kf, filter_state, t_fusion,
+                    imu_params, runner.config.estimate_imu_bias
+                )
+            except ValueError as e:
+                print(f"[ERROR] Failed to propagate to fusion time {t_fusion:.6f}: {e}")
+                continue
+        
+        # ---------------------------------------------------------------------
+        # Handle event by type (at fusion time)
+        # ---------------------------------------------------------------------
+        if event.event_type == EventType.CAMERA:
+            # Camera event: already at fusion time, process VIO
+            runner.state.img_idx = event.index
+            try:
+                used_vo, vo_data = handle_camera_event(runner, event, filter_state, imu_params)
+            except Exception as e:
+                print(f"[ERROR] Camera event failed at {t_measurement:.6f}: {e}")
+            
+        elif event.event_type == EventType.VPS:
+            # VPS event: already at fusion time, apply update
+            try:
+                handle_vps_event(runner, event, filter_state, imu_params)
+                runner.state.vps_idx = event.index + 1
+            except Exception as e:
+                print(f"[ERROR] VPS event failed at {t_measurement:.6f}: {e}")
+            
+        elif event.event_type == EventType.MAG:
+            # Magnetometer event: already at fusion time, apply update
+            try:
+                handle_magnetometer_event(runner, event, filter_state, imu_params)
+                runner.state.mag_idx = event.index + 1
+            except Exception as e:
+                print(f"[ERROR] MAG event failed at {t_measurement:.6f}: {e}")
+        
+        # ---------------------------------------------------------------------
+        # Output logging (at output_time using fast propagation)
+        # ---------------------------------------------------------------------
+        if filter_state.output_time - last_output_time >= output_interval:
+            # Fast-propagate from fusion_time to output_time for logging
+            try:
+                x_output, _ = fast_propagate_output(
+                    runner.kf,
+                    filter_state,
+                    filter_state.output_time,
+                    imu_params,
+                    propagate_covariance=False
+                )
+            except Exception as e:
+                print(f"[WARNING] Fast propagation failed: {e}, using fusion state")
+                x_output = runner.kf.x
+            
+            # Get current position for logging (using output state)
             lat_now, lon_now = xy_to_latlon(
-                runner.kf.x[0, 0], runner.kf.x[1, 0],
+                x_output[0, 0], x_output[1, 0],
                 runner.lat0, runner.lon0
             )
             dem_now = runner.dem.sample_m(lat_now, lon_now) if runner.dem.ds else 0.0
@@ -875,39 +1045,26 @@ def run_event_driven_loop(runner):
                 dem_now = 0.0
             
             if runner.config.z_state.lower() == "agl":
-                agl_now = runner.kf.x[2, 0]
+                agl_now = x_output[2, 0]
                 msl_now = agl_now + dem_now
             else:
-                msl_now = runner.kf.x[2, 0]
+                msl_now = x_output[2, 0]
                 agl_now = msl_now - dem_now
             
-            # DEM height updates
-            if event.event_type == EventType.IMU:
-                runner.process_dem_height(t)
+            # Save current fusion state and temporarily swap for logging
+            x_backup = runner.kf.x.copy()
+            runner.kf.x = x_output
             
-            # TRN updates
-            if runner.trn is not None:
-                runner.trn.update_altitude_history(
-                    timestamp=t,
-                    msl_altitude=msl_now,
-                    estimated_x=runner.kf.x[0, 0],
-                    estimated_y=runner.kf.x[1, 0]
-                )
-                if runner.trn.check_update_needed(t):
-                    runner.trn.apply_trn_update(
-                        kf=runner.kf,
-                        lat0=runner.lat0,
-                        lon0=runner.lon0,
-                        current_time=t
-                    )
+            # Log pose (using output state at real-time)
+            dt = filter_state.output_time - runner.state.last_t
+            used_vo = event.event_type == EventType.CAMERA
+            runner.log_pose(filter_state.output_time, dt, used_vo, None, msl_now, agl_now, lat_now, lon_now)
             
             # Log error
-            runner.log_error(t)
+            runner.log_error(filter_state.output_time)
             
-            # Log pose
-            dt = max(0.0, t - runner.state.last_t) if event.event_type != EventType.IMU else 0.0
-            used_vo = event.event_type == EventType.CAMERA
-            runner.log_pose(t, dt, used_vo, None, msl_now, agl_now, lat_now, lon_now)
+            # Restore fusion state
+            runner.kf.x = x_backup
             
             # Log inference timing
             toc_iter = time.time()
@@ -916,18 +1073,16 @@ def run_event_driven_loop(runner):
                 fps = (1.0 / dt_proc) if dt_proc > 0 else 0.0
                 f.write(f"{event_count},{dt_proc:.6f},{fps:.2f}\n")
             
-            # Log state debug
-            log_state_debug(runner.state_dbg_csv, t, runner.kf, dem_now, agl_now, msl_now, last_a_world)
-            
-            last_output_time = t
+            runner.state.last_t = filter_state.output_time
+            last_output_time = filter_state.output_time
         
         # Progress display
         if event_count % 1000 == 0:
-            time_elapsed = t - filter_state.t0
+            time_elapsed = t_measurement - filter_state.t0
             speed_ms = float(np.linalg.norm(runner.kf.x[3:6, 0]))
+            fusion_lag = filter_state.output_time - filter_state.filter_time
             print(f"t={time_elapsed:8.3f}s | speed={speed_ms*3.6:5.1f}km/h | "
-                  f"phase={runner.PHASE_NAMES[runner.state.current_phase]} | "
-                  f"events={event_count}", end="\r")
+                  f"lag={fusion_lag*1000:.1f}ms | events={event_count}", end="\r")
     
     # =========================================================================
     # Step 5: Finish
@@ -935,18 +1090,16 @@ def run_event_driven_loop(runner):
     toc_all = time.time()
     
     runner.print_summary()
-    print(f"\n[EVENT-DRIVEN] Processed {event_count} events")
-    print(f"  IMU: {scheduler.processed_count[EventType.IMU]}")
-    print(f"  Camera: {scheduler.processed_count[EventType.CAMERA]}")
-    print(f"  VPS: {scheduler.processed_count[EventType.VPS]}")
-    print(f"  MAG: {scheduler.processed_count[EventType.MAG]}")
+    print(f"\n[PURE EVENT-DRIVEN] Processed {event_count} sensor events")
+    print(f"  Camera: {scheduler.processed_count.get(EventType.CAMERA, 0)}")
+    print(f"  VPS: {scheduler.processed_count.get(EventType.VPS, 0)}")
+    print(f"  MAG: {scheduler.processed_count.get(EventType.MAG, 0)}")
+    print(f"  IMU: {len(filter_state.imu_buffer)} samples (data source only)")
     
-    # Report extrapolation statistics (should be ZERO in correct architecture)
-    extrapolate_count = getattr(filter_state, 'extrapolate_count', 0)
-    if extrapolate_count > 0:
-        print(f"\n[WARNING] IMU extrapolations: {extrapolate_count} (indicates timing/priority bug!)")
-        print(f"  → Should be ZERO if IMU events have correct priority.")
-    else:
-        print(f"\n[OK] No IMU extrapolations (timing is correct)")
+    print(f"\n[FUSION TIMING]")
+    print(f"  Delay: {filter_state.fusion_delay*1000:.1f}ms")
+    print(f"  Final fusion time: {filter_state.filter_time:.3f}s")
+    print(f"  Final output time: {filter_state.output_time:.3f}s")
+    print(f"  Final lag: {(filter_state.output_time - filter_state.filter_time)*1000:.1f}ms")
     
     print(f"\n=== Finished in {toc_all - tic_all:.2f} seconds ===")
