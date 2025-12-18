@@ -28,16 +28,24 @@ def propagate_nominal_state(kf: ExtendedKalmanFilter,
                             bg: np.ndarray, ba: np.ndarray,
                             imu_params: dict):
     """
-    Lightweight nominal state propagation (position, velocity, rotation).
-    Does NOT update covariance (P matrix) - that's done with preintegration.
+    [DEPRECATED v3.5.1] Lightweight nominal state propagation - DO NOT USE!
     
-    This ensures state is always at current time for measurement updates.
-    Part of OpenVINS-style architecture where:
-    - Nominal state propagates at IMU rate (400 Hz) - LIGHTWEIGHT
-    - Covariance propagates at camera rate (20 Hz) - HEAVY
+    This function was based on a MISUNDERSTANDING of OpenVINS architecture.
     
-    This solves the "stale state" problem where measurement updates were
-    applied on outdated state when using preintegration.
+    WRONG APPROACH (v3.5.0):
+    - Propagate only state (x) at 400 Hz
+    - Propagate covariance (P) at 20 Hz
+    - Result: P is stale when VPS/MAG arrive → inconsistent Kalman gain!
+    
+    CORRECT APPROACH (v3.5.1+):
+    - Propagate BOTH x and P at every IMU tick (400 Hz)
+    - Use preintegration ONLY for MSCKF/camera constraints
+    - Never skip covariance propagation between measurements!
+    
+    OpenVINS also propagates P at every IMU tick. The "fast" part is using
+    preintegration for MSCKF instead of per-clone Jacobians.
+    
+    Use process_imu() instead - it correctly propagates both x and P.
     
     Args:
         kf: Kalman filter
@@ -46,10 +54,6 @@ def propagate_nominal_state(kf: ExtendedKalmanFilter,
         bg: Gyro bias
         ba: Accel bias
         imu_params: IMU parameters (g_norm)
-    
-    References:
-        - OpenVINS: Propagator::propagate_and_clone()
-        - OKVIS: propagateState()
     """
     # Bias-corrected measurements
     w_corr = rec.ang - bg

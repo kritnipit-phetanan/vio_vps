@@ -100,6 +100,7 @@ class VIOState:
     mag_updates: int = 0
     mag_rejects: int = 0
     consecutive_stationary: int = 0
+    imu_propagation_count: int = 0  # For debug logging
     
     # Timing
     t0: float = 0.0
@@ -524,16 +525,16 @@ class VIORunner:
             )
             print(f"[DEBUG] Calibration snapshot saved: {cal_path}")
     
-    def process_imu_sample(self, rec, dt: float):
+    def _update_imu_helpers(self, rec, dt: float, imu_params: dict):
         """
-        Process single IMU sample (propagation + ZUPT).
+        Update IMU-related helper variables (ZUPT, mag filter).
+        Shared by both preintegration and legacy modes.
         
         Args:
             rec: IMU record
             dt: Time delta since last sample
+            imu_params: IMU parameters dict
         """
-        imu_params = self.global_config.get('IMU_PARAMS', {'g_norm': 9.803})
-        
         # Get current state
         x = self.kf.x.reshape(-1)
         bg = x[10:13]
@@ -543,19 +544,9 @@ class VIORunner:
         a_corr = rec.lin.astype(float) - ba
         w_corr = rec.ang.astype(float) - bg
         
-        # Store gyro_z and dt for mag filtering
+        # Store gyro_z and dt for mag filtering (CRITICAL for preintegration mode)
         self.last_gyro_z = float(w_corr[2])
         self.last_imu_dt = dt
-        
-        # Propagate state
-        if not self.config.use_preintegration:
-            # Legacy propagation
-            process_imu(
-                self.kf, rec, dt,
-                estimate_imu_bias=self.config.estimate_imu_bias,
-                t=rec.t, t0=self.state.t0,
-                imu_params=imu_params
-            )
         
         # Check for stationary (ZUPT)
         v_mag = np.linalg.norm(x[3:6])
@@ -590,6 +581,27 @@ class VIORunner:
         # Save priors
         self.kf.x_prior = self.kf.x.copy()
         self.kf.P_prior = self.kf.P.copy()
+    
+    def process_imu_sample(self, rec, dt: float):
+        """
+        Process single IMU sample (legacy mode: propagation + helpers).
+        
+        Args:
+            rec: IMU record
+            dt: Time delta since last sample
+        """
+        imu_params = self.global_config.get('IMU_PARAMS', {'g_norm': 9.803})
+        
+        # Propagate state + covariance
+        process_imu(
+            self.kf, rec, dt,
+            estimate_imu_bias=self.config.estimate_imu_bias,
+            t=rec.t, t0=self.state.t0,
+            imu_params=imu_params
+        )
+        
+        # Update helpers (ZUPT, mag filter)
+        self._update_imu_helpers(rec, dt, imu_params)
     
     def process_vps(self, t: float):
         """
@@ -1407,19 +1419,30 @@ class VIORunner:
             )
             self.state.current_phase = phase_num
             
-            # IMU propagation (v3.5.0: OpenVINS-style nominal propagation)
+            # IMU propagation (v3.5.1: FIXED - propagate P every tick)
+            # CRITICAL: Both modes must propagate state AND covariance every IMU tick
+            # Preintegration is ONLY used for MSCKF/camera constraints, NOT to skip P propagation!
             if self.config.use_preintegration and ongoing_preint is not None:
-                # Step 1: Accumulate IMU for covariance propagation
+                # Step 1: Accumulate IMU measurements for later MSCKF use
                 ongoing_preint.integrate_measurement(rec.ang, rec.lin, dt)
                 
-                # Step 2: Lightweight nominal state propagation (keep state fresh)
-                # This ensures measurement updates (VPS/MAG) apply on current state
-                bg = self.kf.x[10:13, 0]
-                ba = self.kf.x[13:16, 0]
-                propagate_nominal_state(self.kf, rec, dt, bg, ba, imu_params)
+                # Step 2: Propagate state + covariance (REQUIRED for consistent EKF updates)
+                # This ensures BOTH x and P are at current time when VPS/MAG/DEM arrive
+                process_imu(
+                    self.kf, rec, dt,
+                    estimate_imu_bias=self.config.estimate_imu_bias,
+                    t=rec.t, t0=self.state.t0,
+                    imu_params=imu_params
+                )
+                
+                # Step 3: Update mag filter variables and check ZUPT
+                self._update_imu_helpers(rec, dt, imu_params)
             else:
-                # Legacy mode: full propagation (state + covariance)
+                # Legacy mode: full propagation + helpers
                 self.process_imu_sample(rec, dt)
+            
+            # Increment counter for debug logging
+            self.state.imu_propagation_count += 1
             
             # Debug logging: raw IMU and state covariance
             self.debug_writers.log_imu_raw(t, rec)
