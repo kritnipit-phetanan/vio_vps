@@ -79,8 +79,8 @@ from .output_utils import (
     DebugCSVWriters, init_output_csvs, get_ground_truth_error
 )
 from .trn import TerrainReferencedNavigation, TRNConfig, create_trn_from_config
-
-# VIOConfig is imported from config.py (single source of truth)
+from .imu_driven import run_imu_driven_loop
+from .event_driven import run_event_driven_loop
 
 @dataclass
 class VIOState:
@@ -1129,6 +1129,131 @@ class VIORunner:
             else:
                 self.state.mag_rejects += 1
     
+    def _process_single_vps(self, vps, t: float):
+        """
+        Process a single VPS measurement (for event-driven mode).
+        
+        Args:
+            vps: VPS record with lat, lon, etc.
+            t: VPS timestamp
+        """
+        from .vps_integration import (
+            compute_vps_innovation, compute_vps_acceptance_threshold
+        )
+        
+        sigma_vps = self.global_config.get('SIGMA_VPS_XY', 1.0)
+        
+        # Compute innovation and Mahalanobis distance
+        vps_xy, innovation, m2_test = compute_vps_innovation(
+            vps, self.kf, self.lat0, self.lon0
+        )
+        
+        # Compute adaptive acceptance threshold
+        time_since_correction = t - getattr(self.kf, 'last_absolute_correction_time', t)
+        innovation_mag = float(np.linalg.norm(innovation))
+        max_innovation_m, r_scale, tier_name = compute_vps_acceptance_threshold(
+            time_since_correction, innovation_mag
+        )
+        
+        # Chi-square threshold (2 DOF)
+        chi2_threshold = 5.99  # 95% confidence
+        
+        # Gate by innovation magnitude OR chi-square test
+        if innovation_mag > max_innovation_m:
+            print(f"[VPS] REJECTED: innovation {innovation_mag:.1f}m > {max_innovation_m:.1f}m "
+                  f"({tier_name}, drift={time_since_correction:.1f}s)")
+            return
+        
+        if m2_test > chi2_threshold * 10:  # Very permissive for first VPS
+            print(f"[VPS] REJECTED: chi2={m2_test:.1f} >> {chi2_threshold} "
+                  f"(innovation={innovation_mag:.1f}m)")
+            return
+        
+        # Apply update with adaptive R scaling
+        applied = apply_vps_update(
+            self.kf,
+            vps_xy=vps_xy,
+            sigma_vps=sigma_vps,
+            r_scale=r_scale
+        )
+        
+        if applied:
+            self.kf.last_absolute_correction_time = t
+            print(f"[VPS] Applied at t={t:.3f}, innovation={innovation_mag:.1f}m, "
+                  f"tier={tier_name}, R_scale={r_scale:.1f}x")
+    
+    def _process_single_mag(self, mag_rec, t: float):
+        """
+        Process a single magnetometer measurement (for event-driven mode).
+        
+        Args:
+            mag_rec: Magnetometer record
+            t: Magnetometer timestamp
+        """
+        sigma_mag = self.global_config.get('SIGMA_MAG_YAW', 0.15)
+        declination = self.global_config.get('MAG_DECLINATION', 0.0)
+        use_raw = self.global_config.get('MAG_USE_RAW_HEADING', True)
+        
+        # Calibrate using hard-iron and soft-iron from config
+        hard_iron = self.global_config.get('MAG_HARD_IRON_OFFSET', None)
+        soft_iron = self.global_config.get('MAG_SOFT_IRON_MATRIX', None)
+        mag_cal = calibrate_magnetometer(mag_rec.mag, hard_iron=hard_iron, soft_iron=soft_iron)
+        
+        # Compute raw yaw from calibrated magnetometer
+        from .magnetometer import compute_yaw_from_mag
+        q_current = self.kf.x[6:10, 0].flatten()
+        yaw_mag_raw, quality = compute_yaw_from_mag(
+            mag_body=mag_cal,
+            q_wxyz=q_current,
+            mag_declination=declination,
+            use_raw_heading=use_raw
+        )
+        
+        # Apply magnetometer filter (EMA smoothing + gyro consistency check)
+        in_convergence = self.state.current_phase < 2  # SPINUP or EARLY phase
+        yaw_mag_filtered, r_scale, filter_info = apply_mag_filter(
+            yaw_mag=yaw_mag_raw,
+            yaw_t=mag_rec.t,
+            gyro_z=self.last_gyro_z,
+            dt_imu=self.last_imu_dt,
+            in_convergence=in_convergence,
+            mag_max_yaw_rate=self.global_config.get('MAG_MAX_YAW_RATE_DEG', 30.0) * np.pi / 180.0,
+            mag_gyro_threshold=self.global_config.get('MAG_GYRO_THRESHOLD_DEG', 10.0) * np.pi / 180.0,
+            mag_ema_alpha=self.global_config.get('MAG_EMA_ALPHA', 0.3),
+            mag_consistency_r_inflate=self.global_config.get('MAG_R_INFLATE', 5.0)
+        )
+        
+        # Scale measurement noise based on filter confidence
+        sigma_mag_scaled = sigma_mag * r_scale
+        
+        # Use filtered yaw instead of raw calibrated mag
+        has_ppk = self.ppk_state is not None
+        
+        # Get residual_csv path if debug data is enabled
+        residual_path = self.residual_csv if self.config.save_debug_data and hasattr(self, 'residual_csv') else None
+        
+        # Apply magnetometer update using FILTERED yaw
+        applied, reason = apply_magnetometer_update(
+            self.kf,
+            mag_calibrated=mag_cal,
+            mag_declination=declination,
+            use_raw_heading=use_raw,
+            sigma_mag_yaw=sigma_mag_scaled,
+            current_phase=self.state.current_phase,
+            in_convergence=in_convergence,
+            has_ppk_yaw=has_ppk,
+            timestamp=t,
+            residual_csv=residual_path,
+            frame=self.state.vio_frame,
+            yaw_override=yaw_mag_filtered,
+            filter_info=filter_info
+        )
+        
+        if applied:
+            self.state.mag_updates += 1
+        else:
+            self.state.mag_rejects += 1
+    
     def process_dem_height(self, t: float):
         """
         Process DEM height update.
@@ -1306,332 +1431,22 @@ class VIORunner:
         print(f"  frame_skip: {self.config.frame_skip}")
         
         # =================================================================
-        # Architecture Selection (v3.7.0: enum-based)
+        # Architecture Selection (v3.8.0: enum-based with full event-driven support)
         # =================================================================
         if self.config.estimator_mode == "event_queue_output_predictor":
             # Event-driven mode: propagate to each measurement time
-            print("\n[ARCH] Selected: Event-driven (event_queue_output_predictor)")
-            print("[TODO] Event-driven architecture not implemented yet!")
-            print("[TODO] Will use propagate_to_timestamp() for exact timing")
-            print("[TODO] See analysis in conversation for implementation details")
-            raise NotImplementedError(
-                "Event-driven architecture not yet implemented. "
-                "Set estimator_mode: imu_step_preint_cache in YAML to use IMU-driven mode."
-            )
+            # Key guarantee: filter_time == measurement_time before EVERY update
+            print("\n[ARCH] Selected: Event-driven with output predictor (event_queue_output_predictor)")
+            print("[ARCH] Features:")
+            print("  - Priority queue orders all sensor events by timestamp")
+            print("  - Propagate-to-event ensures state_time == measurement_time")
+            print("  - Fast-propagate output layer for low-latency logging")
+            run_event_driven_loop(self)
         elif self.config.estimator_mode == "imu_step_preint_cache":
             # IMU-driven mode: process all IMU @ 400Hz with sub-sample precision
             print("\n[ARCH] Selected: IMU-driven with sub-sample timestamp precision (imu_step_preint_cache)")
-            self._run_imu_driven()
+            run_imu_driven_loop(self)
         else:
             raise ValueError(f"Unknown estimator_mode: {self.config.estimator_mode}")
-    
-    def _run_imu_driven(self):
-        """
-        IMU-driven VIO loop (v3.6.0).
-        
-        Architecture:
-        - Iterate through all IMU samples @ 400Hz
-        - Accumulate preintegration buffer for MSCKF Jacobians
-        - Propagate state + covariance every IMU tick
-        - Process measurements when their timestamps are reached
-        
-        Advantages:
-        - Simple sequential processing
-        - Streaming-friendly (no need to buffer all data)
-        - Clear separation between propagation and update
-        
-        Disadvantages:
-        - State can lag measurement time by ~2.5ms (1 IMU sample)
-        - Need careful timestamp handling for camera events
-        """
-        # Load data
-        self.load_data()
-        
-        # Initialize EKF
-        self.initialize_ekf()
-        
-        # Initialize VIO frontend
-        self.initialize_vio_frontend()
-        
-        # Initialize fisheye rectifier (optional - for converting fisheye to pinhole)
-        self._initialize_rectifier()
-        
-        # Initialize loop closure detector (for yaw drift correction)
-        self._initialize_loop_closure()
-        
-        # Initialize magnetometer filter state
-        reset_mag_filter_state()
-        
-        # Set magnetometer constants from config
-        mag_ema_alpha = self.global_config.get('MAG_EMA_ALPHA', 0.3)
-        mag_max_yaw_rate_deg = self.global_config.get('MAG_MAX_YAW_RATE_DEG', 30.0)
-        mag_gyro_threshold_deg = self.global_config.get('MAG_GYRO_THRESHOLD_DEG', 10.0)
-        mag_r_inflate = self.global_config.get('MAG_R_INFLATE', 5.0)
-        set_mag_constants(
-            ema_alpha=mag_ema_alpha,
-            max_yaw_rate=np.radians(mag_max_yaw_rate_deg),
-            gyro_threshold=np.radians(mag_gyro_threshold_deg),
-            consistency_r_inflate=mag_r_inflate
-        )
-        print(f"[MAG-FILTER] Initialized: EMA_α={mag_ema_alpha:.2f}, max_rate={mag_max_yaw_rate_deg:.1f}°/s, gyro_thresh={mag_gyro_threshold_deg:.1f}°")
-        
-        # Initialize vibration detector
-        imu_params = self.global_config.get('IMU_PARAMS', {})
-        vib_buffer_size = self.global_config.get('VIBRATION_WINDOW_SIZE', 50)
-        vib_threshold_mult = self.global_config.get('VIBRATION_THRESHOLD_MULT', 5.0)
-        self.vibration_detector = VibrationDetector(
-            buffer_size=vib_buffer_size,
-            threshold=imu_params.get('acc_n', 0.1) * vib_threshold_mult
-        )
-        
-        # Initialize TRN (Terrain Referenced Navigation) - v3.3.0
-        if self.global_config.get('TRN_ENABLED', False):
-            self.trn = create_trn_from_config(self.dem, self.global_config)
-            if self.trn:
-                print(f"[TRN] Initialized: search_radius={self.global_config.get('TRN_SEARCH_RADIUS', 500)}m, "
-                      f"update_interval={self.global_config.get('TRN_UPDATE_INTERVAL', 10)}s")
-            else:
-                print("[TRN] WARNING: Failed to initialize TRN")
-        else:
-            print("[TRN] Disabled in config")
-        
-        # Store initial MSL for altitude change tracking
-        self.initial_msl = self.msl0
-        
-        # Setup output files
-        self.setup_output_files()
-        
-        # Initialize timing
-        self.state.t0 = self.imu[0].t
-        self.state.last_t = self.state.t0
-        
-        # Initialize preintegration cache for MSCKF Jacobians
-        imu_params = self.global_config.get('IMU_PARAMS', {})
-        ongoing_preint = IMUPreintegration(
-            bg=self.kf.x[10:13, 0].reshape(3,),
-            ba=self.kf.x[13:16, 0].reshape(3,),
-            sigma_g=imu_params.get('gyr_n', 0.01),
-            sigma_a=imu_params.get('acc_n', 0.1),
-            sigma_bg=imu_params.get('gyr_w', 0.0001),
-            sigma_ba=imu_params.get('acc_w', 0.001)
-        )
-        print(f"[PREINT] Initialized preintegration cache for MSCKF Jacobians")
-        
-        # Main IMU-driven loop
-        print("\n=== Running (IMU-driven with preintegration cache) ===")
-        tic_all = time.time()
-        
-        # Store last a_world for state_debug logging
-        last_a_world = np.array([0.0, 0.0, 0.0])
-        
-        for i, rec in enumerate(self.imu):
-            # Start timing for inference_log
-            tic_iter = time.time()
-            
-            t = rec.t
-            dt = max(0.0, float(t - self.state.last_t)) if i > 0 else 0.0
-            
-            time_elapsed = t - self.state.t0
-            
-            # Update vibration detector
-            gyro_mag = np.linalg.norm(rec.ang)
-            is_high_vibration, vibration_level = self.vibration_detector.update(gyro_mag)
-            
-            # Get current velocity and uncertainty for state-based phase detection
-            velocity = self.kf.x[3:6, 0].flatten() if self.kf is not None else None
-            velocity_sigma = None
-            if self.kf is not None and self.kf.P.shape[0] > 5:
-                velocity_sigma = np.sqrt(np.mean(np.diag(self.kf.P[3:6, 3:6])))
-            
-            altitude_change = self.kf.x[2, 0] - self.initial_msl if self.kf is not None else 0.0
-            
-            # Get flight phase (v3.4.0: pure state-based with config thresholds)
-            phase_num, _ = get_flight_phase(
-                velocity=velocity,
-                velocity_sigma=velocity_sigma,
-                vibration_level=vibration_level,
-                altitude_change=altitude_change,
-                spinup_velocity_thresh=self.PHASE_SPINUP_VELOCITY_THRESH,
-                spinup_vibration_thresh=self.PHASE_SPINUP_VIBRATION_THRESH,
-                spinup_alt_change_thresh=self.PHASE_SPINUP_ALT_CHANGE_THRESH,
-                early_velocity_sigma_thresh=self.PHASE_EARLY_VELOCITY_SIGMA_THRESH
-            )
-            self.state.current_phase = phase_num
-            
-            # =====================================================================
-            # IMU Propagation (v3.7.0: IMU-driven with sub-sample timestamp precision)
-            # =====================================================================
-            # Architecture: Always propagate x+P at every IMU tick (400Hz)
-            # Sub-sample precision: Split dt when crossing camera timestamp (OpenVINS-style)
-            # Preintegration cache is ONLY for MSCKF Jacobians, NOT to skip propagation
-            
-            # Check if we cross camera timestamp during this IMU step
-            next_cam_time = self.imgs[self.state.img_idx].t if self.state.img_idx < len(self.imgs) else float('inf')
-            t_last = self.state.last_t
-            t_current = rec.t
-            
-            # Detect camera crossing: last_t < t_cam <= current_t
-            if t_last < next_cam_time <= t_current and dt > 0:
-                # Split dt at camera timestamp for sub-sample precision
-                dt_before = next_cam_time - t_last  # Propagate to camera time
-                dt_after = t_current - next_cam_time  # Propagate remaining
-                
-                # Step 1a: Propagate to camera time (exact timestamp)
-                ongoing_preint.integrate_measurement(rec.ang, rec.lin, dt_before)
-                process_imu(
-                    self.kf, rec, dt_before,
-                    estimate_imu_bias=self.config.estimate_imu_bias,
-                    t=next_cam_time, t0=self.state.t0,
-                    imu_params=imu_params
-                )
-                self._update_imu_helpers(rec, dt_before, imu_params)
-                self.state.last_t = next_cam_time
-                
-                # Process camera at exact timestamp
-                # VIO updates (feature tracking, MSCKF, velocity) at t_cam
-                used_vo, vo_data = self.process_vio(rec, next_cam_time, ongoing_preint)
-                
-                # Step 1b: Propagate remaining dt after camera
-                if dt_after > 1e-6:  # Only if significant remaining time
-                    ongoing_preint.integrate_measurement(rec.ang, rec.lin, dt_after)
-                    process_imu(
-                        self.kf, rec, dt_after,
-                        estimate_imu_bias=self.config.estimate_imu_bias,
-                        t=t_current, t0=self.state.t0,
-                        imu_params=imu_params
-                    )
-                    self._update_imu_helpers(rec, dt_after, imu_params)
-                self.state.last_t = t_current
-            else:
-                # Normal propagation (no camera crossing)
-                # Step 1: Accumulate IMU measurements in preintegration cache for MSCKF
-                ongoing_preint.integrate_measurement(rec.ang, rec.lin, dt)
-                
-                # Step 2: Propagate state + covariance (REQUIRED for consistent EKF updates)
-                # This ensures BOTH x and P are at current time when VPS/MAG/DEM arrive
-                process_imu(
-                    self.kf, rec, dt,
-                    estimate_imu_bias=self.config.estimate_imu_bias,
-                    t=rec.t, t0=self.state.t0,
-                    imu_params=imu_params
-                )
-                
-                # Step 3: Update mag filter variables and check ZUPT
-                self._update_imu_helpers(rec, dt, imu_params)
-                
-                # Update state time
-                self.state.last_t = t
-                
-                # VIO updates (feature tracking, MSCKF, velocity) if no camera crossed
-                used_vo, vo_data = self.process_vio(rec, t, ongoing_preint)
-            
-            # Increment counter for debug logging
-            self.state.imu_propagation_count += 1
-            
-            # Debug logging: raw IMU and state covariance
-            self.debug_writers.log_imu_raw(t, rec)
-            if i % 10 == 0:  # Every 10 samples (~25ms @ 400Hz)
-                bg = self.kf.x[10:13, 0]
-                ba = self.kf.x[13:16, 0]
-                self.debug_writers.log_state_covariance(t, self.state.vio_frame, self.kf, bg, ba)
-            
-            # VPS updates
-            self.process_vps(t)
-            
-            # Magnetometer updates
-            if self.config.use_magnetometer:
-                self.process_magnetometer(t)
-            
-            # Capture current MSL/AGL BEFORE DEM update (matches vio_vps.py behavior)
-            lat_now, lon_now = xy_to_latlon(
-                self.kf.x[0, 0], self.kf.x[1, 0],
-                self.lat0, self.lon0
-            )
-            dem_now = self.dem.sample_m(lat_now, lon_now) if self.dem.ds else 0.0
-            if dem_now is None:
-                dem_now = 0.0
-            if self.config.z_state.lower() == "agl":
-                agl_now = self.kf.x[2, 0]
-                msl_now = agl_now + dem_now
-            else:
-                msl_now = self.kf.x[2, 0]
-                agl_now = msl_now - dem_now
-            
-            # DEM height updates (modifies kf.x[2,0], but we use pre-update values for logging)
-            self.process_dem_height(t)
-            
-            # TRN (Terrain Referenced Navigation) updates - v3.3.0
-            if self.trn is not None:
-                # Update altitude history for profile matching
-                self.trn.update_altitude_history(
-                    timestamp=t,
-                    msl_altitude=msl_now,
-                    estimated_x=self.kf.x[0, 0],
-                    estimated_y=self.kf.x[1, 0]
-                )
-                
-                # Try TRN position fix
-                if self.trn.check_update_needed(t):
-                    trn_success = self.trn.apply_trn_update(
-                        kf=self.kf,
-                        lat0=self.lat0,
-                        lon0=self.lon0,
-                        current_time=t
-                    )
-            
-            # Log error vs ground truth (every sample, like vio_vps.py)
-            self.log_error(t)
-            
-            # Log pose (using pre-DEM-update msl_now/agl_now for consistency with vio_vps.py)
-            self.log_pose(t, dt, used_vo, vo_data, msl_now=msl_now, agl_now=agl_now, 
-                          lat_now=lat_now, lon_now=lon_now)
-            
-            # Log inference timing (every sample, like vio_vps.py)
-            toc_iter = time.time()
-            with open(self.inf_csv, "a", newline="") as f:
-                dt_proc = toc_iter - tic_iter
-                fps = (1.0 / dt_proc) if dt_proc > 0 else 0.0
-                f.write(f"{i},{dt_proc:.6f},{fps:.2f}\n")
-            
-            # Log state debug (every sample, like vio_vps.py)
-            log_state_debug(self.state_dbg_csv, t, self.kf, dem_now, agl_now, msl_now, last_a_world)
-            
-            # Update last_a_world for next iteration
-            # Get a_world from last IMU sample processing
-            try:
-                # Convert quaternion to rotation matrix (state is [w,x,y,z])
-                q = self.kf.x[6:10, 0].flatten()
-                quat_xyzw = np.array([q[1], q[2], q[3], q[0]])  # scipy uses [x,y,z,w]
-                r_body_to_world = R_scipy.from_quat(quat_xyzw).as_matrix()
-                
-                # Compute world-frame acceleration with gravity subtraction
-                a_body = rec.lin - self.kf.x[13:16, 0].flatten()  # bias-corrected
-                g_norm = self.global_config.get('IMU_PARAMS', {}).get('g_norm', 9.8066)
-                g_world = np.array([0.0, 0.0, -g_norm])  # ENU: gravity points down
-                a_world_raw = r_body_to_world @ a_body
-                last_a_world = a_world_raw + g_world  # Subtract gravity
-            except Exception:
-                pass
-            
-            # Progress
-            if i % 1000 == 0:
-                speed_ms = float(np.linalg.norm(self.kf.x[3:6, 0]))
-                print(f"t={time_elapsed:8.3f}s | speed={speed_ms*3.6:5.1f}km/h | "
-                      f"phase={self.PHASE_NAMES[self.state.current_phase]}", end="\r")
-        
-        toc_all = time.time()
-        
-        # Print summary
-        self.print_summary()
-        print(f"\n=== Finished in {toc_all - tic_all:.2f} seconds ===")
 
 
-def run_vio(config: VIOConfig):
-    """
-    Convenience function to run VIO pipeline.
-    
-    Args:
-        config: VIOConfig instance
-    """
-    runner = VIORunner(config)
-    runner.run()
