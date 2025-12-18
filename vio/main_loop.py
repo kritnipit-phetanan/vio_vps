@@ -1448,5 +1448,3 @@ class VIORunner:
             run_imu_driven_loop(self)
         else:
             raise ValueError(f"Unknown estimator_mode: {self.config.estimator_mode}")
-
-
