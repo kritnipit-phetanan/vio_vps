@@ -60,14 +60,17 @@ class EventType(IntEnum):
     Sensor event types with natural ordering.
     
     Lower value = higher priority when timestamps equal.
-    IMU has lowest priority because we want to process all sensor updates
-    at a given timestamp BEFORE advancing IMU time.
+    
+    CRITICAL FIX: IMU must come FIRST at timestamp t!
+    Reason: Sensor updates at t need IMU data up to t for propagate_to_event().
+    Wrong order: sensor@t → propagate(no IMU@t yet) → extrapolate fallback ❌
+    Correct order: IMU@t → sensor@t → propagate(has IMU@t) → exact ✅
     """
-    VPS = 1      # Highest priority: absolute position correction
-    MAG = 2      # Magnetometer yaw
-    CAMERA = 3   # Visual features / MSCKF
-    DEM = 4      # Terrain height
-    IMU = 5      # Lowest priority: state propagation
+    IMU = 1      # Highest priority: MUST process first for propagation data
+    VPS = 2      # Position correction (needs propagate to t first)
+    MAG = 3      # Magnetometer yaw (needs propagate to t first)
+    CAMERA = 4   # Visual features / MSCKF (needs propagate to t first)
+    DEM = 5      # Terrain height (needs propagate to t first)
 
 
 @dataclass
@@ -292,16 +295,28 @@ def propagate_to_event(kf: ExtendedKalmanFilter,
     imu_samples = filter_state.imu_buffer.get_range(current_time, target_time)
     
     if len(imu_samples) == 0:
-        # No IMU data available - check if we can extrapolate
+        # WARNING: No IMU data in range - this indicates scheduling/priority bug!
+        # Should NOT happen if IMU events have higher priority than sensor events.
         last_imu = filter_state.imu_buffer.get_closest_before(target_time)
         if last_imu is None:
-            print(f"[PROPAGATE] ERROR: No IMU data for range ({current_time:.3f}, {target_time:.3f}]")
+            print(f"[PROPAGATE] ERROR: No IMU data before {target_time:.3f}, cannot propagate!")
             return False
         
-        # Extrapolate using last IMU (not ideal but better than nothing)
+        # Fallback: Extrapolate using last IMU (NOT RECOMMENDED - indicates bug)
+        print(f"[PROPAGATE] WARNING: Extrapolating from {last_imu.t:.3f} to {target_time:.3f} "
+              f"(dt={target_time - current_time:.4f}s) - missing IMU data!")
+        print(f"  → This suggests sensor event arrived before IMU event at same timestamp.")
+        print(f"  → Check EventType priority: IMU should be highest (processed first).")
+        
         dt = target_time - current_time
         _propagate_single_step(kf, last_imu, dt, filter_state, imu_params, estimate_imu_bias, target_time=target_time)
         filter_state.filter_time = target_time
+        
+        # Track extrapolation count for debugging
+        if not hasattr(filter_state, 'extrapolate_count'):
+            filter_state.extrapolate_count = 0
+        filter_state.extrapolate_count += 1
+        
         return True
     
     # Propagate through each IMU sample
@@ -586,7 +601,8 @@ def run_event_driven_loop(runner):
     """
     Event-driven VIO loop (v3.8.0).
     
-    Architecture (Hybrid: Event-driven updates + IMU-driven propagation):
+    Current Architecture (Hybrid: NOT pure event-driven):
+    ======================================================
     1. Load all sensor data and create event queue
     2. Process events in chronological order (priority queue)
     3. IMU events: propagate state, update helpers, log at IMU rate
@@ -595,10 +611,48 @@ def run_event_driven_loop(runner):
     
     Key guarantee: Before ANY sensor update, filter_time == measurement_time.
     
-    NOTE: This is NOT pure event-driven (OpenVINS-style "propagate-to-next-meas").
-    We still propagate at EVERY IMU sample (400Hz) like IMU-driven mode.
-    Pure event-driven would: skip IMU between measurements → propagate only when needed.
-    Trade-off: Current approach ensures consistent IMU rate for logging/debug.
+    CRITICAL LIMITATIONS:
+    ====================
+    ❌ Still propagates at EVERY IMU sample (400Hz) - no computation savings
+    ❌ Adds overhead: priority queue + buffer scanning + event creation
+    ❌ fast_propagate_output() not used (no output predictor benefit)
+    ⚠️  Extrapolation fallback can hide timing bugs silently
+    
+    TODO: Migrate to Pure Event-Driven (OpenVINS-style)
+    ===================================================
+    Changes needed for true event-driven architecture:
+    
+    1. **Remove IMU from event queue**
+       - Keep only: CAMERA, VPS, MAG (DEM optional)
+       - IMU buffer is data source, not event source
+    
+    2. **Implement IMU segment selection + interpolation**
+       - propagate_to(t_event) selects IMU in range [filter_time, t_event]
+       - Interpolate IMU at exact t_event if between samples
+       - See OpenVINS Propagator::select_imu_readings()
+    
+    3. **Add fusion time horizon**
+       - State fuses at delayed horizon (e.g., t - 50ms)
+       - Buffer out-of-order measurements
+       - See PX4 EKF2 delayed fusion
+    
+    4. **Enable fast_propagate_output()**
+       - Fusion at t_fusion → output at t_current via IMU extrapolation
+       - Provides low-latency output without disrupting fusion
+    
+    5. **Remove/assert extrapolation fallback**
+       - Should never trigger if architecture is correct
+       - Add assertion/error instead of silent fallback
+    
+    6. **1-shot measurement consume**
+       - Handler processes single measurement at exact timestamp
+       - No while loops scanning forward
+    
+    Benefits of Pure Event-Driven:
+    - Skip IMU propagation between sparse measurements (computation savings)
+    - Better handling of out-of-order/delayed measurements
+    - Proper separation: fusion time ≠ output time
+    - Matches production systems (PX4 EKF2, OpenVINS)
     
     Args:
         runner: VIORunner instance with initialized config and state
@@ -676,6 +730,10 @@ def run_event_driven_loop(runner):
     print("\n[EVENT-DRIVEN] Building event queue...")
     
     # Add IMU events
+    # TODO: REMOVE THIS for pure event-driven!
+    # IMU should be data source (buffer), not event source (queue).
+    # Pure event-driven: propagate_to() selects IMU segment from buffer when needed.
+    # Current approach defeats the purpose of event-driven (still processes all IMU).
     for i, imu_rec in enumerate(runner.imu):
         scheduler.add_event(SensorEvent(
             timestamp=imu_rec.t,
@@ -882,4 +940,13 @@ def run_event_driven_loop(runner):
     print(f"  Camera: {scheduler.processed_count[EventType.CAMERA]}")
     print(f"  VPS: {scheduler.processed_count[EventType.VPS]}")
     print(f"  MAG: {scheduler.processed_count[EventType.MAG]}")
+    
+    # Report extrapolation statistics (should be ZERO in correct architecture)
+    extrapolate_count = getattr(filter_state, 'extrapolate_count', 0)
+    if extrapolate_count > 0:
+        print(f"\n[WARNING] IMU extrapolations: {extrapolate_count} (indicates timing/priority bug!)")
+        print(f"  → Should be ZERO if IMU events have correct priority.")
+    else:
+        print(f"\n[OK] No IMU extrapolations (timing is correct)")
+    
     print(f"\n=== Finished in {toc_all - tic_all:.2f} seconds ===")
