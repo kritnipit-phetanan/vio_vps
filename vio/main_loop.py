@@ -700,6 +700,10 @@ class VIORunner:
         
         # Process images up to current time
         while self.state.img_idx < len(self.imgs) and self.imgs[self.state.img_idx].t <= t:
+            # Get camera timestamp (CRITICAL: use this instead of IMU time t)
+            # Prevents timestamp mismatch when cloning/resetting preintegration
+            t_cam = self.imgs[self.state.img_idx].t
+            
             # FRAME SKIP (v2.9.9): Process every N frames for speedup
             # frame_skip=1 → all frames, frame_skip=2 → every other frame (50% faster)
             if self.config.frame_skip > 1 and (self.state.img_idx % self.config.frame_skip) != 0:
@@ -728,13 +732,13 @@ class VIORunner:
                 continue
             
             # Run VIO frontend
-            ok, ninl, r_vo_mat, t_unit, dt_img = self.vio_fe.step(img_for_tracking, self.imgs[self.state.img_idx].t)
+            ok, ninl, r_vo_mat, t_unit, dt_img = self.vio_fe.step(img_for_tracking, t_cam)
             
             # Loop closure detection - check when we have sufficient position estimate
             match_result = check_loop_closure(
                 loop_detector=self.loop_detector,
                 img_gray=img,
-                t=t,
+                t=t_cam,
                 kf=self.kf,
                 global_config=self.global_config,
                 vio_fe=self.vio_fe
@@ -746,7 +750,7 @@ class VIORunner:
                     relative_yaw=relative_yaw,
                     kf_idx=kf_idx,
                     num_inliers=num_inliers,
-                    t=t,
+                    t=t_cam,
                     cam_states=self.state.cam_states,
                     loop_detector=self.loop_detector
                 )
@@ -771,7 +775,7 @@ class VIORunner:
             tracking_ratio = 1.0 if num_features > 0 else 0.0
             inlier_ratio = num_inliers / max(1, num_features)
             self.debug_writers.log_feature_stats(
-                self.vio_fe.frame_idx, t, num_features, num_features, num_inliers,
+                self.vio_fe.frame_idx, t_cam, num_features, num_features, num_inliers,
                 avg_flow_px, avg_flow_px, tracking_ratio, inlier_ratio
             )
             
@@ -779,7 +783,7 @@ class VIORunner:
             # Store Jacobians for bias observability in MSCKF
             preint_jacobians = None
             if self.config.use_preintegration and ongoing_preint is not None:
-                preint_jacobians = apply_preintegration_at_camera(self.kf, ongoing_preint, t, imu_params)
+                preint_jacobians = apply_preintegration_at_camera(self.kf, ongoing_preint, t_cam, imu_params)
             
             # Check parallax for different purposes
             # CRITICAL CHANGE: Separate low-parallax handling for velocity vs MSCKF/plane
@@ -795,7 +799,7 @@ class VIORunner:
             if should_clone:
                 clone_idx = clone_camera_for_msckf(
                     kf=self.kf,
-                    t=t,
+                    t=t_cam,  # Use camera time for accurate cloning
                     cam_states=self.state.cam_states,
                     cam_observations=self.state.cam_observations,
                     vio_fe=self.vio_fe,
@@ -806,11 +810,11 @@ class VIORunner:
                 # Log MSCKF window state
                 if clone_idx >= 0:
                     num_tracked = len(self.state.cam_observations[-1]['observations']) if self.state.cam_observations else 0
-                    window_start = self.state.cam_states[0]['t'] if self.state.cam_states else t
+                    window_start = self.state.cam_states[0]['t'] if self.state.cam_states else t_cam
                     log_msckf_window(
                         msckf_window_csv=self.msckf_window_csv,
                         frame=self.vio_fe.frame_idx,
-                        t=t,
+                        t=t_cam,
                         num_clones=len(self.state.cam_states),
                         num_tracked=num_tracked,
                         num_mature=0,
@@ -825,7 +829,7 @@ class VIORunner:
                             cam_states=self.state.cam_states,
                             cam_observations=self.state.cam_observations,
                             vio_fe=self.vio_fe,
-                            t=t,
+                            t=t_cam,
                             msckf_dbg_csv=self.msckf_dbg_csv if hasattr(self, 'msckf_dbg_csv') else None,
                             dem_reader=self.dem,
                             origin_lat=self.lat0,
@@ -839,7 +843,7 @@ class VIORunner:
                         if num_updates > 0 and self.config.save_debug_data:
                             log_fej_consistency(
                                 fej_csv=self.fej_csv,
-                                t=t,
+                                t=t_cam,
                                 frame=self.vio_fe.frame_idx if self.vio_fe else 0,
                                 cam_states=self.state.cam_states,
                                 kf=self.kf
@@ -851,14 +855,14 @@ class VIORunner:
             if self.config.use_vio_velocity and avg_flow_px > 0.5:  # Very low threshold: any motion
                 # Get ground truth error for NEES calculation (v2.9.9.8)
                 vel_error, vel_cov = get_ground_truth_error(
-                    t, self.kf, self.ppk_trajectory, self.flight_log_df,
+                    t_cam, self.kf, self.ppk_trajectory, self.flight_log_df,
                     self.lat0, self.lon0, 'velocity')
                 
                 apply_vio_velocity_update(
                     kf=self.kf,
                     r_vo_mat=r_vo_mat if ok else None,  # Can be None - will use optical flow direction
                     t_unit=t_unit if ok else None,      # Can be None - will use optical flow direction
-                    t=t,
+                    t=t_cam,  # Use camera time for velocity update
                     dt_img=dt_img,
                     avg_flow_px=avg_flow_px,
                     imu_rec=rec,
