@@ -241,10 +241,6 @@ def load_config(config_path: str) -> VIOConfig:
     # "imu_step_preint_cache": IMU-driven with preintegration cache (was use_preintegration: false)
     # "event_queue_output_predictor": Event-driven with propagate-to-timestamp (was use_preintegration: true)
     estimator_mode_raw = imu.get('estimator_mode', None)
-    # Backward compatibility: map old use_preintegration to new estimator_mode
-    if estimator_mode_raw is None:
-        use_preint_legacy = imu.get('use_preintegration', False)
-        estimator_mode_raw = "event_queue_output_predictor" if use_preint_legacy else "imu_step_preint_cache"
     result['ESTIMATOR_MODE'] = estimator_mode_raw
     
     # Flight phase detection thresholds (v3.4.0: State-based)

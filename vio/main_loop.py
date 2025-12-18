@@ -781,7 +781,7 @@ class VIORunner:
             # Apply preintegration at EVERY camera frame
             # Store Jacobians for bias observability in MSCKF
             preint_jacobians = None
-            if self.config.use_preintegration and ongoing_preint is not None:
+            if ongoing_preint is not None:
                 preint_jacobians = apply_preintegration_at_camera(self.kf, ongoing_preint, t_cam, imu_params)
             
             # Check parallax for different purposes
@@ -1272,11 +1272,11 @@ class VIORunner:
         """
         Run the complete VIO pipeline.
         
-        Architecture Router (v3.6.0):
-        - use_preintegration: False → IMU-driven (with preintegration cache)
-        - use_preintegration: True  → Event-driven (TODO - not implemented yet)
+        Architecture Router (v3.7.0):
+        - estimator_mode: "imu_step_preint_cache" → IMU-driven (with preintegration cache)
+        - estimator_mode: "event_queue_output_predictor" → Event-driven (TODO - not implemented yet)
         
-        IMU-driven: Process all IMU samples sequentially, accumulate preintegration
+        IMU-driven: Process all IMU samples sequentially @ 400Hz with sub-sample precision
         Event-driven: Process measurements in chronological order using priority queue
         """
         print("=" * 80)

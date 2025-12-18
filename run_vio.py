@@ -202,7 +202,7 @@ def main():
         print(f"  estimate_imu_bias: {config.estimate_imu_bias}")
         print(f"  use_magnetometer: {config.use_magnetometer}")
         print(f"  use_vio_velocity: {config.use_vio_velocity}")
-        print(f"  use_preintegration: {config.use_preintegration}")
+        print(f"  estimator_mode: {config.estimator_mode}")
         print(f"  fast_mode: {config.fast_mode}")
         print(f"  frame_skip: {config.frame_skip}")
         print(f"\nDebug Settings:")
