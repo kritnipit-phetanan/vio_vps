@@ -869,24 +869,32 @@ def apply_preintegration_at_camera(kf: ExtendedKalmanFilter,
                                    ongoing_preint,
                                    t: float, imu_params: dict) -> dict:
     """
-    Apply accumulated preintegration covariance at camera frame.
+    Snapshot preintegration Jacobians and reset buffer at camera frame.
     
-    OpenVINS-style architecture (v3.5.0):
-    - Nominal state is ALREADY propagated by propagate_nominal_state() at IMU rate (400Hz)
-    - This function ONLY propagates covariance (P matrix) at camera rate (20Hz)
-    - This separation keeps state fresh for measurement updates while reducing computational cost
+    CRITICAL (v3.5.1): This function does NOT propagate covariance anymore!
+    - Covariance (P) is already propagated by process_imu() at every IMU tick (400Hz)
+    - This function ONLY snapshots Jacobians for MSCKF/bias observability
+    - Then resets preintegration buffer for next camera frame
     
-    Called at EVERY camera frame to prevent IMU accumulation explosion.
-    Following Forster et al. TRO 2017 + OpenVINS design.
+    Why NOT propagate P here?
+    -------------------------
+    If we propagate P here with preintegration, we would DOUBLE-COUNT:
+      1. P propagated every IMU tick via process_imu() (400Hz)
+      2. P propagated again here with same IMU data (20Hz)
+      → Result: P inflates (overconfident) → NEES wrong → gating broken
+    
+    Correct approach (v3.5.1):
+    - P propagates continuously at IMU rate
+    - Preintegration is ONLY for MSCKF Jacobians (bias observability)
     
     Args:
-        kf: ExtendedKalmanFilter instance (state x already updated!)
+        kf: ExtendedKalmanFilter instance (P already propagated!)
         ongoing_preint: IMUPreintegration object
         t: Current timestamp
-        imu_params: IMU noise parameters
+        imu_params: IMU noise parameters (unused now)
     
     Returns:
-        dict: Preintegration Jacobians for bias observability (J_R_bg, etc.)
+        dict: Preintegration Jacobians for MSCKF (J_R_bg, J_v_bg, etc.)
               Returns None if dt too small
     """
     from scipy.spatial.transform import Rotation as R_scipy
@@ -896,67 +904,27 @@ def apply_preintegration_at_camera(kf: ExtendedKalmanFilter,
     if dt_total < 1e-6:
         return None
     
-    # Get deltas
-    delta_R, delta_v, delta_p = ongoing_preint.get_deltas()
-    
-    # Current state
-    p_i = kf.x[0:3, 0].reshape(3,)
-    v_i = kf.x[3:6, 0].reshape(3,)
-    q_i = kf.x[6:10, 0].reshape(4,)  # [w,x,y,z]
+    # Current biases for reset
     bg = kf.x[10:13, 0].reshape(3,)
     ba = kf.x[13:16, 0].reshape(3,)
     
-    # NOTE (v3.5.0): State (x) is already propagated by propagate_nominal_state()!
-    # We only need to propagate covariance (P) here using preintegrated Jacobians
-    
-    # Get current rotation for covariance projection
-    q_i_xyzw = np.array([q_i[1], q_i[2], q_i[3], q_i[0]])
-    R_BW = R_scipy.from_quat(q_i_xyzw).as_matrix()
-    
-    # Get bias-corrected deltas for covariance calculation
-    delta_R_corr, delta_v_corr, delta_p_corr = ongoing_preint.get_deltas_corrected(bg, ba)
-    
-    # Covariance propagation (state is already up-to-date from nominal propagation)
-    preint_cov = ongoing_preint.get_covariance()
+    # Snapshot Jacobians for MSCKF/bias observability
+    # These Jacobians relate integrated motion to biases (δbg, δba)
     J_R_bg, J_v_bg, J_v_ba, J_p_bg, J_p_ba = ongoing_preint.get_jacobians()
     
-    num_clones = (kf.x.shape[0] - 16) // 7
-    
-    # Build state transition matrix
-    Phi_core = np.eye(15, dtype=float)
-    Phi_core[0:3, 3:6] = np.eye(3) * dt_total
-    Phi_core[0:3, 6:9] = -R_BW @ skew_symmetric(delta_p_corr)
-    Phi_core[0:3, 9:12] = R_BW @ J_p_bg
-    Phi_core[0:3, 12:15] = R_BW @ J_p_ba
-    Phi_core[3:6, 6:9] = -R_BW @ skew_symmetric(delta_v_corr)
-    Phi_core[3:6, 9:12] = R_BW @ J_v_bg
-    Phi_core[3:6, 12:15] = R_BW @ J_v_ba
-    Phi_core[6:9, 9:12] = -J_R_bg
-    
-    # Process noise
-    Q_core = np.zeros((15, 15), dtype=float)
-    Q_core[0:3, 0:3] = R_BW @ preint_cov[6:9, 6:9] @ R_BW.T
-    Q_core[3:6, 3:6] = R_BW @ preint_cov[3:6, 3:6] @ R_BW.T
-    Q_core[6:9, 6:9] = R_BW @ preint_cov[0:3, 0:3] @ R_BW.T
-    Q_core[9:12, 9:12] = np.eye(3) * (imu_params.get('gyr_w', 0.0001)**2 * dt_total)
-    Q_core[12:15, 12:15] = np.eye(3) * (imu_params.get('acc_w', 0.001)**2 * dt_total)
-    
-    from .ekf import propagate_error_state_covariance
-    kf.P = propagate_error_state_covariance(kf.P, Phi_core, Q_core, num_clones)
-    
-    # Store Jacobians BEFORE reset for bias observability in MSCKF
     preint_jacobians = {
         'J_R_bg': J_R_bg.copy(),
         'J_v_bg': J_v_bg.copy(),
         'J_v_ba': J_v_ba.copy(),
         'J_p_bg': J_p_bg.copy(),
-        'J_p_ba': J_p_ba.copy()
+        'J_p_ba': J_p_ba.copy(),
+        'dt_total': dt_total  # For MSCKF temporal baseline
     }
     
-    # Reset preintegration buffer
+    # Reset preintegration buffer for next camera frame
     ongoing_preint.reset(bg=bg, ba=ba)
     
-    print(f"[PREINT] Covariance propagated: Δt={dt_total:.3f}s")
+    print(f"[PREINT] Jacobians snapshotted and reset: Δt={dt_total:.3f}s")
     
     return preint_jacobians
 
