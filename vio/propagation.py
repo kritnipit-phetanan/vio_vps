@@ -23,77 +23,9 @@ from .ekf import ExtendedKalmanFilter, ensure_covariance_valid, propagate_error_
 from .data_loaders import IMURecord
 
 
-def propagate_nominal_state(kf: ExtendedKalmanFilter, 
-                            rec: IMURecord, dt: float,
-                            bg: np.ndarray, ba: np.ndarray,
-                            imu_params: dict):
-    """
-    [DEPRECATED v3.5.1] Lightweight nominal state propagation - DO NOT USE!
-    
-    This function was based on a MISUNDERSTANDING of OpenVINS architecture.
-    
-    WRONG APPROACH (v3.5.0):
-    - Propagate only state (x) at 400 Hz
-    - Propagate covariance (P) at 20 Hz
-    - Result: P is stale when VPS/MAG arrive → inconsistent Kalman gain!
-    
-    CORRECT APPROACH (v3.5.1+):
-    - Propagate BOTH x and P at every IMU tick (400 Hz)
-    - Use preintegration ONLY for MSCKF/camera constraints
-    - Never skip covariance propagation between measurements!
-    
-    OpenVINS also propagates P at every IMU tick. The "fast" part is using
-    preintegration for MSCKF instead of per-clone Jacobians.
-    
-    Use process_imu() instead - it correctly propagates both x and P.
-    
-    Args:
-        kf: Kalman filter
-        rec: IMU record (ang, lin)
-        dt: Time step
-        bg: Gyro bias
-        ba: Accel bias
-        imu_params: IMU parameters (g_norm)
-    """
-    # Bias-corrected measurements
-    w_corr = rec.ang - bg
-    a_corr = rec.lin - ba
-    
-    # Current state
-    p = kf.x[0:3, 0]
-    v = kf.x[3:6, 0]
-    q = kf.x[6:10, 0]  # [w,x,y,z]
-    
-    # Rotation update (discrete integration)
-    q_xyzw = np.array([q[1], q[2], q[3], q[0]])
-    R_BW = R_scipy.from_quat(q_xyzw).as_matrix()
-    
-    # Discrete rotation: exp(w * dt)
-    theta = np.linalg.norm(w_corr) * dt
-    if theta < 1e-8:
-        # Small angle approximation: exp([w×]dt) ≈ I + [w×]dt
-        delta_R = np.eye(3) + skew_symmetric(w_corr * dt)
-    else:
-        # Rodrigues formula
-        axis = w_corr / np.linalg.norm(w_corr)
-        delta_R = R_scipy.from_rotvec(axis * theta).as_matrix()
-    
-    R_BW_new = R_BW @ delta_R
-    q_new_xyzw = R_scipy.from_matrix(R_BW_new).as_quat()
-    q_new = np.array([q_new_xyzw[3], q_new_xyzw[0], q_new_xyzw[1], q_new_xyzw[2]])
-    
-    # Velocity update (world frame acceleration)
-    g_world = np.array([0, 0, imu_params.get('g_norm', 9.803)])
-    a_world = R_BW @ a_corr - g_world
-    v_new = v + a_world * dt
-    
-    # Position update (trapezoidal integration for better accuracy)
-    p_new = p + (v + v_new) / 2.0 * dt
-    
-    # Write back to state (only p, v, q - NOT bias or clones)
-    kf.x[0:3, 0] = p_new
-    kf.x[3:6, 0] = v_new
-    kf.x[6:10, 0] = q_new
+# Note: propagate_nominal_state() was removed in v3.5.1
+# It was based on a misunderstanding of OpenVINS architecture.
+# Use process_imu() instead - it correctly propagates both x and P every tick.
 
 
 def propagate_to_timestamp(kf: ExtendedKalmanFilter, target_time: float, 
