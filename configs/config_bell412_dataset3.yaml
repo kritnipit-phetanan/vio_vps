@@ -77,7 +77,7 @@ imu:
   
   # Enable IMU preintegration (Forster et al.)
   # Uses preintegrated measurements between keyframes for better motion estimation
-  use_preintegration: true
+  use_preintegration: True
   
   # Flight phase detection (v3.4.0: State-based with configurable thresholds)
   # - SPINUP (0): High vibration + low velocity (rotor spinup)
@@ -364,7 +364,7 @@ vibration:
 #
 # Expected accuracy: ~50-100m horizontal (depends on terrain)
 trn:
-  enabled: true               # Enable Terrain Referenced Navigation
+  enabled: false               # Enable Terrain Referenced Navigation
   profile_window_sec: 30.0    # Seconds of altitude history for matching
   min_samples: 20             # Minimum samples for valid profile
   search_radius_m: 500.0      # Search radius around current estimate [m]

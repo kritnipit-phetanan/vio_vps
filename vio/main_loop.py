@@ -518,6 +518,7 @@ class VIORunner:
                 initial_state=initial_state,
                 estimate_imu_bias=self.config.estimate_imu_bias,
                 plane_config=plane_config,
+                global_config=self.global_config,
                 vio_config=self.config  # Pass VIOConfig for full audit
             )
             print(f"[DEBUG] Calibration snapshot saved: {cal_path}")

@@ -557,7 +557,8 @@ def save_calibration_log(output_path: str, camera_view: str, view_cfg: Dict,
                          noise_params: Dict, vio_params: Dict,
                          initial_state: Dict, estimate_imu_bias: bool,
                          plane_config: Optional[Dict] = None,
-                         vio_config: Optional[Any] = None):
+                         vio_config: Optional[Any] = None,
+                         global_config: Optional[Dict] = None):
     """
     Save calibration snapshot for reproducibility.
     
@@ -574,6 +575,7 @@ def save_calibration_log(output_path: str, camera_view: str, view_cfg: Dict,
         estimate_imu_bias: Whether bias estimation was enabled
         plane_config: Plane-Aided MSCKF configuration (optional)
         vio_config: VIOConfig dataclass (optional, for full audit)
+        global_config: Complete YAML configuration dict (optional, for full audit)
     """
     from datetime import datetime
     
@@ -668,6 +670,77 @@ def save_calibration_log(output_path: str, camera_view: str, view_cfg: Dict,
                     f.write(f"  Use aided triangulation: {plane_config.get('use_aided_triangulation', True)}\n")
                     f.write(f"  Use constraints: {plane_config.get('use_constraints', True)}\n")
                 f.write("\n")
+            
+            # TRN (Terrain Referenced Navigation)
+            if global_config:
+                trn_cfg = global_config.get('trn', {})
+                if trn_cfg:
+                    f.write("[Terrain Referenced Navigation (TRN)]\n")
+                    f.write(f"  Enabled: {trn_cfg.get('enabled', False)}\n")
+                    if trn_cfg.get('enabled', False):
+                        f.write(f"  Profile window: {trn_cfg.get('profile_window_sec', 30.0)} sec\n")
+                        f.write(f"  Min samples: {trn_cfg.get('min_samples', 20)}\n")
+                        f.write(f"  Search radius: {trn_cfg.get('search_radius_m', 500.0)} m\n")
+                        f.write(f"  Search step: {trn_cfg.get('search_step_m', 30.0)} m\n")
+                        f.write(f"  Min terrain variation: {trn_cfg.get('min_terrain_variation_m', 10.0)} m\n")
+                        f.write(f"  Correlation threshold: {trn_cfg.get('max_correlation_threshold', 0.7)}\n")
+                        f.write(f"  Update interval: {trn_cfg.get('update_interval_sec', 10.0)} sec\n")
+                        f.write(f"  Sigma TRN XY: {trn_cfg.get('sigma_trn_xy', 50.0)} m\n")
+                    f.write("\n")
+                
+                # Loop Closure Detection
+                loop_cfg = global_config.get('loop_closure', {})
+                if loop_cfg:
+                    f.write("[Loop Closure Detection]\n")
+                    f.write(f"  Enabled: {loop_cfg.get('use_loop_closure', False)}\n")
+                    if loop_cfg.get('use_loop_closure', False):
+                        f.write(f"  Position threshold: {loop_cfg.get('position_threshold', 30.0)} m\n")
+                        f.write(f"  Min keyframe distance: {loop_cfg.get('min_keyframe_dist', 15.0)} m\n")
+                        f.write(f"  Min keyframe yaw: {loop_cfg.get('min_keyframe_yaw', 20.0)}°\n")
+                        f.write(f"  Min frame gap: {loop_cfg.get('min_frame_gap', 50)}\n")
+                        f.write(f"  Min inliers: {loop_cfg.get('min_inliers', 15)}\n")
+                    f.write("\n")
+                
+                # Vibration Detection
+                vib_cfg = global_config.get('vibration', {})
+                if vib_cfg:
+                    f.write("[Vibration Detection]\n")
+                    f.write(f"  Enabled: {vib_cfg.get('use_vibration_detector', True)}\n")
+                    if vib_cfg.get('use_vibration_detector', True):
+                        f.write(f"  Window size: {vib_cfg.get('window_size', 50)}\n")
+                        f.write(f"  Threshold multiplier: {vib_cfg.get('threshold_multiplier', 5.0)}\n")
+                    f.write("\n")
+                
+                # ZUPT (Zero Velocity Update)
+                zupt_cfg = global_config.get('zupt', {})
+                if zupt_cfg:
+                    f.write("[ZUPT (Zero Velocity Update)]\n")
+                    f.write(f"  Enabled: {zupt_cfg.get('enabled', False)}\n")
+                    if zupt_cfg.get('enabled', False):
+                        f.write(f"  Accel threshold: {zupt_cfg.get('accel_threshold', 0.5)} m/s²\n")
+                        f.write(f"  Gyro threshold: {zupt_cfg.get('gyro_threshold', 0.05)} rad/s\n")
+                        f.write(f"  Min duration: {zupt_cfg.get('min_duration', 2.0)} sec\n")
+                        f.write(f"  Velocity threshold: {zupt_cfg.get('velocity_threshold', 0.2)} m/s\n")
+                        f.write(f"  Consecutive required: {zupt_cfg.get('consecutive_required', 5)}\n")
+                    f.write("\n")
+                
+                # Fast Mode
+                fast_cfg = global_config.get('fast_mode', {})
+                if fast_cfg:
+                    f.write("[Performance Optimization (Fast Mode)]\n")
+                    f.write(f"  Use fast mode: {fast_cfg.get('use_fast_mode', False)}\n")
+                    f.write(f"  Frame skip: {fast_cfg.get('frame_skip', 1)}\n")
+                    f.write("\n")
+                
+                # Phase Detection Thresholds (v3.4.0)
+                phase_cfg = global_config.get('PHASE_SPINUP_VELOCITY_THRESH', None)
+                if phase_cfg is not None:
+                    f.write("[Flight Phase Detection Thresholds (v3.4.0)]\n")
+                    f.write(f"  SPINUP velocity thresh: {global_config.get('PHASE_SPINUP_VELOCITY_THRESH', 1.0)} m/s\n")
+                    f.write(f"  SPINUP vibration thresh: {global_config.get('PHASE_SPINUP_VIBRATION_THRESH', 0.3)} rad/s\n")
+                    f.write(f"  SPINUP altitude change thresh: {global_config.get('PHASE_SPINUP_ALT_CHANGE_THRESH', 5.0)} m\n")
+                    f.write(f"  EARLY velocity sigma thresh: {global_config.get('PHASE_EARLY_VELOCITY_SIGMA_THRESH', 3.0)} m/s\n")
+                    f.write("\n")
             
             f.write("[Magnetometer Calibration]\n")
             for key, val in mag_params.items():
