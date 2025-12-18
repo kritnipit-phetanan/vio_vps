@@ -1272,15 +1272,15 @@ class VIORunner:
         """
         Run the complete VIO pipeline.
         
-        This is the main entry point that orchestrates:
-        1. Configuration loading
-        2. Data loading
-        3. EKF initialization
-        4. IMU-driven loop with measurement updates
-        5. Output generation
+        Architecture Router (v3.6.0):
+        - use_preintegration: False → IMU-driven (with preintegration cache)
+        - use_preintegration: True  → Event-driven (TODO - not implemented yet)
+        
+        IMU-driven: Process all IMU samples sequentially, accumulate preintegration
+        Event-driven: Process measurements in chronological order using priority queue
         """
         print("=" * 80)
-        print("VIO+EKF Pipeline Starting (v3.2.0)")
+        print("VIO+EKF Pipeline Starting (v3.6.0)")
         print("=" * 80)
         
         # =================================================================
@@ -1305,6 +1305,43 @@ class VIORunner:
         print(f"  fast_mode: {self.config.fast_mode}")
         print(f"  frame_skip: {self.config.frame_skip}")
         
+        # =================================================================
+        # Architecture Selection (v3.6.0)
+        # =================================================================
+        if self.config.use_preintegration:
+            # Event-driven mode: propagate to each measurement time
+            print("\n[ARCH] Selected: Event-driven (propagate-to-next-measurement)")
+            print("[TODO] Event-driven architecture not implemented yet!")
+            print("[TODO] Will use propagate_to_timestamp() for exact timing")
+            print("[TODO] See analysis in conversation for implementation details")
+            raise NotImplementedError(
+                "Event-driven architecture not yet implemented. "
+                "Set use_preintegration: False in YAML to use IMU-driven mode."
+            )
+        else:
+            # IMU-driven mode: process all IMU samples sequentially
+            print("\n[ARCH] Selected: IMU-driven (preintegration cache for MSCKF)")
+            self._run_imu_driven()
+    
+    def _run_imu_driven(self):
+        """
+        IMU-driven VIO loop (v3.6.0).
+        
+        Architecture:
+        - Iterate through all IMU samples @ 400Hz
+        - Accumulate preintegration buffer for MSCKF Jacobians
+        - Propagate state + covariance every IMU tick
+        - Process measurements when their timestamps are reached
+        
+        Advantages:
+        - Simple sequential processing
+        - Streaming-friendly (no need to buffer all data)
+        - Clear separation between propagation and update
+        
+        Disadvantages:
+        - State can lag measurement time by ~2.5ms (1 IMU sample)
+        - Need careful timestamp handling for camera events
+        """
         # Load data
         self.load_data()
         
@@ -1366,22 +1403,20 @@ class VIORunner:
         self.state.t0 = self.imu[0].t
         self.state.last_t = self.state.t0
         
-        # Initialize preintegration if enabled
-        ongoing_preint = None
-        if self.config.use_preintegration:
-            imu_params = self.global_config.get('IMU_PARAMS', {})
-            ongoing_preint = IMUPreintegration(
-                bg=self.kf.x[10:13, 0].reshape(3,),
-                ba=self.kf.x[13:16, 0].reshape(3,),
-                sigma_g=imu_params.get('gyr_n', 0.01),
-                sigma_a=imu_params.get('acc_n', 0.1),
-                sigma_bg=imu_params.get('gyr_w', 0.0001),
-                sigma_ba=imu_params.get('acc_w', 0.001)
-            )
-            print(f"[PREINT] Initialized preintegration buffer")
+        # Initialize preintegration cache for MSCKF Jacobians
+        imu_params = self.global_config.get('IMU_PARAMS', {})
+        ongoing_preint = IMUPreintegration(
+            bg=self.kf.x[10:13, 0].reshape(3,),
+            ba=self.kf.x[13:16, 0].reshape(3,),
+            sigma_g=imu_params.get('gyr_n', 0.01),
+            sigma_a=imu_params.get('acc_n', 0.1),
+            sigma_bg=imu_params.get('gyr_w', 0.0001),
+            sigma_ba=imu_params.get('acc_w', 0.001)
+        )
+        print(f"[PREINT] Initialized preintegration cache for MSCKF Jacobians")
         
-        # Main loop
-        print("\n=== Running (IMU-driven) ===")
+        # Main IMU-driven loop
+        print("\n=== Running (IMU-driven with preintegration cache) ===")
         tic_all = time.time()
         
         # Store last a_world for state_debug logging
@@ -1422,82 +1457,27 @@ class VIORunner:
             self.state.current_phase = phase_num
             
             # =====================================================================
-            # IMU Propagation with sub-sample camera timestamp precision (v3.5.2)
+            # IMU Propagation (v3.6.0: IMU-driven with preintegration cache)
             # =====================================================================
-            # OpenVINS-style: Split dt when IMU crosses camera timestamp
-            # Propagate to t_cam → process camera → propagate remainder
+            # Architecture: Always propagate x+P at every IMU tick (400Hz)
+            # Preintegration cache is ONLY for MSCKF Jacobians, NOT to skip propagation
             
-            # Check if we're crossing a camera timestamp
-            t_cam_next = None
-            if (self.state.img_idx < len(self.imgs) and 
-                self.state.last_t < self.imgs[self.state.img_idx].t <= t):
-                t_cam_next = self.imgs[self.state.img_idx].t
+            # Step 1: Accumulate IMU measurements in preintegration cache for MSCKF
+            ongoing_preint.integrate_measurement(rec.ang, rec.lin, dt)
             
-            # Split IMU propagation if crossing camera
-            if t_cam_next is not None and dt > 0:
-                # Split dt into two parts: [last_t → t_cam] and [t_cam → t]
-                dt_before_cam = t_cam_next - self.state.last_t
-                dt_after_cam = t - t_cam_next
-                
-                # Part 1: Propagate to camera time
-                if dt_before_cam > 1e-6:  # Avoid numerical issues
-                    if self.config.use_preintegration and ongoing_preint is not None:
-                        # Scale IMU measurements proportionally for first part
-                        ratio_before = dt_before_cam / dt if dt > 0 else 0.0
-                        ongoing_preint.integrate_measurement(rec.ang, rec.lin, dt_before_cam)
-                        process_imu(
-                            self.kf, rec, dt_before_cam,
-                            estimate_imu_bias=self.config.estimate_imu_bias,
-                            t=t_cam_next, t0=self.state.t0,
-                            imu_params=imu_params
-                        )
-                        self._update_imu_helpers(rec, dt_before_cam, imu_params)
-                    else:
-                        self.process_imu_sample(rec, dt_before_cam)
-                
-                # Update state time to camera time
-                self.state.last_t = t_cam_next
-                
-                # Process camera at exact timestamp (will be handled by process_vio later)
-                # We just ensure state is at t_cam when it's processed
-                
-                # Part 2: Propagate remaining dt after camera
-                if dt_after_cam > 1e-6:
-                    if self.config.use_preintegration and ongoing_preint is not None:
-                        # Accumulate second part (full measurements since we can't split)
-                        # Note: This is approximate - true split needs IMU interpolation
-                        ongoing_preint.integrate_measurement(rec.ang, rec.lin, dt_after_cam)
-                        process_imu(
-                            self.kf, rec, dt_after_cam,
-                            estimate_imu_bias=self.config.estimate_imu_bias,
-                            t=t, t0=self.state.t0,
-                            imu_params=imu_params
-                        )
-                        self._update_imu_helpers(rec, dt_after_cam, imu_params)
-                    else:
-                        self.process_imu_sample(rec, dt_after_cam)
-            else:
-                # No camera crossing - regular propagation
-                if self.config.use_preintegration and ongoing_preint is not None:
-                    # Step 1: Accumulate IMU measurements for later MSCKF use
-                    ongoing_preint.integrate_measurement(rec.ang, rec.lin, dt)
-                    
-                    # Step 2: Propagate state + covariance (REQUIRED for consistent EKF updates)
-                    # This ensures BOTH x and P are at current time when VPS/MAG/DEM arrive
-                    process_imu(
-                        self.kf, rec, dt,
-                        estimate_imu_bias=self.config.estimate_imu_bias,
-                        t=rec.t, t0=self.state.t0,
-                        imu_params=imu_params
-                    )
-                    
-                    # Step 3: Update mag filter variables and check ZUPT
-                    self._update_imu_helpers(rec, dt, imu_params)
-                else:
-                    # Legacy mode: full propagation + helpers
-                    self.process_imu_sample(rec, dt)
+            # Step 2: Propagate state + covariance (REQUIRED for consistent EKF updates)
+            # This ensures BOTH x and P are at current time when VPS/MAG/DEM arrive
+            process_imu(
+                self.kf, rec, dt,
+                estimate_imu_bias=self.config.estimate_imu_bias,
+                t=rec.t, t0=self.state.t0,
+                imu_params=imu_params
+            )
             
-            # Update final state time
+            # Step 3: Update mag filter variables and check ZUPT
+            self._update_imu_helpers(rec, dt, imu_params)
+            
+            # Update state time
             self.state.last_t = t
             
             # Increment counter for debug logging
