@@ -90,7 +90,7 @@ class VIOConfig:
     estimate_imu_bias: bool = False
     use_magnetometer: bool = True
     use_vio_velocity: bool = True
-    use_preintegration: bool = False
+    estimator_mode: str = "imu_step_preint_cache"  # "imu_step_preint_cache" or "event_queue_output_predictor"
     
     # Performance options (from YAML fast_mode section)
     fast_mode: bool = False
@@ -237,8 +237,15 @@ def load_config(config_path: str) -> VIOConfig:
     initial_accel_bias = imu.get('initial_accel_bias', [0.0, 0.0, 0.0])
     result['INITIAL_ACCEL_BIAS'] = np.array(initial_accel_bias, dtype=float)
     
-    # IMU preintegration toggle (v3.1.0)
-    result['USE_PREINTEGRATION'] = imu.get('use_preintegration', False)
+    # Estimator mode (v3.7.0: enum instead of boolean)
+    # "imu_step_preint_cache": IMU-driven with preintegration cache (was use_preintegration: false)
+    # "event_queue_output_predictor": Event-driven with propagate-to-timestamp (was use_preintegration: true)
+    estimator_mode_raw = imu.get('estimator_mode', None)
+    # Backward compatibility: map old use_preintegration to new estimator_mode
+    if estimator_mode_raw is None:
+        use_preint_legacy = imu.get('use_preintegration', False)
+        estimator_mode_raw = "event_queue_output_predictor" if use_preint_legacy else "imu_step_preint_cache"
+    result['ESTIMATOR_MODE'] = estimator_mode_raw
     
     # Flight phase detection thresholds (v3.4.0: State-based)
     phase_detection = imu.get('phase_detection', {})
@@ -439,7 +446,7 @@ def load_config(config_path: str) -> VIOConfig:
         estimate_imu_bias=result['ESTIMATE_IMU_BIAS'],
         use_magnetometer=result['MAG_ENABLED'],
         use_vio_velocity=result['USE_VIO_VELOCITY'],
-        use_preintegration=result['USE_PREINTEGRATION'],
+        estimator_mode=result['ESTIMATOR_MODE'],
         
         # Performance options
         fast_mode=result['FAST_MODE'],

@@ -75,9 +75,10 @@ imu:
   # Enable bias estimation from initial static samples
   estimate_bias: true
   
-  # Enable IMU preintegration (Forster et al.)
-  # Uses preintegrated measurements between keyframes for better motion estimation
-  use_preintegration: True
+  # Estimator Mode (v3.7.0: enum instead of boolean)
+  # "imu_step_preint_cache": IMU-driven @ 400Hz with preintegration cache + sub-sample timestamp precision
+  # "event_queue_output_predictor": Event-driven with propagate-to-timestamp (TODO: not implemented yet)
+  estimator_mode: "imu_step_preint_cache"
   
   # Flight phase detection (v3.4.0: State-based with configurable thresholds)
   # - SPINUP (0): High vibration + low velocity (rotor spinup)
