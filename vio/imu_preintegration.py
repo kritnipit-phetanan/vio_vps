@@ -206,26 +206,29 @@ class IMUPreintegration:
                 self.integrate_measurement(w_meas, a_meas, dt_split, g_norm)
             return
         
-        # Bias-corrected measurements (using linearization point)
+        # ================================================================
+        # GRAVITY MODEL (Forster TRO 2017 / OpenVINS standard)
+        # ================================================================
+        # Preintegration computes SPECIFIC FORCE (a_meas - b_a) in body frame
+        # WITHOUT gravity compensation during accumulation.
+        # 
+        # Gravity is added later during state update (propagation.py):
+        #   v_new = v_old + g_world*dt + R_WB^T @ delta_v
+        #   p_new = p_old + v_old*dt + 0.5*g_world*dt² + R_WB^T @ delta_p
+        # 
+        # where g_world = [0, 0, -9.80665] in ENU frame (Z points up)
+        # 
+        # This approach:
+        # ✓ Separates body-frame preintegration from world-frame gravity
+        # ✓ Avoids rotating gravity (numerically stable)
+        # ✓ Matches OpenVINS/Forster standard implementation
+        # ================================================================
+        
+        # Bias-corrected measurements (specific force only, NO gravity here)
         w_hat = w_meas - self.bg_lin
         a_hat = a_meas - self.ba_lin
-        
-        # NOTE: Gravity compensation is intentionally REMOVED from preintegration!
-        # 
-        # Why: Forster TRO 2017 Section III-B states that preintegration computes
-        # relative motion in BODY frame, and gravity must be compensated in WORLD frame
-        # during state update (not during preintegration).
-        # 
-        # Original (WRONG) approach: a_hat += [0,0,9.8] (fixed body-frame vector)
-        # Problem: As UAV rotates, g_body changes! Fixed [0,0,9.8] is only valid
-        # when UAV is level. This causes drift during banking/pitching.
-        # 
-        # Correct approach (Forster Eq. 24-26):
-        # 1. Preintegrate WITHOUT gravity: delta_v, delta_p (body frame)
-        # 2. State update WITH gravity: v_new = v + g*dt + R @ delta_v
-        #                                p_new = p + v*dt + 0.5*g*dt² + R @ delta_p
-        # 
-        # This matches OpenVINS implementation and is numerically stable.
+        # NOTE: a_hat is "specific force" = accelerometer reading minus bias
+        #       Gravity will be added in propagation.py during state update
         
         # --- Step 1: Update rotation delta ---
         # ΔR_{k+1} = ΔR_k * Exp(ω_hat * dt)

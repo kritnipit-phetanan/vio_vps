@@ -144,17 +144,27 @@ def propagate_to_timestamp(kf: ExtendedKalmanFilter, target_time: float,
         # R_BW = R_WB.T (Body-to-World) for projecting to world frame
         R_BW = R_old.T
         
-        # GRAVITY COMPENSATION (Forster TRO 2017, Eq. 24-26)
-        # Gravity in world frame (ENU: [0, 0, -9.8] pointing down)
+        # ================================================================
+        # GRAVITY COMPENSATION (Forster TRO 2017, OpenVINS standard)
+        # ================================================================
+        # Preintegration computed delta_v and delta_p WITHOUT gravity.
+        # Now add gravity in WORLD frame during state update:
+        #
+        # v_new = v_old + g_world*dt + R_WB^T @ delta_v
+        # p_new = p_old + v_old*dt + 0.5*g_world*dt² + R_WB^T @ delta_p
+        #
+        # where:
+        # - g_world = [0, 0, -9.80665] in ENU frame (Z points up)
+        # - R_WB^T = R_BW rotates body-frame preintegrated deltas to world
+        # - This matches OpenVINS state propagation equations exactly
+        # ================================================================
         dt_total = target_time - current_time
         g_world = np.array([0.0, 0.0, -9.80665], dtype=float)
         
         # Velocity: v_new = v_old + g*dt + R_BW * delta_v
-        # (delta_v is preintegrated WITHOUT gravity, so we add it here in world frame)
         v_new = v + g_world * dt_total + R_BW @ delta_v
         
         # Position: p_new = p_old + v_old*dt + 0.5*g*dt² + R_BW * delta_p
-        # (delta_p is preintegrated WITHOUT gravity, so we add drift term here)
         p_new = p + v * dt_total + 0.5 * g_world * (dt_total ** 2) + R_BW @ delta_p
         
         # Update nominal state
@@ -316,9 +326,16 @@ def _propagate_single_imu_step(kf: ExtendedKalmanFilter, imu: IMURecord, dt: flo
     # Rotate acceleration to world frame
     a_world = R_body_to_world @ a_corr
     
-    # Nominal state propagation
-    p_new = p + v * dt + 0.5 * a_world * dt**2
-    v_new = v + a_world * dt
+    # GRAVITY COMPENSATION (must match MODE 1 preintegration approach)
+    # a_corr is "specific force" (accelerometer - bias), does NOT include gravity
+    # Must add gravity in world frame (ENU: [0, 0, -9.80665])
+    g_world = np.array([0.0, 0.0, -9.80665], dtype=float)
+    
+    # Nominal state propagation WITH gravity
+    # p = p + v*dt + 0.5*(a_world + g)*dt²
+    # v = v + (a_world + g)*dt
+    p_new = p + v * dt + 0.5 * (a_world + g_world) * (dt**2)
+    v_new = v + (a_world + g_world) * dt
     
     # Quaternion propagation
     theta_vec = w_corr * dt
