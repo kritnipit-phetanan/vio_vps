@@ -79,8 +79,20 @@ def propagate_to_timestamp(kf: ExtendedKalmanFilter, target_time: float,
     print(f"[PROPAGATE] t={current_time:.3f}→{target_time:.3f}, dt={target_time-current_time:.3f}s, found {len(relevant_imu)} IMU samples")
     
     if len(relevant_imu) == 0:
-        # No IMU data in range - need to extrapolate (not recommended)
-        print(f"[WARNING] propagate_to_timestamp: No IMU in range ({current_time:.3f}, {target_time:.3f}], extrapolating")
+        # No IMU data in range - need to extrapolate (DANGEROUS!)
+        # This happens when: sensor dropout, timestamp jump, or sparse IMU
+        
+        # HARD LIMIT on extrapolation to prevent numerical blow-up
+        MAX_EXTRAPOLATION_DT = 0.05  # 50ms max extrapolation (20Hz equivalent)
+        
+        dt = target_time - current_time
+        
+        if dt > MAX_EXTRAPOLATION_DT:
+            print(f"[ERROR] Extrapolation dt={dt:.6f}s > MAX={MAX_EXTRAPOLATION_DT}s, REJECTING")
+            print(f"[ERROR] This indicates IMU dropout or timestamp jump!")
+            return False, None
+        
+        print(f"[WARNING] propagate_to_timestamp: No IMU in range ({current_time:.3f}, {target_time:.3f}], extrapolating dt={dt:.6f}s")
         
         # Find closest IMU before target
         past_imu = [imu for imu in imu_buffer if imu.t <= target_time]
@@ -89,10 +101,20 @@ def propagate_to_timestamp(kf: ExtendedKalmanFilter, target_time: float,
             return False, None
         
         last_imu = past_imu[-1]
-        dt = target_time - current_time
         
-        # Propagate with constant IMU (extrapolation) - legacy mode only
-        _propagate_single_imu_step(kf, last_imu, dt, estimate_imu_bias, current_time, imu_params)
+        # SPLIT extrapolation into small chunks to maintain numerical stability
+        # Even if dt < MAX_EXTRAPOLATION_DT, split to avoid Phi/Q overflow
+        DT_CHUNK = 0.01  # 10ms chunks (100Hz rate)
+        num_chunks = max(1, int(np.ceil(dt / DT_CHUNK)))
+        dt_chunk = dt / num_chunks
+        
+        if num_chunks > 1:
+            print(f"[EXTRAPOLATE] Splitting dt={dt:.6f}s into {num_chunks} chunks of {dt_chunk:.6f}s")
+        
+        # Propagate with constant IMU (extrapolation) in small chunks
+        for _ in range(num_chunks):
+            _propagate_single_imu_step(kf, last_imu, dt_chunk, estimate_imu_bias, current_time, imu_params)
+        
         return True, None
     
     # ============================================================

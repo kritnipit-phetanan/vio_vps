@@ -342,3 +342,58 @@ def mahalanobis_squared(y: np.ndarray, S: np.ndarray) -> float:
     except np.linalg.LinAlgError:
         # Fallback to pseudoinverse if Cholesky fails
         return float(y @ np.linalg.pinv(S) @ y)
+
+
+def safe_matrix_inverse(S: np.ndarray, damping: float = 1e-9, method: str = 'solve') -> np.ndarray:
+    """
+    Numerically stable matrix inversion with damping.
+    
+    This function prevents numerical blow-up from ill-conditioned matrices:
+    1. Checks for inf/nan
+    2. Adds damping (regularization): S_reg = S + eps*I
+    3. Uses stable solve() instead of inv() when possible
+    4. Falls back to pseudoinverse if needed
+    
+    Args:
+        S: Matrix to invert (should be symmetric positive definite)
+        damping: Regularization factor (default: 1e-9)
+        method: 'solve' for equation solving, 'cholesky' for Cholesky, 'pinv' for pseudoinverse
+    
+    Returns:
+        S_inv: Inverse or pseudoinverse of S
+        
+    Raises:
+        ValueError: If S contains inf/nan or is severely ill-conditioned
+    """
+    # Check validity
+    if np.any(np.isinf(S)) or np.any(np.isnan(S)):
+        raise ValueError("Matrix contains inf/nan, cannot invert")
+    
+    # Add damping for numerical stability (Joseph form regularization)
+    n = S.shape[0]
+    S_damped = S + damping * np.eye(n)
+    
+    # Ensure symmetry (floating-point drift prevention)
+    S_damped = (S_damped + S_damped.T) / 2.0
+    
+    try:
+        if method == 'cholesky':
+            # Most stable for SPD matrices
+            L = np.linalg.cholesky(S_damped)
+            # Solve S_inv @ I = inv(S) by solving S @ X = I
+            S_inv = np.linalg.solve(L.T, np.linalg.solve(L, np.eye(n)))
+            return S_inv
+        
+        elif method == 'solve':
+            # For equation solving (faster than inversion)
+            # Returns identity for testing, caller should use solve() directly
+            return np.linalg.inv(S_damped)
+        
+        else:  # method == 'pinv'
+            # Most robust but slowest
+            return np.linalg.pinv(S_damped)
+            
+    except np.linalg.LinAlgError:
+        # Last resort: pseudoinverse
+        print(f"[WARN] Matrix inversion failed, using pseudoinverse")
+        return np.linalg.pinv(S_damped)

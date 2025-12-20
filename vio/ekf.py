@@ -132,8 +132,30 @@ def propagate_error_state_covariance(P: np.ndarray, Phi: np.ndarray,
         print(f"[EKF-PROP] P propagation produced inf/nan, using previous P")
         p_new = P
     
-    # Ensure symmetry
-    p_new = (p_new + p_new.T) / 2
+    # CRITICAL: Ensure symmetry IMMEDIATELY after propagation
+    # Floating-point errors can break symmetry, leading to negative eigenvalues
+    p_new = (p_new + p_new.T) / 2.0
+    
+    # PSD PROJECTION: Fix negative eigenvalues (numerical drift prevention)
+    # This is MORE CORRECT than just clamping - maintains covariance meaning
+    try:
+        eigvals, eigvecs = np.linalg.eigh(p_new)
+        min_eigenvalue = 1e-9  # Floor for numerical stability
+        
+        if np.any(eigvals < min_eigenvalue):
+            num_negative = np.sum(eigvals < min_eigenvalue)
+            print(f"[EKF-PROP] Found {num_negative} eigenvalues < {min_eigenvalue:.2e}, projecting to PSD")
+            
+            # Clamp eigenvalues to minimum
+            eigvals_clamped = np.maximum(eigvals, min_eigenvalue)
+            
+            # Reconstruct P_new = V @ Lambda @ V^T
+            p_new = eigvecs @ np.diag(eigvals_clamped) @ eigvecs.T
+            
+            # Re-symmetrize after reconstruction
+            p_new = (p_new + p_new.T) / 2.0
+    except np.linalg.LinAlgError as e:
+        print(f"[EKF-PROP] Eigenvalue decomposition failed: {e}, skipping PSD projection")
     
     # Covariance floor
     p_pos_min = 1.0**2
