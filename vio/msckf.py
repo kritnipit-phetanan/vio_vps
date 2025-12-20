@@ -626,10 +626,11 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
     depth0 = np.dot(p_init - c0, ray0_w)
     depth1 = np.dot(p_init - c1, ray1_w)
     
-    # v2.9.9.10: REVERT to v2.9.9.8 stricter check (v2.9.9.9's -0.5m was too permissive)
-    # Quality over quantity: Reject features with negative or very small depth
-    # Analysis showed relaxation increased fail_reproj_error (27.6% → 38.2%)
-    if depth0 <= 0.0 or depth1 <= 0.0:
+    # v3.5.0: RELAXED depth check to handle high position uncertainty
+    # When P_pos is large (42m σ), triangulation becomes very noisy
+    # Allow small negative depths (-0.5m) for numerical tolerance
+    # Quality over quantity BUT account for filter divergence
+    if depth0 < -0.5 or depth1 < -0.5:
         MSCKF_STATS['fail_depth_sign'] += 1
         return None
     
@@ -691,8 +692,16 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
         # Transform point to camera frame
         p_c = R_wc @ (p_refined - p_cam)
         
-        # v2.9.9.10: REVERT to v2.9.9.8 stricter check
-        if p_c[2] <= 0.1:
+        # v3.5.0: ADAPTIVE depth check based on position uncertainty
+        # When P_pos is large, triangulation is noisy → need relaxed threshold
+        # Get position uncertainty from filter
+        P_pos_trace = kf.P[0,0] + kf.P[1,1] + kf.P[2,2]  # Total position variance
+        pos_sigma = np.sqrt(P_pos_trace / 3.0)  # Average position std
+        
+        # Adaptive threshold: 0.05m (good case) to 0.5m (high uncertainty)
+        min_depth_threshold = 0.05 + min(0.45, pos_sigma * 0.01)
+        
+        if p_c[2] < min_depth_threshold:
             MSCKF_STATS['fail_depth_sign'] += 1
             return None
         
