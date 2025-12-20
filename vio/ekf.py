@@ -103,11 +103,18 @@ def propagate_error_state_covariance(P: np.ndarray, Phi: np.ndarray,
         print(f"[EKF-PROP] CRITICAL: P not PSD before propagation, resetting")
         P = np.eye(err_dim, dtype=float) * 1e-2
     
+    # [DIAGNOSTIC] Check P growth - log if abnormally large
+    P_trace = np.trace(P)
+    P_max = np.max(np.abs(P))
+    if P_max > 1e6:
+        print(f"[EKF-PROP] WARNING: P growing large: max={P_max:.2e}, trace={P_trace:.2e}")
+        print(f"[EKF-PROP]   → P_pos={P[0,0]:.1f}, P_vel={P[3,3]:.2f}, P_yaw={P[8,8]:.4f}")
+    
     # VALIDATION: Check P matrix validity before propagation
     # This prevents divide-by-zero and overflow from corrupted covariance
     if not assert_finite("ekf_P_before", P, extra_info={
-        "P_max": np.max(np.abs(P)),
-        "P_trace": np.trace(P),
+        "P_max": P_max,
+        "P_trace": P_trace,
         "err_dim": err_dim
     }):
         # P corrupted - reset with safe diagonal values
