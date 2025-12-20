@@ -170,10 +170,31 @@ class VIOFrontEnd:
         if E is None or pts_prev.shape[0] == 0:
             return np.array([])
         
+        # CRITICAL: Check E validity before matmul (prevent numerical explosion)
+        if not np.all(np.isfinite(E)):
+            print(f"[VIO] WARNING: Essential matrix E contains inf/nan, skipping epipolar error")
+            return np.array([])
+        
         pts_prev_h = np.hstack([pts_prev, np.ones((len(pts_prev), 1))])
         pts_curr_h = np.hstack([pts_curr, np.ones((len(pts_curr), 1))])
         
-        lines = (E @ pts_prev_h.T).T
+        # Check for numerical issues before matmul
+        if not np.all(np.isfinite(pts_prev_h)) or not np.all(np.isfinite(pts_curr_h)):
+            print(f"[VIO] WARNING: Points contain inf/nan, skipping epipolar error")
+            return np.array([])
+        
+        try:
+            with np.errstate(invalid='ignore', divide='ignore', over='ignore'):
+                lines = (E @ pts_prev_h.T).T
+        except (FloatingPointError, RuntimeWarning) as e:
+            print(f"[VIO] WARNING: Matmul overflow in epipolar error computation: {e}")
+            return np.array([])
+        
+        # Check result validity
+        if not np.all(np.isfinite(lines)):
+            print(f"[VIO] WARNING: Epipolar lines contain inf/nan")
+            return np.array([])
+        
         numerator = np.abs(np.sum(pts_curr_h * lines, axis=1))
         denominator = np.linalg.norm(lines[:, :2], axis=1)
         
@@ -464,10 +485,17 @@ class VIOFrontEnd:
         q2n = self._undistort_pts(q2)
         E, mask = cv2.findEssentialMat(q2n, q1n, method=cv2.RANSAC, prob=0.999, threshold=5e-3)
         
-        if E is None or mask is None:
+        # CRITICAL: Validate E matrix (Step 1: catch explosion early)
+        if E is None or mask is None or not np.all(np.isfinite(E)):
+            print(f"[VIO] WARNING: Essential matrix invalid or contains inf/nan")
             return False, len(q1), None, None, dt_img
         
         num_inl, R_vo, t_unit, pose_mask = cv2.recoverPose(E, q2n, q1n, mask=mask)
+        
+        # Validate pose estimate
+        if not np.all(np.isfinite(R_vo)) or not np.all(np.isfinite(t_unit)):
+            print(f"[VIO] WARNING: Pose estimate contains inf/nan")
+            return False, num_inl, None, None, dt_img
         
         if num_inl < VO_MIN_INLIERS:
             return False, num_inl, None, None, dt_img
