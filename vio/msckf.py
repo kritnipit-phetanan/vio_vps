@@ -957,6 +957,18 @@ def msckf_measurement_update(fid: int, triangulated: dict, cam_observations: Lis
     
     Returns: (success, innovation_norm, chi2_test)
     """
+    # CRITICAL: Check P matrix validity BEFORE any computation (Step 1: catch explosion early)
+    if not np.all(np.isfinite(kf.P)):
+        print(f"[MSCKF] CRITICAL: P matrix contains inf/nan, skipping MSCKF update")
+        return (False, np.nan, np.nan)
+    
+    # Check for large P values that will cause overflow
+    max_p_val = np.max(np.abs(kf.P))
+    if max_p_val > 1e10:
+        print(f"[MSCKF] WARNING: P matrix has very large values (max={max_p_val:.2e}), may overflow")
+        kf.P = ensure_covariance_valid(kf.P, label="MSCKF-entry", max_value=1e8,
+                                       symmetrize=True, check_psd=True)
+    
     p_w = triangulated['p_w']
     obs_list = triangulated['observations']
     
@@ -1034,8 +1046,15 @@ def msckf_measurement_update(fid: int, triangulated: dict, cam_observations: Lis
     try:
         U_obs = compute_observability_nullspace(kf, num_clones)
         projection_matrix = np.eye(err_state_size) - U_obs @ U_obs.T
-        h_constrained = h_proj @ projection_matrix
-        r_constrained = r_proj
+        
+        # Check projection matrix validity before matmul
+        if not np.all(np.isfinite(projection_matrix)):
+            print(f"[MSCKF] WARNING: Projection matrix contains inf/nan, using identity")
+            h_constrained = h_proj
+            r_constrained = r_proj
+        else:
+            h_constrained = h_proj @ projection_matrix
+            r_constrained = r_proj
         
         # DEBUG: Check if bias Jacobians are non-zero before/after projection (disabled for performance)
         # h_bias_before = np.linalg.norm(h_proj[:, 9:15])
@@ -1059,8 +1078,23 @@ def msckf_measurement_update(fid: int, triangulated: dict, cam_observations: Lis
     r_cov_original = np.eye(meas_dim) * measurement_noise
     r_cov = weight_matrix @ r_cov_original @ weight_matrix.T
     
+    # CRITICAL: Check P matrix validity before S = H @ P @ H.T
+    if not np.all(np.isfinite(kf.P)):
+        print(f"[MSCKF] CRITICAL: P matrix corrupted before S computation, aborting")
+        return (False, np.nan, np.nan)
+    
     # Innovation and chi-square gating
-    s_mat = h_weighted @ kf.P @ h_weighted.T + r_cov
+    try:
+        with np.errstate(invalid='ignore', divide='ignore', over='ignore'):
+            s_mat = h_weighted @ kf.P @ h_weighted.T + r_cov
+    except (FloatingPointError, RuntimeWarning) as e:
+        print(f"[MSCKF] WARNING: Matmul overflow in S matrix: {e}")
+        return (False, np.nan, np.nan)
+    
+    if not np.all(np.isfinite(s_mat)):
+        print(f"[MSCKF] WARNING: S matrix contains inf/nan after computation")
+        return (False, np.nan, np.nan)
+    
     innovation_norm = float(np.linalg.norm(r_weighted))
     
     try:
@@ -1077,7 +1111,17 @@ def msckf_measurement_update(fid: int, triangulated: dict, cam_observations: Lis
     
     # EKF update
     try:
+        # Check S_inv before using it
+        if not np.all(np.isfinite(s_inv)):
+            print(f"[MSCKF] WARNING: S_inv contains inf/nan")
+            return (False, innovation_norm, np.nan)
+        
         k_gain = kf.P @ h_weighted.T @ s_inv
+        
+        if not np.all(np.isfinite(k_gain)):
+            print(f"[MSCKF] WARNING: Kalman gain contains inf/nan")
+            return (False, innovation_norm, np.nan)
+        
         delta_x = k_gain @ r_weighted
         
         # DEBUG: Check bias correction magnitude (disabled for performance)
@@ -1091,6 +1135,11 @@ def msckf_measurement_update(fid: int, triangulated: dict, cam_observations: Lis
         kf._apply_error_state_correction(delta_x)
         
         i_kh = np.eye(err_state_size) - k_gain @ h_weighted
+        
+        if not np.all(np.isfinite(i_kh)):
+            print(f"[MSCKF] WARNING: (I - KH) matrix contains inf/nan")
+            return (False, innovation_norm, np.nan)
+        
         kf.P = i_kh @ kf.P @ i_kh.T + k_gain @ r_cov @ k_gain.T
         
         kf.P = ensure_covariance_valid(kf.P, label="MSCKF-Update", 
@@ -1133,6 +1182,17 @@ def msckf_measurement_update_with_plane(fid: int, triangulated: dict,
     
     Returns: (success, innovation_norm, chi2_test)
     """
+    # CRITICAL: Check P matrix validity BEFORE any computation
+    if not np.all(np.isfinite(kf.P)):
+        print(f"[MSCKF-PLANE] CRITICAL: P matrix contains inf/nan, skipping")
+        return (False, np.nan, np.nan)
+    
+    # Check for large P values that will cause overflow
+    max_p_val = np.max(np.abs(kf.P))
+    if max_p_val > 1e10:
+        print(f"[MSCKF-PLANE] WARNING: P matrix has very large values (max={max_p_val:.2e})")
+        kf.P = ensure_covariance_valid(kf.P, label="MSCKF-Plane-entry", max_value=1e8,
+                                       symmetrize=True, check_psd=True)
     from .plane_utils import compute_plane_jacobian
     
     # =========================================================================
@@ -1350,14 +1410,36 @@ def msckf_measurement_update_with_plane(fid: int, triangulated: dict,
     
     if U_nullspace is not None and U_nullspace.shape[0] == h_stacked.shape[1]:
         A_proj = np.eye(h_stacked.shape[1]) - U_nullspace @ U_nullspace.T
-        h_weighted = h_stacked @ A_proj
-        r_weighted = r_stacked
+        
+        # Check projection matrix validity before matmul
+        if not np.all(np.isfinite(A_proj)):
+            print(f"[MSCKF-PLANE] WARNING: Projection matrix contains inf/nan")
+            h_weighted = h_stacked
+            r_weighted = r_stacked
+        else:
+            h_weighted = h_stacked @ A_proj
+            r_weighted = r_stacked
     else:
         h_weighted = h_stacked
         r_weighted = r_stacked
     
+    # CRITICAL: Check P matrix validity before S = H @ P @ H.T
+    if not np.all(np.isfinite(kf.P)):
+        print(f"[MSCKF-PLANE] CRITICAL: P matrix corrupted before S computation")
+        return (False, np.nan, np.nan)
+    
     # Chi-square gating
-    s_mat = h_weighted @ kf.P @ h_weighted.T + R_stacked
+    try:
+        with np.errstate(invalid='ignore', divide='ignore', over='ignore'):
+            s_mat = h_weighted @ kf.P @ h_weighted.T + R_stacked
+    except (FloatingPointError, RuntimeWarning) as e:
+        print(f"[MSCKF-PLANE] WARNING: Matmul overflow in S matrix: {e}")
+        return (False, np.nan, np.nan)
+    
+    if not np.all(np.isfinite(s_mat)):
+        print(f"[MSCKF-PLANE] WARNING: S matrix contains inf/nan")
+        return (False, np.nan, np.nan)
+    
     innovation_norm = float(np.linalg.norm(r_weighted))
     
     try:
@@ -1373,12 +1455,27 @@ def msckf_measurement_update_with_plane(fid: int, triangulated: dict,
     
     # EKF update
     try:
+        # Check S_inv before using it
+        if not np.all(np.isfinite(s_inv)):
+            print(f"[MSCKF-PLANE] WARNING: S_inv contains inf/nan")
+            return (False, innovation_norm, np.nan)
+        
         k_gain = kf.P @ h_weighted.T @ s_inv
+        
+        if not np.all(np.isfinite(k_gain)):
+            print(f"[MSCKF-PLANE] WARNING: Kalman gain contains inf/nan")
+            return (False, innovation_norm, np.nan)
+        
         delta_x = k_gain @ r_weighted
         
         kf._apply_error_state_correction(delta_x)
         
         i_kh = np.eye(err_state_size) - k_gain @ h_weighted
+        
+        if not np.all(np.isfinite(i_kh)):
+            print(f"[MSCKF-PLANE] WARNING: (I - KH) matrix contains inf/nan")
+            return (False, innovation_norm, np.nan)
+        
         kf.P = i_kh @ kf.P @ i_kh.T + k_gain @ R_stacked @ k_gain.T
         
         kf.P = ensure_covariance_valid(kf.P, label="MSCKF-Plane-Update", 
