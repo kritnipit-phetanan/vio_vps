@@ -63,13 +63,13 @@ echo ""
 
 # Dataset paths
 CONFIG="configs/config_bell412_dataset3.yaml"
-DATASET_BASE="/mnt/External_Storage/CV_team/vio_dataset/bell412_dataset3"
+DATASET_BASE="/Users/france/Downloads/vio_dataset/bell412_dataset3"
 IMU_PATH="${DATASET_BASE}/extracted_data/imu_data/imu__data/imu.csv"
 QUARRY_PATH="${DATASET_BASE}/flight_log_from_gga.csv"
 IMAGES_DIR="${DATASET_BASE}/extracted_data/cam_data/camera__image_mono/images"
 IMAGES_INDEX="${DATASET_BASE}/extracted_data/cam_data/camera__image_mono/images_index.csv"
 MAG_PATH="${DATASET_BASE}/extracted_data/imu_data/imu__mag/vector3.csv"
-DEM_PATH="/mnt/External_Storage/CV_team/vio_dataset/Copernicus_DSM_10_N45_00_W076_00_DEM.tif"
+DEM_PATH="${DATASET_BASE}/Copernicus_DSM_10_N45_00_W076_00_DEM.tif"
 GROUND_TRUTH="${DATASET_BASE}/bell412_dataset3_frl.pos"
 
 # Output directory

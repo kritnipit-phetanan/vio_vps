@@ -144,12 +144,18 @@ def propagate_to_timestamp(kf: ExtendedKalmanFilter, target_time: float,
         # R_BW = R_WB.T (Body-to-World) for projecting to world frame
         R_BW = R_old.T
         
-        # Velocity: v_new = v_old + R_BW * delta_v
-        v_new = v + R_BW @ delta_v
-        
-        # Position: p_new = p_old + v_old * dt + R_BW * delta_p
+        # GRAVITY COMPENSATION (Forster TRO 2017, Eq. 24-26)
+        # Gravity in world frame (ENU: [0, 0, -9.8] pointing down)
         dt_total = target_time - current_time
-        p_new = p + v * dt_total + R_BW @ delta_p
+        g_world = np.array([0.0, 0.0, -9.80665], dtype=float)
+        
+        # Velocity: v_new = v_old + g*dt + R_BW * delta_v
+        # (delta_v is preintegrated WITHOUT gravity, so we add it here in world frame)
+        v_new = v + g_world * dt_total + R_BW @ delta_v
+        
+        # Position: p_new = p_old + v_old*dt + 0.5*g*dt² + R_BW * delta_p
+        # (delta_p is preintegrated WITHOUT gravity, so we add drift term here)
+        p_new = p + v * dt_total + 0.5 * g_world * (dt_total ** 2) + R_BW @ delta_p
         
         # Update nominal state
         kf.x[0:3, 0] = p_new

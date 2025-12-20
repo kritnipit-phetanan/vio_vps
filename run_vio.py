@@ -55,9 +55,18 @@ Version: 3.2.0 (YAML single source of truth - all settings from YAML)
 import argparse
 import sys
 import os
+import numpy as np
 
 # Add workspace to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+# STRICT NUMERICAL ERROR DETECTION (debug mode)
+# Uncomment to catch inf/nan at the EXACT line where it first occurs
+# WARNING: This will crash the program immediately on first inf/nan
+# np.seterr(all='raise')  # Raise FloatingPointError on divide-by-zero, overflow, invalid
+# 
+# For production, use 'warn' to log but continue:
+np.seterr(divide='warn', over='warn', invalid='warn', under='ignore')
 
 
 def parse_args():

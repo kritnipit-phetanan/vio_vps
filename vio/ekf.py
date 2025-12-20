@@ -366,11 +366,21 @@ class ExtendedKalmanFilter:
 
         H = HJacobian(self.x, *args)
 
+        # NUMERICAL STABILITY: Symmetrize P before computing PHT
+        # This prevents accumulation of asymmetry from floating-point errors
+        self.P = (self.P + self.P.T) / 2.0
+        
         PHT = dot(self.P, H.T)
         self.S = dot(H, PHT) + R
         
+        # NUMERICAL STABILITY: Symmetrize S (innovation covariance)
+        self.S = (self.S + self.S.T) / 2.0
+        
+        # NUMERICAL STABILITY: Use solve() instead of inv() for Kalman gain
+        # K = P @ H.T @ inv(S) is rewritten as K = solve(S.T, (H @ P).T).T
+        # This avoids explicit matrix inversion which is numerically unstable
         try:
-            self.K = PHT.dot(linalg.inv(self.S))
+            self.K = linalg.solve(self.S.T, PHT.T).T
         except np.linalg.LinAlgError:
             print("[ESKF] WARNING: Singular S matrix, rejecting update")
             self.z = deepcopy(z)

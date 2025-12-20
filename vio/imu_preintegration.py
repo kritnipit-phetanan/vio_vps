@@ -182,21 +182,50 @@ class IMUPreintegration:
             dt: Time step (seconds)
             g_norm: Gravity magnitude (m/s², default 9.80665)
         """
+        # VALIDATION: Strict dt checking to prevent numerical blow-up
+        DT_MIN = 1e-6  # 1 microsecond minimum
+        DT_MAX = 0.1   # 100ms maximum (IMU should be > 10Hz)
+        
+        if dt <= 0.0:
+            # Negative or zero dt is invalid - skip this integration
+            print(f"[PREINT] Invalid dt={dt:.9f}s (≤0), skipping integration")
+            return
+        
+        if dt < DT_MIN:
+            # dt too small - numerical instability, skip
+            print(f"[PREINT] dt={dt:.9f}s < DT_MIN={DT_MIN}s, skipping")
+            return
+        
+        if dt > DT_MAX:
+            # dt too large - likely timestamp jump or missing data
+            # Split into smaller chunks to maintain numerical stability
+            num_splits = int(np.ceil(dt / DT_MAX))
+            dt_split = dt / num_splits
+            print(f"[PREINT] Large dt={dt:.6f}s split into {num_splits} × {dt_split:.6f}s")
+            for _ in range(num_splits):
+                self.integrate_measurement(w_meas, a_meas, dt_split, g_norm)
+            return
+        
         # Bias-corrected measurements (using linearization point)
         w_hat = w_meas - self.bg_lin
         a_hat = a_meas - self.ba_lin
         
-        # CRITICAL FIX: Preintegration MUST compensate for gravity!
-        # IMU convention: Z-axis points DOWN (FRD body frame)
-        # - Stationary reading: a_meas = [0, 0, -9.8] (upward support force)
-        # - Free fall: a_meas = [0, 0, 0] (weightless)
+        # NOTE: Gravity compensation is intentionally REMOVED from preintegration!
         # 
-        # Gravity compensation: ADD gravity to cancel measurement bias
-        # - a_true = a_meas + g_body, where g_body = [0, 0, +9.8] for Z-down frame
+        # Why: Forster TRO 2017 Section III-B states that preintegration computes
+        # relative motion in BODY frame, and gravity must be compensated in WORLD frame
+        # during state update (not during preintegration).
         # 
-        # Forster et al. TRO 2017, Eq. 5: a_k = a_meas_k - b_a + R_WB @ g_world
-        g_body = np.array([0.0, 0.0, g_norm], dtype=float)
-        a_hat = a_hat + g_body  # Add gravity to get true acceleration
+        # Original (WRONG) approach: a_hat += [0,0,9.8] (fixed body-frame vector)
+        # Problem: As UAV rotates, g_body changes! Fixed [0,0,9.8] is only valid
+        # when UAV is level. This causes drift during banking/pitching.
+        # 
+        # Correct approach (Forster Eq. 24-26):
+        # 1. Preintegrate WITHOUT gravity: delta_v, delta_p (body frame)
+        # 2. State update WITH gravity: v_new = v + g*dt + R @ delta_v
+        #                                p_new = p + v*dt + 0.5*g*dt² + R @ delta_p
+        # 
+        # This matches OpenVINS implementation and is numerically stable.
         
         # --- Step 1: Update rotation delta ---
         # ΔR_{k+1} = ΔR_k * Exp(ω_hat * dt)
