@@ -426,8 +426,32 @@ def apply_dem_height_update(kf,
     
     r_mat = np.array([[sigma_height**2 * height_cov_scale]])
     
-    # Innovation gating
-    S_mat = H_height @ kf.P @ H_height.T + r_mat
+    # VALIDATION: Check P matrix for numerical issues before innovation computation
+    # This prevents divide-by-zero and overflow from corrupted covariance
+    has_invalid_p = np.any(np.isinf(kf.P)) or np.any(np.isnan(kf.P))
+    if has_invalid_p:
+        # P corrupted - cannot compute valid innovation, skip update
+        return False, "Invalid P matrix (contains inf/nan)"
+    
+    # Clamp large P values to prevent overflow in matmul
+    P_max = np.max(np.abs(kf.P))
+    if P_max > 1e10:
+        # Scale P down to prevent numerical explosion
+        scale_factor = 1e8 / P_max
+        kf.P = kf.P * scale_factor
+        return False, f"P matrix overflow clamped (max={P_max:.2e})"
+    
+    # Innovation gating with overflow protection
+    with np.errstate(divide='warn', over='warn', invalid='warn'):
+        try:
+            S_mat = H_height @ kf.P @ H_height.T + r_mat
+        except Exception as e:
+            return False, f"S_mat computation failed: {e}"
+    
+    # Check S_mat validity after computation
+    if np.any(np.isinf(S_mat)) or np.any(np.isnan(S_mat)):
+        return False, "Invalid S_mat (contains inf/nan)"
+    
     predicted_height = kf.x[2, 0]
     innovation = np.array([[height_measurement - predicted_height]])
     
@@ -858,10 +882,38 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
     
     # Apply update with chi-square gating
     if use_vio_velocity:
-        # Compute innovation for gating
+        # VALIDATION: Check P matrix for numerical issues before innovation computation
+        # This prevents divide-by-zero and overflow from corrupted covariance
+        has_invalid_p = np.any(np.isinf(kf.P)) or np.any(np.isnan(kf.P))
+        if has_invalid_p:
+            # P corrupted - cannot compute valid innovation, skip update
+            print(f"[VIO] Velocity REJECTED: P matrix contains inf/nan")
+            return False
+        
+        # Clamp large P values to prevent overflow in matmul
+        P_max = np.max(np.abs(kf.P))
+        if P_max > 1e10:
+            # Scale P down to prevent numerical explosion
+            scale_factor = 1e8 / P_max
+            kf.P = kf.P * scale_factor
+            print(f"[VIO] Velocity REJECTED: P matrix overflow clamped (max={P_max:.2e})")
+            return False
+        
+        # Compute innovation for gating with overflow protection
         predicted_vel = hx_fun(kf.x)
         innovation = vel_meas - predicted_vel
-        s_mat = h_vel @ kf.P @ h_vel.T + r_mat
+        
+        with np.errstate(divide='warn', over='warn', invalid='warn'):
+            try:
+                s_mat = h_vel @ kf.P @ h_vel.T + r_mat
+            except Exception as e:
+                print(f"[VIO] Velocity REJECTED: s_mat computation failed: {e}")
+                return False
+        
+        # Check s_mat validity after computation
+        if np.any(np.isinf(s_mat)) or np.any(np.isnan(s_mat)):
+            print(f"[VIO] Velocity REJECTED: s_mat contains inf/nan")
+            return False
         
         # Chi-square test
         try:
