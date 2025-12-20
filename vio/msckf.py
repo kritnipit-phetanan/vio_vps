@@ -17,7 +17,7 @@ import numpy as np
 from typing import Optional, Tuple, List, Dict, Any
 from scipy.spatial.transform import Rotation as R_scipy
 
-from .math_utils import quat_to_rot, quaternion_to_yaw, skew_symmetric
+from .math_utils import quat_to_rot, quaternion_to_yaw, skew_symmetric, safe_matrix_inverse
 
 
 # =============================================================================
@@ -1443,7 +1443,7 @@ def msckf_measurement_update_with_plane(fid: int, triangulated: dict,
     innovation_norm = float(np.linalg.norm(r_weighted))
     
     try:
-        s_inv = np.linalg.inv(s_mat)
+        s_inv = safe_matrix_inverse(s_mat, damping=1e-9, method='cholesky')
         chi2_test = float(r_weighted.T @ s_inv @ r_weighted)
         
         chi2_threshold = 15.36 * meas_dim_total  # Same as standard MSCKF

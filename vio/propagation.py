@@ -13,7 +13,7 @@ import numpy as np
 from typing import Tuple, List, Optional
 from scipy.spatial.transform import Rotation as R_scipy
 
-from .math_utils import skew_symmetric
+from .math_utils import skew_symmetric, safe_matrix_inverse
 from .imu_preintegration import (
     IMUPreintegration, 
     compute_error_state_jacobian, 
@@ -545,7 +545,8 @@ def apply_zupt(kf: ExtendedKalmanFilter, v_mag: float,
         return False, 0.0, consecutive_stationary_count
     
     try:
-        mahal_squared = float(innovation.T @ np.linalg.inv(S_zupt) @ innovation)
+        S_zupt_inv = safe_matrix_inverse(S_zupt, damping=1e-9, method='cholesky')
+        mahal_squared = float(innovation.T @ S_zupt_inv @ innovation)
         mahal_dist = np.sqrt(mahal_squared)
     except:
         mahal_dist = float('nan')

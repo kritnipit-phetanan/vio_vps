@@ -54,8 +54,10 @@ def compute_vps_innovation(vps: VPSItem, kf: ExtendedKalmanFilter,
     innovation = (vps_xy - xy_pred).reshape(-1, 1)
     
     try:
-        m2_test = float(innovation.T @ np.linalg.inv(s_mat) @ innovation)
-    except np.linalg.LinAlgError:
+        from .math_utils import safe_matrix_inverse
+        s_inv = safe_matrix_inverse(s_mat, damping=1e-9, method='cholesky')
+        m2_test = float(innovation.T @ s_inv @ innovation)
+    except (np.linalg.LinAlgError, ValueError):
         m2_test = np.inf
     
     return vps_xy, innovation, m2_test

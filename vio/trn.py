@@ -390,8 +390,10 @@ class TerrainReferencedNavigation:
         # Kalman gain
         S = H @ kf.P @ H.T + R
         try:
-            K = kf.P @ H.T @ np.linalg.inv(S)
-        except np.linalg.LinAlgError:
+            from .math_utils import safe_matrix_inverse
+            S_inv = safe_matrix_inverse(S, damping=1e-9, method='cholesky')
+            K = kf.P @ H.T @ S_inv
+        except (np.linalg.LinAlgError, ValueError):
             return False
         
         # State update (error-state)

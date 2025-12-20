@@ -16,7 +16,7 @@ import scipy.linalg as linalg
 from filterpy.stats import logpdf
 from filterpy.common import pretty_str, reshape_z
 
-from .math_utils import quat_boxplus, skew_symmetric
+from .math_utils import quat_boxplus, skew_symmetric, safe_matrix_inverse
 
 
 def ensure_covariance_valid(P: np.ndarray, label: str = "", 
@@ -347,7 +347,7 @@ class ExtendedKalmanFilter:
 
         PHT = dot(P, H.T)
         self.S = dot(H, PHT) + R
-        self.SI = linalg.inv(self.S)
+        self.SI = safe_matrix_inverse(self.S, damping=1e-9, method='cholesky')
         self.K = dot(PHT, self.SI)
 
         self.y = z - Hx(x, *hx_args)

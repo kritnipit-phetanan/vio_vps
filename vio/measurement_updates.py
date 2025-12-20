@@ -18,7 +18,7 @@ from typing import Optional, Tuple, Callable
 import math
 
 # Import shared math utilities (avoid duplication)
-from .math_utils import quaternion_to_yaw, mahalanobis_squared
+from .math_utils import quaternion_to_yaw, mahalanobis_squared, safe_matrix_inverse
 from .output_utils import log_measurement_update
 
 
@@ -917,7 +917,8 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
         
         # Chi-square test
         try:
-            m2 = innovation.T @ np.linalg.inv(s_mat) @ innovation
+            s_inv = safe_matrix_inverse(s_mat, damping=1e-9, method='cholesky')
+            m2 = innovation.T @ s_inv @ innovation
             chi2_value = float(m2)
             mahal_dist = np.sqrt(chi2_value)
         except Exception:
@@ -1010,7 +1011,8 @@ def apply_plane_constraint(kf,
     S_alt = H_plane @ kf.P @ H_plane.T + R_altitude
     
     try:
-        chi2_alt = float(innovation.T @ np.linalg.inv(S_alt) @ innovation)
+        S_alt_inv = safe_matrix_inverse(S_alt, damping=1e-9, method='cholesky')
+        chi2_alt = float(innovation.T @ S_alt_inv @ innovation)
     except:
         return False, "Covariance singular"
     
