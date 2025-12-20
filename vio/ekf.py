@@ -17,6 +17,7 @@ from filterpy.stats import logpdf
 from filterpy.common import pretty_str, reshape_z
 
 from .math_utils import quat_boxplus, skew_symmetric, safe_matrix_inverse
+from .numerical_checks import assert_finite, check_quaternion, check_covariance_psd
 
 
 def ensure_covariance_valid(P: np.ndarray, label: str = "", 
@@ -355,6 +356,16 @@ class ExtendedKalmanFilter:
 
         I_KH = self._I - dot(self.K, H)
         self.P = dot(I_KH, P).dot(I_KH.T) + dot(self.K, R).dot(self.K.T)
+        
+        # [TRIPWIRE] Check state and covariance after update
+        if not assert_finite("state_after_update", self.x, extra_info={
+            "innovation_norm": np.linalg.norm(self.y),
+            "K_norm": np.linalg.norm(self.K)
+        }):
+            print(f"[EKF-UPDATE] CRITICAL: State contains NaN/inf after update!")
+        
+        if not check_covariance_psd(self.P, name="P_after_update"):
+            print(f"[EKF-UPDATE] WARNING: Covariance not PSD after update!")
 
         self.z = deepcopy(z)
         self.x_post = self.x.copy()

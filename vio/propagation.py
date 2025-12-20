@@ -20,6 +20,8 @@ from .imu_preintegration import (
     compute_error_state_process_noise
 )
 from .ekf import ExtendedKalmanFilter, ensure_covariance_valid, propagate_error_state_covariance
+from .numerical_checks import assert_finite, check_quaternion, check_covariance_psd, check_state_validity
+from .numerical_checks import assert_finite, check_quaternion, check_covariance_psd, check_state_validity
 from .data_loaders import IMURecord
 
 
@@ -156,15 +158,38 @@ def propagate_to_timestamp(kf: ExtendedKalmanFilter, target_time: float,
         
         # Apply preintegrated delta to nominal state
         q_xyzw = np.array([q[1], q[2], q[3], q[0]])
-        R_old = R_scipy.from_quat(q_xyzw).as_matrix()
+        R_old = R_scipy.from_quat(q_xyzw).as_matrix()  # R_WB (World-to-Body)
         
-        # R_WB_new = R_delta^T * R_WB_old
-        R_new = delta_R.T @ R_old
+        # ================================================================
+        # ROTATION UPDATE (Forster TRO 2017, OpenVINS)
+        # ================================================================
+        # delta_R is rotation from body frame i to j: R_i^j
+        # R_WB at time j: R_WB_new = R_WB_old @ delta_R
+        # 
+        # This is CORRECT per Forster Eq. (11a):
+        # R_j = R_i * ΔR_ij where R is world-to-body
+        # ================================================================
+        R_new = R_old @ delta_R  # FIXED: was delta_R.T @ R_old (WRONG!)
         q_new_xyzw = R_scipy.from_matrix(R_new).as_quat()
         q_new = np.array([q_new_xyzw[3], q_new_xyzw[0], q_new_xyzw[1], q_new_xyzw[2]])  # [w,x,y,z]
         
-        # R_BW = R_WB.T (Body-to-World) for projecting to world frame
-        R_BW = R_old.T
+        # [TRIPWIRE] Normalize quaternion to prevent norm drift
+        q_new, q_valid = check_quaternion(q_new, name="q_after_preint", normalize=True, t=target_time)
+        if not q_valid:
+            print(f"[PROPAGATE] WARNING: Quaternion invalid after preintegration at t={target_time}")
+        
+        # ================================================================
+        # ROTATION FOR DELTA PROJECTION (Forster TRO 2017)
+        # ================================================================
+        # Per Forster Eq. (11b-c):
+        #   v_j = v_i + g*dt + R_i @ Δv_ij
+        #   p_j = p_i + v_i*dt + 0.5*g*dt² + R_i @ Δp_ij
+        # 
+        # Use R_OLD (initial rotation) to project deltas, NOT R_new!
+        # Deltas were accumulated in the body frame from time i to j,
+        # so we use R_i to rotate them to world frame.
+        # ================================================================
+        R_BW = R_old.T  # R_old is R_WB, so R_BW = R_WB.T projects body to world
         
         # ================================================================
         # GRAVITY COMPENSATION (Forster TRO 2017, OpenVINS standard)
@@ -193,6 +218,15 @@ def propagate_to_timestamp(kf: ExtendedKalmanFilter, target_time: float,
         kf.x[0:3, 0] = p_new
         kf.x[3:6, 0] = v_new
         kf.x[6:10, 0] = q_new
+        
+        # [TRIPWIRE] Check state validity after propagation
+        if not assert_finite("state_after_propagate", kf.x, t=target_time, extra_info={
+            "dt_total": dt_total,
+            "delta_R_det": np.linalg.det(delta_R),
+            "p_norm": np.linalg.norm(p_new),
+            "v_norm": np.linalg.norm(v_new)
+        }):
+            print(f"[PROPAGATE] CRITICAL: State contains NaN/inf after propagation!")
         
         # Propagate error-state covariance using preintegration Jacobians
         preint_cov = preint.get_covariance()
@@ -240,6 +274,10 @@ def propagate_to_timestamp(kf: ExtendedKalmanFilter, target_time: float,
         
         # Propagate covariance
         kf.P = Phi @ kf.P @ Phi.T + Q
+        
+        # [TRIPWIRE] Check covariance validity after raw propagation
+        if not check_covariance_psd(kf.P, name="P_after_raw_propagate", t=target_time):
+            print(f"[PROPAGATE] WARNING: Covariance not PSD after raw propagation!")
         
         # Ensure covariance validity
         kf.P = ensure_covariance_valid(

@@ -220,6 +220,12 @@ def main():
         print("=" * 70)
         
         # =================================================================
+        # [TRIPWIRE] Check which files are being used
+        # =================================================================
+        from vio.numerical_checks import check_file_being_used
+        check_file_being_used()
+        
+        # =================================================================
         # Step 4: Create output directory and save CLI command
         # =================================================================
         os.makedirs(args.output, exist_ok=True)
