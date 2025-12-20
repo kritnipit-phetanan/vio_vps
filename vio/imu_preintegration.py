@@ -55,6 +55,7 @@ from typing import Tuple
 import numpy as np
 
 from .math_utils import skew_symmetric
+from .numerical_checks import assert_finite, check_covariance_psd
 
 
 class IMUPreintegration:
@@ -313,6 +314,10 @@ class IMUPreintegration:
             print(f"[PREINT] Covariance contains inf/nan at t={self.dt_sum:.6f}s, resetting")
             self.cov = np.eye(9, dtype=float) * 1e-6
         
+        # [TRIPWIRE] Check covariance BEFORE propagation
+        if not check_covariance_psd(self.cov, name="preint_cov_before", t=self.dt_sum):
+            print(f"[PREINT] WARNING: Covariance not PSD before propagation at dt={self.dt_sum:.3f}s")
+        
         # Clamp large covariance values to prevent overflow
         cov_max = np.max(np.abs(self.cov))
         if cov_max > 1e10:
@@ -321,16 +326,35 @@ class IMUPreintegration:
             self.cov = self.cov * scale_factor
             print(f"[PREINT] Covariance overflow clamped: max={cov_max:.2e} → scaled by {scale_factor:.2e}")
         
-        # Propagate covariance with overflow protection
-        with np.errstate(divide='warn', over='warn', invalid='warn'):
+        # [TRIPWIRE] Check A, B, Q matrices before propagation
+        if not assert_finite("preint_A", A, t=self.dt_sum, extra_info={"dt": dt}):
+            print(f"[PREINT] CRITICAL: A matrix contains NaN/inf, skipping integration")
+            return
+        
+        if not assert_finite("preint_B", B, t=self.dt_sum, extra_info={"dt": dt}):
+            print(f"[PREINT] CRITICAL: B matrix contains NaN/inf, skipping integration")
+            return
+        
+        if not assert_finite("preint_Q", Q, t=self.dt_sum, extra_info={"dt": dt}):
+            print(f"[PREINT] CRITICAL: Q matrix contains NaN/inf, skipping integration")
+            return
+        
+        # Propagate covariance with SUPPRESSED warnings (we check manually)
+        with np.errstate(all='ignore'):  # Suppress numpy warnings, we handle explicitly
             try:
                 cov_new = A @ self.cov @ A.T + B @ Q @ B.T
             except Exception as e:
                 print(f"[PREINT] Covariance propagation failed: {e}, using previous covariance")
                 cov_new = self.cov
         
-        # Check result validity after computation
-        if np.any(np.isinf(cov_new)) or np.any(np.isnan(cov_new)):
+        # [TRIPWIRE] Check result validity after computation
+        if not assert_finite("preint_cov_new", cov_new, t=self.dt_sum, extra_info={
+            "dt": dt,
+            "cov_max_before": cov_max,
+            "A_norm": np.linalg.norm(A),
+            "B_norm": np.linalg.norm(B),
+            "Q_norm": np.linalg.norm(Q)
+        }):
             print(f"[PREINT] Covariance propagation produced inf/nan, reverting")
             cov_new = self.cov
         
@@ -339,6 +363,10 @@ class IMUPreintegration:
         
         # Apply result
         self.cov = cov_new
+        
+        # [TRIPWIRE] Final check after symmetrization
+        if not check_covariance_psd(self.cov, name="preint_cov_after", t=self.dt_sum):
+            print(f"[PREINT] WARNING: Covariance not PSD after propagation!")
         
         # --- Step 6: Commit updates ---
         self.delta_R = delta_R_k1
