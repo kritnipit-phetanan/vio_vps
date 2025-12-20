@@ -434,8 +434,21 @@ def apply_zupt(kf: ExtendedKalmanFilter, v_mag: float,
             - v_reduction: Velocity reduction magnitude [m/s]
             - updated_consecutive_count: Updated stationary count
     """
+    # CRITICAL: Check P matrix validity BEFORE any computation (Step 1: catch explosion early)
+    if not np.all(np.isfinite(kf.P)):
+        print(f"[ZUPT] CRITICAL: P matrix contains inf/nan, skipping ZUPT")
+        return False, 0.0, consecutive_stationary_count
+    
     if v_mag >= max_v_for_zupt:
         return False, 0.0, 0
+    
+    # Check for large P values that will cause overflow
+    max_p_val = np.max(np.abs(kf.P))
+    if max_p_val > 1e10:
+        print(f"[ZUPT] WARNING: P matrix has very large values (max={max_p_val:.2e}), clamping")
+        from .ekf import ensure_covariance_valid
+        kf.P = ensure_covariance_valid(kf.P, label="ZUPT-entry", max_value=1e8,
+                                       symmetrize=True, check_psd=True)
     
     # Calculate dimensions
     num_clones = (kf.x.shape[0] - 16) // 7
@@ -469,7 +482,22 @@ def apply_zupt(kf: ExtendedKalmanFilter, v_mag: float,
     # Compute innovation and Mahalanobis distance for logging
     predicted_vel = kf.x[3:6, 0].reshape(3, 1)
     innovation = z_zupt - predicted_vel
-    S_zupt = H_zupt @ kf.P @ H_zupt.T + R_zupt
+    
+    # CRITICAL: Check P and compute S_zupt with overflow protection
+    if not np.all(np.isfinite(kf.P)):
+        print(f"[ZUPT] CRITICAL: P matrix contains inf/nan before S_zupt computation")
+        return False, 0.0, consecutive_stationary_count
+    
+    try:
+        with np.errstate(invalid='ignore', divide='ignore', over='ignore'):
+            S_zupt = H_zupt @ kf.P @ H_zupt.T + R_zupt
+    except (FloatingPointError, RuntimeWarning) as e:
+        print(f"[ZUPT] WARNING: Matmul overflow in S matrix: {e}")
+        return False, 0.0, consecutive_stationary_count
+    
+    if not np.all(np.isfinite(S_zupt)):
+        print(f"[ZUPT] WARNING: S_zupt matrix contains inf/nan")
+        return False, 0.0, consecutive_stationary_count
     
     try:
         mahal_squared = float(innovation.T @ np.linalg.inv(S_zupt) @ innovation)
