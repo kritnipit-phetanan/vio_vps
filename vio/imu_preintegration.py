@@ -272,8 +272,41 @@ class IMUPreintegration:
             self.sigma_a**2 * dt, self.sigma_a**2 * dt, self.sigma_a**2 * dt
         ])
         
-        # Propagate covariance
-        self.cov = A @ self.cov @ A.T + B @ Q @ B.T
+        # VALIDATION: Check covariance validity before propagation
+        # This prevents numerical explosion from corrupted preintegration covariance
+        has_invalid_cov = np.any(np.isinf(self.cov)) or np.any(np.isnan(self.cov))
+        if has_invalid_cov:
+            # Covariance corrupted - reset to identity/small value
+            # This prevents cascading corruption through IMU preintegration
+            print(f"[PREINT] Covariance contains inf/nan at t={self.dt_sum:.6f}s, resetting")
+            self.cov = np.eye(9, dtype=float) * 1e-6
+        
+        # Clamp large covariance values to prevent overflow
+        cov_max = np.max(np.abs(self.cov))
+        if cov_max > 1e10:
+            # Scale covariance down to prevent numerical explosion
+            scale_factor = 1e8 / cov_max
+            self.cov = self.cov * scale_factor
+            print(f"[PREINT] Covariance overflow clamped: max={cov_max:.2e} → scaled by {scale_factor:.2e}")
+        
+        # Propagate covariance with overflow protection
+        with np.errstate(divide='warn', over='warn', invalid='warn'):
+            try:
+                cov_new = A @ self.cov @ A.T + B @ Q @ B.T
+            except Exception as e:
+                print(f"[PREINT] Covariance propagation failed: {e}, using previous covariance")
+                cov_new = self.cov
+        
+        # Check result validity after computation
+        if np.any(np.isinf(cov_new)) or np.any(np.isnan(cov_new)):
+            print(f"[PREINT] Covariance propagation produced inf/nan, reverting")
+            cov_new = self.cov
+        
+        # Ensure symmetry
+        cov_new = (cov_new + cov_new.T) / 2.0
+        
+        # Apply result
+        self.cov = cov_new
         
         # --- Step 6: Commit updates ---
         self.delta_R = delta_R_k1

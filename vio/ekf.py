@@ -95,6 +95,22 @@ def propagate_error_state_covariance(P: np.ndarray, Phi: np.ndarray,
     """
     err_dim = 15 + 6 * num_clones
     
+    # VALIDATION: Check P matrix validity before propagation
+    # This prevents divide-by-zero and overflow from corrupted covariance
+    has_invalid_p = np.any(np.isinf(P)) or np.any(np.isnan(P))
+    if has_invalid_p:
+        # P corrupted - reset with safe diagonal values
+        print(f"[EKF-PROP] P contains inf/nan at entry, resetting to safe diagonal")
+        P = np.eye(err_dim, dtype=float) * 1e-2
+    
+    # Clamp large P values to prevent overflow in matmul
+    P_max = np.max(np.abs(P))
+    if P_max > 1e10:
+        # Scale P down to prevent numerical explosion
+        scale_factor = 1e8 / P_max
+        P = P * scale_factor
+        print(f"[EKF-PROP] P overflow clamped: max={P_max:.2e} → scaled by {scale_factor:.2e}")
+    
     # Build full Φ matrix
     phi_full = np.eye(err_dim, dtype=float)
     phi_full[0:15, 0:15] = Phi
@@ -103,8 +119,18 @@ def propagate_error_state_covariance(P: np.ndarray, Phi: np.ndarray,
     q_full = np.zeros((err_dim, err_dim), dtype=float)
     q_full[0:15, 0:15] = Q
     
-    # Propagate: P_k+1 = Φ * P_k * Φ^T + Q
-    p_new = phi_full @ P @ phi_full.T + q_full
+    # Propagate: P_k+1 = Φ * P_k * Φ^T + Q with overflow protection
+    with np.errstate(divide='warn', over='warn', invalid='warn'):
+        try:
+            p_new = phi_full @ P @ phi_full.T + q_full
+        except Exception as e:
+            print(f"[EKF-PROP] P propagation failed: {e}, using previous P")
+            p_new = P
+    
+    # Check result validity after computation
+    if np.any(np.isinf(p_new)) or np.any(np.isnan(p_new)):
+        print(f"[EKF-PROP] P propagation produced inf/nan, using previous P")
+        p_new = P
     
     # Ensure symmetry
     p_new = (p_new + p_new.T) / 2
