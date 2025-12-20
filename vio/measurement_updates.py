@@ -441,16 +441,34 @@ def apply_dem_height_update(kf,
         kf.P = kf.P * scale_factor
         return False, f"P matrix overflow clamped (max={P_max:.2e})"
     
+    from .numerical_checks import assert_finite
+    
+    # [TRIPWIRE] Validate inputs before S matrix computation
+    if not assert_finite("height_H", H_height, extra_info={"H_norm": np.linalg.norm(H_height)}):
+        return False, "H_height contains inf/nan"
+    
+    if not assert_finite("height_kf_P", kf.P, extra_info={
+        "P_max": np.max(np.abs(kf.P)),
+        "P_trace": np.trace(kf.P)
+    }):
+        return False, "kf.P contains inf/nan before height update"
+    
     # Innovation gating with overflow protection
-    with np.errstate(divide='warn', over='warn', invalid='warn'):
+    # Suppress numpy warnings - we handle explicitly with tripwires
+    with np.errstate(all='ignore'):
         try:
             S_mat = H_height @ kf.P @ H_height.T + r_mat
         except Exception as e:
             return False, f"S_mat computation failed: {e}"
     
-    # Check S_mat validity after computation
-    if np.any(np.isinf(S_mat)) or np.any(np.isnan(S_mat)):
-        return False, "Invalid S_mat (contains inf/nan)"
+    # [TRIPWIRE] Check S_mat validity after computation
+    if not assert_finite("height_S_mat", S_mat, extra_info={
+        "S_mat_max": np.max(np.abs(S_mat)),
+        "r_mat_val": r_mat[0,0] if r_mat.size > 0 else 0,
+        "H_norm": np.linalg.norm(H_height),
+        "P_max": np.max(np.abs(kf.P))
+    }):
+        return False, "S_mat contains inf/nan after computation"
     
     predicted_height = kf.x[2, 0]
     innovation = np.array([[height_measurement - predicted_height]])
@@ -899,20 +917,40 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
             print(f"[VIO] Velocity REJECTED: P matrix overflow clamped (max={P_max:.2e})")
             return False
         
+        from .numerical_checks import assert_finite
+        
+        # [TRIPWIRE] Validate inputs before S matrix computation
+        if not assert_finite("vel_h_vel", h_vel, extra_info={"h_vel_norm": np.linalg.norm(h_vel)}):
+            print(f"[VIO] Velocity REJECTED: h_vel contains inf/nan")
+            return False
+        
+        if not assert_finite("vel_kf_P", kf.P, extra_info={
+            "P_max": np.max(np.abs(kf.P)),
+            "P_trace": np.trace(kf.P)
+        }):
+            print(f"[VIO] Velocity REJECTED: kf.P contains inf/nan")
+            return False
+        
         # Compute innovation for gating with overflow protection
         predicted_vel = hx_fun(kf.x)
         innovation = vel_meas - predicted_vel
         
-        with np.errstate(divide='warn', over='warn', invalid='warn'):
+        # Suppress numpy warnings - we handle explicitly with tripwires
+        with np.errstate(all='ignore'):
             try:
                 s_mat = h_vel @ kf.P @ h_vel.T + r_mat
             except Exception as e:
                 print(f"[VIO] Velocity REJECTED: s_mat computation failed: {e}")
                 return False
         
-        # Check s_mat validity after computation
-        if np.any(np.isinf(s_mat)) or np.any(np.isnan(s_mat)):
-            print(f"[VIO] Velocity REJECTED: s_mat contains inf/nan")
+        # [TRIPWIRE] Check s_mat validity after computation
+        if not assert_finite("vel_s_mat", s_mat, extra_info={
+            "s_mat_max": np.max(np.abs(s_mat)),
+            "r_mat_max": np.max(np.abs(r_mat)),
+            "h_norm": np.linalg.norm(h_vel),
+            "P_max": np.max(np.abs(kf.P))
+        }):
+            print(f"[VIO] Velocity REJECTED: s_mat contains inf/nan after computation")
             return False
         
         # Chi-square test

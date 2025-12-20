@@ -94,12 +94,22 @@ def propagate_error_state_covariance(P: np.ndarray, Phi: np.ndarray,
     Returns:
         P_new: Propagated covariance
     """
+    from .numerical_checks import assert_finite, check_covariance_psd
+    
     err_dim = 15 + 6 * num_clones
+    
+    # [TRIPWIRE] Check P matrix BEFORE propagation
+    if not check_covariance_psd(P, name="ekf_P_before_prop"):
+        print(f"[EKF-PROP] CRITICAL: P not PSD before propagation, resetting")
+        P = np.eye(err_dim, dtype=float) * 1e-2
     
     # VALIDATION: Check P matrix validity before propagation
     # This prevents divide-by-zero and overflow from corrupted covariance
-    has_invalid_p = np.any(np.isinf(P)) or np.any(np.isnan(P))
-    if has_invalid_p:
+    if not assert_finite("ekf_P_before", P, extra_info={
+        "P_max": np.max(np.abs(P)),
+        "P_trace": np.trace(P),
+        "err_dim": err_dim
+    }):
         # P corrupted - reset with safe diagonal values
         print(f"[EKF-PROP] P contains inf/nan at entry, resetting to safe diagonal")
         P = np.eye(err_dim, dtype=float) * 1e-2
@@ -120,16 +130,33 @@ def propagate_error_state_covariance(P: np.ndarray, Phi: np.ndarray,
     q_full = np.zeros((err_dim, err_dim), dtype=float)
     q_full[0:15, 0:15] = Q
     
+    # [TRIPWIRE] Validate Phi and Q matrices before propagation
+    if not assert_finite("ekf_Phi", Phi, extra_info={"Phi_norm": np.linalg.norm(Phi)}):
+        print(f"[EKF-PROP] CRITICAL: Phi contains inf/nan, using identity")
+        phi_full = np.eye(err_dim, dtype=float)
+        return P  # Early return - cannot propagate safely
+    
+    if not assert_finite("ekf_Q", Q, extra_info={"Q_norm": np.linalg.norm(Q)}):
+        print(f"[EKF-PROP] CRITICAL: Q contains inf/nan, skipping propagation")
+        return P  # Early return - cannot add process noise safely
+    
     # Propagate: P_k+1 = Φ * P_k * Φ^T + Q with overflow protection
-    with np.errstate(divide='warn', over='warn', invalid='warn'):
+    # Suppress numpy warnings - we handle explicitly with tripwires
+    with np.errstate(all='ignore'):
         try:
             p_new = phi_full @ P @ phi_full.T + q_full
         except Exception as e:
             print(f"[EKF-PROP] P propagation failed: {e}, using previous P")
             p_new = P
     
-    # Check result validity after computation
-    if np.any(np.isinf(p_new)) or np.any(np.isnan(p_new)):
+    # [TRIPWIRE] Check result validity after computation
+    if not assert_finite("ekf_P_new", p_new, extra_info={
+        "P_new_max": np.max(np.abs(p_new)),
+        "P_new_trace": np.trace(p_new),
+        "Phi_norm": np.linalg.norm(phi_full),
+        "Q_norm": np.linalg.norm(q_full),
+        "P_old_max": P_max
+    }):
         print(f"[EKF-PROP] P propagation produced inf/nan, using previous P")
         p_new = P
     
