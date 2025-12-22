@@ -92,7 +92,7 @@ class VIOFrontEnd:
         self.min_tracked_ratio = 0.6
         self.min_parallax_threshold = 30.0
         self.max_track_length = 100
-        self.min_track_length = 4
+        self.min_track_length = 4  # Will be overridden by config
         
         # Track quality scoring
         self.quality_threshold = 0.001
@@ -380,17 +380,10 @@ class VIOFrontEnd:
                     good_mask = good_mask & (p1_reshaped[:, 0] >= margin) & (p1_reshaped[:, 0] < self.img_w - margin)
                     good_mask = good_mask & (p1_reshaped[:, 1] >= margin) & (p1_reshaped[:, 1] < self.img_h - margin)
                     
-                    # Compute mean parallax IMMEDIATELY after KLT (before any filtering)
-                    # This ensures we always have a valid flow value even if pose estimation fails
-                    if np.sum(good_mask) > 0:
-                        good_flow_mag = flow_mag[good_mask]
-                        self.mean_parallax = float(np.median(good_flow_mag))
-                        self.last_flow_px = self.mean_parallax
-                        self.last_num_tracked = int(np.sum(good_mask))
-                    else:
-                        self.mean_parallax = 0.0
-                        self.last_flow_px = 0.0
-                        self.last_num_tracked = 0
+                    # Store flow_mag for later parallax computation (after RANSAC)
+                    # FIX v3.9.3: Moved parallax computation to after RANSAC inlier filtering
+                    # Previously computed here with outliers → inaccurate parallax
+                    self.last_num_tracked = int(np.sum(good_mask))
                     
                     st = st.reshape(-1) * good_mask
                     p1 = p1.reshape(-1, 2)
@@ -402,6 +395,9 @@ class VIOFrontEnd:
                     new_pts = []
                     new_fids = []
                     
+                    # FIX v3.9.3: Store indices for later inlier marking (after RANSAC)
+                    tracked_indices = []  # Maps new_pts index to original p1 index
+                    
                     for idx in range(len(p1)):
                         if idx >= len(self.last_fids_for_klt):
                             break
@@ -411,10 +407,12 @@ class VIOFrontEnd:
                         if st[idx] and fid in self.tracks:
                             pt = (float(p1[idx, 0]), float(p1[idx, 1]))
                             quality = 1.0 / (1.0 + fb_err[idx] + err.reshape(-1)[idx] * 0.1)
-                            self.tracks[fid].append({'frame': self.frame_idx, 'pt': pt, 'quality': quality})
+                            # Note: is_inlier will be updated after RANSAC (see below)
+                            self.tracks[fid].append({'frame': self.frame_idx, 'pt': pt, 'quality': quality, 'is_inlier': False})
                             tracked_fids.append(fid)
                             new_pts.append(pt)
                             new_fids.append(fid)
+                            tracked_indices.append(idx)  # Store for inlier marking
                             num_tracked_successfully += 1
                     
                     total_tracks_before = len(self.last_pts_for_klt)
@@ -425,8 +423,12 @@ class VIOFrontEnd:
                         self.last_fids_for_klt = np.array(new_fids, dtype=np.int64)
                         self.last_gray_for_klt = img_gray.copy()
                     else:
-                        # Emergency replenish
-                        self._emergency_replenish(img_gray)
+                        # FIX v3.9.3-D: Don't emergency replenish in tracking loop
+                        # Let it fail naturally and rely on regular replenishment
+                        # Emergency reset breaks multi-view consistency for MSCKF
+                        self.last_pts_for_klt = np.empty((0, 2), dtype=np.float32)
+                        self.last_fids_for_klt = np.empty(0, dtype=np.int64)
+                        print(f"[VIO][TRACK] Frame {self.frame_idx}: All features lost, will replenish next cycle")
         except Exception as e:
             print(f"[VIO] KLT tracking exception: {e}")
         
@@ -515,6 +517,57 @@ class VIOFrontEnd:
         # Update inlier count (successful pose estimation)
         self.last_num_inliers = int(num_final)
         
+        # FIX v3.9.3-A: Compute parallax using ONLY RANSAC inliers
+        # This gives accurate parallax without outliers from moving objects
+        try:
+            if 'tracked_indices' in locals() and len(tracked_indices) > 0:
+                # Get flow magnitudes for tracked features that are RANSAC inliers
+                flow_vectors_tracked = q2 - q1  # Already filtered by flow_valid_mask
+                flow_mag_tracked = np.linalg.norm(flow_vectors_tracked, axis=1)
+                
+                # inlier_idx maps to flow_valid_mask indices
+                # final_inliers maps to inlier_idx indices
+                # Need to map back to tracked_indices
+                ransac_inlier_flow = flow_mag_tracked[inlier_idx][final_inliers]
+                
+                if len(ransac_inlier_flow) > 0:
+                    self.mean_parallax = float(np.median(ransac_inlier_flow))
+                    self.last_flow_px = self.mean_parallax
+                else:
+                    self.mean_parallax = 0.0
+                    self.last_flow_px = 0.0
+            else:
+                self.mean_parallax = 0.0
+                self.last_flow_px = 0.0
+        except Exception as e:
+            print(f"[VIO] WARNING: Parallax computation failed: {e}")
+            self.mean_parallax = 0.0
+            self.last_flow_px = 0.0
+        
+        # FIX v3.9.3-B: Mark RANSAC inliers in track database
+        # This prevents MSCKF from using outlier features that were tracked by KLT
+        # but failed geometric consistency checks
+        try:
+            if 'tracked_indices' in locals() and 'new_fids' in locals():
+                # Build set of indices that are RANSAC inliers
+                # inlier_idx maps flow_valid_mask → True/False
+                # final_inliers maps inlier_idx → True/False  
+                # Need to find which tracked_indices are final inliers
+                
+                # Get indices in flow_valid_mask that are inliers
+                flow_valid_indices = np.where(flow_valid_mask)[0]
+                ransac_inlier_indices_in_flow = flow_valid_indices[inlier_idx][final_inliers]
+                
+                # Mark inliers in tracks
+                for i, fid in enumerate(new_fids):
+                    if fid in self.tracks and len(self.tracks[fid]) > 0:
+                        # Check if this feature's index is in ransac inliers
+                        original_idx = tracked_indices[i]
+                        if original_idx in ransac_inlier_indices_in_flow:
+                            self.tracks[fid][-1]['is_inlier'] = True
+        except Exception as e:
+            print(f"[VIO] WARNING: Inlier marking failed: {e}")
+        
         # Save inlier matches
         try:
             q1n_arr = self._undistort_pts(q1).reshape(-1, 2)
@@ -579,12 +632,34 @@ class VIOFrontEnd:
                     existing_pts = np.array([hist[-1]['pt'] for hist in self.tracks.values() 
                                             if hist and hist[-1]['frame'] == self.frame_idx])
                     
+                    # FIX v3.9.3-E: Optimize spatial filtering with grid hashing
+                    # Instead of O(N×M) cdist, use spatial grid for O(N+M)
+                    # Also increase threshold from 10px → 15px to avoid overcrowding
                     if len(existing_pts) > 0:
                         try:
-                            from scipy.spatial.distance import cdist
-                            dists = cdist(new_features, existing_pts)
-                            min_dists = np.min(dists, axis=1)
-                            far_enough = min_dists > 10.0
+                            min_dist_threshold = 15.0  # Increased from 10.0
+                            
+                            # Simple grid-based spatial hashing
+                            grid_size = int(min_dist_threshold)
+                            occupied = set()
+                            for pt in existing_pts:
+                                gx = int(pt[0] / grid_size)
+                                gy = int(pt[1] / grid_size)
+                                # Mark this cell and neighbors as occupied
+                                for dx in [-1, 0, 1]:
+                                    for dy in [-1, 0, 1]:
+                                        occupied.add((gx + dx, gy + dy))
+                            
+                            # Filter new features
+                            far_enough = []
+                            for pt in new_features:
+                                gx = int(pt[0] / grid_size)
+                                gy = int(pt[1] / grid_size)
+                                if (gx, gy) not in occupied:
+                                    far_enough.append(True)
+                                else:
+                                    far_enough.append(False)
+                            
                             new_features = new_features[far_enough]
                         except Exception:
                             pass
@@ -621,11 +696,26 @@ class VIOFrontEnd:
         return res
     
     def get_mature_tracks(self) -> Dict[int, List[dict]]:
-        """Return tracks ready for MSCKF update (length >= min_track_length)."""
+        """Return tracks ready for MSCKF update (length >= min_track_length).
+        
+        FIX v3.9.3-C: Filter out tracks with inconsistent RANSAC inliers
+        Only return tracks where majority of observations are inliers
+        This prevents MSCKF from using features tracked by KLT but rejected by RANSAC
+        """
         mature = {}
         for fid, hist in self.tracks.items():
-            if len(hist) >= self.min_track_length:
+            if len(hist) < self.min_track_length:
+                continue
+            
+            # Check inlier consistency (v3.9.3)
+            # Require at least 60% of observations to be RANSAC inliers
+            # This filters out features on moving objects or with poor geometry
+            inlier_count = sum(1 for obs in hist if obs.get('is_inlier', False))
+            inlier_ratio = inlier_count / len(hist)
+            
+            if inlier_ratio >= 0.6:  # 60% threshold
                 mature[fid] = hist
+        
         return mature
     
     def get_track_by_id(self, fid: int) -> Optional[List[dict]]:

@@ -288,6 +288,11 @@ def load_config(config_path: str) -> VIOConfig:
     result['MSCKF_MAX_REPROJECTION_ERROR'] = vio['msckf_max_reprojection_error']
     result['VO_MIN_INLIERS'] = vio['min_inliers']
     result['VO_RATIO_TEST'] = vio['ratio_test']
+    
+    # MSCKF sliding window parameters (v3.9.1)
+    msckf_cfg = vio.get('msckf', {})
+    result['MSCKF_MAX_CLONE_SIZE'] = msckf_cfg.get('max_clone_size', 11)
+    result['MSCKF_MIN_TRACK_LENGTH'] = msckf_cfg.get('min_track_length', 4)
     result['VO_NADIR_ALIGN_DEG'] = vio['views']['nadir']['nadir_threshold_deg']
     result['VO_FRONT_ALIGN_DEG'] = vio['views']['front']['nadir_threshold_deg']
     

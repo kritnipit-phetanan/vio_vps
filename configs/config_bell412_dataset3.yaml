@@ -72,6 +72,11 @@ imu:
   # Initial static samples show: [-0.0023, -0.0038, -0.0077] rad/s
   initial_gyro_bias: [-0.0023, -0.0038, -0.0077]
   
+  # Initial accelerometer bias (estimated from first 100 samples)
+  # ENU frame: measured [-0.103, 0.392, -9.682], expected [0, 0, -9.803]
+  # Bias = measured - expected
+  initial_accel_bias: [0.391959, -0.103155, 0.121209]
+  
   # Enable bias estimation from initial static samples
   estimate_bias: true
   
@@ -241,8 +246,9 @@ vio:
   min_msckf_baseline: 0.01   # CRITICAL FIX: was 0.03 (baseline ~0.026m was failing) → now 0.01
   
   # MSCKF parameters (PERMISSIVE for noisy/slow motion)
+  # TUNED v3.9.2: Increased from 8.0→12.0 to reduce fail_reproj_error (was 36.6%)
   msckf_chi2_multiplier: 15.0        # Chi-square threshold multiplier
-  msckf_max_reprojection_error: 8.0  # Max reprojection error [pixels]
+  msckf_max_reprojection_error: 12.0  # Max reprojection error [pixels] (increased from 8.0)
   
   # Feature tracking
   min_inliers: 6             # Minimum RANSAC inliers
@@ -253,6 +259,12 @@ vio:
   sigma_vo: 1.5              # INCREASED 3× (was 0.5) - realistic measurement uncertainty
   min_tracked_features: 50   # Minimum features for velocity update
   fast_rotation_threshold: 0.5236  # Skip if rotation > 30°/s (rad/s)
+  
+  # MSCKF sliding window configuration (v3.9.1)
+  # Controls camera clone management and feature track lifetime
+  msckf:
+    max_clone_size: 11       # Maximum camera poses in sliding window (11 is OpenVINS default)
+    min_track_length: 4      # Minimum observations for MSCKF triangulation
   
   # Camera view configurations
   # CRITICAL FIX: use_vz_only=true for nadir camera

@@ -391,9 +391,17 @@ def save_keyframe_with_overlay(img_gray: np.ndarray, frame_id: int, keyframe_dir
         reprojections = None
         
         if vio_fe is not None:
-            # Get current features
-            if hasattr(vio_fe, 'prev_pts') and vio_fe.prev_pts is not None:
-                features = vio_fe.prev_pts.copy()
+            # Get current tracked points (KLT features)
+            if hasattr(vio_fe, 'last_pts_for_klt') and vio_fe.last_pts_for_klt is not None:
+                # Convert from normalized coordinates to pixel coordinates
+                focal = vio_fe.K[0, 0]  # Assume fx = fy
+                cx = vio_fe.K[0, 2]
+                cy = vio_fe.K[1, 2]
+                features = vio_fe.last_pts_for_klt * focal + np.array([[cx, cy]])
+            
+            # Get inlier mask if available
+            if hasattr(vio_fe, 'last_inlier_mask') and vio_fe.last_inlier_mask is not None:
+                inliers = vio_fe.last_inlier_mask
             
             # Get tracking stats
             tracking_stats = {

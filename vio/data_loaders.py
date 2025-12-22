@@ -206,25 +206,143 @@ def load_imu_csv(path: str) -> List[IMURecord]:
     return recs
 
 
-def load_mag_csv(path: Optional[str]) -> List[MagRecord]:
-    """Load magnetometer data from vector3.csv."""
+def interpolate_time_ref(t_ros_array: np.ndarray, 
+                        time_ref_pairs: List[Tuple[float, float]]) -> np.ndarray:
+    """
+    Interpolate hardware timestamps from ROS timestamps using time_ref mapping.
+    
+    CRITICAL: This ensures magnetometer uses same time base as IMU (hardware clock).
+    
+    Args:
+        t_ros_array: ROS timestamps to convert (stamp_msg from magnetometer)
+        time_ref_pairs: List of (t_ros, t_hw) from /imu/time_ref topic
+    
+    Returns:
+        Hardware timestamps corresponding to t_ros_array
+        
+    Implementation:
+        - Pre-computes numpy arrays for O(N log M) complexity instead of O(N×M)
+        - Uses linear interpolation between nearest time_ref samples
+        - Handles edge cases: before first sample → use first, after last → use last
+        - Guards against division by zero when consecutive timestamps are identical
+    """
+    if len(time_ref_pairs) == 0:
+        return t_ros_array  # Fallback: no conversion
+    
+    # Pre-compute arrays once (avoid list comprehension in loop)
+    t_ros_refs = np.array([pair[0] for pair in time_ref_pairs])
+    t_hw_refs = np.array([pair[1] for pair in time_ref_pairs])
+    
+    # Find insertion indices for each query timestamp
+    indices = np.searchsorted(t_ros_refs, t_ros_array)
+    
+    # Vectorized interpolation
+    t_hw_array = np.zeros_like(t_ros_array)
+    
+    for i, (t_ros, idx) in enumerate(zip(t_ros_array, indices)):
+        # Edge case 1: before first time_ref sample
+        if idx == 0:
+            t_hw_array[i] = t_hw_refs[0]
+            continue
+        
+        # Edge case 2: after last time_ref sample
+        if idx >= len(t_ros_refs):
+            t_hw_array[i] = t_hw_refs[-1]
+            continue
+        
+        # Normal case: linear interpolation
+        t_ros_0 = t_ros_refs[idx - 1]
+        t_ros_1 = t_ros_refs[idx]
+        t_hw_0 = t_hw_refs[idx - 1]
+        t_hw_1 = t_hw_refs[idx]
+        
+        # Guard against division by zero
+        dt_ros = t_ros_1 - t_ros_0
+        if dt_ros < 1e-9:  # Duplicate timestamps
+            t_hw_array[i] = t_hw_0
+        else:
+            alpha = (t_ros - t_ros_0) / dt_ros
+            t_hw_array[i] = t_hw_0 + alpha * (t_hw_1 - t_hw_0)
+    
+    return t_hw_array
+
+
+def load_mag_csv(path: Optional[str], timeref_csv: Optional[str] = None) -> List[MagRecord]:
+    """
+    Load magnetometer data from vector3.csv.
+    
+    v3.9.4: Uses time_ref to synchronize with IMU clock (same as camera).
+    
+    CRITICAL: Magnetometer MUST use same time base as IMU for correct EKF updates.
+    Without time_ref, stamp_msg may have offset → incorrect propagation → filter divergence.
+    
+    Args:
+        path: Path to magnetometer CSV (usually extracted_data/imu_data/imu__mag/vector3.csv)
+        timeref_csv: Path to time_ref CSV from /imu/time_ref topic (hardware clock mapping)
+    
+    Returns:
+        List of MagRecord with hardware-synchronized timestamps
+    """
     if not path or not os.path.exists(path):
         return []
     
     df = pd.read_csv(path)
-    tcol = next((c for c in df.columns if 'stamp' in c.lower()), None)
-    if tcol is None or 'x' not in df.columns:
-        print(f"[Mag] WARNING: vector3.csv missing required columns")
+    
+    # Find timestamp column (priority: time_ref > stamp_bag > stamp_msg)
+    if "time_ref" in df.columns:
+        tcol = "time_ref"
+        print(f"[Mag] Using unified hardware clock (time_ref) - already synchronized!")
+    elif "stamp_bag" in df.columns:
+        tcol = "stamp_bag"
+        print(f"[Mag] Using stamp_bag (ROS recording time)")
+    elif "stamp_msg" in df.columns:
+        tcol = "stamp_msg"
+        print(f"[Mag] Using stamp_msg (header.stamp from sensor)")
+    else:
+        print(f"[Mag] WARNING: No timestamp column found")
+        return []
+    
+    if 'x' not in df.columns:
+        print(f"[Mag] WARNING: vector3.csv missing magnetic field columns")
         return []
     
     df = df.sort_values(tcol).reset_index(drop=True)
+    
+    # If using stamp_msg and time_ref CSV is available, convert to hardware time
+    if tcol == "stamp_msg" and timeref_csv and os.path.exists(timeref_csv):
+        try:
+            # Load time_ref mapping
+            timeref_df = pd.read_csv(timeref_csv)
+            if "time_ref" in timeref_df.columns and "stamp_msg" in timeref_df.columns:
+                time_ref_pairs = list(zip(
+                    timeref_df["stamp_msg"].values,
+                    timeref_df["time_ref"].values
+                ))
+                
+                # Convert all magnetometer timestamps using interpolation
+                t_ros_array = df[tcol].values
+                t_hw_array = interpolate_time_ref(t_ros_array, time_ref_pairs)
+                
+                # Replace timestamp column with hardware time
+                df["time_ref"] = t_hw_array
+                tcol = "time_ref"
+                
+                print(f"[Mag] Converted {len(df)} timestamps: stamp_msg → time_ref (hardware clock)")
+                print(f"[Mag] Time range: {t_hw_array[0]:.3f} → {t_hw_array[-1]:.3f} s")
+            else:
+                print(f"[Mag] WARNING: time_ref CSV missing required columns (time_ref, stamp_msg)")
+        except Exception as e:
+            print(f"[Mag] WARNING: Failed to load time_ref mapping: {e}")
+    
+    # Build MagRecord list
     recs = []
     for _, r in df.iterrows():
         recs.append(MagRecord(
             t=float(r[tcol]),
             mag=np.array([r['x'], r['y'], r['z']], dtype=float)
         ))
-    print(f"[Mag] Loaded {len(recs)} magnetometer samples")
+    
+    print(f"[Mag] Loaded {len(recs)} magnetometer samples using {tcol}")
     return recs
 
 

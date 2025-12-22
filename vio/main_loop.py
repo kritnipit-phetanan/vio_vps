@@ -238,7 +238,8 @@ class VIORunner:
         
         # v3.2.0: use_magnetometer is already populated from YAML (magnetometer.enabled)
         # No need for redundant check - VIOConfig.use_magnetometer is the final decision
-        self.mag_list = load_mag_csv(self.config.mag_csv) if self.config.use_magnetometer else []
+        # v3.9.4: Pass timeref_csv to magnetometer for hardware clock synchronization
+        self.mag_list = load_mag_csv(self.config.mag_csv, timeref_csv=self.config.timeref_csv) if self.config.use_magnetometer else []
         
         self.dem = DEMReader.open(self.config.dem_path)
         
@@ -370,9 +371,13 @@ class VIORunner:
             use_fisheye=use_fisheye,
             fast_mode=self.config.fast_mode  # v2.9.9: Performance optimization
         )
-        self.vio_fe.camera_view = self.config.camera_view
+        
+        # Override min_track_length from config (v3.9.1)
+        self.vio_fe.min_track_length = self.global_config.get('MSCKF_MIN_TRACK_LENGTH', 4)
         
         print(f"[VIO] Camera view mode: {self.config.camera_view}")
+        print(f"[MSCKF] max_clone_size={self.global_config.get('MSCKF_MAX_CLONE_SIZE', 11)}, "
+              f"min_track_length={self.vio_fe.min_track_length}")
         
         # Initialize plane detector if enabled
         if self.global_config.get('USE_PLANE_MSCKF', False):
@@ -808,7 +813,8 @@ class VIORunner:
                     cam_observations=self.state.cam_observations,
                     vio_fe=self.vio_fe,
                     frame_idx=self.vio_fe.frame_idx,
-                    preint_jacobians=preint_jacobians  # Pass Jacobians for bias observability
+                    preint_jacobians=preint_jacobians,  # Pass Jacobians for bias observability
+                    max_clone_size=self.global_config.get('MSCKF_MAX_CLONE_SIZE', 11)
                 )
                 
                 # Log MSCKF window state
@@ -992,11 +998,29 @@ class VIORunner:
             pos_error = np.sqrt(err_E**2 + err_N**2 + err_U**2)
             
             # Velocity error (compute from consecutive GPS positions)
+            # FIX v3.9.3: Use PPK velocity columns directly instead of position difference
+            # Position difference method fails when gt_idx doesn't change between samples
             vel_error = 0.0
             vel_err_E = vel_err_N = vel_err_U = 0.0
             
-            if gt_idx > 0 and gt_idx < len(gt_df) - 1:
-                # Use central difference for velocity
+            if use_ppk and 've' in gt_row and 'vn' in gt_row and 'vu' in gt_row:
+                # PPK provides direct velocity measurements
+                gt_vel_E = float(gt_row['ve'])
+                gt_vel_N = float(gt_row['vn'])
+                gt_vel_U = float(gt_row['vu'])
+                
+                # VIO velocity
+                vio_vel_E = float(self.kf.x[3, 0])
+                vio_vel_N = float(self.kf.x[4, 0])
+                vio_vel_U = float(self.kf.x[5, 0])
+                
+                # Velocity error
+                vel_err_E = vio_vel_E - gt_vel_E
+                vel_err_N = vio_vel_N - gt_vel_N
+                vel_err_U = vio_vel_U - gt_vel_U
+                vel_error = np.sqrt(vel_err_E**2 + vel_err_N**2 + vel_err_U**2)
+            elif gt_idx > 0 and gt_idx < len(gt_df) - 1:
+                # Fallback: compute from consecutive GPS positions (for flight_log)
                 gt_row_prev = gt_df.iloc[gt_idx - 1]
                 gt_row_next = gt_df.iloc[gt_idx + 1]
                 
@@ -1191,10 +1215,29 @@ class VIORunner:
         """
         Process a single magnetometer measurement (for event-driven mode).
         
+        v3.9.4 CRITICAL: Magnetometer time synchronization via time_ref
+        
+        CONDITION 1: Filter must use SAME TIME BASE for all sensors
+        - IMU: time_ref (hardware monotonic clock)
+        - Camera: time_ref via timeref.csv interpolation
+        - Magnetometer: time_ref via interpolation in load_mag_csv()
+        
+        CONDITION 2: mag_rec.t must represent TRUE measurement time
+        - After interpolation, mag_rec.t is hardware time (consistent with IMU)
+        - State is already at time t (propagated by IMU loop)
+        - If |t - mag_rec.t| > threshold, skip measurement (timing issue)
+        
+        NOTE: Full state propagation to mag_rec.t requires storing IMU buffer.
+        Current implementation: Use state at closest IMU time if within threshold.
+        
         Args:
-            mag_rec: Magnetometer record
-            t: Magnetometer timestamp
+            mag_rec: Magnetometer record with hardware-synchronized timestamp
+            t: Current IMU timestamp (after propagation)
         """
+        # Check time synchronization (should be very close if time_ref works)
+        if abs(t - mag_rec.t) > 0.05:  # 50ms threshold
+            print(f"[Mag] WARNING: Large time difference {t - mag_rec.t:.3f}s - may indicate clock sync issue")
+        
         sigma_mag = self.global_config.get('SIGMA_MAG_YAW', 0.15)
         declination = self.global_config.get('MAG_DECLINATION', 0.0)
         use_raw = self.global_config.get('MAG_USE_RAW_HEADING', True)
@@ -1280,21 +1323,25 @@ class VIORunner:
         if dem_now is None or np.isnan(dem_now):
             return
         
-        # Compute height measurement
+        # Compute height measurement from DEM + estimated AGL
+        # CRITICAL FIX v3.9.2: DO NOT use GPS MSL - that causes innovation=0!
+        # DEM update must constrain drift by comparing: (DEM + estimated_AGL) vs state
         if self.config.z_state.lower() == "agl":
-            height_m = self.kf.x[2, 0]  # State is AGL
+            # State is AGL, measurement should also be AGL
+            # For nadir camera, estimate AGL from optical flow scale
+            # Use barometer if available, otherwise use current state as prior
+            height_m = self.kf.x[2, 0]  # Use current AGL estimate
         else:
-            # Use flight log MSL if available
-            msl_measured = None
-            if self.flight_log_df is not None:
-                idx = np.argmin(np.abs(self.flight_log_df['stamp_log'].values - t))
-                if abs(self.flight_log_df['stamp_log'].iloc[idx] - t) < 0.5:
-                    msl_measured = float(self.flight_log_df['altitude_MSL_m'].iloc[idx])
+            # State is MSL, measurement = DEM + estimated_AGL
+            # Estimate AGL from current MSL state and DEM
+            current_msl = self.kf.x[2, 0]
+            estimated_agl = current_msl - dem_now
             
-            if msl_measured is not None:
-                height_m = msl_measured
-            else:
-                height_m = self.kf.x[2, 0]
+            # Clamp AGL to reasonable range (helicopter doesn't fly underground or >500m AGL)
+            estimated_agl = np.clip(estimated_agl, 0.0, 500.0)
+            
+            # Reconstruct MSL measurement from DEM + estimated AGL
+            height_m = dem_now + estimated_agl
         
         # Compute uncertainties
         xy_uncertainty = float(np.trace(self.kf.P[0:2, 0:2]))

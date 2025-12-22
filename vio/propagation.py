@@ -793,7 +793,7 @@ def augment_state_with_camera(kf: ExtendedKalmanFilter, cam_q_wxyz: np.ndarray,
                               cam_p: np.ndarray, cam_states: list, 
                               cam_observations: list,
                               p_quat: float = 1e-3, p_pos: float = 1.0, 
-                              max_poses: int = 5) -> int:
+                              max_poses: int = 11) -> int:
     """
     Augment EKF state with camera pose for MSCKF sliding window.
     
@@ -976,7 +976,8 @@ def apply_preintegration_at_camera(kf: ExtendedKalmanFilter,
 def clone_camera_for_msckf(kf: ExtendedKalmanFilter, t: float,
                            cam_states: list, cam_observations: list,
                            vio_fe, frame_idx: int,
-                           preint_jacobians: dict = None) -> int:
+                           preint_jacobians: dict = None,
+                           max_clone_size: int = 11) -> int:
     """
     Clone current IMU pose for MSCKF.
     
@@ -998,8 +999,14 @@ def clone_camera_for_msckf(kf: ExtendedKalmanFilter, t: float,
     
     try:
         start_idx = augment_state_with_camera(
-            kf, q_imu, p_imu,
-            cam_states, cam_observations
+            kf=kf,
+            cam_q_wxyz=q_imu,
+            cam_p=p_imu,
+            cam_states=cam_states,
+            cam_observations=cam_observations,
+            p_quat=1e-3,
+            p_pos=1.0,
+            max_poses=max_clone_size
         )
         
         # Store FEJ linearization points

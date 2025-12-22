@@ -1718,8 +1718,9 @@ def trigger_msckf_update(kf, cam_states: list, cam_observations: list,
     num_mature = sum(1 for c in feature_obs_count.values() if c >= 2)
     
     # Decide if we should update
+    # TUNED: Reduced from 20→10 to process features earlier (was causing 77.5% to wait for full window)
     should_update = (
-        num_mature >= 20 or                                    # Many mature features
+        num_mature >= 10 or                                    # Many mature features (reduced from 20)
         len(cam_states) >= 4 or                               # Window getting full
         (vio_fe.frame_idx % 5 == 0 and len(cam_states) >= 3)  # Periodic update
     )
