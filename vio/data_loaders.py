@@ -151,26 +151,58 @@ class DEMReader:
 # =============================================================================
 
 def load_imu_csv(path: str) -> List[IMURecord]:
-    """Load IMU data from CSV file."""
+    """Load IMU data from CSV file.
+    
+    v3.9.0: Uses time_ref (hardware monotonic clock) as unified timestamp.
+    time_ref = Hardware monotonic clock synchronized via PPS (Pulse Per Second)
+    stamp_msg = ROS header.stamp (may have clock offset between sensors)
+    stamp_bag = ROS bag recording time (has network/disk latency)
+    
+    Priority: time_ref (unified HW clock) > stamp_bag (ROS synchronized) > stamp_msg (has offset)
+    
+    Background: MUN-FRL dataset has clock desynchronization between IMU and Camera
+    when using stamp_msg (offset drifts 47ms over 308s), causing VIO failure.
+    time_ref solves this by providing a single hardware clock source for all sensors.
+    """
     if not os.path.exists(path):
         raise FileNotFoundError(f"IMU CSV not found: {path}")
     
     df = pd.read_csv(path)
-    cols = ["stamp_log", "ori_x", "ori_y", "ori_z", "ori_w",
+    
+    # Priority: time_ref (unified HW) > stamp_bag (ROS sync) > stamp_msg (has offset)
+    if "time_ref" in df.columns:
+        t_col = "time_ref"
+        print(f"[IMU] Using unified hardware clock (time_ref) - monotonic clock")
+    elif "stamp_bag" in df.columns:
+        t_col = "stamp_bag"
+        print(f"[IMU] Using ROS synchronized timestamp (stamp_bag)")
+    elif "stamp_msg" in df.columns:
+        t_col = "stamp_msg"
+        print(f"[IMU] WARNING: Using stamp_msg (may have clock offset with camera)")
+    elif "stamp_log" in df.columns:
+        t_col = "stamp_log"
+        print(f"[IMU] WARNING: Using legacy timestamp (stamp_log) - deprecated")
+    else:
+        raise ValueError(f"IMU CSV missing timestamp column (time_ref, stamp_bag, stamp_msg, or stamp_log)")
+    
+    # Check required columns
+    cols = [t_col, "ori_x", "ori_y", "ori_z", "ori_w",
             "ang_x", "ang_y", "ang_z", "lin_x", "lin_y", "lin_z"]
     for c in cols:
         if c not in df.columns:
             raise ValueError(f"IMU CSV missing column: {c}")
     
-    df = df.sort_values("stamp_log").reset_index(drop=True)
+    df = df.sort_values(t_col).reset_index(drop=True)
     recs = []
     for _, r in df.iterrows():
         recs.append(IMURecord(
-            t=float(r["stamp_log"]),
+            t=float(r[t_col]),
             q=np.array([r["ori_x"], r["ori_y"], r["ori_z"], r["ori_w"]], dtype=float),
             ang=np.array([r["ang_x"], r["ang_y"], r["ang_z"]], dtype=float),
             lin=np.array([r["lin_x"], r["lin_y"], r["lin_z"]], dtype=float),
         ))
+    
+    print(f"[IMU] Loaded {len(recs)} samples using {t_col}")
     return recs
 
 
@@ -196,8 +228,22 @@ def load_mag_csv(path: Optional[str]) -> List[MagRecord]:
     return recs
 
 
-def load_images(images_dir: Optional[str], index_csv: Optional[str]) -> List[ImageItem]:
-    """Load image list from directory and index CSV."""
+def load_images(images_dir: Optional[str], index_csv: Optional[str], 
+                timeref_csv: Optional[str] = None) -> List[ImageItem]:
+    """Load image list from directory and index CSV.
+    
+    v3.9.0: Uses time_ref (hardware monotonic clock) to match IMU timestamps.
+    time_ref = Hardware monotonic clock (same as IMU - synchronized)
+    stamp_bag = ROS bag recording time (synchronized by ROS)
+    stamp_msg = camera trigger time (may have offset from IMU clock)
+    
+    Priority: timeref_csv with time_ref > stamp_bag from index > stamp_msg (has offset)
+    
+    Args:
+        images_dir: Directory containing image files
+        index_csv: CSV with stamp_bag/stamp_msg and filename (actual captured images)
+        timeref_csv: CSV with time_ref for camera triggers (includes dropped frames)
+    """
     if not images_dir or not os.path.isdir(images_dir):
         print(f"[Images] Directory not found: {images_dir}")
         return []
@@ -205,19 +251,82 @@ def load_images(images_dir: Optional[str], index_csv: Optional[str]) -> List[Ima
         print(f"[Images] Index CSV not found: {index_csv}")
         return []
     
-    df = pd.read_csv(index_csv)
-    t_cols = [c for c in df.columns if c.lower().startswith("stamp") or c.lower().startswith("time")]
-    f_cols = [c for c in df.columns if "file" in c.lower() or "name" in c.lower()]
+    # Load actual image list (4625 images)
+    df_images = pd.read_csv(index_csv)
     
-    tcol = t_cols[0] if t_cols else None
+    # Check if we have timeref.csv with time_ref (6149 camera triggers)
+    if timeref_csv and os.path.exists(timeref_csv):
+        print(f"[Images] Loading camera time_ref from {os.path.basename(timeref_csv)}")
+        df_timeref = pd.read_csv(timeref_csv)
+        
+        # Match each image to its closest timeref entry to get time_ref
+        if "time_ref" in df_timeref.columns and "stamp_msg" in df_timeref.columns:
+            # Use stamp_msg to match between images_index and timeref
+            match_col = "stamp_msg" if "stamp_msg" in df_images.columns else "stamp_bag"
+            
+            timestamps = []
+            filenames = []
+            fcol = next((c for c in df_images.columns if "file" in c.lower() or "name" in c.lower()), None)
+            
+            for _, img_row in df_images.iterrows():
+                img_stamp = float(img_row[match_col])
+                # Find closest timeref entry (within 50ms for 20Hz timeref @ 50ms interval)
+                time_diffs = np.abs(df_timeref["stamp_msg"].values - img_stamp)
+                closest_idx = np.argmin(time_diffs)
+                
+                if time_diffs[closest_idx] < 0.050:  # 50ms threshold (relaxed from 20ms)
+                    time_ref = float(df_timeref["time_ref"].iloc[closest_idx])
+                    timestamps.append(time_ref)
+                    filenames.append(str(img_row[fcol]).strip())
+            
+            print(f"[Images] Matched {len(timestamps)}/{len(df_images)} images to time_ref")
+            print(f"[Images] Using unified hardware clock (time_ref) - synchronized with IMU")
+            
+            # Build items using matched data
+            items = []
+            skipped = 0
+            for ts, fn_raw in zip(timestamps, filenames):
+                candidates = [
+                    os.path.join(images_dir, fn_raw),
+                    os.path.join(images_dir, os.path.basename(fn_raw)),
+                    fn_raw
+                ]
+                chosen = None
+                for cpath in candidates:
+                    if os.path.exists(cpath):
+                        chosen = cpath
+                        break
+                if chosen is None:
+                    skipped += 1
+                    continue
+                items.append(ImageItem(ts, chosen))
+            
+            items.sort(key=lambda x: x.t)
+            print(f"[Images] Loaded {len(items)} images using time_ref | Missing: {skipped}")
+            return items
+    
+    # Fallback: use timestamps directly from images_index.csv
+    # Priority: stamp_bag (ROS sync) > stamp_msg (has offset)
+    if "stamp_bag" in df_images.columns:
+        tcol = "stamp_bag"
+        print(f"[Images] Using ROS synchronized timestamp (stamp_bag)")
+    elif "stamp_msg" in df_images.columns:
+        tcol = "stamp_msg"
+        print(f"[Images] WARNING: Using stamp_msg (may have clock offset with IMU)")
+    else:
+        # Legacy: auto-detect timestamp column
+        t_cols = [c for c in df_images.columns if c.lower().startswith("stamp") or c.lower().startswith("time")]
+        tcol = t_cols[0] if t_cols else None
+    
+    f_cols = [c for c in df_images.columns if "file" in c.lower() or "name" in c.lower()]
     fcol = f_cols[0] if f_cols else None
     
     if tcol is None or fcol is None:
-        raise ValueError("images_index.csv must have time/stamp and filename columns")
+        raise ValueError("images_index.csv must have timestamp and filename columns")
     
     items = []
     skipped = 0
-    for _, r in df.iterrows():
+    for _, r in df_images.iterrows():
         try:
             ts = float(str(r[tcol]).strip())
         except Exception:
@@ -242,7 +351,7 @@ def load_images(images_dir: Optional[str], index_csv: Optional[str]) -> List[Ima
         items.append(ImageItem(ts, chosen))
     
     items.sort(key=lambda x: x.t)
-    print(f"[Images] Valid: {len(items)} | Missing: {skipped}")
+    print(f"[Images] Loaded {len(items)} images using {tcol} | Missing: {skipped}")
     return items
 
 

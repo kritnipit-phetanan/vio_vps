@@ -90,14 +90,17 @@ imu:
     spinup_altitude_change_thresh: 5.0 # m - altitude change below this = still on ground
     early_velocity_sigma_thresh: 3.0   # m/s - velocity uncertainty above this = unconverged
   
-  # Preintegration-specific (v2.9.9.10: AGGRESSIVE 3× increase)
-  # v2.9.9.9 with 2× still showed 13.1σ overconfidence
-  # Strategy: Increase to 3× to reach target velocity σ of 2-3 m/s
+  # Preintegration-specific (v3.7.2: REDUCE bias random walk to prevent divergence)
+  # Previous v2.9.9.10 with 3× increase caused MASSIVE bias drift:
+  #   - Accel bias: 0 → 3483 mg over flight (DIVERGED!)
+  #   - Gyro bias: 0 → 204 mrad/s (DIVERGED!)
+  #   - Root cause: acc_w/gyr_w too high → bias drifts unconstrained
+  # Strategy: Keep acc_n/gyr_n high for velocity uncertainty, but LOCK DOWN bias drift
   preintegration:
-    acc_n: 0.60        # INCREASED 3× (was 0.20) - aggressive IMU accel noise
-    gyr_n: 0.030       # INCREASED 3× (was 0.010) - aggressive IMU gyro noise
-    acc_w: 0.0015      # INCREASED 3× (was 0.0005) - aggressive accel bias random walk
-    gyr_w: 0.0015      # INCREASED 3× (was 0.0005) - aggressive gyro bias random walk
+    acc_n: 0.60        # Keep 3× (measurement noise for velocity)
+    gyr_n: 0.030       # Keep 3× (measurement noise for attitude)
+    acc_w: 0.00004     # REDUCED 37× (was 0.0015) - LOCK bias estimates
+    gyr_w: 0.0001      # REDUCED 15× (was 0.0015) - LOCK bias estimates
 
 # IMU-GNSS Lever Arm (Body frame to GNSS antenna)
 # Source: https://mun-frl-vil-dataset.readthedocs.io/en/latest/Calibration.html#imu-gnss-extrinsic-calibration

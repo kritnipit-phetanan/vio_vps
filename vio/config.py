@@ -73,6 +73,7 @@ class VIOConfig:
     # Optional data paths (set by CLI)
     images_dir: Optional[str] = None
     images_index_csv: Optional[str] = None
+    timeref_csv: Optional[str] = None
     vps_csv: Optional[str] = None
     mag_csv: Optional[str] = None
     dem_path: Optional[str] = None

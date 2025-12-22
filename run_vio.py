@@ -126,6 +126,8 @@ Examples:
                         help="Directory containing images")
     parser.add_argument("--images_index", type=str, default=None, 
                         help="Path to images_index.csv")
+    parser.add_argument("--timeref_csv", type=str, default=None,
+                        help="Path to camera timeref.csv (time_ref for unified clock)")
     parser.add_argument("--vps", type=str, default=None, 
                         help="Path to VPS results CSV")
     parser.add_argument("--mag", type=str, default=None, 
@@ -181,6 +183,8 @@ def main():
             config.images_dir = args.images_dir
         if args.images_index:
             config.images_index_csv = args.images_index
+        if args.timeref_csv:
+            config.timeref_csv = args.timeref_csv
         if args.vps:
             config.vps_csv = args.vps
         if args.mag:

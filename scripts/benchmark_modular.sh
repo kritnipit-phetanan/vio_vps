@@ -35,12 +35,12 @@ REPO_DIR="$(dirname "$SCRIPT_DIR")"
 
 cd "$REPO_DIR"
 
-# Activate conda environment
-if command -v conda &> /dev/null; then
-    eval "$(conda shell.bash hook)"
-    conda activate 3D_Building_DepthAnyThingV2 2>/dev/null || {
-        echo "⚠️  Warning: Could not activate conda environment"
-    }
+# Activate virtual environment
+if [ -f ".venv/bin/activate" ]; then
+    source .venv/bin/activate
+    echo "✅ Activated virtual environment (.venv)"
+else
+    echo "⚠️  Warning: .venv not found, using system Python"
 fi
 
 # Verify modular package imports work
@@ -64,11 +64,14 @@ echo ""
 # Dataset paths
 CONFIG="configs/config_bell412_dataset3.yaml"
 DATASET_BASE="/Users/france/Downloads/vio_dataset/bell412_dataset3"
-IMU_PATH="${DATASET_BASE}/extracted_data/imu_data/imu__data/imu.csv"
+# v3.9.0: Use imu_with_ref.csv (has time_ref for unified clock)
+IMU_PATH="${DATASET_BASE}/extracted_data_new/imu_data/imu__data_stamped/imu_with_ref.csv"
 QUARRY_PATH="${DATASET_BASE}/flight_log_from_gga.csv"
-IMAGES_DIR="${DATASET_BASE}/extracted_data/cam_data/camera__image_mono/images"
-IMAGES_INDEX="${DATASET_BASE}/extracted_data/cam_data/camera__image_mono/images_index.csv"
-MAG_PATH="${DATASET_BASE}/extracted_data/imu_data/imu__mag/vector3.csv"
+IMAGES_DIR="${DATASET_BASE}/extracted_data_new/cam_data/camera__image_mono/images"
+IMAGES_INDEX="${DATASET_BASE}/extracted_data_new/cam_data/camera__image_mono/images_index.csv"
+# v3.9.0: Add timeref.csv for camera time_ref matching
+TIMEREF_CSV="${DATASET_BASE}/extracted_data_new/imu_data/imu__time_ref_cam/timeref.csv"
+MAG_PATH="${DATASET_BASE}/extracted_data_new/imu_data/imu__mag/vector3.csv"
 DEM_PATH="${DATASET_BASE}/Copernicus_DSM_10_N45_00_W076_00_DEM.tif"
 GROUND_TRUTH="${DATASET_BASE}/bell412_dataset3_frl.pos"
 
@@ -96,17 +99,20 @@ START_TIME=$(date +%s.%N)
 # v3.2.0: VIOConfig Dataclass - Pure YAML reader
 # All settings (including camera_view) from YAML
 # CLI provides only: paths, debug flags
+# v3.9.0: Add --timeref_csv for camera time_ref matching
 python3 run_vio.py \
     --config "$CONFIG" \
     --imu "$IMU_PATH" \
     --quarry "$QUARRY_PATH" \
     --images_dir "$IMAGES_DIR" \
     --images_index "$IMAGES_INDEX" \
+    --timeref_csv "$TIMEREF_CSV" \
     --mag "$MAG_PATH" \
     --dem "$DEM_PATH" \
     --ground_truth "$GROUND_TRUTH" \
     --output "$OUTPUT_DIR" \
-    --save_debug_data 2>&1 | tee "$OUTPUT_DIR/run.log"
+    --save_debug_data \
+    --save_keyframe_images 2>&1 | tee "$OUTPUT_DIR/run.log"
 
 END_TIME=$(date +%s.%N)
 RUNTIME=$(echo "$END_TIME - $START_TIME" | bc)

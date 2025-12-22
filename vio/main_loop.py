@@ -228,7 +228,12 @@ class VIORunner:
         
         # Load main data
         self.imu = load_imu_csv(self.config.imu_path)
-        self.imgs = load_images(self.config.images_dir, self.config.images_index_csv)
+        # v3.9.0: Pass cam_timeref_csv for time_ref matching
+        self.imgs = load_images(
+            self.config.images_dir, 
+            self.config.images_index_csv,
+            self.config.timeref_csv
+        )
         self.vps_list = load_vps_csv(self.config.vps_csv)
         
         # v3.2.0: use_magnetometer is already populated from YAML (magnetometer.enabled)

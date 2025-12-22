@@ -104,11 +104,16 @@ def propagate_error_state_covariance(P: np.ndarray, Phi: np.ndarray,
         P = np.eye(err_dim, dtype=float) * 1e-2
     
     # [DIAGNOSTIC] Check P growth - log if abnormally large
+    # Monitor FULL position covariance (x,y,z) to catch divergence in any axis
     P_trace = np.trace(P)
     P_max = np.max(np.abs(P))
+    P_pos_trace = P[0,0] + P[1,1] + P[2,2]  # Total position variance
+    P_pos_max = max(P[0,0], P[1,1], P[2,2])  # Worst axis
+    
     if P_max > 1e6:
         print(f"[EKF-PROP] WARNING: P growing large: max={P_max:.2e}, trace={P_trace:.2e}")
-        print(f"[EKF-PROP]   → P_pos={P[0,0]:.1f}, P_vel={P[3,3]:.2f}, P_yaw={P[8,8]:.4f}")
+        print(f"[EKF-PROP]   → P_pos: xx={P[0,0]:.1f}, yy={P[1,1]:.1f}, zz={P[2,2]:.1f}, trace={P_pos_trace:.1f}")
+        print(f"[EKF-PROP]   → P_vel={P[3,3]:.2f}, P_yaw={P[8,8]:.4f}")
     
     # VALIDATION: Check P matrix validity before propagation
     # This prevents divide-by-zero and overflow from corrupted covariance

@@ -632,6 +632,25 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
     # Quality over quantity BUT account for filter divergence
     if depth0 < -0.5 or depth1 < -0.5:
         MSCKF_STATS['fail_depth_sign'] += 1
+        
+        # [DIAGNOSTIC] Log first 10 failures + every 5000th to diagnose root cause
+        should_log = (MSCKF_STATS['fail_depth_sign'] <= 10 or 
+                     MSCKF_STATS['fail_depth_sign'] % 5000 == 1)
+        if should_log and debug:
+            print(f"[MSCKF-DIAG] fail_depth_sign #{MSCKF_STATS['fail_depth_sign']}:")
+            print(f"  depth0={depth0:.3f}m, depth1={depth1:.3f}m")
+            print(f"  baseline={baseline:.3f}m, ray_angle={np.degrees(ray_angle):.1f}°")
+            
+            # Geometry diagnosis
+            if baseline < 0.1:
+                print(f"  → POOR GEOMETRY: baseline < 0.1m (too close)")
+            elif np.degrees(ray_angle) < 5.0:
+                print(f"  → POOR GEOMETRY: ray_angle < 5° (insufficient parallax)")
+            elif depth0 < 0 and depth1 < 0:
+                print(f"  → BOTH NEGATIVE: Likely camera frame flip or pt_norm mismatch")
+            else:
+                print(f"  → SINGLE NEGATIVE: Likely geometry issue or time misalignment")
+        
         return None
     
     # Maximum depth check
@@ -703,6 +722,23 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
         
         if p_c[2] < min_depth_threshold:
             MSCKF_STATS['fail_depth_sign'] += 1
+            
+            # [DIAGNOSTIC] Log to detect camera frame issues
+            should_log = (MSCKF_STATS['fail_depth_sign'] <= 10 or 
+                         MSCKF_STATS['fail_depth_sign'] % 5000 == 1)
+            if should_log and debug:
+                print(f"[MSCKF-DIAG] Camera-frame depth failure #{MSCKF_STATS['fail_depth_sign']}:")
+                print(f"  p_c=[{p_c[0]:.2f}, {p_c[1]:.2f}, {p_c[2]:.2f}] (camera frame)")
+                print(f"  threshold={min_depth_threshold:.3f}m (adaptive, pos_sigma={pos_sigma:.1f}m)")
+                
+                # Diagnosis
+                if p_c[2] < 0:
+                    print(f"  → NEGATIVE DEPTH: Camera frame axis may be flipped (check extrinsics)")
+                elif pos_sigma > 20:
+                    print(f"  → HIGH UNCERTAINTY: pos_sigma={pos_sigma:.1f}m → threshold relaxed but still failing")
+                else:
+                    print(f"  → MARGINAL: depth slightly below threshold, likely geometry issue")
+            
             return None
         
         # Compute normalized coordinates (legacy method - always used)
@@ -736,12 +772,19 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
                         return None
     
     avg_error = total_error / len(obs_list)
+    norm_threshold = MAX_REPROJ_ERROR_PX / 120.0
     
-    # v2.9.10.0: Scale normalized error threshold adaptively
-    # 20px → 0.15, 15px → 0.12, 12px → 0.10, 10px → 0.08
-    norm_threshold = MAX_REPROJ_ERROR_PX / 120.0  # Linear scaling
     if avg_error > norm_threshold:
         MSCKF_STATS['fail_reproj_error'] += 1
+        
+        # [DIAGNOSTIC] Log reprojection failures to identify root cause
+        # Causes: 1) intrinsic/extrinsic calibration error (especially fisheye KB params)
+        #         2) outlier feature / data association mismatch
+        #         3) high uncertainty / poor triangulation geometry
+        if MSCKF_STATS['fail_reproj_error'] % 500 == 1 and debug:
+            print(f"[MSCKF-DIAG] fail_reproj_error #{MSCKF_STATS['fail_reproj_error']}: fid={fid}, avg_norm_error={avg_error:.4f}, threshold={norm_threshold:.4f}")
+            print(f"  WARNING: Using /120.0 scaling - should use /fx for proper threshold!")
+        
         return None
     
     MSCKF_STATS['success'] += 1
