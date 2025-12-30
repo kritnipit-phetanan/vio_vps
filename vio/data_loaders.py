@@ -288,15 +288,10 @@ def load_mag_csv(path: Optional[str], timeref_csv: Optional[str] = None) -> List
     
     df = pd.read_csv(path)
     
-    # Find timestamp column (priority: time_ref > stamp_msg > stamp_bag)
-    # CRITICAL v3.9.5: Prefer stamp_msg when timeref_csv available to enable conversion
+    # Find timestamp column (priority: time_ref > stamp_bag > stamp_msg)
     if "time_ref" in df.columns:
         tcol = "time_ref"
         print(f"[Mag] Using unified hardware clock (time_ref) - already synchronized!")
-    elif "stamp_msg" in df.columns and timeref_csv and os.path.exists(timeref_csv):
-        # Prefer stamp_msg when we can convert it to time_ref
-        tcol = "stamp_msg"
-        print(f"[Mag] Using stamp_msg (will convert to time_ref via hardware clock)")
     elif "stamp_bag" in df.columns:
         tcol = "stamp_bag"
         print(f"[Mag] Using stamp_bag (ROS recording time)")
