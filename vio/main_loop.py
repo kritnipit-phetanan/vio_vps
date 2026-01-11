@@ -41,8 +41,7 @@ from .config import load_config, VIOConfig, CAMERA_VIEW_CONFIGS
 from .data_loaders import (
     load_imu_csv, load_images, load_vps_csv, 
     load_mag_csv, load_ppk_initial_state, load_ppk_trajectory,
-    load_msl_from_gga, load_quarry_initial,
-    DEMReader, ProjectionCache
+    load_msl_from_gga, DEMReader, ProjectionCache
 )
 from .ekf import ExtendedKalmanFilter
 from .state_manager import initialize_ekf_state, imu_to_gnss_position
@@ -212,22 +211,22 @@ class VIORunner:
         if self.config.ground_truth_path:
             self.ppk_state = load_ppk_initial_state(self.config.ground_truth_path)
         
-        # Load initial position from PPK or GGA
+        # Load initial position from PPK (required for GPS-denied operation)
         if self.ppk_state is not None:
             self.lat0 = self.ppk_state.lat
             self.lon0 = self.ppk_state.lon
             v_init = np.array([self.ppk_state.ve, self.ppk_state.vn, self.ppk_state.vu])
             print(f"[INIT] Using PPK for lat/lon/velocity")
         else:
-            self.lat0, self.lon0, _, v_init = load_quarry_initial(self.config.quarry_path)
-            print(f"[INIT] Using GGA for lat/lon/velocity")
+            raise RuntimeError("[INIT] PPK file is required for initialization. Check ppk_csv path in config.")
         
         self.v_init = v_init
         
-        # Always use GGA for MSL (PPK has ellipsoidal height)
+        # Use GGA for MSL (PPK has ellipsoidal height), fallback to PPK height
         self.msl0 = load_msl_from_gga(self.config.quarry_path)
         if self.msl0 is None:
-            _, _, self.msl0, _ = load_quarry_initial(self.config.quarry_path)
+            self.msl0 = self.ppk_state.height  # Use PPK ellipsoidal height as fallback
+            print(f"[INIT] GGA not found, using PPK height: {self.msl0:.1f}m")
         
         # Load main data
         self.imu = load_imu_csv(self.config.imu_path)

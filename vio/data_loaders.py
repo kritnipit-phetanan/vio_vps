@@ -685,38 +685,3 @@ def load_msl_from_gga(path: str) -> Optional[float]:
     except Exception:
         return None
 
-
-def load_quarry_initial(path: str) -> Tuple[float, float, float, np.ndarray]:
-    """Load initial position and velocity from GGA file."""
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"GGA file not found: {path}")
-    
-    df = pd.read_csv(path)
-    
-    lat_col = next((c for c in df.columns if c.lower() in ["lat", "lat_dd"]), None)
-    lon_col = next((c for c in df.columns if c.lower() in ["lon", "lon_dd"]), None)
-    msl_col = next((c for c in df.columns if "altitude_msl_m" in c.lower()), None)
-    
-    if lat_col is None or lon_col is None or msl_col is None:
-        raise ValueError("GGA file must have lat_dd, lon_dd, altitude_MSL_m")
-    
-    row0 = df.iloc[0]
-    lat0 = float(row0[lat_col])
-    lon0 = float(row0[lon_col])
-    msl_m = float(row0[msl_col])
-    
-    # Read velocity if available
-    v_init = np.zeros(3, dtype=float)
-    vx_col = next((c for c in df.columns if "xspeed" in c.lower()), None)
-    vy_col = next((c for c in df.columns if "yspeed" in c.lower()), None)
-    vz_col = next((c for c in df.columns if "zspeed" in c.lower()), None)
-    
-    if vx_col and vy_col and vz_col:
-        v_init = np.array([
-            float(row0[vx_col]) * 0.44704,  # mph to m/s
-            float(row0[vy_col]) * 0.44704,
-            float(row0[vz_col]) * 0.44704,
-        ], dtype=float)
-    
-    print(f"[GGA] Initial: lat={lat0:.6f}°, lon={lon0:.6f}°, MSL={msl_m:.1f}m")
-    return lat0, lon0, msl_m, v_init
