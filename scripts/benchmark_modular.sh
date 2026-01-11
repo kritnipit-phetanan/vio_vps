@@ -111,8 +111,7 @@ python3 run_vio.py \
     --dem "$DEM_PATH" \
     --ground_truth "$GROUND_TRUTH" \
     --output "$OUTPUT_DIR" \
-    --save_debug_data \
-    --save_keyframe_images 2>&1 | tee "$OUTPUT_DIR/run.log"
+    --save_debug_data 2>&1 | tee "$OUTPUT_DIR/run.log"
 
 END_TIME=$(date +%s.%N)
 RUNTIME=$(echo "$END_TIME - $START_TIME" | bc)

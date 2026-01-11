@@ -21,34 +21,68 @@ from pyproj import CRS, Transformer
 # Projection Cache
 # =============================================================================
 
-_proj_cache = {"origin": None, "to_xy": None, "to_ll": None}
-
-
-def ensure_local_proj(origin_lat: float, origin_lon: float):
-    """Initialize local projection centered at origin."""
-    global _proj_cache
-    if _proj_cache["origin"] != (origin_lat, origin_lon) or _proj_cache["to_xy"] is None:
-        crs_wgs84 = CRS.from_epsg(4326)
-        crs_aeqd = CRS.from_proj4(
-            f"+proj=aeqd +lat_0={origin_lat} +lon_0={origin_lon} +datum=WGS84 +units=m +no_defs"
-        )
-        _proj_cache["to_xy"] = Transformer.from_crs(crs_wgs84, crs_aeqd, always_xy=True)
-        _proj_cache["to_ll"] = Transformer.from_crs(crs_aeqd, crs_wgs84, always_xy=True)
-        _proj_cache["origin"] = (origin_lat, origin_lon)
-
-
-def latlon_to_xy(lat: float, lon: float, origin_lat: float, origin_lon: float) -> np.ndarray:
-    """Convert lat/lon to local XY (meters) centered at origin."""
-    ensure_local_proj(origin_lat, origin_lon)
-    x, y = _proj_cache["to_xy"].transform(lon, lat)
-    return np.array([x, y], dtype=float)
-
-
-def xy_to_latlon(px: float, py: float, origin_lat: float, origin_lon: float) -> Tuple[float, float]:
-    """Convert local XY (meters) to lat/lon."""
-    ensure_local_proj(origin_lat, origin_lon)
-    lon, lat = _proj_cache["to_ll"].transform(px, py)
-    return float(lat), float(lon)
+class ProjectionCache:
+    """
+    Projection cache for coordinate transformation.
+    
+    Manages projection transformers between WGS84 (lat/lon) and local 
+    Azimuthal Equidistant coordinates (XY in meters).
+    
+    Use this class directly when you need isolated projection state 
+    (e.g., multiple VIO sessions). For single-session use, the module-level 
+    wrapper functions (latlon_to_xy, xy_to_latlon) are available.
+    
+    Example:
+        # Using class directly
+        proj = ProjectionCache()
+        xy = proj.latlon_to_xy(35.0, 139.0, 35.0, 139.0)
+        
+        # Using wrapper functions (backward compatible)
+        from vio.data_loaders import latlon_to_xy
+        xy = latlon_to_xy(35.0, 139.0, 35.0, 139.0)
+    """
+    
+    def __init__(self):
+        """Initialize empty projection cache."""
+        self._origin: Optional[Tuple[float, float]] = None
+        self._to_xy: Optional[Transformer] = None
+        self._to_ll: Optional[Transformer] = None
+    
+    def ensure_proj(self, origin_lat: float, origin_lon: float) -> None:
+        """Initialize local projection centered at origin if needed."""
+        if self._origin != (origin_lat, origin_lon) or self._to_xy is None:
+            crs_wgs84 = CRS.from_epsg(4326)
+            crs_aeqd = CRS.from_proj4(
+                f"+proj=aeqd +lat_0={origin_lat} +lon_0={origin_lon} +datum=WGS84 +units=m +no_defs"
+            )
+            self._to_xy = Transformer.from_crs(crs_wgs84, crs_aeqd, always_xy=True)
+            self._to_ll = Transformer.from_crs(crs_aeqd, crs_wgs84, always_xy=True)
+            self._origin = (origin_lat, origin_lon)
+    
+    def latlon_to_xy(self, lat: float, lon: float, 
+                     origin_lat: float, origin_lon: float) -> np.ndarray:
+        """Convert lat/lon to local XY (meters) centered at origin."""
+        self.ensure_proj(origin_lat, origin_lon)
+        x, y = self._to_xy.transform(lon, lat)
+        return np.array([x, y], dtype=float)
+    
+    def xy_to_latlon(self, px: float, py: float, 
+                     origin_lat: float, origin_lon: float) -> Tuple[float, float]:
+        """Convert local XY (meters) to lat/lon."""
+        self.ensure_proj(origin_lat, origin_lon)
+        lon, lat = self._to_ll.transform(px, py)
+        return float(lat), float(lon)
+    
+    def reset(self) -> None:
+        """Reset cache for new session."""
+        self._origin = None
+        self._to_xy = None
+        self._to_ll = None
+    
+    @property
+    def origin(self) -> Optional[Tuple[float, float]]:
+        """Current origin (lat, lon) or None if not initialized."""
+        return self._origin
 
 
 # =============================================================================
@@ -98,13 +132,17 @@ class VPSItem:
 
 @dataclass
 class PPKInitialState:
-    """Initial state from PPK ground truth file."""
+    """Initial state from PPK ground truth file (GPS-denied: single t=0 value).
+    
+    v3.9.0: All values come from a single row at t=0, ensuring GPS-denied compliance.
+    Uses yaw directly from PPK file (attitude yaw, not computed).
+    """
     lat: float  # degrees
     lon: float  # degrees
     height: float  # meters (ellipsoidal)
     roll: float  # radians (NED frame)
     pitch: float  # radians (NED frame)
-    yaw: float  # radians (NED frame)
+    yaw: float  # radians (NED frame) - attitude yaw
     ve: float  # m/s East velocity
     vn: float  # m/s North velocity
     vu: float  # m/s Up velocity
@@ -308,29 +346,43 @@ def load_mag_csv(path: Optional[str], timeref_csv: Optional[str] = None) -> List
     
     df = df.sort_values(tcol).reset_index(drop=True)
     
-    # If using stamp_msg and time_ref CSV is available, convert to hardware time
-    if tcol == "stamp_msg" and timeref_csv and os.path.exists(timeref_csv):
+    # If using stamp_msg or stamp_bag and time_ref CSV is available, convert to hardware time
+    if tcol in ["stamp_msg", "stamp_bag"] and timeref_csv and os.path.exists(timeref_csv):
         try:
             # Load time_ref mapping
             timeref_df = pd.read_csv(timeref_csv)
-            if "time_ref" in timeref_df.columns and "stamp_msg" in timeref_df.columns:
-                time_ref_pairs = list(zip(
-                    timeref_df["stamp_msg"].values,
-                    timeref_df["time_ref"].values
-                ))
+            
+            # Try to find matching timestamp column in time_ref CSV
+            if "time_ref" in timeref_df.columns:
+                # Use the same column name that exists in timeref CSV
+                if tcol in timeref_df.columns:
+                    ros_col = tcol
+                elif "stamp_msg" in timeref_df.columns:
+                    ros_col = "stamp_msg"
+                elif "stamp_bag" in timeref_df.columns:
+                    ros_col = "stamp_bag"
+                else:
+                    ros_col = None
+                    print(f"[Mag] WARNING: time_ref CSV missing ROS timestamp column")
                 
-                # Convert all magnetometer timestamps using interpolation
-                t_ros_array = df[tcol].values
-                t_hw_array = interpolate_time_ref(t_ros_array, time_ref_pairs)
-                
-                # Replace timestamp column with hardware time
-                df["time_ref"] = t_hw_array
-                tcol = "time_ref"
-                
-                print(f"[Mag] Converted {len(df)} timestamps: stamp_msg → time_ref (hardware clock)")
-                print(f"[Mag] Time range: {t_hw_array[0]:.3f} → {t_hw_array[-1]:.3f} s")
+                if ros_col:
+                    time_ref_pairs = list(zip(
+                        timeref_df[ros_col].values,
+                        timeref_df["time_ref"].values
+                    ))
+                    
+                    # Convert all magnetometer timestamps using interpolation
+                    t_ros_array = df[tcol].values
+                    t_hw_array = interpolate_time_ref(t_ros_array, time_ref_pairs)
+                    
+                    # Replace timestamp column with hardware time
+                    df["time_ref"] = t_hw_array
+                    tcol = "time_ref"
+                    
+                    print(f"[Mag] Converted {len(df)} timestamps: {ros_col} → time_ref (hardware clock)")
+                    print(f"[Mag] Time range: {t_hw_array[0]:.3f} → {t_hw_array[-1]:.3f} s")
             else:
-                print(f"[Mag] WARNING: time_ref CSV missing required columns (time_ref, stamp_msg)")
+                print(f"[Mag] WARNING: time_ref CSV missing time_ref column")
         except Exception as e:
             print(f"[Mag] WARNING: Failed to load time_ref mapping: {e}")
     
@@ -504,7 +556,16 @@ def load_vps_csv(path: Optional[str]) -> List[VPSItem]:
 
 
 def load_ppk_initial_state(path: str) -> Optional[PPKInitialState]:
-    """Load initial state from PPK ground truth file (.pos)."""
+    """Load initial state from PPK ground truth file (.pos).
+    
+    v3.9.0: GPS-DENIED COMPLIANT - All values from single row at t=0.
+    
+    Args:
+        path: Path to PPK .pos file
+        
+    Returns:
+        PPKInitialState with initial position, attitude, and velocity
+    """
     if path is None or not os.path.exists(path):
         return None
     
@@ -520,6 +581,7 @@ def load_ppk_initial_state(path: str) -> Optional[PPKInitialState]:
             return None
         
         timestamp = f"{parts[0]} {parts[1]}"
+        
         state = PPKInitialState(
             lat=float(parts[2]),
             lon=float(parts[3]),
@@ -533,87 +595,20 @@ def load_ppk_initial_state(path: str) -> Optional[PPKInitialState]:
             timestamp=timestamp
         )
         
-        print(f"\n[PPK] Initial state loaded:")
-        print(f"  Position: lat={state.lat:.6f}°, lon={state.lon:.6f}°")
+        vel_mag = np.sqrt(state.ve**2 + state.vn**2 + state.vu**2)
+        
+        print(f"\n[PPK] Initial state loaded (GPS-denied compliant: single t=0 value):")
+        print(f"  Position: lat={state.lat:.6f}°, lon={state.lon:.6f}°, h={state.height:.1f}m")
         print(f"  Attitude (NED): roll={np.degrees(state.roll):.1f}°, "
               f"pitch={np.degrees(state.pitch):.1f}°, yaw={np.degrees(state.yaw):.1f}°")
+        print(f"  Velocity: ve={state.ve:.2f}, vn={state.vn:.2f}, vu={state.vu:.2f} m/s (|v|={vel_mag:.2f})")
+        
         return state
         
     except Exception as e:
         print(f"[WARN] Failed to load PPK: {e}")
         return None
 
-
-def get_ppk_initial_heading(ppk_trajectory: Optional[pd.DataFrame], 
-                            lat0: float, lon0: float, 
-                            duration: float = 0.0) -> Optional[float]:
-    """Extract initial heading from PPK trajectory (GPS-denied: single value at t=0).
-    
-    v2.9.10.2 FIX: If vehicle is stationary at t=0, return None and let caller
-    use PPK attitude yaw instead (which is also a single value at t=0).
-    
-    STRATEGY:
-    - Priority 1: Velocity heading from first 2 samples (if moving)
-    - Priority 2: Fall back to None → caller uses PPK attitude yaw (single value)
-    
-    GPS-denied compliant: Uses only t=0 state (velocity or attitude).
-    
-    Args:
-        ppk_trajectory: PPK ground truth DataFrame
-        lat0: Origin latitude (degrees)
-        lon0: Origin longitude (degrees)
-        duration: DEPRECATED - now always uses 2 samples
-    
-    Returns:
-        Initial heading in radians (ENU frame), or None if stationary
-    """
-    if ppk_trajectory is None or len(ppk_trajectory) < 2:
-        return None
-    
-    try:
-        # GPS-DENIED FIX: Use ONLY first 2 samples (t=0 and t≈0.05s)
-        ppk_2samples = ppk_trajectory.iloc[:2].copy()
-        
-        # Convert lat/lon to local ENU coordinates
-        lats = ppk_2samples['lat'].values
-        lons = ppk_2samples['lon'].values
-        times = ppk_2samples['stamp_log'].values
-        
-        xy0 = latlon_to_xy(lats[0], lons[0], lat0, lon0)
-        xy1 = latlon_to_xy(lats[1], lons[1], lat0, lon0)
-        
-        # Compute velocity from first 2 samples only
-        dx = xy1[0] - xy0[0]
-        dy = xy1[1] - xy0[1]
-        dt = times[1] - times[0]
-        
-        if dt < 1e-6:
-            print(f"[PPK Init Heading] Error: dt too small ({dt:.6f}s)")
-            return None
-        
-        vx = dx / dt
-        vy = dy / dt
-        vel_mag = np.sqrt(vx**2 + vy**2)
-        
-        # Check if moving (velocity > 0.5 m/s)
-        if vel_mag < 0.5:
-            print(f"[PPK Init Heading] Vehicle stationary at t=0 (vel={vel_mag:.2f} m/s < 0.5 m/s)")
-            print(f"[PPK Init Heading] → Will use PPK attitude yaw instead (also single t=0 value)")
-            return None
-        
-        # Compute heading from velocity vector at t=0
-        heading = np.arctan2(vy, vx)
-        
-        print(f"[PPK Init Heading] Extracted from t=0 velocity (GPS-denied compliant):")
-        print(f"  Samples: 2 (t=0 and t={dt:.3f}s)")
-        print(f"  Velocity: vx={vx:.2f}, vy={vy:.2f}, |v|={vel_mag:.2f} m/s")
-        print(f"  Heading: {np.degrees(heading):.1f}° (ENU)")
-        
-        return float(heading)
-        
-    except Exception as e:
-        print(f"[WARN] Failed to extract PPK initial heading: {e}")
-        return None
 
 
 def load_ppk_trajectory(path: str) -> Optional[pd.DataFrame]:

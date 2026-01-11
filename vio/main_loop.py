@@ -42,7 +42,7 @@ from .data_loaders import (
     load_imu_csv, load_images, load_vps_csv, 
     load_mag_csv, load_ppk_initial_state, load_ppk_trajectory,
     load_msl_from_gga, load_quarry_initial,
-    DEMReader, ensure_local_proj
+    DEMReader, ProjectionCache
 )
 from .ekf import ExtendedKalmanFilter
 from .state_manager import initialize_ekf_state, imu_to_gnss_position
@@ -54,7 +54,7 @@ from .propagation import (
     apply_preintegration_at_camera, clone_camera_for_msckf,
     get_flight_phase  # v3.3.0: State-based phase detection
 )
-from .vps_integration import apply_vps_update, xy_to_latlon, latlon_to_xy
+from .vps_integration import apply_vps_update, compute_vps_innovation
 from .msckf import perform_msckf_updates, print_msckf_stats, trigger_msckf_update
 from .plane_detection import PlaneDetector
 from .measurement_updates import (
@@ -186,6 +186,9 @@ class VIORunner:
         # Last gyro for mag filtering
         self.last_gyro_z = 0.0
         self.last_imu_dt = 0.01
+        
+        # Projection cache for coordinate conversion
+        self.proj_cache = ProjectionCache()
     
     def load_config(self) -> dict:
         """Load YAML configuration file."""
@@ -270,7 +273,7 @@ class VIORunner:
     def initialize_ekf(self):
         """Initialize EKF state and covariance."""
         # Ensure local projection is set up
-        ensure_local_proj(self.lat0, self.lon0)
+        self.proj_cache.ensure_proj(self.lat0, self.lon0)
         
         # Sample DEM at origin
         self.dem0 = self.dem.sample_m(self.lat0, self.lon0) if self.dem.ds else None
@@ -309,14 +312,17 @@ class VIORunner:
         
         lever_arm = self.global_config.get('IMU_GNSS_LEVER_ARM', np.zeros(3))
         
-        # v2.9.10.1 FIX: Extract PPK initial heading (GPS-denied: 2 samples only)
-        # FIXED: Now uses only first 2 samples (t=0 velocity) instead of 30s trajectory
+        # v3.9.0 GPS-DENIED COMPLIANT: Use yaw directly from ppk_state (single t=0 value)
+        # CRITICAL: Convert from NED frame (PPK file) to ENU frame (EKF uses ENU)
+        # NED: 0 = North, positive = clockwise
+        # ENU: 0 = East, positive = counter-clockwise
+        # Conversion: yaw_enu = π/2 - yaw_ned
         ppk_initial_heading = None
-        if self.ppk_trajectory is not None:
-            from .data_loaders import get_ppk_initial_heading
-            ppk_initial_heading = get_ppk_initial_heading(
-                self.ppk_trajectory, self.lat0, self.lon0
-            )
+        if self.ppk_state is not None:
+            yaw_ned = self.ppk_state.yaw  # Attitude yaw from PPK file (NED frame)
+            yaw_enu = np.pi/2 - yaw_ned  # Convert to ENU frame
+            yaw_enu = np.arctan2(np.sin(yaw_enu), np.cos(yaw_enu))  # Normalize to [-π, π]
+            ppk_initial_heading = yaw_enu
         
         # MAG params for initial correction
         # v2.9.10.12: Include hard_iron and soft_iron for proper initial calibration
@@ -633,7 +639,7 @@ class VIORunner:
             
             # Compute innovation and Mahalanobis distance
             vps_xy, innovation, m2_test = compute_vps_innovation(
-                vps, self.kf, self.lat0, self.lon0
+                vps, self.kf, self.lat0, self.lon0, self.proj_cache
             )
             
             # Compute adaptive acceptance threshold
@@ -866,7 +872,7 @@ class VIORunner:
                 # Get ground truth error for NEES calculation (v2.9.9.8)
                 vel_error, vel_cov = get_ground_truth_error(
                     t_cam, self.kf, self.ppk_trajectory, self.flight_log_df,
-                    self.lat0, self.lon0, 'velocity')
+                    self.lat0, self.lon0, self.proj_cache, 'velocity')
                 
                 apply_vio_velocity_update(
                     kf=self.kf,
@@ -883,6 +889,7 @@ class VIORunner:
                     lon0=self.lon0,
                     z_state=self.config.z_state,
                     use_vio_velocity=True,  # Always True when entering this block
+                    proj_cache=self.proj_cache,
                     save_debug=self.config.save_debug_data,
                     residual_csv=self.residual_csv if self.config.save_debug_data else None,
                     vio_frame=self.state.vio_frame,
@@ -971,7 +978,7 @@ class VIORunner:
                 gt_lon = gt_row['lon_dd']
                 gt_alt = gt_row['altitude_MSL_m']
             
-            gt_E, gt_N = latlon_to_xy(gt_lat, gt_lon, self.lat0, self.lon0)
+            gt_E, gt_N = self.proj_cache.latlon_to_xy(gt_lat, gt_lon, self.lat0, self.lon0)
             gt_U = gt_alt
             
             # VIO prediction (IMU position)
@@ -1027,13 +1034,13 @@ class VIORunner:
                 dt = gt_row_next['stamp_log'] - gt_row_prev['stamp_log']
                 if dt > 0.01:  # Avoid division by zero
                     if use_ppk:
-                        gt_E_prev, gt_N_prev = latlon_to_xy(gt_row_prev['lat'], gt_row_prev['lon'], self.lat0, self.lon0)
-                        gt_E_next, gt_N_next = latlon_to_xy(gt_row_next['lat'], gt_row_next['lon'], self.lat0, self.lon0)
+                        gt_E_prev, gt_N_prev = self.proj_cache.latlon_to_xy(gt_row_prev['lat'], gt_row_prev['lon'], self.lat0, self.lon0)
+                        gt_E_next, gt_N_next = self.proj_cache.latlon_to_xy(gt_row_next['lat'], gt_row_next['lon'], self.lat0, self.lon0)
                         gt_U_prev = gt_row_prev['height']
                         gt_U_next = gt_row_next['height']
                     else:
-                        gt_E_prev, gt_N_prev = latlon_to_xy(gt_row_prev['lat_dd'], gt_row_prev['lon_dd'], self.lat0, self.lon0)
-                        gt_E_next, gt_N_next = latlon_to_xy(gt_row_next['lat_dd'], gt_row_next['lon_dd'], self.lat0, self.lon0)
+                        gt_E_prev, gt_N_prev = self.proj_cache.latlon_to_xy(gt_row_prev['lat_dd'], gt_row_prev['lon_dd'], self.lat0, self.lon0)
+                        gt_E_next, gt_N_next = self.proj_cache.latlon_to_xy(gt_row_next['lat_dd'], gt_row_next['lon_dd'], self.lat0, self.lon0)
                         gt_U_prev = gt_row_prev['altitude_MSL_m']
                         gt_U_next = gt_row_next['altitude_MSL_m']
                     
@@ -1174,7 +1181,7 @@ class VIORunner:
         
         # Compute innovation and Mahalanobis distance
         vps_xy, innovation, m2_test = compute_vps_innovation(
-            vps, self.kf, self.lat0, self.lon0
+            vps, self.kf, self.lat0, self.lon0, self.proj_cache
         )
         
         # Compute adaptive acceptance threshold
@@ -1312,7 +1319,7 @@ class VIORunner:
         sigma_height = self.global_config.get('SIGMA_AGL_Z', 2.5)
         
         # Get current position
-        lat_now, lon_now = xy_to_latlon(
+        lat_now, lon_now = self.proj_cache.xy_to_latlon(
             self.kf.x[0, 0], self.kf.x[1, 0],
             self.lat0, self.lon0
         )
@@ -1386,7 +1393,7 @@ class VIORunner:
         """
         # Use pre-computed values if provided, otherwise compute from current state
         if lat_now is None or lon_now is None:
-            lat_now, lon_now = xy_to_latlon(
+            lat_now, lon_now = self.proj_cache.xy_to_latlon(
                 self.kf.x[0, 0], self.kf.x[1, 0],
                 self.lat0, self.lon0
             )

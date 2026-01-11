@@ -114,9 +114,10 @@ def apply_magnetometer_update(kf,
         if filter_info.get('gyro_inconsistent', False):
             _MAG_STATE['reject_gyro_inconsistent'] += 1
     
-    # Skip during convergence if PPK provided initial yaw
-    if in_convergence and has_ppk_yaw:
-        return False, "PPK convergence period"
+    # v3.9.0: REMOVED - PPK convergence skip was blocking ALL mag updates
+    # Mag updates should still work during convergence with reduced weight
+    # if in_convergence and has_ppk_yaw:
+    #     return False, "PPK convergence period"
     
     # Track total attempts
     _MAG_STATE['total_attempts'] += 1
@@ -668,6 +669,7 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
                                imu_rec, global_config: dict, camera_view: str,
                                dem_reader, lat0: float, lon0: float,
                                z_state: str, use_vio_velocity: bool,
+                               proj_cache,
                                save_debug: bool = False,
                                residual_csv: Optional[str] = None,
                                vio_frame: int = -1,
@@ -697,6 +699,7 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
         lat0, lon0: Origin coordinates
         z_state: Z state representation ("msl" or "agl")
         use_vio_velocity: Whether to apply velocity update
+        proj_cache: ProjectionCache instance for coordinate conversion
         save_debug: Enable debug logging
         residual_csv: Path to residual CSV
         vio_frame: Current VIO frame index
@@ -707,7 +710,7 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
     """
     from scipy.spatial.transform import Rotation as R_scipy
     from .config import CAMERA_VIEW_CONFIGS
-    from .vps_integration import xy_to_latlon
+    from .data_loaders import ProjectionCache
     
     kb_params = global_config.get('KB_PARAMS', {'mu': 600})
     sigma_vo = global_config.get('SIGMA_VO', 0.5)
@@ -774,7 +777,7 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
         agl = initial_agl
     else:
         # Fallback: dynamic AGL from current state (original behavior)
-        lat_now, lon_now = xy_to_latlon(kf.x[0, 0], kf.x[1, 0], lat0, lon0)
+        lat_now, lon_now = proj_cache.xy_to_latlon(kf.x[0, 0], kf.x[1, 0], lat0, lon0)
         dem_now = dem_reader.sample_m(lat_now, lon_now) if dem_reader.ds else 0.0
         if dem_now is None or np.isnan(dem_now):
             dem_now = 0.0

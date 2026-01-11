@@ -153,7 +153,7 @@ plane:
 # v2.9.10.12: Re-enabling magnetometer to fix yaw drift
 # Without magnetometer, yaw drifts 90° in 51 seconds from gyro bias alone
 magnetometer:
-  enabled: true   # v2.9.10.12: RE-ENABLED - required for yaw observability
+  enabled: false   # v2.9.10.12: RE-ENABLED - required for yaw observability
   
   # Hard-iron offset (CALIBRATED - normalized units)
   hard_iron_offset: [0.243467, -0.194837, 0.341668]
@@ -217,7 +217,7 @@ process_noise:
   # NOTE: sigma_vo removed - use vio.sigma_vo instead (line 211)
   sigma_vps_xy: 0.8          # VPS position measurement [m]
   sigma_agl_z: 1.0           # Height/DEM constraint
-  sigma_mag_yaw: 0.15        # RE-ENABLED: ~17° (std from GPS calibration = 16°, add margin)
+  sigma_mag_yaw: 0.35        # INCREASED: ~20° (was 0.15 ~8.6°) - reduce MAG aggressiveness to prevent yaw divergence
 
 # VIO/VO Parameters
 # TUNED FOR SLOW MOTION / HOVERING (Bell 412 dataset characteristics)

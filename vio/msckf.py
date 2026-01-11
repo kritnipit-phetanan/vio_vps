@@ -1079,6 +1079,16 @@ def msckf_measurement_update(fid: int, triangulated: dict, cam_observations: Lis
     # else:
     #     print(f"[MSCKF-BIAS-RAW] H[:,9:15] is ZERO!")
     
+    # ROOT CAUSE FIX: Check Jacobian magnitude BEFORE any matmul
+    # Large Jacobians indicate bad feature (bad depth/parallax) → overflow in matmul
+    h_max = np.max(np.abs(h_x))
+    if h_max > 1e6:  # Threshold for reasonable Jacobian magnitude
+        return (False, np.nan, np.nan)
+    
+    # EARLY EXIT: Validate input matrices before any computation
+    if not np.all(np.isfinite(h_x)) or not np.all(np.isfinite(h_f)) or not np.all(np.isfinite(r_o)):
+        return (False, np.nan, np.nan)
+    
     # Nullspace projection
     try:
         u_mat, s_mat, vh_mat = np.linalg.svd(h_f, full_matrices=True)
@@ -1086,8 +1096,18 @@ def msckf_measurement_update(fid: int, triangulated: dict, cam_observations: Lis
         rank = np.sum(s_mat > tol)
         null_space = u_mat[:, rank:]
         
-        h_proj = null_space.T @ h_x
-        r_proj = null_space.T @ r_o
+        # Check null_space validity before matmul
+        if not np.all(np.isfinite(null_space)):
+            h_proj = h_x
+            r_proj = r_o
+        else:
+            with np.errstate(divide='ignore', over='ignore', invalid='ignore'):
+                h_proj = null_space.T @ h_x
+                r_proj = null_space.T @ r_o
+            # Validate result
+            if not np.all(np.isfinite(h_proj)) or not np.all(np.isfinite(r_proj)):
+                h_proj = h_x
+                r_proj = r_o
     except np.linalg.LinAlgError:
         h_proj = h_x
         r_proj = r_o
@@ -1097,16 +1117,28 @@ def msckf_measurement_update(fid: int, triangulated: dict, cam_observations: Lis
     
     try:
         U_obs = compute_observability_nullspace(kf, num_clones)
-        projection_matrix = np.eye(err_state_size) - U_obs @ U_obs.T
         
-        # Check projection matrix validity before matmul
-        if not np.all(np.isfinite(projection_matrix)):
-            print(f"[MSCKF] WARNING: Projection matrix contains inf/nan, using identity")
+        # EARLY EXIT: Validate U_obs before matmul
+        if not np.all(np.isfinite(U_obs)):
             h_constrained = h_proj
             r_constrained = r_proj
         else:
-            h_constrained = h_proj @ projection_matrix
-            r_constrained = r_proj
+            with np.errstate(divide='ignore', over='ignore', invalid='ignore'):
+                projection_matrix = np.eye(err_state_size) - U_obs @ U_obs.T
+            
+            # Check projection matrix validity before matmul
+            if not np.all(np.isfinite(projection_matrix)):
+                h_constrained = h_proj
+                r_constrained = r_proj
+            else:
+                with np.errstate(divide='ignore', over='ignore', invalid='ignore'):
+                    h_constrained = h_proj @ projection_matrix
+                r_constrained = r_proj
+                
+                # Validate result
+                if not np.all(np.isfinite(h_constrained)):
+                    h_constrained = h_proj
+                    r_constrained = r_proj
         
         # DEBUG: Check if bias Jacobians are non-zero before/after projection (disabled for performance)
         # h_bias_before = np.linalg.norm(h_proj[:, 9:15])
@@ -1123,12 +1155,21 @@ def msckf_measurement_update(fid: int, triangulated: dict, cam_observations: Lis
     weights = compute_huber_weights(r_normalized.flatten(), threshold=huber_threshold)
     weight_matrix = np.diag(np.sqrt(weights))
     
-    h_weighted = weight_matrix @ h_constrained
-    r_weighted = weight_matrix @ r_constrained
+    with np.errstate(divide='ignore', over='ignore', invalid='ignore'):
+        h_weighted = weight_matrix @ h_constrained
+        r_weighted = weight_matrix @ r_constrained
+    
+    # Check for inf/nan after Huber weighting
+    if not np.all(np.isfinite(h_weighted)) or not np.all(np.isfinite(r_weighted)):
+        return (False, np.nan, np.nan)
     
     meas_dim = r_weighted.shape[0]
     r_cov_original = np.eye(meas_dim) * measurement_noise
-    r_cov = weight_matrix @ r_cov_original @ weight_matrix.T
+    with np.errstate(divide='ignore', over='ignore', invalid='ignore'):
+        r_cov = weight_matrix @ r_cov_original @ weight_matrix.T
+    
+    if not np.all(np.isfinite(r_cov)):
+        return (False, np.nan, np.nan)
     
     # CRITICAL: Check P matrix validity before S = H @ P @ H.T
     if not np.all(np.isfinite(kf.P)):
@@ -1168,13 +1209,15 @@ def msckf_measurement_update(fid: int, triangulated: dict, cam_observations: Lis
             print(f"[MSCKF] WARNING: S_inv contains inf/nan")
             return (False, innovation_norm, np.nan)
         
-        k_gain = kf.P @ h_weighted.T @ s_inv
+        with np.errstate(divide='ignore', over='ignore', invalid='ignore'):
+            k_gain = kf.P @ h_weighted.T @ s_inv
         
         if not np.all(np.isfinite(k_gain)):
             print(f"[MSCKF] WARNING: Kalman gain contains inf/nan")
             return (False, innovation_norm, np.nan)
         
-        delta_x = k_gain @ r_weighted
+        with np.errstate(divide='ignore', over='ignore', invalid='ignore'):
+            delta_x = k_gain @ r_weighted
         
         # DEBUG: Check bias correction magnitude (disabled for performance)
         # dbg = delta_x[9:12, 0]
@@ -1186,13 +1229,15 @@ def msckf_measurement_update(fid: int, triangulated: dict, cam_observations: Lis
         
         kf._apply_error_state_correction(delta_x)
         
-        i_kh = np.eye(err_state_size) - k_gain @ h_weighted
+        with np.errstate(divide='ignore', over='ignore', invalid='ignore'):
+            i_kh = np.eye(err_state_size) - k_gain @ h_weighted
         
         if not np.all(np.isfinite(i_kh)):
             print(f"[MSCKF] WARNING: (I - KH) matrix contains inf/nan")
             return (False, innovation_norm, np.nan)
         
-        kf.P = i_kh @ kf.P @ i_kh.T + k_gain @ r_cov @ k_gain.T
+        with np.errstate(divide='ignore', over='ignore', invalid='ignore'):
+            kf.P = i_kh @ kf.P @ i_kh.T + k_gain @ r_cov @ k_gain.T
         
         kf.P = ensure_covariance_valid(kf.P, label="MSCKF-Update", 
                                         symmetrize=True, check_psd=True)
@@ -1449,6 +1494,10 @@ def msckf_measurement_update_with_plane(fid: int, triangulated: dict,
     # Ensure r_stacked is 2D column vector (same as standard MSCKF)
     r_stacked = np.concatenate([r_bearing, [residual_plane]]).reshape(-1, 1)
     
+    # EARLY EXIT: Validate stacked matrices before any computation
+    if not np.all(np.isfinite(h_stacked)) or not np.all(np.isfinite(r_stacked)):
+        return (False, np.nan, np.nan)
+    
     # Measurement noise
     sigma_bearing = 1e-4  # Standard MSCKF bearing noise
     sigma_plane = plane_config.get('PLANE_SIGMA', 0.05)
@@ -1461,16 +1510,27 @@ def msckf_measurement_update_with_plane(fid: int, triangulated: dict,
     U_nullspace = compute_observability_nullspace(kf, len(cam_states))
     
     if U_nullspace is not None and U_nullspace.shape[0] == h_stacked.shape[1]:
-        A_proj = np.eye(h_stacked.shape[1]) - U_nullspace @ U_nullspace.T
-        
-        # Check projection matrix validity before matmul
-        if not np.all(np.isfinite(A_proj)):
-            print(f"[MSCKF-PLANE] WARNING: Projection matrix contains inf/nan")
+        # Check U_nullspace validity before matmul
+        if not np.all(np.isfinite(U_nullspace)):
             h_weighted = h_stacked
             r_weighted = r_stacked
         else:
-            h_weighted = h_stacked @ A_proj
-            r_weighted = r_stacked
+            with np.errstate(divide='ignore', over='ignore', invalid='ignore'):
+                A_proj = np.eye(h_stacked.shape[1]) - U_nullspace @ U_nullspace.T
+            
+            # Check projection matrix validity before matmul
+            if not np.all(np.isfinite(A_proj)):
+                print(f"[MSCKF-PLANE] WARNING: Projection matrix contains inf/nan")
+                h_weighted = h_stacked
+                r_weighted = r_stacked
+            else:
+                with np.errstate(divide='ignore', over='ignore', invalid='ignore'):
+                    h_weighted = h_stacked @ A_proj
+                r_weighted = r_stacked
+                
+                # Check h_weighted validity after matmul
+                if not np.all(np.isfinite(h_weighted)):
+                    return (False, np.nan, np.nan)
     else:
         h_weighted = h_stacked
         r_weighted = r_stacked
@@ -1512,23 +1572,27 @@ def msckf_measurement_update_with_plane(fid: int, triangulated: dict,
             print(f"[MSCKF-PLANE] WARNING: S_inv contains inf/nan")
             return (False, innovation_norm, np.nan)
         
-        k_gain = kf.P @ h_weighted.T @ s_inv
+        with np.errstate(divide='ignore', over='ignore', invalid='ignore'):
+            k_gain = kf.P @ h_weighted.T @ s_inv
         
         if not np.all(np.isfinite(k_gain)):
             print(f"[MSCKF-PLANE] WARNING: Kalman gain contains inf/nan")
             return (False, innovation_norm, np.nan)
         
-        delta_x = k_gain @ r_weighted
+        with np.errstate(divide='ignore', over='ignore', invalid='ignore'):
+            delta_x = k_gain @ r_weighted
         
         kf._apply_error_state_correction(delta_x)
         
-        i_kh = np.eye(err_state_size) - k_gain @ h_weighted
+        with np.errstate(divide='ignore', over='ignore', invalid='ignore'):
+            i_kh = np.eye(err_state_size) - k_gain @ h_weighted
         
         if not np.all(np.isfinite(i_kh)):
             print(f"[MSCKF-PLANE] WARNING: (I - KH) matrix contains inf/nan")
             return (False, innovation_norm, np.nan)
         
-        kf.P = i_kh @ kf.P @ i_kh.T + k_gain @ R_stacked @ k_gain.T
+        with np.errstate(divide='ignore', over='ignore', invalid='ignore'):
+            kf.P = i_kh @ kf.P @ i_kh.T + k_gain @ R_stacked @ k_gain.T
         
         kf.P = ensure_covariance_valid(kf.P, label="MSCKF-Plane-Update", 
                                         symmetrize=True, check_psd=True)

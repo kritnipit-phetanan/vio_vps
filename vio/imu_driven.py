@@ -16,7 +16,7 @@ from .propagation import (
 )
 from .magnetometer import reset_mag_filter_state, set_mag_constants
 from .trn import create_trn_from_config
-from .vps_integration import xy_to_latlon
+from .data_loaders import ProjectionCache
 from .output_utils import log_state_debug
 
 
@@ -243,7 +243,7 @@ def run_imu_driven_loop(runner):
             runner.process_magnetometer(t)
         
         # Capture current MSL/AGL BEFORE DEM update (matches vio_vps.py behavior)
-        lat_now, lon_now = xy_to_latlon(
+        lat_now, lon_now = runner.proj_cache.xy_to_latlon(
             runner.kf.x[0, 0], runner.kf.x[1, 0],
             runner.lat0, runner.lon0
         )

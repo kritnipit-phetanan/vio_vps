@@ -46,7 +46,7 @@ from .propagation import (
 )
 from .magnetometer import reset_mag_filter_state, set_mag_constants
 from .trn import create_trn_from_config
-from .vps_integration import xy_to_latlon
+from .data_loaders import ProjectionCache
 from .output_utils import log_state_debug
 from .ekf import ExtendedKalmanFilter
 
@@ -1036,7 +1036,7 @@ def run_event_driven_loop(runner):
                 x_output = runner.kf.x
             
             # Get current position for logging (using output state)
-            lat_now, lon_now = xy_to_latlon(
+            lat_now, lon_now = runner.proj_cache.xy_to_latlon(
                 x_output[0, 0], x_output[1, 0],
                 runner.lat0, runner.lon0
             )

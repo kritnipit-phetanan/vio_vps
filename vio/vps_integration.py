@@ -14,11 +14,12 @@ from typing import Tuple, Optional
 from scipy.spatial.transform import Rotation as R_scipy
 
 from .ekf import ExtendedKalmanFilter
-from .data_loaders import VPSItem, DEMReader, latlon_to_xy, xy_to_latlon
+from .data_loaders import VPSItem, DEMReader, ProjectionCache
 
 
 def compute_vps_innovation(vps: VPSItem, kf: ExtendedKalmanFilter,
-                           lat0: float, lon0: float) -> Tuple[np.ndarray, np.ndarray, float]:
+                           lat0: float, lon0: float,
+                           proj_cache: ProjectionCache) -> Tuple[np.ndarray, np.ndarray, float]:
     """
     Compute VPS innovation and S matrix for gating.
     
@@ -27,13 +28,14 @@ def compute_vps_innovation(vps: VPSItem, kf: ExtendedKalmanFilter,
         kf: Extended Kalman Filter
         lat0: Origin latitude
         lon0: Origin longitude
+        proj_cache: ProjectionCache instance for coordinate conversion
     
     Returns:
         vps_xy: VPS position in local frame
         innovation: Position innovation
         m2_test: Mahalanobis distance squared
     """
-    vps_xy = latlon_to_xy(vps.lat, vps.lon, lat0, lon0)
+    vps_xy = proj_cache.latlon_to_xy(vps.lat, vps.lon, lat0, lon0)
     
     # ESKF Jacobian
     num_clones = (kf.x.shape[0] - 16) // 7

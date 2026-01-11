@@ -19,7 +19,8 @@ from typing import Optional, Dict, List, Any, Tuple, Tuple
 # =============================================================================
 
 def get_ground_truth_error(t: float, kf, ppk_trajectory, flight_log_df, 
-                           lat0: float, lon0: float, error_type: str = 'position') -> Tuple:
+                           lat0: float, lon0: float, proj_cache,
+                           error_type: str = 'position') -> Tuple:
     """
     Get ground truth error for NEES calculation.
     
@@ -29,6 +30,7 @@ def get_ground_truth_error(t: float, kf, ppk_trajectory, flight_log_df,
         ppk_trajectory: PPK trajectory DataFrame (higher priority)
         flight_log_df: Flight log DataFrame (fallback)
         lat0, lon0: Reference origin for coordinate conversion
+        proj_cache: ProjectionCache instance for coordinate conversion
         error_type: 'position', 'velocity', or 'both'
         
     Returns:
@@ -38,8 +40,6 @@ def get_ground_truth_error(t: float, kf, ppk_trajectory, flight_log_df,
         Returns (None, None) gracefully if no ground truth is available.
         This ensures the system continues to work without GT data.
     """
-    from .data_loaders import latlon_to_xy
-    
     gt_df = ppk_trajectory if ppk_trajectory is not None else flight_log_df
     if gt_df is None or len(gt_df) == 0:
         return None, None
@@ -57,7 +57,7 @@ def get_ground_truth_error(t: float, kf, ppk_trajectory, flight_log_df,
                 gt_lat, gt_lon = gt_row['lat_dd'], gt_row['lon_dd']
                 gt_alt = gt_row['altitude_MSL_m']
             
-            gt_E, gt_N = latlon_to_xy(gt_lat, gt_lon, lat0, lon0)
+            gt_E, gt_N = proj_cache.latlon_to_xy(gt_lat, gt_lon, lat0, lon0)
             gt_pos = np.array([[gt_E], [gt_N], [gt_alt]])
             vio_pos = kf.x[0:3, 0:1]
             pos_error = gt_pos - vio_pos
@@ -75,12 +75,12 @@ def get_ground_truth_error(t: float, kf, ppk_trajectory, flight_log_df,
                 
                 if dt > 0.01:
                     if use_ppk:
-                        gt_E_prev, gt_N_prev = latlon_to_xy(gt_row_prev['lat'], gt_row_prev['lon'], lat0, lon0)
-                        gt_E_next, gt_N_next = latlon_to_xy(gt_row_next['lat'], gt_row_next['lon'], lat0, lon0)
+                        gt_E_prev, gt_N_prev = proj_cache.latlon_to_xy(gt_row_prev['lat'], gt_row_prev['lon'], lat0, lon0)
+                        gt_E_next, gt_N_next = proj_cache.latlon_to_xy(gt_row_next['lat'], gt_row_next['lon'], lat0, lon0)
                         gt_U_prev, gt_U_next = gt_row_prev['height'], gt_row_next['height']
                     else:
-                        gt_E_prev, gt_N_prev = latlon_to_xy(gt_row_prev['lat_dd'], gt_row_prev['lon_dd'], lat0, lon0)
-                        gt_E_next, gt_N_next = latlon_to_xy(gt_row_next['lat_dd'], gt_row_next['lon_dd'], lat0, lon0)
+                        gt_E_prev, gt_N_prev = proj_cache.latlon_to_xy(gt_row_prev['lat_dd'], gt_row_prev['lon_dd'], lat0, lon0)
+                        gt_E_next, gt_N_next = proj_cache.latlon_to_xy(gt_row_next['lat_dd'], gt_row_next['lon_dd'], lat0, lon0)
                         gt_U_prev, gt_U_next = gt_row_prev['altitude_MSL_m'], gt_row_next['altitude_MSL_m']
                     
                     gt_vel = np.array([[(gt_E_next - gt_E_prev) / dt],
