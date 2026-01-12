@@ -38,8 +38,8 @@ def compute_vps_innovation(vps: VPSItem, kf: ExtendedKalmanFilter,
     vps_xy = proj_cache.latlon_to_xy(vps.lat, vps.lon, lat0, lon0)
     
     # ESKF Jacobian
-    num_clones = (kf.x.shape[0] - 16) // 7
-    err_dim = 15 + 6 * num_clones
+    num_clones = (kf.x.shape[0] - 19) // 7  # v3.9.7: 19D nominal
+    err_dim = 18 + 6 * num_clones  # v3.9.7: 18D core error
     h_xy = np.zeros((2, err_dim), dtype=float)
     h_xy[0, 0] = 1.0  # δp_x
     h_xy[1, 1] = 1.0  # δp_y
@@ -130,8 +130,8 @@ def apply_vps_update(kf: ExtendedKalmanFilter, vps_xy: np.ndarray,
     Returns:
         success: True if update was applied
     """
-    num_clones = (kf.x.shape[0] - 16) // 7
-    err_dim = 15 + 6 * num_clones
+    num_clones = (kf.x.shape[0] - 19) // 7  # v3.9.7: 19D nominal
+    err_dim = 18 + 6 * num_clones  # v3.9.7: 18D core error
     
     h_xy = np.zeros((2, err_dim), dtype=float)
     h_xy[0, 0] = 1.0
@@ -337,8 +337,8 @@ def apply_height_update(kf: ExtendedKalmanFilter, height_m: float,
     if np.isnan(height_m):
         return False, 0.0, np.inf
     
-    num_clones = (kf.x.shape[0] - 16) // 7
-    err_dim = 15 + 6 * num_clones
+    num_clones = (kf.x.shape[0] - 19) // 7  # v3.9.7: 19D nominal
+    err_dim = 18 + 6 * num_clones  # v3.9.7: 18D core error
     
     h_height = np.zeros((1, err_dim), dtype=float)
     h_height[0, 2] = 1.0  # δp_z
@@ -478,8 +478,8 @@ def compute_plane_constraint_jacobian(kf: ExtendedKalmanFilter,
     p_world = kf.x[0:3, 0]
     predicted_altitude = p_world[2]
     
-    num_clones = (kf.x.shape[0] - 16) // 7
-    err_state_size = 15 + 6 * num_clones
+    num_clones = (kf.x.shape[0] - 19) // 7  # v3.9.7: 19D nominal
+    err_state_size = 18 + 6 * num_clones  # v3.9.7: 18D core error
     
     h_matrix = np.zeros((1, err_state_size), dtype=float)
     h_matrix[0, 2] = 1.0

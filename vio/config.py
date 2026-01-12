@@ -90,6 +90,9 @@ class VIOConfig:
     # Algorithm options (from YAML)
     estimate_imu_bias: bool = False
     use_magnetometer: bool = True
+    use_mag_estimated_bias: bool = True  # v3.9.7: Online hard-iron estimation
+    sigma_mag_bias_init: float = 0.1     # v3.9.7: Initial uncertainty
+    sigma_mag_bias: float = 0.001        # v3.9.7: Process noise
     use_vio_velocity: bool = True
     estimator_mode: str = "imu_step_preint_cache"  # "imu_step_preint_cache" or "event_queue_output_predictor"
     
@@ -265,6 +268,11 @@ def load_config(config_path: str) -> VIOConfig:
     result['MAG_USE_RAW_HEADING'] = mag.get('use_raw_heading', True)
     result['MAG_APPLY_INITIAL_CORRECTION'] = mag.get('apply_initial_correction', True)
     result['MAG_INITIAL_CONVERGENCE_WINDOW'] = mag.get('convergence_window', 30.0)
+    
+    # v3.9.7: Online Mag Bias Estimation
+    result['MAG_USE_ESTIMATED_BIAS'] = mag.get('use_estimated_bias', True)
+    result['SIGMA_MAG_BIAS_INIT'] = mag.get('sigma_mag_bias_init', 0.1)
+    result['SIGMA_MAG_BIAS'] = mag.get('sigma_mag_bias', 0.001)
     
     # Enhanced Magnetometer Filtering Parameters (v2.9.0+)
     result['MAG_EMA_ALPHA'] = mag.get('ema_alpha', 0.3)
@@ -447,6 +455,9 @@ def load_config(config_path: str) -> VIOConfig:
         # Algorithm options from YAML
         estimate_imu_bias=result['ESTIMATE_IMU_BIAS'],
         use_magnetometer=result['MAG_ENABLED'],
+        use_mag_estimated_bias=result['MAG_USE_ESTIMATED_BIAS'],
+        sigma_mag_bias_init=result['SIGMA_MAG_BIAS_INIT'],
+        sigma_mag_bias=result['SIGMA_MAG_BIAS'],
         use_vio_velocity=result['USE_VIO_VELOCITY'],
         estimator_mode=result['ESTIMATOR_MODE'],
         

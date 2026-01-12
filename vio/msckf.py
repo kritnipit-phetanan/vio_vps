@@ -937,7 +937,7 @@ def compute_observability_nullspace(kf: ExtendedKalmanFilter,
     
     Returns: (err_state_size, 3) nullspace matrix
     """
-    err_state_size = 15 + 6 * num_clones
+    err_state_size = 18 + 6 * num_clones  # v3.9.7: 18 core + 6*clones
     
     q_imu = kf.x[6:10, 0]
     yaw = quaternion_to_yaw(q_imu)
@@ -947,13 +947,13 @@ def compute_observability_nullspace(kf: ExtendedKalmanFilter,
     # Global X translation
     U[0, 0] = 1.0
     for i in range(num_clones):
-        clone_p_idx = 15 + 6*i + 3
+        clone_p_idx = 18 + 6*i + 3  # v3.9.7: 18 core error dim
         U[clone_p_idx, 0] = 1.0
     
     # Global Y translation
     U[1, 1] = 1.0
     for i in range(num_clones):
-        clone_p_idx = 15 + 6*i + 3
+        clone_p_idx = 18 + 6*i + 3  # v3.9.7: 18 core error dim
         U[clone_p_idx + 1, 1] = 1.0
     
     # Global yaw rotation
@@ -963,13 +963,13 @@ def compute_observability_nullspace(kf: ExtendedKalmanFilter,
     U[0, 2] = -p_imu[1]
     U[1, 2] = p_imu[0]
     
-    core_size = 16
+    core_size = 19  # v3.9.7: nominal state with mag_bias
     for i in range(num_clones):
         clone_p_idx = core_size + 7*i + 4
         p_cam = kf.x[clone_p_idx:clone_p_idx+3, 0]
         
-        err_theta_idx = 15 + 6*i
-        err_p_idx = 15 + 6*i + 3
+        err_theta_idx = 18 + 6*i  # v3.9.7: 18 core error dim
+        err_p_idx = 18 + 6*i + 3
         
         U[err_theta_idx + 2, 2] = 1.0
         U[err_p_idx, 2] = -p_cam[1]
@@ -1113,7 +1113,7 @@ def msckf_measurement_update(fid: int, triangulated: dict, cam_observations: Lis
         r_proj = r_o
     
     # Observability constraint
-    num_clones = (err_state_size - 15) // 6
+    num_clones = (err_state_size - 18) // 6  # v3.9.7: 18 core error dim
     
     try:
         U_obs = compute_observability_nullspace(kf, num_clones)
@@ -1351,7 +1351,7 @@ def msckf_measurement_update_with_plane(fid: int, triangulated: dict,
         J_q = -J_proj @ R_cw @ skew_symmetric(p_c)
         J_p = -J_proj @ R_wc
         
-        clone_idx_err = 15 + 6 * cam_id
+        clone_idx_err = 18 + 6 * cam_id  # v3.9.7: 18 core error dim
         h_bearing[2*i:2*i+2, clone_idx_err:clone_idx_err+3] = J_q
         h_bearing[2*i:2*i+2, clone_idx_err+3:clone_idx_err+6] = J_p
     
@@ -1453,8 +1453,8 @@ def msckf_measurement_update_with_plane(fid: int, triangulated: dict,
                 dp_dθ1 = np.zeros((3, 3))  # Approximation: first-order only
                 
                 # ∂(n^T*p_w + d)/∂cam_states = n^T * ∂p_w/∂cam_states
-                clone_idx0 = 15 + 6 * cam_id0
-                clone_idx1 = 15 + 6 * cam_id1
+                clone_idx0 = 18 + 6 * cam_id0  # v3.9.7: 18 core error dim
+                clone_idx1 = 18 + 6 * cam_id1
                 
                 h_plane[0, clone_idx0:clone_idx0+3] = n @ dp_dθ0
                 h_plane[0, clone_idx0+3:clone_idx0+6] = n @ dp_dc0
@@ -1479,7 +1479,7 @@ def msckf_measurement_update_with_plane(fid: int, triangulated: dict,
                     
                     p_c = R_wc @ (point_world - p_cam)
                     
-                    clone_idx_err = 15 + 6 * cam_id
+                    clone_idx_err = 18 + 6 * cam_id  # v3.9.7: 18 core error dim
                     J_p_theta = -R_wc @ skew_symmetric(p_c)
                     J_p_pos = -R_wc
                     

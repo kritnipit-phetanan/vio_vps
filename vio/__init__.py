@@ -2,11 +2,30 @@
 VIO (Visual-Inertial Odometry) Package
 
 Complete modularized implementation of the VIO+ESKF+MSCKF system
-for helicopter navigation. Version 3.2.0 - VIOConfig Dataclass Model.
+for helicopter navigation. Version 3.9.7 - EKF Mag Bias Online Estimation.
 
-Version: 3.2.0 (VIOConfig Dataclass - Pure YAML Reader)
+Version: 3.9.7 (EKF Mag Bias Online Estimation)
 Modules: 18
-Total Lines: ~11,000
+Total Lines: ~11,500
+
+Changes in v3.9.7:
+- EKF MAG BIAS ESTIMATION: Added magnetometer hard iron online estimation
+  * State augmented from 16D to 19D nominal (15D to 18D error)
+  * New state: [p, v, q, bg, ba, mag_bias, clones...]
+  * Process noise for mag_bias random walk (sigma_mag_bias = 0.001)
+  * Initial uncertainty configurable via sigma_mag_bias_init
+  
+- FILES MODIFIED (8 files, ~30 locations):
+  * ekf.py: CORE_NOMINAL_DIM=19, CORE_ERROR_DIM=18, new IDX_MAG_BIAS
+  * state_manager.py: 18x18 covariance, mag_bias initialization
+  * imu_preintegration.py: Phi 18x18, Q 18x18 with mag noise
+  * propagation.py: Clone indices updated (15→18, 16→19)
+  * msckf.py: Clone indices, observability nullspace
+  * measurement_updates.py: Error state dimension
+  * vps_integration.py: Error state dimension  
+  * loop_closure.py: Error state dimension
+  * main_loop.py: EKF initialization (dim_x=19)
+  * config.yaml: sigma_mag_bias, sigma_mag_bias_init, use_estimated_bias
 
 Changes in v3.2.0:
 - VIOCONFIG DATACLASS: config.py is now pure YAML reader returning VIOConfig
@@ -287,7 +306,7 @@ Usage:
     from vio.propagation import VibrationDetector
 """
 
-__version__ = "3.2.0"
+__version__ = "3.9.7"
 
 # Lazy module imports - access as vio.config, vio.math_utils, etc.
 # This avoids importing all dependencies at once

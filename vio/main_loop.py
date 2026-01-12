@@ -300,9 +300,9 @@ class VIORunner:
         # Store in global config for VIO velocity update to access
         self.global_config['INITIAL_AGL'] = self.initial_agl
         
-        # Create EKF
-        self.kf = ExtendedKalmanFilter(dim_x=16, dim_z=3, dim_u=3)
-        self.kf.x = np.zeros((16, 1), dtype=float)
+        # Create EKF (v3.9.7: 19D nominal state with mag_bias)
+        self.kf = ExtendedKalmanFilter(dim_x=19, dim_z=3, dim_u=3)
+        self.kf.x = np.zeros((19, 1), dtype=float)
         
         # Get config parameters from YAML (v3.2.0: no fallback - require proper config)
         imu_params = self.global_config.get('IMU_PARAMS')
@@ -334,6 +334,9 @@ class VIORunner:
                 'max_field': self.global_config.get('MAG_MAX_FIELD_STRENGTH', 100.0),
                 'hard_iron': self.global_config.get('MAG_HARD_IRON_OFFSET', None),
                 'soft_iron': self.global_config.get('MAG_SOFT_IRON_MATRIX', None),
+                'sigma_mag_bias_init': self.global_config.get('SIGMA_MAG_BIAS_INIT', 0.1),  # v3.9.7
+                'sigma_mag_bias': self.global_config.get('SIGMA_MAG_BIAS', 0.001),         # v3.9.7
+                'use_estimated_bias': self.config.use_mag_estimated_bias,                  # v3.9.8
             }
         
         # Initialize state
@@ -606,12 +609,20 @@ class VIORunner:
         """
         imu_params = self.global_config.get('IMU_PARAMS', {'g_norm': 9.803})
         
+        # v3.9.7: Prepare mag params for process noise
+        # v3.9.8: Include use_estimated_bias flag to freeze states when disabled
+        mag_params = {
+            'sigma_mag_bias': self.config.sigma_mag_bias,
+            'use_estimated_bias': self.config.use_mag_estimated_bias
+        }
+        
         # Propagate state + covariance
         process_imu(
             self.kf, rec, dt,
             estimate_imu_bias=self.config.estimate_imu_bias,
             t=rec.t, t0=self.state.t0,
-            imu_params=imu_params
+            imu_params=imu_params,
+            mag_params=mag_params
         )
         
         # Update helpers (ZUPT, mag filter)
@@ -1102,8 +1113,14 @@ class VIORunner:
             if (self.state.mag_idx - 1) % rate_limit != 0:
                 continue
             
-            # Calibrate using hard-iron and soft-iron from config
-            hard_iron = self.global_config.get('MAG_HARD_IRON_OFFSET', None)
+            # v3.9.7: Use EKF estimated mag_bias instead of static config hard_iron
+            # This enables online hard iron estimation for time-varying interference
+            if self.config.use_mag_estimated_bias:
+                # Use EKF state mag_bias (indices 16:19) as hard iron
+                hard_iron = self.kf.x[16:19, 0].flatten()
+            else:
+                # Fallback to static config hard iron
+                hard_iron = self.global_config.get('MAG_HARD_IRON_OFFSET', None)
             soft_iron = self.global_config.get('MAG_SOFT_IRON_MATRIX', None)
             mag_cal = calibrate_magnetometer(mag_rec.mag, hard_iron=hard_iron, soft_iron=soft_iron)
             
@@ -1156,7 +1173,8 @@ class VIORunner:
                 residual_csv=residual_path,
                 frame=self.state.vio_frame,
                 yaw_override=yaw_mag_filtered,  # NEW: pass filtered yaw directly
-                filter_info=filter_info  # v2.9.2: track filter rejection reasons
+                filter_info=filter_info,  # v2.9.2: track filter rejection reasons
+                use_estimated_bias=self.config.use_mag_estimated_bias  # v3.9.8: freeze states if disabled
             )
             
             if applied:
@@ -1248,8 +1266,11 @@ class VIORunner:
         declination = self.global_config.get('MAG_DECLINATION', 0.0)
         use_raw = self.global_config.get('MAG_USE_RAW_HEADING', True)
         
-        # Calibrate using hard-iron and soft-iron from config
-        hard_iron = self.global_config.get('MAG_HARD_IRON_OFFSET', None)
+        # v3.9.7: Use EKF estimated mag_bias instead of static config hard_iron
+        if self.config.use_mag_estimated_bias:
+            hard_iron = self.kf.x[16:19, 0].flatten()
+        else:
+            hard_iron = self.global_config.get('MAG_HARD_IRON_OFFSET', None)
         soft_iron = self.global_config.get('MAG_SOFT_IRON_MATRIX', None)
         mag_cal = calibrate_magnetometer(mag_rec.mag, hard_iron=hard_iron, soft_iron=soft_iron)
         
@@ -1300,7 +1321,8 @@ class VIORunner:
             residual_csv=residual_path,
             frame=self.state.vio_frame,
             yaw_override=yaw_mag_filtered,
-            filter_info=filter_info
+            filter_info=filter_info,
+            use_estimated_bias=self.config.use_mag_estimated_bias  # v3.9.8: freeze states if disabled
         )
         
         if applied:

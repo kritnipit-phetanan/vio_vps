@@ -446,7 +446,8 @@ def compute_error_state_jacobian(q: np.ndarray, a_corr: np.ndarray,
     """
     Compute error-state transition matrix Φ for ESKF propagation.
     
-    Error state: δx = [δp, δv, δθ, δbg, δba]^T (15 dimensions)
+    v3.9.7: Updated for 18D error state with mag_bias
+    Error state: δx = [δp, δv, δθ, δbg, δba, δmag]^T (18 dimensions)
     
     Args:
         q: Current quaternion [w,x,y,z]
@@ -456,10 +457,10 @@ def compute_error_state_jacobian(q: np.ndarray, a_corr: np.ndarray,
         R_body_to_world: Rotation matrix from body to world frame
     
     Returns:
-        Φ: 15×15 error-state transition matrix
+        Φ: 18×18 error-state transition matrix
     """
-    # Initialize as identity
-    Phi = np.eye(15, dtype=float)
+    # Initialize as identity (18x18)
+    Phi = np.eye(18, dtype=float)
     
     # δp depends on δv
     Phi[0:3, 3:6] = np.eye(3) * dt
@@ -473,15 +474,21 @@ def compute_error_state_jacobian(q: np.ndarray, a_corr: np.ndarray,
     Phi[6:9, 6:9] = np.eye(3) - skew_symmetric(theta_vec)
     Phi[6:9, 9:12] = -np.eye(3) * dt
     
+    # δmag remains constant during IMU propagation (identity block at 15:18)
+    # Already set by np.eye() initialization
+    
     return Phi
 
 
 def compute_error_state_process_noise(dt: float, estimate_imu_bias: bool,
                                        t: float, t0: float,
                                        imu_params: dict,
-                                       sigma_accel: float) -> np.ndarray:
+                                       sigma_accel: float,
+                                       mag_params: dict = None) -> np.ndarray:
     """
-    Compute process noise Q for error-state covariance (15×15).
+    Compute process noise Q for error-state covariance (18×18).
+    
+    v3.9.7: Updated for 18D error state with mag_bias
     
     Args:
         dt: Time step
@@ -490,9 +497,10 @@ def compute_error_state_process_noise(dt: float, estimate_imu_bias: bool,
         t0: Start time
         imu_params: IMU noise parameters dict
         sigma_accel: Unmodeled acceleration noise
+        mag_params: Magnetometer parameters dict (optional)
     
     Returns:
-        Q: 15×15 process noise covariance matrix
+        Q: 18×18 process noise covariance matrix
     """
     # IMU noise (sensor noise)
     imu_acc_noise = imu_params['acc_n']
@@ -513,19 +521,28 @@ def compute_error_state_process_noise(dt: float, estimate_imu_bias: bool,
     q_theta = (combined_gyr_noise * dt)**2
     
     # Minimum yaw process noise
-    # v2.9.10.10: REDUCED from 8.0 to 3.0 deg/sqrt(Hz)
-    # Problem: 8.0 deg/sqrt(Hz) caused yaw covariance to grow too fast,
-    # leading to runaway drift where mag correction couldn't keep up
-    min_yaw_process_noise = np.radians(3.0)  # Was 8.0
+    min_yaw_process_noise = np.radians(3.0)
     q_theta_z_min = (min_yaw_process_noise * np.sqrt(dt))**2
     
-    # Bias random walk (v3.4.0: removed time-based decay)
-    # Note: Adaptive tuning removed - use constant bias random walk from config
+    # Bias random walk
     q_bg = (imu_params['gyr_w']**2) * dt
     q_ba = (imu_params['acc_w']**2) * dt
     
-    # Build 15×15 matrix
-    Q = np.zeros((15, 15), dtype=float)
+    # Mag bias random walk (v3.9.7: NEW)
+    # v3.9.8: Set to 0 when use_estimated_bias=False (freeze states)
+    # v3.9.9: Also freeze when mag_params is None (no mag data)
+    if mag_params is None:
+        # No mag data - freeze mag_bias completely
+        sigma_mag_bias = 0.0
+    else:
+        sigma_mag_bias = mag_params.get('sigma_mag_bias', 0.001)
+        use_estimated_bias = mag_params.get('use_estimated_bias', True)
+        if not use_estimated_bias:
+            sigma_mag_bias = 0.0  # Freeze mag_bias states
+    q_mag = (sigma_mag_bias**2) * dt
+    
+    # Build 18×18 matrix
+    Q = np.zeros((18, 18), dtype=float)
     Q[0:3, 0:3] = np.eye(3) * q_pos
     Q[3:6, 3:6] = np.eye(3) * q_vel
     Q[6:9, 6:9] = np.eye(3) * q_theta
@@ -535,5 +552,6 @@ def compute_error_state_process_noise(dt: float, estimate_imu_bias: bool,
     
     Q[9:12, 9:12] = np.eye(3) * q_bg
     Q[12:15, 12:15] = np.eye(3) * q_ba
+    Q[15:18, 15:18] = np.eye(3) * q_mag  # NEW: mag bias process noise
     
     return Q

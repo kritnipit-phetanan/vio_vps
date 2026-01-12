@@ -214,6 +214,7 @@ def main():
         print(f"  camera_view: {config.camera_view}")
         print(f"  estimate_imu_bias: {config.estimate_imu_bias}")
         print(f"  use_magnetometer: {config.use_magnetometer}")
+        print(f"  use_mag_estimated_bias: {config.use_mag_estimated_bias} (sigma_init={config.sigma_mag_bias_init}, sigma_proc={config.sigma_mag_bias})")
         print(f"  use_vio_velocity: {config.use_vio_velocity}")
         print(f"  estimator_mode: {config.estimator_mode}")
         print(f"  fast_mode: {config.fast_mode}")

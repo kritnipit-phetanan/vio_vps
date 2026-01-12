@@ -275,32 +275,49 @@ def apply_mag_yaw_correction(q_current: np.ndarray,
 
 def initialize_covariance(imu_params: dict,
                           estimate_imu_bias: bool = False,
-                          has_static_calibration: bool = False) -> np.ndarray:
+                          has_static_calibration: bool = False,
+                          mag_params: Optional[dict] = None) -> np.ndarray:
     """
-    Initialize ESKF covariance matrix (15x15 for core state).
+    Initialize ESKF covariance matrix (18x18 for core state).
+    
+    v3.9.7: Updated for mag_bias (3 additional states)
     
     Args:
         imu_params: Dict with IMU noise parameters
         estimate_imu_bias: Whether bias estimation is enabled
         has_static_calibration: Whether bias was estimated from static period
+        mag_params: Dict with magnetometer parameters (optional)
         
     Returns:
-        15x15 diagonal covariance matrix
+        18x18 diagonal covariance matrix
     """
     P_pos = 10.0     # Position uncertainty (m²)
     P_vel = 4.0      # Velocity uncertainty (m/s)²
     P_theta = 0.1    # Rotation uncertainty (rad²)
     
     # Bias uncertainty depends on calibration state
-    # NOTE: Even with static calibration, keep bias uncertainty high enough
-    # to allow MSCKF to refine bias estimates during flight (for observability)
     if estimate_imu_bias and has_static_calibration:
-        # Increased from 10x to 100x to allow MSCKF bias updates
         P_bg = (imu_params["gyr_w"] * 100) ** 2  # ~0.01 rad/s std
         P_ba = (imu_params["acc_w"] * 100) ** 2  # ~0.1 m/s² std
     else:
         P_bg = (imu_params["gyr_w"] * 1000) ** 2
         P_ba = (imu_params["acc_w"] * 1000) ** 2
+    
+    # Mag bias uncertainty (v3.9.7)
+    # Start with high uncertainty to allow online estimation
+    # v3.9.8: Set tiny when disabled to freeze states
+    # v3.9.9: Also freeze when mag_params is None (no mag data)
+    if mag_params is None:
+        # No mag data - freeze mag_bias completely
+        P_mag = 1e-12
+    else:
+        use_estimated_bias = mag_params.get('use_estimated_bias', True)
+        if use_estimated_bias:
+            sigma_mag = mag_params.get('sigma_mag_bias_init', 0.1)
+            P_mag = sigma_mag ** 2
+        else:
+            # Freeze mag_bias by setting tiny covariance (effectively constant)
+            P_mag = 1e-12
     
     P = np.diag([
         P_pos, P_pos, P_pos,        # δp (3)
@@ -308,14 +325,16 @@ def initialize_covariance(imu_params: dict,
         P_theta, P_theta, P_theta,  # δθ (3)
         P_bg, P_bg, P_bg,           # δbg (3)
         P_ba, P_ba, P_ba,           # δba (3)
+        P_mag, P_mag, P_mag,        # δmag (3) - NEW
     ]).astype(float)
     
-    print(f"\n=== Initial Covariance (ESKF error-state 15×15) ===")
+    print(f"\n=== Initial Covariance (ESKF error-state 18×18) ===")
     print(f"[COV] Position error (δp): {P_pos:.2e} m²")
     print(f"[COV] Velocity error (δv): {P_vel:.2e} (m/s)²")
     print(f"[COV] Rotation error (δθ): {P_theta:.2e}")
     print(f"[COV] Gyro bias error: {P_bg:.2e} (rad/s)²")
     print(f"[COV] Accel bias error: {P_ba:.2e} (m/s²)²")
+    print(f"[COV] Mag bias error: {P_mag:.2e} (normalized)²")
     
     return P
 
@@ -484,17 +503,27 @@ def initialize_ekf_state(kf,
     kf.x[10:13, 0] = bg_init
     kf.x[13:16, 0] = ba_init
     
-    # Initialize covariance
-    kf.P = initialize_covariance(imu_params, estimate_imu_bias, has_static_calibration)
+    # v3.9.7: Initialize mag_bias from config hard_iron offset
+    mag_bias_init = np.zeros(3)
+    if mag_params is not None:
+        hard_iron = mag_params.get('hard_iron', None)
+        if hard_iron is not None:
+            mag_bias_init = np.array(hard_iron)
+            print(f"[DEBUG][MAG_BIAS] Initialized from config hard_iron: {mag_bias_init}")
+    kf.x[16:19, 0] = mag_bias_init
+    
+    # Initialize covariance (now 18x18)
+    kf.P = initialize_covariance(imu_params, estimate_imu_bias, has_static_calibration, mag_params)
     
     # Print state summary
-    print(f"\n=== Initial State (ESKF: nominal 16D, error 15D) ===")
+    print(f"\n=== Initial State (ESKF: nominal 19D, error 18D) ===")
     print(f"[STATE] Position (p_I): [{kf.x[0,0]:.3f}, {kf.x[1,0]:.3f}, {kf.x[2,0]:.3f}] m (ENU, {z_mode})")
     print(f"[STATE] Velocity (v_I): [{kf.x[3,0]:.6f}, {kf.x[4,0]:.6f}, {kf.x[5,0]:.6f}] m/s (ENU)")
     print(f"[STATE] Quaternion (q_I): [{kf.x[6,0]:.4f}, {kf.x[7,0]:.4f}, "
           f"{kf.x[8,0]:.4f}, {kf.x[9,0]:.4f}] (w,x,y,z)")
     print(f"[STATE] Gyro bias (b_g): [{kf.x[10,0]:.6f}, {kf.x[11,0]:.6f}, {kf.x[12,0]:.6f}] rad/s")
     print(f"[STATE] Accel bias (b_a): [{kf.x[13,0]:.6f}, {kf.x[14,0]:.6f}, {kf.x[15,0]:.6f}] m/s²")
+    print(f"[STATE] Mag bias (b_m): [{kf.x[16,0]:.6f}, {kf.x[17,0]:.6f}, {kf.x[18,0]:.6f}] (normalized)")
     
     return InitialState(
         position=kf.x[0:3, 0].copy(),
@@ -514,18 +543,22 @@ def get_num_clones(kf) -> int:
     """
     Get number of camera clones in state vector.
     
+    v3.9.7: Updated for 19D core nominal state
+    
     Args:
         kf: ExtendedKalmanFilter instance
         
     Returns:
         Number of camera clones
     """
-    return (kf.x.shape[0] - 16) // 7
+    return (kf.x.shape[0] - 19) // 7
 
 
 def get_error_state_dim(kf) -> int:
     """
-    Get error state dimension (15 + 6*M).
+    Get error state dimension (18 + 6*M).
+    
+    v3.9.7: Updated for 18D core error state
     
     Args:
         kf: ExtendedKalmanFilter instance
@@ -534,7 +567,7 @@ def get_error_state_dim(kf) -> int:
         Error state dimension
     """
     num_clones = get_num_clones(kf)
-    return 15 + 6 * num_clones
+    return 18 + 6 * num_clones
 
 
 # ===============================
