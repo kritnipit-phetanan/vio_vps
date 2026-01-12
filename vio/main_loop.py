@@ -505,6 +505,9 @@ class VIORunner:
                 'declination': self.global_config.get('MAG_DECLINATION', 0.0),
                 'hard_iron': self.global_config.get('MAG_HARD_IRON_OFFSET', None),
                 'soft_iron': self.global_config.get('MAG_SOFT_IRON_MATRIX', None),
+                'use_estimated_bias': self.config.use_mag_estimated_bias,  # v3.9.9
+                'sigma_mag_bias_init': self.config.sigma_mag_bias_init,    # v3.9.9
+                'sigma_mag_bias': self.config.sigma_mag_bias,              # v3.9.9
             }
             noise_params = {
                 'sigma_vo_vel': self.global_config.get('SIGMA_VO', 0.5),

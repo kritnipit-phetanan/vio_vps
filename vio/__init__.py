@@ -2,11 +2,23 @@
 VIO (Visual-Inertial Odometry) Package
 
 Complete modularized implementation of the VIO+ESKF+MSCKF system
-for helicopter navigation. Version 3.9.7 - EKF Mag Bias Online Estimation.
+for helicopter navigation. Version 3.9.9 - EKF Mag Bias with Proper Freeze.
 
-Version: 3.9.7 (EKF Mag Bias Online Estimation)
+Version: 3.9.9 (EKF Mag Bias with Proper Freeze)
 Modules: 18
 Total Lines: ~11,500
+
+Changes in v3.9.9:
+- NO-MAG FREEZE: When magnetometer disabled or mag_params=None
+  * P_mag = 1e-12 (frozen covariance)
+  * Q_mag = 0 (no process noise)
+  * Prevents unbounded covariance growth
+
+Changes in v3.9.8:
+- PROPER FREEZE: When use_estimated_bias=false
+  * Sets Jacobian H[15:18] = 0
+  * Sets process noise sigma_mag_bias = 0
+  * Sets initial covariance P_mag = 1e-12
 
 Changes in v3.9.7:
 - EKF MAG BIAS ESTIMATION: Added magnetometer hard iron online estimation

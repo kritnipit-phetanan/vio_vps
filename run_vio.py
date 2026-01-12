@@ -6,7 +6,7 @@ VIO Standalone Entry Point (run_vio.py)
 This script runs the VIO+EKF pipeline using the modular vio/ package.
 It is completely independent of vio_vps.py and uses VIORunner directly.
 
-Configuration Model (v3.2.0):
+Configuration Model (v3.9.9):
 -----------------------------
     YAML config is the single source of truth for ALL settings.
     CLI provides only data paths and debug flags.
