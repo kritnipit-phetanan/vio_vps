@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VIO System Flow Diagram (v3.9.9)</title>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.min.js"></script>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 1200px; margin: 0 auto; padding: 20px; background: #f5f5f5; }
+        h1, h2 { color: #1a1a2e; }
+        h1 { border-bottom: 3px solid #4a90d9; padding-bottom: 10px; }
+        .mermaid { background: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); margin: 20px 0; }
+        table { width: 100%; border-collapse: collapse; background: white; box-shadow: 0 2px 10px rgba(0,0,0,0.1); border-radius: 10px; overflow: hidden; margin: 20px 0; }
+        th { background: #4a90d9; color: white; padding: 12px; text-align: left; }
+        td { padding: 10px 12px; border-bottom: 1px solid #eee; }
+        code { background: #e8e8e8; padding: 2px 6px; border-radius: 4px; font-family: Monaco, Consolas, monospace; }
+        pre { background: #1a1a2e; color: #a8dadc; padding: 20px; border-radius: 10px; }
+        .state-box { background: linear-gradient(135deg, #667eea, #764ba2); color: white; padding: 20px; border-radius: 10px; font-family: monospace; margin: 20px 0; }
+    </style>
+</head>
+<body>
+    <h1>🚁 VIO System Flow Diagram (v3.9.9)</h1>
+    <h2>📊 Complete Process Flow</h2>
+    <div class="mermaid">
+flowchart TD
+    subgraph CLI["1️⃣ CLI Entry"]
+        A[parse_args] --> B[load_config] --> C[VIOConfig]
+    end
+    subgraph LOAD["2️⃣ Data Loading"]
+        C --> D1[load_imu_csv] & D2[load_mag_csv] & D3[load_images_index]
+    end
+    subgraph INIT["3️⃣ Initialization"]
+        D1 & D2 & D3 --> E[VIORunner] --> F["EKF(19D)"] --> G["P(18×18)"]
+    end
+    subgraph MAIN["4️⃣ Main Loop"]
+        G --> H{IMU?}
+        H -->|Yes| I[propagate]
+        H -->|No| J{Image?}
+        J -->|Yes| K[msckf_update]
+    end
+    subgraph MAG["5️⃣ Mag Update"]
+        I --> L[apply_magnetometer_update]
+    end
+    K & L --> M[save_pose_csv]
+    </div>
+    <h2>📁 Execution Order</h2>
+    <table>
+        <tr><th>Step</th><th>File</th><th>Function</th></tr>
+        <tr><td>1</td><td><code>run_vio.py</code></td><td>main()</td></tr>
+        <tr><td>2</td><td><code>vio/config.py</code></td><td>load_config()</td></tr>
+        <tr><td>3</td><td><code>vio/data_loaders.py</code></td><td>load_imu/mag/images</td></tr>
+        <tr><td>4</td><td><code>vio/main_loop.py</code></td><td>VIORunner.__init__()</td></tr>
+        <tr><td>5</td><td><code>vio/state_manager.py</code></td><td>initialize_ekf_state()</td></tr>
+        <tr><td>6</td><td><code>vio/propagation.py</code></td><td>propagate_to_timestamp()</td></tr>
+        <tr><td>7</td><td><code>vio/imu_preintegration.py</code></td><td>propagate()</td></tr>
+        <tr><td>8</td><td><code>vio/measurement_updates.py</code></td><td>apply_magnetometer_update()</td></tr>
+        <tr><td>9</td><td><code>vio/msckf.py</code></td><td>msckf_update()</td></tr>
+    </table>
+    <h2>📊 State Vector (19D)</h2>
+    <div class="state-box">
+        <pre style="background:transparent;color:white;">
+kf.x: [p(3), v(3), q(4), bg(3), ba(3), mag_bias(3), clones(7×N)]
+kf.P: [δp(3), δv(3), δθ(3), δbg(3), δba(3), δmag(3), clone_err(6×N)]
+        </pre>
+    </div>
+    <script>mermaid.initialize({startOnLoad:true});</script>
+</body>
+</html>
