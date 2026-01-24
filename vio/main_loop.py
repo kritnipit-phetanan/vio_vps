@@ -75,7 +75,8 @@ from .output_utils import (
     save_calibration_log, save_keyframe_image_with_overlay,
     save_keyframe_with_overlay,
     log_state_debug, log_vo_debug, log_msckf_window, log_fej_consistency,
-    DebugCSVWriters, init_output_csvs, get_ground_truth_error
+    DebugCSVWriters, init_output_csvs, get_ground_truth_error,
+    build_calibration_params
 )
 from .trn import TerrainReferencedNavigation, TRNConfig, create_trn_from_config
 from .imu_driven import run_imu_driven_loop
@@ -494,56 +495,16 @@ class VIORunner:
         if self.config.save_debug_data:
             cal_path = os.path.join(self.config.output_dir, "debug_calibration.txt")
             
-            # Get camera view config from loaded YAML (not hardcoded defaults)
-            view_cfg = self.global_config.get('CAMERA_VIEW_CONFIGS', {}).get(
-                self.config.camera_view,
-                CAMERA_VIEW_CONFIGS.get(self.config.camera_view, CAMERA_VIEW_CONFIGS['nadir'])
-            )
-            
-            kb_params = self.global_config.get('KB_PARAMS', {})
-            imu_params = self.global_config.get('IMU_PARAMS', {})
-            mag_params = {
-                'declination': self.global_config.get('MAG_DECLINATION', 0.0),
-                'hard_iron': self.global_config.get('MAG_HARD_IRON_OFFSET', None),
-                'soft_iron': self.global_config.get('MAG_SOFT_IRON_MATRIX', None),
-                'use_estimated_bias': self.config.use_mag_estimated_bias,  # v3.9.9
-                'sigma_mag_bias_init': self.config.sigma_mag_bias_init,    # v3.9.9
-                'sigma_mag_bias': self.config.sigma_mag_bias,              # v3.9.9
-            }
-            noise_params = {
-                'sigma_vo_vel': self.global_config.get('SIGMA_VO', 0.5),
-                'sigma_mag_yaw': self.global_config.get('SIGMA_MAG_YAW', 0.15),
-                'sigma_agl_z': self.global_config.get('SIGMA_AGL_Z', 2.5),
-            }
-            vio_params = {
-                'use_vio_velocity': self.config.use_vio_velocity,
-                'use_magnetometer': self.config.use_magnetometer,
-                'camera_view': self.config.camera_view,
-                'z_state': self.config.z_state,
-            }
-            initial_state = {
-                'lat0': self.lat0,
-                'lon0': self.lon0,
-                'alt0': getattr(self, 'alt0', 0.0),
-            }
-            # Get plane config
-            plane_config = self.global_config.get('plane', None)
-            
-            save_calibration_log(
-                output_path=cal_path,
-                camera_view=self.config.camera_view,
-                view_cfg=view_cfg,
-                kb_params=kb_params,
-                imu_params=imu_params,
-                mag_params=mag_params,
-                noise_params=noise_params,
-                vio_params=vio_params,
-                initial_state=initial_state,
-                estimate_imu_bias=self.config.estimate_imu_bias,
-                plane_config=plane_config,
+            # Use helper function to build all calibration params
+            cal_params = build_calibration_params(
                 global_config=self.global_config,
-                vio_config=self.config  # Pass VIOConfig for full audit
+                vio_config=self.config,
+                lat0=self.lat0,
+                lon0=self.lon0,
+                alt0=getattr(self, 'alt0', 0.0)
             )
+            
+            save_calibration_log(output_path=cal_path, **cal_params)
             print(f"[DEBUG] Calibration snapshot saved: {cal_path}")
     
     def _update_imu_helpers(self, rec, dt: float, imu_params: dict):

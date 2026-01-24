@@ -560,6 +560,67 @@ class DebugCSVWriters:
             pass
 
 
+def build_calibration_params(global_config: Dict, vio_config: Any,
+                             lat0: float = 0.0, lon0: float = 0.0, 
+                             alt0: float = 0.0) -> Dict:
+    """
+    Build calibration parameters dict from configs.
+    
+    This extracts all calibration-related parameters from global_config
+    and vio_config into a single dict that can be passed to save_calibration_log.
+    
+    Args:
+        global_config: Complete YAML configuration dict
+        vio_config: VIOConfig dataclass
+        lat0, lon0, alt0: Initial position coordinates
+        
+    Returns:
+        Dict with all parameters needed for save_calibration_log
+    """
+    from .camera import CAMERA_VIEW_CONFIGS
+    
+    # Get camera view config
+    view_cfg = global_config.get('CAMERA_VIEW_CONFIGS', {}).get(
+        vio_config.camera_view,
+        CAMERA_VIEW_CONFIGS.get(vio_config.camera_view, CAMERA_VIEW_CONFIGS['nadir'])
+    )
+    
+    return {
+        'camera_view': vio_config.camera_view,
+        'view_cfg': view_cfg,
+        'kb_params': global_config.get('KB_PARAMS', {}),
+        'imu_params': global_config.get('IMU_PARAMS', {}),
+        'mag_params': {
+            'declination': global_config.get('MAG_DECLINATION', 0.0),
+            'hard_iron': global_config.get('MAG_HARD_IRON_OFFSET', None),
+            'soft_iron': global_config.get('MAG_SOFT_IRON_MATRIX', None),
+            'use_estimated_bias': getattr(vio_config, 'use_mag_estimated_bias', False),
+            'sigma_mag_bias_init': getattr(vio_config, 'sigma_mag_bias_init', 0.1),
+            'sigma_mag_bias': getattr(vio_config, 'sigma_mag_bias', 0.001),
+        },
+        'noise_params': {
+            'sigma_vo_vel': global_config.get('SIGMA_VO', 0.5),
+            'sigma_mag_yaw': global_config.get('SIGMA_MAG_YAW', 0.15),
+            'sigma_agl_z': global_config.get('SIGMA_AGL_Z', 2.5),
+        },
+        'vio_params': {
+            'use_vio_velocity': vio_config.use_vio_velocity,
+            'use_magnetometer': vio_config.use_magnetometer,
+            'camera_view': vio_config.camera_view,
+            'z_state': vio_config.z_state,
+        },
+        'initial_state': {
+            'lat0': lat0,
+            'lon0': lon0,
+            'alt0': alt0,
+        },
+        'estimate_imu_bias': vio_config.estimate_imu_bias,
+        'plane_config': global_config.get('plane', None),
+        'global_config': global_config,
+        'vio_config': vio_config,
+    }
+
+
 def save_calibration_log(output_path: str, camera_view: str, view_cfg: Dict,
                          kb_params: Dict, imu_params: Dict, mag_params: Dict,
                          noise_params: Dict, vio_params: Dict,
