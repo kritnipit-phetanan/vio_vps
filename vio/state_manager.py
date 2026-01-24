@@ -353,7 +353,7 @@ def initialize_ekf_state(kf,
                          initial_accel_bias: Optional[np.ndarray] = None,
                          mag_records: Optional[list] = None,
                          mag_params: Optional[dict] = None,
-                         ppk_initial_heading: Optional[float] = None) -> InitialState:
+                         ppk_initial_yaw: Optional[float] = None) -> InitialState:
     """
     Complete EKF state initialization.
     
@@ -379,7 +379,7 @@ def initialize_ekf_state(kf,
         initial_gyro_bias: Config-provided gyro bias (optional)
         initial_accel_bias: Config-provided accel bias (optional)
         mag_records: Magnetometer records for initial correction
-        mag_params: Magnetometer parameters dict
+        ppk_initial_yaw: PPK attitude yaw in ENU frame (optional)
         
     Returns:
         InitialState object with all initialization data
@@ -433,25 +433,18 @@ def initialize_ekf_state(kf,
     
     use_ppk_attitude = False  # Flag to skip magnetometer correction
     
-    if ppk_initial_heading is not None:
-        # Use PPK heading from velocity (moving at t=0)
+    if ppk_initial_yaw is not None:
+        # Use PPK ATTITUDE yaw (level flight assumption: pitch=0, roll=0)
         from scipy.spatial.transform import Rotation as R_scipy
-        R_init = R_scipy.from_euler('ZYX', [ppk_initial_heading, 0.0, 0.0])
+        R_init = R_scipy.from_euler('ZYX', [ppk_initial_yaw, 0.0, 0.0])
         q_xyzw = R_init.as_quat()  # [x, y, z, w]
         q_init = np.array([q_xyzw[3], q_xyzw[0], q_xyzw[1], q_xyzw[2]])  # [w, x, y, z]
-        print(f"[INIT][PPK VELOCITY] Using PPK initial heading from t=0 velocity: {np.degrees(ppk_initial_heading):.1f}° (ENU)")
+        print(f"[INIT][PPK ATTITUDE] Using PPK attitude yaw at t=0: {np.degrees(ppk_initial_yaw):.1f}° (ENU)")
         use_ppk_attitude = True  # Skip magnetometer correction
-    elif ppk_state is not None:
-        # v2.9.10.2: Use PPK attitude yaw (stationary at t=0)
-        # This is ALSO a single t=0 value, GPS-denied compliant!
-        q_init, _ = initialize_quaternion_from_ppk(ppk_state)
-        print(f"[INIT][PPK ATTITUDE] Using PPK attitude yaw at t=0 (stationary case)")
-        print(f"[INIT][PPK ATTITUDE] PPK yaw (NED): {np.degrees(ppk_state.yaw):.1f}° → ENU: {90 - np.degrees(ppk_state.yaw):.1f}°")
-        # v2.9.10.12: NO LONGER skip magnetometer - will be corrected below if mag available
-        use_ppk_attitude = False  # CHANGED: Allow mag correction to align with reference
     else:
+        # No PPK data - use IMU quaternion as fallback
         q_init = initialize_quaternion_from_imu(imu_records[0].q)
-        print(f"[INIT][IMU] Using IMU quaternion")
+        print(f"[INIT][IMU] Using IMU quaternion (no PPK available)")
     
     kf.x[6, 0] = q_init[0]  # w
     kf.x[7, 0] = q_init[1]  # x

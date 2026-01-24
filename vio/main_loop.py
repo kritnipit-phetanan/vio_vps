@@ -311,17 +311,18 @@ class VIORunner:
         
         lever_arm = self.global_config.get('IMU_GNSS_LEVER_ARM', np.zeros(3))
         
-        # v3.9.0 GPS-DENIED COMPLIANT: Use yaw directly from ppk_state (single t=0 value)
-        # CRITICAL: Convert from NED frame (PPK file) to ENU frame (EKF uses ENU)
+        # v3.9.10: Use PPK ATTITUDE yaw for initial heading (GPS-denied compliant)
+        # NOTE: This is ATTITUDE yaw from PPK, NOT velocity heading!
+        # Convert from NED frame (PPK file) to ENU frame (EKF uses ENU)
         # NED: 0 = North, positive = clockwise
         # ENU: 0 = East, positive = counter-clockwise
         # Conversion: yaw_enu = π/2 - yaw_ned
-        ppk_initial_heading = None
+        ppk_initial_yaw = None
         if self.ppk_state is not None:
             yaw_ned = self.ppk_state.yaw  # Attitude yaw from PPK file (NED frame)
             yaw_enu = np.pi/2 - yaw_ned  # Convert to ENU frame
             yaw_enu = np.arctan2(np.sin(yaw_enu), np.cos(yaw_enu))  # Normalize to [-π, π]
-            ppk_initial_heading = yaw_enu
+            ppk_initial_yaw = yaw_enu
         
         # MAG params for initial correction
         # v2.9.10.12: Include hard_iron and soft_iron for proper initial calibration
@@ -355,7 +356,7 @@ class VIORunner:
             initial_accel_bias=self.global_config.get('INITIAL_ACCEL_BIAS'),
             mag_records=self.mag_list if mag_params else None,
             mag_params=mag_params,
-            ppk_initial_heading=ppk_initial_heading  # v2.9.10.0 Priority 1
+            ppk_initial_yaw=ppk_initial_yaw  # PPK attitude yaw (ENU)
         )
         
         return init_state
