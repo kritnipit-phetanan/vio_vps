@@ -397,3 +397,30 @@ trn:
   min_altitude_variation_m: 5.0   # Minimum altitude variation in profile [m]
   update_interval_sec: 10.0   # Seconds between TRN updates
   sigma_trn_xy: 50.0          # Position uncertainty from TRN [m]
+
+# ============================================================================
+# VPS Configuration (Visual Positioning System - Satellite Matching)
+# ============================================================================
+vps:
+  enabled: true
+  mbtiles_path: "mission.mbtiles"  # Path to pre-cached satellite tiles
+  
+  # Processing parameters
+  output_size: [512, 512]          # Output patch size for matching
+  device: "cuda"                   # 'cuda' or 'cpu' for matcher
+  max_keypoints: 2048              # Maximum keypoints to extract
+  
+  # Quality thresholds
+  min_inliers: 20                  # Minimum inliers for valid match
+  max_reproj_error: 5.0            # Maximum reprojection error [px]
+  min_confidence: 0.3              # Minimum confidence score
+  
+  # Altitude limits (AGL)
+  min_altitude: 30.0               # Minimum altitude for VPS [m]
+  max_altitude: 500.0              # Maximum altitude for VPS [m]
+  
+  # Timing
+  min_update_interval: 0.5         # Minimum seconds between VPS updates
+  
+  # Camera selection (which extrinsics to use)
+  camera_view: "nadir"             # 'nadir', 'front', or 'side'
