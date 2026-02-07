@@ -34,7 +34,8 @@ def propagate_to_timestamp(kf: ExtendedKalmanFilter, target_time: float,
                            imu_buffer: List[IMURecord], current_time: float,
                            imu_params: dict,
                            estimate_imu_bias: bool = False,
-                           use_preintegration: bool = True) -> Tuple[bool, Optional[IMUPreintegration]]:
+                           use_preintegration: bool = True,
+                           mag_params: Optional[dict] = None) -> Tuple[bool, Optional[IMUPreintegration]]:
     """
     Propagate state to exact target timestamp using IMU measurements.
     
@@ -115,7 +116,7 @@ def propagate_to_timestamp(kf: ExtendedKalmanFilter, target_time: float,
         
         # Propagate with constant IMU (extrapolation) in small chunks
         for _ in range(num_chunks):
-            _propagate_single_imu_step(kf, last_imu, dt_chunk, estimate_imu_bias, current_time, imu_params)
+            _propagate_single_imu_step(kf, last_imu, dt_chunk, estimate_imu_bias, current_time, imu_params, mag_params)
         
         return True, None
     
@@ -233,8 +234,8 @@ def propagate_to_timestamp(kf: ExtendedKalmanFilter, target_time: float,
         J_R_bg, J_v_bg, J_v_ba, J_p_bg, J_p_ba = preint.get_jacobians()
         
         # Build state transition matrix for error-state
-        num_clones = (kf.x.shape[0] - 16) // 7
-        n_err = 15 + num_clones * 6
+        num_clones = (kf.x.shape[0] - 19) // 7  # v3.9.7: 19D nominal
+        n_err = 18 + num_clones * 6  # v3.9.7: 18D core error
         
         Phi = np.eye(n_err, dtype=float)
         
@@ -272,6 +273,19 @@ def propagate_to_timestamp(kf: ExtendedKalmanFilter, target_time: float,
         Q[9:12, 9:12] = np.eye(3) * (imu_params['gyr_w'] ** 2) * dt_total
         Q[12:15, 12:15] = np.eye(3) * (imu_params['acc_w'] ** 2) * dt_total
         
+        # v3.9.7: mag bias random walk (dynamic parameter)
+        # v3.9.8: Set to 0 when use_estimated_bias=False (freeze states)
+        # v3.9.9: Also freeze when mag_params is None (no mag data)
+        if mag_params is None:
+            # No mag data - freeze mag_bias completely
+            sigma_mag_bias = 0.0
+        else:
+            use_estimated_bias = mag_params.get('use_estimated_bias', True)
+            sigma_mag_bias = mag_params.get('sigma_mag_bias', 0.001)
+            if not use_estimated_bias:
+                sigma_mag_bias = 0.0  # Freeze mag_bias states
+        Q[15:18, 15:18] = np.eye(3) * sigma_mag_bias**2 * dt_total
+        
         # Propagate covariance
         kf.P = Phi @ kf.P @ Phi.T + Q
         
@@ -308,14 +322,14 @@ def propagate_to_timestamp(kf: ExtendedKalmanFilter, target_time: float,
                 dt = imu.t - relevant_imu[i-1].t
             
             if dt > 0:
-                _propagate_single_imu_step(kf, imu, dt, estimate_imu_bias, t_current, imu_params)
+                _propagate_single_imu_step(kf, imu, dt, estimate_imu_bias, t_current, imu_params, mag_params)
                 t_current = imu.t
         
         # Check if we need to interpolate to exact target_time
         if t_current < target_time:
             last_imu = relevant_imu[-1]
             dt = target_time - t_current
-            _propagate_single_imu_step(kf, last_imu, dt, estimate_imu_bias, t_current, imu_params)
+            _propagate_single_imu_step(kf, last_imu, dt, estimate_imu_bias, t_current, imu_params, mag_params)
         
         # Ensure covariance validity
         kf.P = ensure_covariance_valid(
@@ -331,7 +345,8 @@ def propagate_to_timestamp(kf: ExtendedKalmanFilter, target_time: float,
 
 def process_imu(kf: ExtendedKalmanFilter, imu: IMURecord, dt: float,
                 estimate_imu_bias: bool = False, t: float = 0.0, 
-                t0: float = 0.0, imu_params: dict = None):
+                t0: float = 0.0, imu_params: dict = None,
+                mag_params: Optional[dict] = None):
     """
     Public wrapper for single IMU step propagation.
     
@@ -345,6 +360,7 @@ def process_imu(kf: ExtendedKalmanFilter, imu: IMURecord, dt: float,
         t: Current timestamp
         t0: Initial timestamp (for process noise time-varying)
         imu_params: IMU noise parameters dict
+        mag_params: Mag noise parameters dict (optional)
     """
     if imu_params is None:
         imu_params = {'g_norm': 9.80665}
@@ -352,11 +368,12 @@ def process_imu(kf: ExtendedKalmanFilter, imu: IMURecord, dt: float,
     if dt <= 0:
         return
     
-    _propagate_single_imu_step(kf, imu, dt, estimate_imu_bias, t, imu_params)
+    _propagate_single_imu_step(kf, imu, dt, estimate_imu_bias, t, imu_params, mag_params)
 
 
 def _propagate_single_imu_step(kf: ExtendedKalmanFilter, imu: IMURecord, dt: float,
-                                estimate_imu_bias: bool, t: float, imu_params: dict):
+                                estimate_imu_bias: bool, t: float, imu_params: dict,
+                                mag_params: Optional[dict] = None):
     """
     Propagate state by one IMU step (helper for propagate_to_timestamp).
     
@@ -364,7 +381,7 @@ def _propagate_single_imu_step(kf: ExtendedKalmanFilter, imu: IMURecord, dt: flo
         kf: Extended Kalman Filter
         imu: IMU measurement
         dt: Time step
-        estimate_imu_bias: Whether bias was pre-estimated
+        estimate_imu_bias: Whether biases were pre-estimated
         t: Current time (for process noise computation)
         imu_params: IMU noise parameters dict
     """
@@ -424,9 +441,9 @@ def _propagate_single_imu_step(kf: ExtendedKalmanFilter, imu: IMURecord, dt: flo
     
     # ESKF covariance propagation
     Phi_err = compute_error_state_jacobian(q, a_corr, w_corr, dt, R_body_to_world)
-    Q_err = compute_error_state_process_noise(dt, estimate_imu_bias, t, 0.0, imu_params, 0.8)
+    Q_err = compute_error_state_process_noise(dt, estimate_imu_bias, t, 0.0, imu_params, 0.8, mag_params)
     
-    num_clones = (kf.x.shape[0] - 16) // 7
+    num_clones = (kf.x.shape[0] - 19) // 7  # v3.9.7: 19D nominal
     kf.P = propagate_error_state_covariance(kf.P, Phi_err, Q_err, num_clones)
     
     # Update priors
@@ -534,8 +551,8 @@ def apply_zupt(kf: ExtendedKalmanFilter, v_mag: float,
                                        symmetrize=True, check_psd=True)
     
     # Calculate dimensions
-    num_clones = (kf.x.shape[0] - 16) // 7
-    err_dim = 15 + 6 * num_clones
+    num_clones = (kf.x.shape[0] - 19) // 7  # v3.9.7: 19D nominal
+    err_dim = 18 + 6 * num_clones  # v3.9.7: 18D core error
     
     # ZUPT Jacobian
     H_zupt = np.zeros((3, err_dim), dtype=float)
@@ -816,8 +833,8 @@ def augment_state_with_camera(kf: ExtendedKalmanFilter, cam_q_wxyz: np.ndarray,
     """
     pose_size_nominal = 7  # quaternion (4) + position (3)
     pose_size_error = 6    # rotation (3) + position (3)
-    core_size_nominal = 16
-    core_size_error = 15
+    core_size_nominal = 19  # v3.9.7: includes mag_bias
+    core_size_error = 18    # v3.9.7: includes δmag
     
     old_n_nominal = kf.dim_x
     num_poses = (old_n_nominal - core_size_nominal) // pose_size_nominal
@@ -888,8 +905,8 @@ def augment_state_with_camera(kf: ExtendedKalmanFilter, cam_q_wxyz: np.ndarray,
     # Update filter (ESKF fix: separate nominal and error dimensions)
     kf.x = new_x
     kf.P = new_P
-    kf.dim_x = new_n_nominal    # Nominal state: 16 + 7*N
-    kf.dim_err = new_n_error    # Error state: 15 + 6*N
+    kf.dim_x = new_n_nominal    # Nominal state: 19 + 7*N (v3.9.7)
+    kf.dim_err = new_n_error    # Error state: 18 + 6*N (v3.9.7)
     
     # Update error-state matrices
     kf.F = np.eye(new_n_error, dtype=float)
@@ -1011,8 +1028,8 @@ def clone_camera_for_msckf(kf: ExtendedKalmanFilter, t: float,
         
         # Store FEJ linearization points
         clone_idx = len(cam_states)
-        err_theta_idx = 15 + 6 * clone_idx
-        err_p_idx = 15 + 6 * clone_idx + 3
+        err_theta_idx = 18 + 6 * clone_idx  # v3.9.7: 18D core error
+        err_p_idx = 18 + 6 * clone_idx + 3
         
         # Record observations
         obs_data = []

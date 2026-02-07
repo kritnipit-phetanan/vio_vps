@@ -207,6 +207,12 @@ magnetometer:
   max_yaw_rate_deg: 150.0       # Maximum expected yaw rate [deg/s] (was 30.0, too low for helicopter)
   gyro_consistency_threshold_deg: 30.0  # Max deviation from gyro integration [deg] (was 10.0)
   r_inflate: 2.0                # R inflation factor for inconsistent measurements (was 5.0)
+  
+  # ===== NEW: Online Mag Bias Estimation (v3.9.7) =====
+  # Mag bias (hard iron) is now estimated online in EKF state
+  sigma_mag_bias_init: 0.01      # Initial uncertainty for mag bias [normalized]
+  sigma_mag_bias: 0.0001         # Process noise for mag bias (random walk) [normalized/sqrt(s)]
+  use_estimated_bias: true      # Use EKF-estimated bias instead of config hard_iron
 
 # EKF Process Noise
 # v2.9.9.10: AGGRESSIVE 3× increase (v2.9.9.9's 2× still showed 13.1σ overconfidence)
@@ -391,3 +397,30 @@ trn:
   min_altitude_variation_m: 5.0   # Minimum altitude variation in profile [m]
   update_interval_sec: 10.0   # Seconds between TRN updates
   sigma_trn_xy: 50.0          # Position uncertainty from TRN [m]
+
+# ============================================================================
+# VPS Configuration (Visual Positioning System - Satellite Matching)
+# ============================================================================
+vps:
+  enabled: true
+  mbtiles_path: "mission.mbtiles"  # Path to pre-cached satellite tiles
+  
+  # Processing parameters
+  output_size: [512, 512]          # Output patch size for matching
+  device: "cuda"                   # 'cuda' or 'cpu' for matcher
+  max_keypoints: 2048              # Maximum keypoints to extract
+  
+  # Quality thresholds
+  min_inliers: 20                  # Minimum inliers for valid match
+  max_reproj_error: 5.0            # Maximum reprojection error [px]
+  min_confidence: 0.3              # Minimum confidence score
+  
+  # Altitude limits (AGL)
+  min_altitude: 30.0               # Minimum altitude for VPS [m]
+  max_altitude: 500.0              # Maximum altitude for VPS [m]
+  
+  # Timing
+  min_update_interval: 0.5         # Minimum seconds between VPS updates
+  
+  # Camera selection (which extrinsics to use)
+  camera_view: "nadir"             # 'nadir', 'front', or 'side'

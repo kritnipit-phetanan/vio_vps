@@ -72,7 +72,8 @@ def apply_magnetometer_update(kf,
                               timestamp: float = 0.0,
                               frame: int = -1,
                               yaw_override: Optional[float] = None,
-                              filter_info: Optional[dict] = None) -> Tuple[bool, str]:
+                              filter_info: Optional[dict] = None,
+                              use_estimated_bias: bool = True) -> Tuple[bool, str]:
     """
     Apply magnetometer heading update.
     
@@ -100,6 +101,7 @@ def apply_magnetometer_update(kf,
         frame: Current frame number
         yaw_override: If provided, use this yaw instead of computing from mag (for filtered yaw)
         filter_info: Dictionary from apply_mag_filter() with {'high_rate': bool, 'gyro_inconsistent': bool}
+        use_estimated_bias: If True, include mag_bias in Jacobian. If False, freeze mag_bias states.
         
     Returns:
         Tuple of (update_applied: bool, rejection_reason: str)
@@ -237,8 +239,8 @@ def apply_magnetometer_update(kf,
               f"innov={_MAG_STATE['reject_innovation']}, high_rate={_MAG_STATE['reject_high_rate']}, gyro_incons={_MAG_STATE['reject_gyro_inconsistent']}")
     
     # Build measurement model
-    num_clones = (kf.x.shape[0] - 16) // 7
-    err_dim = 15 + 6 * num_clones
+    num_clones = (kf.x.shape[0] - 19) // 7  # v3.9.7: 19D nominal
+    err_dim = 18 + 6 * num_clones  # v3.9.7: 18D core error
     theta_cov_idx = 8  # δθ_z in error state
     
     # v2.9.10.13: Check body Z direction to determine sign for yaw correction
@@ -253,9 +255,43 @@ def apply_magnetometer_update(kf,
     # If body Z points DOWN (negative world Z), flip sign
     yaw_sign = -1.0 if body_z_world[2] < 0 else 1.0
     
+    # v3.9.7: Compute mag_bias Jacobian for online estimation
+    # FIXED DERIVATION:
+    # yaw = atan2(-mag_y_cal, mag_x_cal) + declination
+    # 
+    # Step 1: ∂yaw/∂mag_cal
+    #   ∂yaw/∂mag_x = -(-mag_y) / (mag_x² + mag_y²) = mag_y / denom
+    #   ∂yaw/∂mag_y = -mag_x / (mag_x² + mag_y²)  ← negative from atan2(-mag_y, ...)
+    #
+    # Step 2: mag_cal = mag_raw - hard_iron  →  ∂mag_cal/∂hard_iron = -I
+    #
+    # Step 3: Chain rule: ∂yaw/∂hard_iron = ∂yaw/∂mag_cal × (-I) = -∂yaw/∂mag_cal
+    #   ∂yaw/∂hi_x = -mag_y / denom
+    #   ∂yaw/∂hi_y = mag_x / denom   (double negative: -(-mag_x/denom))
+    #
+    mag_x, mag_y = mag_calibrated[0], mag_calibrated[1]
+    mag_denom = mag_x**2 + mag_y**2
+    if mag_denom > 1e-6:
+        # Jacobian of yaw w.r.t. hard_iron bias (FIXED sign)
+        dyaw_dhix = -mag_y / mag_denom   # ∂yaw/∂hard_iron_x (negative!)
+        dyaw_dhiy = mag_x / mag_denom    # ∂yaw/∂hard_iron_y (positive!)
+        dyaw_dhiz = 0.0                   # Z-axis bias doesn't affect horizontal yaw
+    else:
+        dyaw_dhix = dyaw_dhiy = dyaw_dhiz = 0.0
+    
+    # v3.9.8: When use_estimated_bias=False, freeze mag_bias by setting Jacobian=0
+    if not use_estimated_bias:
+        dyaw_dhix = dyaw_dhiy = dyaw_dhiz = 0.0
+    
     def h_mag_fun(x):
         h_yaw = np.zeros((1, err_dim), dtype=float)
         h_yaw[0, 8] = yaw_sign  # v2.9.10.13: Sign depends on body orientation!
+        # v3.9.7: Add mag_bias Jacobian terms (error state indices 15:18)
+        # NOTE: Do NOT multiply by yaw_sign! yaw_sign is for attitude error,
+        # but mag_bias affects raw measurement directly (sensor frame).
+        h_yaw[0, 15] = dyaw_dhix  # δmag_bias_x
+        h_yaw[0, 16] = dyaw_dhiy  # δmag_bias_y  
+        h_yaw[0, 17] = dyaw_dhiz  # δmag_bias_z
         return h_yaw
     
     def hx_mag_fun(x):
@@ -393,8 +429,8 @@ def apply_dem_height_update(kf,
     if np.isnan(height_measurement):
         return False, "Invalid height measurement"
     
-    num_clones = (kf.x.shape[0] - 16) // 7
-    err_dim = 15 + 6 * num_clones
+    num_clones = (kf.x.shape[0] - 19) // 7  # v3.9.7: 19D nominal
+    err_dim = 18 + 6 * num_clones  # v3.9.7: 18D core error
     
     H_height = np.zeros((1, err_dim), dtype=float)
     H_height[0, 2] = 1.0  # Height is δp_z
@@ -578,8 +614,8 @@ def apply_velocity_update(kf,
     Returns:
         Tuple of (update_applied: bool, rejection_reason: str)
     """
-    num_clones = (kf.x.shape[0] - 16) // 7
-    err_dim = 15 + 6 * num_clones
+    num_clones = (kf.x.shape[0] - 19) // 7  # v3.9.7: 19D nominal
+    err_dim = 18 + 6 * num_clones  # v3.9.7: 18D core error
     
     # Adaptive uncertainty
     align_scale = 1.0 + alignment_deg / 45.0
@@ -868,8 +904,8 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
     use_vz_only = vio_config.get('use_vz_only', use_vz_only_default)
     
     # ESKF velocity update
-    num_clones = (kf.x.shape[0] - 16) // 7
-    err_dim = 15 + 6 * num_clones
+    num_clones = (kf.x.shape[0] - 19) // 7  # v3.9.7: 19D nominal
+    err_dim = 18 + 6 * num_clones  # v3.9.7: 18D core error
     
     if use_vz_only:
         h_vel = np.zeros((1, err_dim), dtype=float)
@@ -1023,8 +1059,8 @@ def apply_plane_constraint(kf,
     Returns:
         Tuple of (update_applied: bool, rejection_reason: str)
     """
-    num_clones = (kf.x.shape[0] - 16) // 7
-    err_dim = 15 + 6 * num_clones
+    num_clones = (kf.x.shape[0] - 19) // 7  # v3.9.7: 19D nominal
+    err_dim = 18 + 6 * num_clones  # v3.9.7: 18D core error
     
     H_plane = np.zeros((1, err_dim), dtype=float)
     H_plane[0, 2] = 1.0  # δp_z

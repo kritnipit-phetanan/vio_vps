@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VIO System Complete Flow (v3.9.9)</title>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.min.js"></script>
+    <style>
+        * { box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 1400px; margin: 0 auto; padding: 20px; background: #f0f4f8; color: #333; line-height: 1.6; }
+        h1 { color: #1a1a2e; border-bottom: 4px solid #4a90d9; padding-bottom: 15px; font-size: 2em; }
+        h2 { color: #2d3748; border-bottom: 2px solid #e2e8f0; padding-bottom: 10px; margin-top: 40px; font-size: 1.5em; }
+        h3 { color: #4a5568; margin-top: 25px; }
+        .mermaid { background: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); margin: 25px 0; overflow-x: auto; }
+        table { width: 100%; border-collapse: collapse; background: white; box-shadow: 0 4px 15px rgba(0,0,0,0.1); border-radius: 12px; overflow: hidden; margin: 20px 0; }
+        th { background: linear-gradient(135deg, #4a90d9, #357abd); color: white; padding: 14px 12px; text-align: left; font-weight: 600; }
+        td { padding: 12px; border-bottom: 1px solid #e2e8f0; }
+        tr:hover { background: #f7fafc; }
+        tr:last-child td { border-bottom: none; }
+        code { background: #edf2f7; padding: 3px 8px; border-radius: 4px; font-family: 'Monaco', 'Consolas', monospace; font-size: 0.9em; color: #553c9a; }
+        pre { background: #1a1a2e; color: #a8dadc; padding: 20px; border-radius: 12px; overflow-x: auto; font-size: 0.9em; }
+        .status-active { color: #38a169; font-weight: bold; }
+        .status-optional { color: #d69e2e; font-weight: bold; }
+        .status-unused { color: #e53e3e; font-weight: bold; }
+        .section-box { background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); margin: 20px 0; }
+        .state-box { background: linear-gradient(135deg, #667eea, #764ba2); color: white; padding: 25px; border-radius: 12px; margin: 20px 0; }
+        .state-box pre { background: rgba(0,0,0,0.3); color: #fff; }
+        .unused-box { background: linear-gradient(135deg, #fc8181, #f56565); color: white; padding: 20px; border-radius: 12px; margin: 20px 0; }
+        .legend { display: flex; gap: 20px; flex-wrap: wrap; padding: 15px; background: #edf2f7; border-radius: 8px; margin: 15px 0; }
+        .legend-item { display: flex; align-items: center; gap: 8px; }
+        .legend-dot { width: 12px; height: 12px; border-radius: 50%; }
+        .legend-active { background: #38a169; }
+        .legend-optional { background: #d69e2e; }
+        .legend-unused { background: #e53e3e; }
+        @media print { body { background: white; } .mermaid, .section-box, table { box-shadow: none; border: 1px solid #ccc; } }
+    </style>
+</head>
+<body>
+    <h1>🚁 VIO System Complete Flow (v3.9.9)</h1>
+
+    <h2>📂 vio/ Scripts Inventory (25 files)</h2>
+    <div class="legend">
+        <div class="legend-item"><div class="legend-dot legend-active"></div> Active</div>
+        <div class="legend-item"><div class="legend-dot legend-optional"></div> Optional/Conditional</div>
+        <div class="legend-item"><div class="legend-dot legend-unused"></div> Not Used</div>
+    </div>
+    <table>
+        <tr><th>#</th><th>Script</th><th>Status</th><th>Phase</th><th>Description</th></tr>
+        <tr><td>1</td><td><code>__init__.py</code></td><td class="status-active">✅</td><td>-</td><td>Package initialization, version info</td></tr>
+        <tr><td>2</td><td><code>config.py</code></td><td class="status-active">✅</td><td>1</td><td>VIOConfig dataclass, YAML loader</td></tr>
+        <tr><td>3</td><td><code>data_loaders.py</code></td><td class="status-active">✅</td><td>2</td><td>IMU/MAG/VPS/DEM/Image loading</td></tr>
+        <tr><td>4</td><td><code>ekf.py</code></td><td class="status-active">✅</td><td>3</td><td>ExtendedKalmanFilter class (19D)</td></tr>
+        <tr><td>5</td><td><code>state_manager.py</code></td><td class="status-active">✅</td><td>3</td><td>State initialization, covariance</td></tr>
+        <tr><td>6</td><td><code>main_loop.py</code></td><td class="status-active">✅</td><td>4</td><td>VIORunner orchestrator</td></tr>
+        <tr><td>7</td><td><code>propagation.py</code></td><td class="status-active">✅</td><td>5</td><td>IMU propagation, ZUPT</td></tr>
+        <tr><td>8</td><td><code>imu_preintegration.py</code></td><td class="status-active">✅</td><td>5</td><td>Forster preintegration</td></tr>
+        <tr><td>9</td><td><code>imu_driven.py</code></td><td class="status-active">✅</td><td>5</td><td>IMU-driven mode handler</td></tr>
+        <tr><td>10</td><td><code>magnetometer.py</code></td><td class="status-active">✅</td><td>6</td><td>Mag calibration, yaw computation</td></tr>
+        <tr><td>11</td><td><code>measurement_updates.py</code></td><td class="status-active">✅</td><td>6</td><td>Mag/Height/Velocity updates</td></tr>
+        <tr><td>12</td><td><code>vio_frontend.py</code></td><td class="status-active">✅</td><td>7</td><td>Feature tracking (KLT)</td></tr>
+        <tr><td>13</td><td><code>msckf.py</code></td><td class="status-active">✅</td><td>7</td><td>Multi-State Constraint KF</td></tr>
+        <tr><td>14</td><td><code>camera.py</code></td><td class="status-active">✅</td><td>7</td><td>Camera projection models</td></tr>
+        <tr><td>15</td><td><code>fisheye_rectifier.py</code></td><td class="status-active">✅</td><td>7</td><td>Kannala-Brandt rectification</td></tr>
+        <tr><td>16</td><td><code>vps_integration.py</code></td><td class="status-active">✅</td><td>8</td><td>VPS/GPS updates</td></tr>
+        <tr><td>17</td><td><code>loop_closure.py</code></td><td class="status-active">✅</td><td>8</td><td>Yaw drift correction</td></tr>
+        <tr><td>18</td><td><code>output_utils.py</code></td><td class="status-active">✅</td><td>9</td><td>Debug output, CSV writers</td></tr>
+        <tr><td>19</td><td><code>math_utils.py</code></td><td class="status-active">✅</td><td>*</td><td>Math helpers (quaternions, etc)</td></tr>
+        <tr><td>20</td><td><code>numerical_checks.py</code></td><td class="status-active">✅</td><td>*</td><td>Covariance PSD checks, tripwires</td></tr>
+        <tr><td>21</td><td><code>plane_detection.py</code></td><td class="status-optional">⚠️</td><td>7</td><td>RANSAC plane fitting (optional)</td></tr>
+        <tr><td>22</td><td><code>plane_msckf.py</code></td><td class="status-optional">⚠️</td><td>7</td><td>Plane-constrained MSCKF (optional)</td></tr>
+        <tr><td>23</td><td><code>plane_utils.py</code></td><td class="status-optional">⚠️</td><td>7</td><td>Plane geometry utilities (optional)</td></tr>
+        <tr><td>24</td><td><code>event_driven.py</code></td><td class="status-unused">❌</td><td>N/A</td><td><strong>NOT USED</strong> (legacy)</td></tr>
+        <tr><td>25</td><td><code>trn.py</code></td><td class="status-unused">❌</td><td>N/A</td><td><strong>NOT USED</strong> (TRN disabled)</td></tr>
+    </table>
+
+    <h2>🔄 Detailed Process Flow</h2>
+    <div class="mermaid">
+flowchart TD
+    subgraph PHASE1["Phase 1: CLI & Config"]
+        A1["run_vio.py<br/>main()"] --> A2["vio/config.py<br/>load_config()"]
+        A2 --> A3["VIOConfig dataclass"]
+    end
+
+    subgraph PHASE2["Phase 2: Data Loading"]
+        A3 --> B1["vio/data_loaders.py"]
+        B1 --> B2[load_imu_csv]
+        B1 --> B3[load_quarry_csv]
+        B1 --> B4[load_mag_csv]
+        B1 --> B5[load_dem]
+        B1 --> B6[load_images_index]
+    end
+
+    subgraph PHASE3["Phase 3: EKF Init"]
+        B2 & B3 & B4 & B5 & B6 --> C1["vio/main_loop.py<br/>VIORunner.__init__()"]
+        C1 --> C2["vio/ekf.py<br/>ExtendedKalmanFilter(dim_x=19)"]
+        C2 --> C3["vio/state_manager.py<br/>initialize_ekf_state()"]
+        C3 --> C4["vio/state_manager.py<br/>initialize_covariance() → P(18×18)"]
+    end
+
+    subgraph PHASE4["Phase 4: Main Loop"]
+        C4 --> D1["vio/main_loop.py<br/>run()"]
+        D1 --> D2{IMU sample?}
+        D2 -->|Yes| D3["process_imu_sample()"]
+        D2 -->|No| D4{Image frame?}
+        D4 -->|Yes| D5["process_image_frame()"]
+    end
+
+    subgraph PHASE5["Phase 5: IMU Propagation"]
+        D3 --> E1["vio/propagation.py<br/>propagate_to_timestamp()"]
+        E1 --> E2["vio/imu_preintegration.py<br/>propagate()"]
+        E2 --> E3["compute_error_state_jacobian()<br/>Φ(18×18)"]
+        E2 --> E4["compute_error_state_process_noise()<br/>Q(18×18)"]
+        E3 & E4 --> E5["P = Φ×P×Φᵀ + Q"]
+        E5 --> E6["vio/propagation.py<br/>ZUPT detection"]
+    end
+
+    subgraph PHASE6["Phase 6: Sensor Updates"]
+        D3 --> F1["vio/main_loop.py<br/>process_magnetometer()"]
+        F1 --> F2["vio/magnetometer.py<br/>calibrate_magnetometer()"]
+        F2 --> F3["compute_yaw_from_mag()"]
+        F3 --> F4["vio/measurement_updates.py<br/>apply_magnetometer_update()"]
+        E6 --> F6["vio/measurement_updates.py<br/>apply_height_update()"]
+        E6 --> F7["apply_velocity_update()"]
+    end
+
+    subgraph PHASE7["Phase 7: Visual Processing"]
+        D5 --> G1["vio/vio_frontend.py<br/>track_features_klt()"]
+        G1 --> G2["vio/camera.py<br/>project/unproject"]
+        G1 --> G3["vio/fisheye_rectifier.py"]
+        G2 & G3 --> G4["create_clone()"]
+        G4 --> G5["marginalize_oldest_pose()"]
+        G5 --> G6["vio/msckf.py<br/>msckf_update()"]
+    end
+
+    subgraph PHASE8["Phase 8: External Updates"]
+        D1 --> H1["vio/vps_integration.py"]
+        D1 --> H2["vio/loop_closure.py"]
+    end
+
+    subgraph PHASE9["Phase 9: Output"]
+        F4 & F6 & F7 & G6 & H1 & H2 --> I1["vio/output_utils.py<br/>save_pose_to_csv()"]
+    end
+    </div>
+
+    <h2>📋 Phase-by-Phase Script Usage</h2>
+
+    <h3>Phase 1: CLI & Configuration</h3>
+    <table>
+        <tr><th>Script</th><th>Functions Called</th></tr>
+        <tr><td><code>run_vio.py</code></td><td><code>main()</code>, <code>parse_args()</code></td></tr>
+        <tr><td><code>vio/config.py</code></td><td><code>load_config()</code> → <code>VIOConfig</code></td></tr>
+    </table>
+
+    <h3>Phase 2: Data Loading</h3>
+    <table>
+        <tr><th>Script</th><th>Functions Called</th></tr>
+        <tr><td><code>vio/data_loaders.py</code></td><td><code>load_imu_csv()</code>, <code>load_quarry_csv()</code>, <code>load_mag_csv()</code>, <code>load_vps_csv()</code>, <code>load_dem()</code>, <code>load_images_index()</code>, <code>load_ground_truth()</code></td></tr>
+    </table>
+
+    <h3>Phase 3: EKF Initialization</h3>
+    <table>
+        <tr><th>Script</th><th>Functions Called</th></tr>
+        <tr><td><code>vio/main_loop.py</code></td><td><code>VIORunner.__init__()</code>, <code>initialize_ekf()</code></td></tr>
+        <tr><td><code>vio/ekf.py</code></td><td><code>ExtendedKalmanFilter(dim_x=19)</code>, <code>apply_correction()</code></td></tr>
+        <tr><td><code>vio/state_manager.py</code></td><td><code>initialize_ekf_state()</code>, <code>initialize_covariance()</code>, <code>get_num_clones()</code></td></tr>
+    </table>
+
+    <h3>Phase 4: Main Loop</h3>
+    <table>
+        <tr><th>Script</th><th>Functions Called</th></tr>
+        <tr><td><code>vio/main_loop.py</code></td><td><code>run()</code>, <code>process_imu_sample()</code>, <code>process_image_frame()</code></td></tr>
+    </table>
+
+    <h3>Phase 5: IMU Propagation</h3>
+    <table>
+        <tr><th>Script</th><th>Functions Called</th></tr>
+        <tr><td><code>vio/propagation.py</code></td><td><code>propagate_to_timestamp()</code>, <code>propagate_error_state_covariance()</code></td></tr>
+        <tr><td><code>vio/imu_preintegration.py</code></td><td><code>propagate()</code>, <code>compute_error_state_jacobian()</code>, <code>compute_error_state_process_noise()</code>, <code>snapshot_jacobians()</code></td></tr>
+        <tr><td><code>vio/imu_driven.py</code></td><td><code>IMUDrivenProcessor.process_batch()</code></td></tr>
+    </table>
+
+    <h3>Phase 6: Sensor Updates</h3>
+    <table>
+        <tr><th>Script</th><th>Functions Called</th></tr>
+        <tr><td><code>vio/magnetometer.py</code></td><td><code>calibrate_magnetometer()</code>, <code>compute_yaw_from_mag()</code>, <code>MagLowPassFilter</code></td></tr>
+        <tr><td><code>vio/measurement_updates.py</code></td><td><code>apply_magnetometer_update()</code>, <code>apply_height_update()</code>, <code>apply_velocity_update()</code>, <code>apply_plane_constraint_update()</code></td></tr>
+    </table>
+
+    <h3>Phase 7: Visual Processing</h3>
+    <table>
+        <tr><th>Script</th><th>Functions Called</th></tr>
+        <tr><td><code>vio/vio_frontend.py</code></td><td><code>track_features_klt()</code>, <code>extract_features_grid()</code></td></tr>
+        <tr><td><code>vio/camera.py</code></td><td><code>project()</code>, <code>unproject()</code>, <code>CameraModel</code></td></tr>
+        <tr><td><code>vio/fisheye_rectifier.py</code></td><td><code>FisheyeRectifier.undistort()</code></td></tr>
+        <tr><td><code>vio/msckf.py</code></td><td><code>msckf_update()</code>, <code>triangulate_feature()</code>, <code>compute_feature_jacobian()</code>, <code>nullspace_projection()</code></td></tr>
+        <tr><td><code>vio/plane_detection.py</code></td><td><code>detect_planes()</code> (optional)</td></tr>
+        <tr><td><code>vio/plane_msckf.py</code></td><td><code>plane_msckf_update()</code> (optional)</td></tr>
+        <tr><td><code>vio/plane_utils.py</code></td><td><code>fit_plane()</code>, <code>point_to_plane_distance()</code> (optional)</td></tr>
+    </table>
+
+    <h3>Phase 8: External Updates</h3>
+    <table>
+        <tr><th>Script</th><th>Functions Called</th></tr>
+        <tr><td><code>vio/vps_integration.py</code></td><td><code>apply_vps_update()</code>, <code>apply_height_update()</code>, <code>compute_vps_innovation()</code></td></tr>
+        <tr><td><code>vio/loop_closure.py</code></td><td><code>process_loop_closure()</code>, <code>LoopClosureHandler</code></td></tr>
+    </table>
+
+    <h3>Phase 9: Output</h3>
+    <table>
+        <tr><th>Script</th><th>Functions Called</th></tr>
+        <tr><td><code>vio/output_utils.py</code></td><td><code>save_pose_to_csv()</code>, <code>save_debug_csv()</code>, <code>save_calibration_log()</code>, <code>DebugWriters</code>, <code>print_error_statistics()</code></td></tr>
+    </table>
+
+    <h3>Utility Scripts (used throughout)</h3>
+    <table>
+        <tr><th>Script</th><th>Functions Called</th></tr>
+        <tr><td><code>vio/math_utils.py</code></td><td><code>quat_mult()</code>, <code>quat_to_rot()</code>, <code>skew_symmetric()</code>, <code>angle_wrap()</code></td></tr>
+        <tr><td><code>vio/numerical_checks.py</code></td><td><code>check_covariance_psd()</code>, <code>enforce_covariance_symmetry()</code>, <code>check_file_being_used()</code></td></tr>
+        <tr><td><code>vio/__init__.py</code></td><td>Package metadata, version info</td></tr>
+    </table>
+
+    <h2>❌ Unused Scripts</h2>
+    <div class="unused-box">
+        <table style="background: rgba(255,255,255,0.15); color: white;">
+            <tr><th style="background: rgba(0,0,0,0.2);">Script</th><th style="background: rgba(0,0,0,0.2);">Reason</th></tr>
+            <tr><td><code>vio/event_driven.py</code></td><td>Legacy code, replaced by <code>main_loop.py</code></td></tr>
+            <tr><td><code>vio/trn.py</code></td><td>TRN (Terrain Referenced Navigation) disabled in config</td></tr>
+        </table>
+    </div>
+
+    <h2>📊 State Vector (v3.9.9)</h2>
+    <div class="state-box">
+        <h3 style="margin-top:0; color: white;">Nominal State (19D):</h3>
+        <pre>
+┌─────────────────────────────────────┐
+│ [0:3]   p      - Position (ENU)     │
+│ [3:6]   v      - Velocity           │
+│ [6:10]  q      - Quaternion         │
+│ [10:13] bg     - Gyro bias          │
+│ [13:16] ba     - Accel bias         │
+│ [16:19] mag    - Mag bias (NEW)     │
+│ [19:26] Clone₀ - Camera pose 0      │
+│ [26:33] Clone₁ - Camera pose 1...   │
+└─────────────────────────────────────┘</pre>
+        <h3 style="color: white;">Error State (18D + 6N):</h3>
+        <pre>
+┌─────────────────────────────────────┐
+│ [0:3]   δp    - Position error      │
+│ [3:6]   δv    - Velocity error      │
+│ [6:9]   δθ    - Rotation error      │
+│ [9:12]  δbg   - Gyro bias error     │
+│ [12:15] δba   - Accel bias error    │
+│ [15:18] δmag  - Mag bias error (NEW)│
+│ [18:24] δC₀   - Clone 0 error       │
+└─────────────────────────────────────┘</pre>
+    </div>
+
+    <script>mermaid.initialize({startOnLoad:true, theme:'default', flowchart:{curve:'basis'}});</script>
+</body>
+</html>

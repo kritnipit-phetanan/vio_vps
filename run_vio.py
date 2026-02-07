@@ -6,7 +6,7 @@ VIO Standalone Entry Point (run_vio.py)
 This script runs the VIO+EKF pipeline using the modular vio/ package.
 It is completely independent of vio_vps.py and uses VIORunner directly.
 
-Configuration Model (v3.2.0):
+Configuration Model (v3.9.9):
 -----------------------------
     YAML config is the single source of truth for ALL settings.
     CLI provides only data paths and debug flags.
@@ -214,6 +214,7 @@ def main():
         print(f"  camera_view: {config.camera_view}")
         print(f"  estimate_imu_bias: {config.estimate_imu_bias}")
         print(f"  use_magnetometer: {config.use_magnetometer}")
+        print(f"  use_mag_estimated_bias: {config.use_mag_estimated_bias} (sigma_init={config.sigma_mag_bias_init}, sigma_proc={config.sigma_mag_bias})")
         print(f"  use_vio_velocity: {config.use_vio_velocity}")
         print(f"  estimator_mode: {config.estimator_mode}")
         print(f"  fast_mode: {config.fast_mode}")

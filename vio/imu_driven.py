@@ -84,6 +84,13 @@ def run_imu_driven_loop(runner):
         threshold=imu_params.get('acc_n', 0.1) * vib_threshold_mult
     )
     
+    # v3.9.7: Prepare mag params for process noise
+    # v3.9.8: Include use_estimated_bias flag to freeze states when disabled
+    mag_params = {
+        'sigma_mag_bias': runner.config.sigma_mag_bias,
+        'use_estimated_bias': runner.config.use_mag_estimated_bias
+    }
+    
     # Initialize TRN (Terrain Referenced Navigation) - v3.3.0
     if runner.global_config.get('TRN_ENABLED', False):
         runner.trn = create_trn_from_config(runner.dem, runner.global_config)
@@ -182,7 +189,8 @@ def run_imu_driven_loop(runner):
                 runner.kf, rec, dt_before,
                 estimate_imu_bias=runner.config.estimate_imu_bias,
                 t=next_cam_time, t0=runner.state.t0,
-                imu_params=imu_params
+                imu_params=imu_params,
+                mag_params=mag_params
             )
             runner._update_imu_helpers(rec, dt_before, imu_params)
             runner.state.last_t = next_cam_time
@@ -198,7 +206,8 @@ def run_imu_driven_loop(runner):
                     runner.kf, rec, dt_after,
                     estimate_imu_bias=runner.config.estimate_imu_bias,
                     t=t_current, t0=runner.state.t0,
-                    imu_params=imu_params
+                    imu_params=imu_params,
+                    mag_params=mag_params
                 )
                 runner._update_imu_helpers(rec, dt_after, imu_params)
             runner.state.last_t = t_current
@@ -213,7 +222,8 @@ def run_imu_driven_loop(runner):
                 runner.kf, rec, dt,
                 estimate_imu_bias=runner.config.estimate_imu_bias,
                 t=rec.t, t0=runner.state.t0,
-                imu_params=imu_params
+                imu_params=imu_params,
+                mag_params=mag_params
             )
             
             # Step 3: Update mag filter variables and check ZUPT

@@ -82,13 +82,14 @@ def propagate_error_state_covariance(P: np.ndarray, Phi: np.ndarray,
     """
     Propagate error-state covariance with camera clones.
     
-    Full error state: [δp, δv, δθ, δbg, δba, δθ_C1, δp_C1, ...]
-    Dimensions: 15 (core) + 6*num_clones
+    v3.9.7: Updated for 18D core error state (includes δmag_bias)
+    Full error state: [δp, δv, δθ, δbg, δba, δmag, δθ_C1, δp_C1, ...]
+    Dimensions: 18 (core) + 6*num_clones
     
     Args:
         P: Current error-state covariance
-        Phi: Core error-state transition (15×15)
-        Q: Core process noise (15×15)
+        Phi: Core error-state transition (18×18)
+        Q: Core process noise (18×18)
         num_clones: Number of camera clones
     
     Returns:
@@ -96,7 +97,7 @@ def propagate_error_state_covariance(P: np.ndarray, Phi: np.ndarray,
     """
     from .numerical_checks import assert_finite, check_covariance_psd
     
-    err_dim = 15 + 6 * num_clones
+    err_dim = CORE_ERROR_DIM + CLONE_ERROR_DIM * num_clones
     
     # [TRIPWIRE] Check P matrix BEFORE propagation
     if not check_covariance_psd(P, name="ekf_P_before_prop"):
@@ -134,13 +135,13 @@ def propagate_error_state_covariance(P: np.ndarray, Phi: np.ndarray,
         P = P * scale_factor
         print(f"[EKF-PROP] P overflow clamped: max={P_max:.2e} → scaled by {scale_factor:.2e}")
     
-    # Build full Φ matrix
+    # Build full Φ matrix (v3.9.7: 18D core)
     phi_full = np.eye(err_dim, dtype=float)
-    phi_full[0:15, 0:15] = Phi
+    phi_full[0:CORE_ERROR_DIM, 0:CORE_ERROR_DIM] = Phi
     
-    # Build full Q matrix
+    # Build full Q matrix (v3.9.7: 18D core)
     q_full = np.zeros((err_dim, err_dim), dtype=float)
-    q_full[0:15, 0:15] = Q
+    q_full[0:CORE_ERROR_DIM, 0:CORE_ERROR_DIM] = Q
     
     # [TRIPWIRE] Validate Phi and Q matrices before propagation
     if not assert_finite("ekf_Phi", Phi, extra_info={"Phi_norm": np.linalg.norm(Phi)}):
@@ -220,29 +221,55 @@ def propagate_error_state_covariance(P: np.ndarray, Phi: np.ndarray,
     return p_new
 
 
+# State dimension constants
+# v3.9.7: Added mag_bias (3D) for online hard iron estimation
+CORE_NOMINAL_DIM = 19  # p(3) + v(3) + q(4) + bg(3) + ba(3) + mag_bias(3)
+CORE_ERROR_DIM = 18    # δp(3) + δv(3) + δθ(3) + δbg(3) + δba(3) + δmag(3)
+CLONE_NOMINAL_DIM = 7  # q(4) + p(3)
+CLONE_ERROR_DIM = 6    # δθ(3) + δp(3)
+
+# State indices (nominal)
+IDX_POS = slice(0, 3)
+IDX_VEL = slice(3, 6)
+IDX_QUAT = slice(6, 10)
+IDX_GYRO_BIAS = slice(10, 13)
+IDX_ACCEL_BIAS = slice(13, 16)
+IDX_MAG_BIAS = slice(16, 19)  # NEW
+
+# Error state indices
+IDX_ERR_POS = slice(0, 3)
+IDX_ERR_VEL = slice(3, 6)
+IDX_ERR_ROT = slice(6, 9)
+IDX_ERR_GYRO_BIAS = slice(9, 12)
+IDX_ERR_ACCEL_BIAS = slice(12, 15)
+IDX_ERR_MAG_BIAS = slice(15, 18)  # NEW
+
+
 class ExtendedKalmanFilter:
     """
     Error-State Kalman Filter (ESKF) for VIO - OpenVINS style.
     
     State vector layout (nominal state x):
-      - Core IMU state (16 elements):
+      - Core IMU state (19 elements):  # UPDATED from 16
         * p (0:3): position [m]
         * v (3:6): velocity [m/s]
         * q (6:10): quaternion [w,x,y,z]
         * bg (10:13): gyro bias [rad/s]
         * ba (13:16): accel bias [m/s²]
+        * mag_bias (16:19): magnetometer hard iron [normalized]  # NEW
       
       - Camera clones (7 elements each):
         * q_C (0:4): camera quaternion
         * p_C (4:7): camera position
     
     Error-state covariance P uses 3D rotation vector instead of 4D quaternion:
-      - Core error state (15 elements):
+      - Core error state (18 elements):  # UPDATED from 15
         * δp (0:3): position error
         * δv (3:6): velocity error
         * δθ (6:9): rotation error (3D)
         * δbg (9:12): gyro bias error
         * δba (12:15): accel bias error
+        * δmag (15:18): mag bias error  # NEW
       
       - Camera clone errors (6 elements each):
         * δθ_C (0:3): rotation error
@@ -298,8 +325,9 @@ class ExtendedKalmanFilter:
         """
         Compute error-state dimension from nominal state dimension.
         
-        Nominal: 16 + 7*N (quaternion = 4D)
-        Error:   15 + 6*N (rotation = 3D)
+        v3.9.7: Updated for mag_bias
+        Nominal: 19 + 7*N (quaternion = 4D, includes mag_bias)
+        Error:   18 + 6*N (rotation = 3D, includes δmag_bias)
         
         Args:
             nominal_dim: Nominal state dimension
@@ -307,24 +335,25 @@ class ExtendedKalmanFilter:
         Returns:
             Error-state dimension
         """
-        if nominal_dim < 16:
-            raise ValueError(f"Nominal dimension {nominal_dim} < 16 (minimum core state)")
+        if nominal_dim < CORE_NOMINAL_DIM:
+            raise ValueError(f"Nominal dimension {nominal_dim} < {CORE_NOMINAL_DIM} (minimum core state)")
         
-        num_clones = (nominal_dim - 16) // 7
-        if (nominal_dim - 16) % 7 != 0:
-            raise ValueError(f"Invalid nominal dimension {nominal_dim}: not 16+7*N")
+        num_clones = (nominal_dim - CORE_NOMINAL_DIM) // CLONE_NOMINAL_DIM
+        if (nominal_dim - CORE_NOMINAL_DIM) % CLONE_NOMINAL_DIM != 0:
+            raise ValueError(f"Invalid nominal dimension {nominal_dim}: not {CORE_NOMINAL_DIM}+7*N")
         
-        return 15 + 6 * num_clones
+        return CORE_ERROR_DIM + CLONE_ERROR_DIM * num_clones
     
     def nominal_to_error_idx(self, nominal_idx: int) -> int:
         """
         Map nominal state index to error-state index.
         
+        v3.9.7: Updated for mag_bias
         Nominal state:
-          [p(0:3), v(3:6), q(6:10), bg(10:13), ba(13:16), q_C1(16:20), p_C1(20:23), ...]
+          [p(0:3), v(3:6), q(6:10), bg(10:13), ba(13:16), mag(16:19), q_C1(19:23), p_C1(23:26), ...]
         
         Error state:
-          [δp(0:3), δv(3:6), δθ(6:9), δbg(9:12), δba(12:15), δθ_C1(15:18), δp_C1(18:21), ...]
+          [δp(0:3), δv(3:6), δθ(6:9), δbg(9:12), δba(12:15), δmag(15:18), δθ_C1(18:21), δp_C1(21:24), ...]
         
         Args:
             nominal_idx: Index in nominal state
@@ -337,28 +366,29 @@ class ExtendedKalmanFilter:
             return nominal_idx  # p, v: direct mapping
         elif nominal_idx < 10:
             # Quaternion (6-9) → rotation (6-8)
-            # Only map to first component (w→δθ_x), others handled by rotation update
             if nominal_idx == 6:
                 return 6  # w → δθ_x
             else:
                 return -1  # x,y,z components don't map directly
         elif nominal_idx < 16:
-            return nominal_idx - 1  # bg, ba: shift by 1
+            return nominal_idx - 1  # bg, ba: shift by 1 (due to quat 4→3)
+        elif nominal_idx < 19:
+            return nominal_idx - 1  # mag_bias: also shift by 1 (16,17,18 → 15,16,17)
         else:
-            # Camera clones
-            clone_offset = nominal_idx - 16
-            clone_id = clone_offset // 7
-            within_clone = clone_offset % 7
+            # Camera clones (start at 19 now, not 16)
+            clone_offset = nominal_idx - CORE_NOMINAL_DIM  # 19
+            clone_id = clone_offset // CLONE_NOMINAL_DIM   # 7
+            within_clone = clone_offset % CLONE_NOMINAL_DIM
             
             if within_clone < 4:
                 # Quaternion → rotation
                 if within_clone == 0:
-                    return 15 + 6 * clone_id  # w → δθ_x
+                    return CORE_ERROR_DIM + CLONE_ERROR_DIM * clone_id  # w → δθ_x
                 else:
                     return -1
             else:
                 # Position
-                return 15 + 6 * clone_id + (within_clone - 4) + 3
+                return CORE_ERROR_DIM + CLONE_ERROR_DIM * clone_id + (within_clone - 4) + 3
 
     def predict_update(self, z, HJacobian, Hx, args=(), hx_args=(), u=0):
         """Performs the predict/update innovation."""
@@ -517,40 +547,43 @@ class ExtendedKalmanFilter:
         """
         Apply error-state correction to nominal state.
         
-        Error state δx (15+6N): [δp, δv, δθ, δbg, δba, δθ_C1, δp_C1, ...]
-        Nominal state x (16+7N): [p, v, q, bg, ba, q_C1, p_C1, ...]
+        v3.9.7: Updated for mag_bias
+        Error state δx (18+6N): [δp, δv, δθ, δbg, δba, δmag, δθ_C1, δp_C1, ...]
+        Nominal state x (19+7N): [p, v, q, bg, ba, mag, q_C1, p_C1, ...]
         
         Args:
-            dx: Error-state correction (15+6N)
+            dx: Error-state correction (18+6N)
         """
         # Core state corrections
-        dp = dx[0:3, 0]      # Position error
-        dv = dx[3:6, 0]      # Velocity error
-        dtheta = dx[6:9, 0]  # Rotation error (3D)
-        dbg = dx[9:12, 0]    # Gyro bias error
-        dba = dx[12:15, 0]   # Accel bias error
+        dp = dx[IDX_ERR_POS, 0]           # Position error (0:3)
+        dv = dx[IDX_ERR_VEL, 0]           # Velocity error (3:6)
+        dtheta = dx[IDX_ERR_ROT, 0]       # Rotation error (6:9)
+        dbg = dx[IDX_ERR_GYRO_BIAS, 0]    # Gyro bias error (9:12)
+        dba = dx[IDX_ERR_ACCEL_BIAS, 0]   # Accel bias error (12:15)
+        dmag = dx[IDX_ERR_MAG_BIAS, 0]    # Mag bias error (15:18) - NEW
         
         # Additive corrections for p, v, biases
-        self.x[0:3, 0] += dp
-        self.x[3:6, 0] += dv
-        self.x[10:13, 0] += dbg
-        self.x[13:16, 0] += dba
+        self.x[IDX_POS, 0] += dp
+        self.x[IDX_VEL, 0] += dv
+        self.x[IDX_GYRO_BIAS, 0] += dbg
+        self.x[IDX_ACCEL_BIAS, 0] += dba
+        self.x[IDX_MAG_BIAS, 0] += dmag   # NEW
         
         # Multiplicative correction for quaternion (manifold update)
-        q_old = self.x[6:10, 0]
+        q_old = self.x[IDX_QUAT, 0]
         q_new = quat_boxplus(q_old, dtheta)
-        self.x[6:10, 0] = q_new
+        self.x[IDX_QUAT, 0] = q_new
         
         # Camera clone corrections
-        num_clones = (self.x.shape[0] - 16) // 7
+        num_clones = (self.x.shape[0] - CORE_NOMINAL_DIM) // CLONE_NOMINAL_DIM
         for i in range(num_clones):
-            # Error-state indices (15 + 6*i)
-            err_base = 15 + i * 6
+            # Error-state indices (18 + 6*i)
+            err_base = CORE_ERROR_DIM + i * CLONE_ERROR_DIM
             dtheta_c = dx[err_base:err_base+3, 0]    # Clone rotation error
             dp_c = dx[err_base+3:err_base+6, 0]      # Clone position error
             
-            # Nominal state indices (16 + 7*i)
-            nom_base = 16 + i * 7
+            # Nominal state indices (19 + 7*i)
+            nom_base = CORE_NOMINAL_DIM + i * CLONE_NOMINAL_DIM
             
             # Multiplicative quaternion update
             q_c_old = self.x[nom_base:nom_base+4, 0]

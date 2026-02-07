@@ -60,6 +60,7 @@ env/
 camera__image_mono/
 extracted_data/
 flight_record/
+test_folder/
 
 # Output directories (benchmark results)
 benchmark_*/
@@ -86,6 +87,10 @@ quick_*.py
 src_old/
 module_old/
 vio_backup_src/
+*.aux.xml
+
+# MBTiles files
+*.mbtiles
 
 # HTML trajectory visualizations
 *.html

@@ -358,8 +358,8 @@ class LoopClosureDetector:
         measured_yaw = np.arctan2(np.sin(measured_yaw), np.cos(measured_yaw))
         
         # Set up measurement update
-        num_clones = (kf.x.shape[0] - 16) // 7
-        err_dim = 15 + 6 * num_clones
+        num_clones = (kf.x.shape[0] - 19) // 7  # v3.9.7: 19D nominal
+        err_dim = 18 + 6 * num_clones  # v3.9.7: 18D core error
         theta_cov_idx = 8  # δθ_z in error state
         
         def h_loop_fun(x):
@@ -571,7 +571,7 @@ def apply_loop_closure_correction(kf, relative_yaw: float, kf_idx: int,
         
         # Build EKF update for yaw
         num_clones = len(cam_states)
-        err_dim = 15 + 6 * num_clones
+        err_dim = 18 + 6 * num_clones  # v3.9.7: 18D core error
         
         H_loop = np.zeros((1, err_dim), dtype=float)
         H_loop[0, 8] = 1.0  # Yaw error index
