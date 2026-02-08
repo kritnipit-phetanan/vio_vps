@@ -38,13 +38,6 @@ import numpy as np
 from dataclasses import dataclass, field
 from typing import Dict, Any, Optional, Tuple
 
-# ========================================
-# Debug verbosity control
-# ========================================
-# Set to True for detailed per-sample debug output
-VERBOSE_DEBUG = False  # Per-IMU sample debug
-VERBOSE_DEM = False    # Per-IMU DEM update logs
-
 
 # =============================================================================
 # VIOConfig Dataclass - Single source of truth for VIO runtime settings
@@ -180,37 +173,16 @@ def load_config(config_path: str) -> VIOConfig:
     # ========================================
     extr = config['extrinsics']
     
-    # CRITICAL: Body frame convention determines whether we need R_flip!
     # ========================================================================
-    # Frame Convention Notes:
-    # - FLU body (Z-up): Kalibr outputs camera Z pointing UP
-    #   → Need R_flip = diag(1, -1, -1) to make camera Z point DOWN for nadir
-    # - FRD body (Z-down): Kalibr already has camera Z pointing DOWN
-    #   → No R_flip needed!
-    #
-    # Bell 412 dataset uses FRD body frame (IMU quaternion shows body Z down)
-    # So we should NOT apply R_flip here!
+    # NOTE: R_flip logic removed - Bell 412 uses FRD body frame (no flip needed)
+    # For FLU body frame datasets, this would need to be re-implemented
     # ========================================================================
-    R_flip = np.array([
-        [1,  0,  0],
-        [0, -1,  0],
-        [0,  0, -1]
-    ], dtype=np.float64)
-    
-    # Check if we should apply R_flip based on body frame convention
-    # For now, DISABLE R_flip for Bell 412 (FRD body)
-    APPLY_R_FLIP = False  # Set to True for FLU body frame datasets
     
     def correct_camera_extrinsics(T_bc):
-        """Apply 180° rotation around camera X-axis to fix optical axis direction."""
-        if not APPLY_R_FLIP:
-            return T_bc.copy()  # No correction needed for FRD body frame
-        T_corrected = T_bc.copy()
-        R_bc = T_bc[:3, :3]
-        # New rotation: R_bc @ R_flip (apply flip in camera frame)
-        T_corrected[:3, :3] = R_bc @ R_flip
-        return T_corrected
+        """Pass-through for FRD body frame (no correction needed)."""
+        return T_bc.copy()
     
+
     T_orig = np.array(extr['nadir']['transform'], dtype=np.float64)
     result['BODY_T_CAMDOWN'] = correct_camera_extrinsics(T_orig)
     
@@ -510,7 +482,7 @@ MAG_UPDATE_RATE_LIMIT = 1  # Process EVERY mag sample for faster convergence
 MAG_USE_RAW_HEADING = True  # GPS-calibrated raw body-frame heading
 MAG_APPLY_INITIAL_CORRECTION = True  # Apply mag correction at startup
 MAG_INITIAL_CONVERGENCE_WINDOW = 30.0  # 30s initial settling window
-MAG_ADAPTIVE_THRESHOLD = True  # Use adaptive threshold based on yaw uncertainty
+# REMOVED: MAG_ADAPTIVE_THRESHOLD (was dead code - never referenced)
 
 # Enhanced Magnetometer Filtering Parameters
 MAG_EMA_ALPHA = 0.3  # EMA smoothing factor: 0.3 = 30% new, 70% old
@@ -520,7 +492,7 @@ MAG_CONSISTENCY_R_INFLATE = 4.0  # Inflate R by this factor when inconsistent
 
 # Process noise parameters
 SIGMA_ACCEL = 0.8
-SIGMA_VO_VEL = 2.0
+# REMOVED: SIGMA_VO_VEL (was dead code - never referenced, use _raw_config['SIGMA_VO'] instead)
 SIGMA_VPS_XY = 1.0
 SIGMA_AGL_Z = 2.5
 SIGMA_MAG_YAW = 0.15  # ~9° measurement noise
@@ -587,60 +559,13 @@ INITIAL_ACCEL_BIAS = np.zeros(3, dtype=float)
 
 
 # =============================================================================
-# MSCKF Triangulation Statistics (for debugging)
+# REMOVED: MSCKF_STATS, reset_msckf_stats(), print_msckf_stats()
+# These are now defined in vio/msckf.py (single source of truth)
+# Import from msckf module: from vio.msckf import MSCKF_STATS, reset_msckf_stats
 # =============================================================================
-MSCKF_STATS = {
-    'total_attempt': 0,
-    'success': 0,
-    'fail_few_obs': 0,
-    'fail_baseline': 0,
-    'fail_parallax': 0,
-    'fail_depth_sign': 0,
-    'fail_depth_large': 0,
-    'fail_reproj_error': 0,
-    'fail_nonlinear': 0,
-    'fail_chi2': 0,
-    'fail_solver': 0,
-    'fail_other': 0,
-}
 
-
-def reset_msckf_stats():
-    """Reset MSCKF statistics counters."""
-    global MSCKF_STATS
-    for key in MSCKF_STATS:
-        MSCKF_STATS[key] = 0
-
-
-def print_msckf_stats():
-    """Print MSCKF triangulation statistics summary."""
-    total = MSCKF_STATS['total_attempt']
-    if total == 0:
-        print("[MSCKF-TRI] No triangulation attempts")
-        return
-    
-    success = MSCKF_STATS['success']
-    rate = 100.0 * success / total if total > 0 else 0
-    
-    print(f"[MSCKF-TRI] total_attempt={total} succ={success} rate={rate:.1f}%")
-    print(f"  Failure breakdown:")
-    print(f"    few_obs={MSCKF_STATS['fail_few_obs']}")
-    print(f"    baseline={MSCKF_STATS['fail_baseline']}")
-    print(f"    parallax={MSCKF_STATS['fail_parallax']}")
-    print(f"    depth_sign={MSCKF_STATS['fail_depth_sign']}")
-    print(f"    depth_large={MSCKF_STATS['fail_depth_large']}")
-    print(f"    reproj_error={MSCKF_STATS['fail_reproj_error']}")
-    print(f"    nonlinear={MSCKF_STATS['fail_nonlinear']}")
-    print(f"    chi2={MSCKF_STATS['fail_chi2']}")
-    print(f"    solver={MSCKF_STATS['fail_solver']}")
-    print(f"    other={MSCKF_STATS['fail_other']}")
-
-
-# Runtime state for magnetometer filtering (reset per run)
-MAG_FILTER_STATE = {
-    'yaw_ema': None,  # EMA smoothed yaw
-    'last_yaw_mag': None,  # Previous yaw_mag for rate check
-    'last_yaw_t': None,  # Timestamp of last mag measurement
-    'integrated_gyro_dz': 0.0,  # Integrated gyro_z since last mag update
-    'n_updates': 0,  # Count of successful mag updates
-}
+# =============================================================================
+# REMOVED: MAG_FILTER_STATE
+# This is now defined in vio/magnetometer.py as _MAG_FILTER_STATE
+# Import from magnetometer module: from vio.magnetometer import get_mag_filter_state
+# =============================================================================
