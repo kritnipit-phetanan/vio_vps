@@ -1,12 +1,19 @@
-"""
-VIO (Visual-Inertial Odometry) Package
+"""VIO (Visual-Inertial Odometry) Package
 
 Complete modularized implementation of the VIO+ESKF+MSCKF system
-for helicopter navigation. Version 3.9.9 - EKF Mag Bias with Proper Freeze.
+for helicopter navigation. Version 3.9.10 - Config Cleanup.
 
-Version: 3.9.9 (EKF Mag Bias with Proper Freeze)
+Version: 3.9.10 (Config.py Refactoring)
 Modules: 18
-Total Lines: ~11,500
+Total Lines: ~11,400
+
+Changes in v3.9.10:
+- REFACTOR: config.py cleanup (647 → 571 lines, -12%)
+  * Removed dead code: VERBOSE_DEBUG, VERBOSE_DEM (never imported)
+  * Removed dead code: R_flip, APPLY_R_FLIP (always False)
+  * Removed dead code: MAG_ADAPTIVE_THRESHOLD, SIGMA_VO_VEL
+  * Removed duplicates: MSCKF_STATS (use msckf.py), MAG_FILTER_STATE (use magnetometer.py)
+  * Simplified correct_camera_extrinsics() to pass-through for FRD body frame
 
 Changes in v3.9.9:
 - NO-MAG FREEZE: When magnetometer disabled or mag_params=None
@@ -318,7 +325,7 @@ Usage:
     from vio.propagation import VibrationDetector
 """
 
-__version__ = "3.9.7"
+__version__ = "3.9.10"
 
 # Lazy module imports - access as vio.config, vio.math_utils, etc.
 # This avoids importing all dependencies at once

@@ -121,8 +121,9 @@ class FisheyeRectifier:
         # But we need pixel coordinates
         
         # Direction in image plane (same as x_norm, y_norm but scaled)
-        # Handle r_norm = 0 (center)
-        scale = np.where(r_norm > 1e-8, theta_d / r_norm, 1.0)
+        # Handle r_norm = 0 (center) - suppress warning since np.where handles it
+        with np.errstate(divide='ignore', invalid='ignore'):
+            scale = np.where(r_norm > 1e-8, theta_d / r_norm, 1.0)
         
         x_fisheye_norm = x_norm * scale
         y_fisheye_norm = y_norm * scale
