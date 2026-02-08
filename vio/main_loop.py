@@ -495,6 +495,13 @@ class VIORunner:
             self.keyframe_dir = os.path.join(self.config.output_dir, "debug_keyframes")
             os.makedirs(self.keyframe_dir, exist_ok=True)
             print(f"[DEBUG] Keyframe images will be saved to: {self.keyframe_dir}")
+            
+            # VPS match visualization directory
+            self.vps_matches_dir = os.path.join(self.config.output_dir, "debug_vps_matches")
+            os.makedirs(self.vps_matches_dir, exist_ok=True)
+            print(f"[DEBUG] VPS match images will be saved to: {self.vps_matches_dir}")
+        else:
+            self.vps_matches_dir = None
         
         # VPS Debug Logger (for future VPSRunner integration)
         # When VPSRunner is integrated, attach logger via: vps_runner.set_logger(self.vps_logger)
@@ -546,6 +553,11 @@ class VIORunner:
                         print(f"[VPS] Real-time VPS enabled with logging")
                     else:
                         print(f"[VPS] Real-time VPS enabled with logging")
+                    
+                    # Set match visualization directory
+                    if hasattr(self, 'vps_matches_dir') and self.vps_matches_dir:
+                        self.vps_runner.save_matches_dir = self.vps_matches_dir
+                        print(f"[VPS] Match visualizations will be saved")
                 else:
                     print(f"[WARNING] VPS enabled but MBTiles not found: {mbtiles_path}")
                     print(f"          Please create MBTiles using: python -m vps.tile_prefetcher")
@@ -774,6 +786,11 @@ class VIORunner:
                 # Start VPS processing in background thread
                 vps_thread = threading.Thread(target=run_vps_in_thread, daemon=True)
                 vps_thread.start()
+                
+                # Clone EKF state for delayed update (stochastic cloning)
+                if hasattr(self, 'vps_clone_manager'):
+                    clone_id = f"vps_{self.state.img_idx}"
+                    self.vps_clone_manager.clone_state(self.kf, t_cam, clone_id)
             
             # ================================================================
             # VIO Processing (continues immediately, parallel with VPS!)

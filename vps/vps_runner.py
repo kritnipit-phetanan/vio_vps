@@ -64,7 +64,8 @@ class VPSRunner:
                  camera_intrinsics: Optional[Dict] = None,
                  config: Optional[VPSConfig] = None,
                  device: str = 'cuda',
-                 camera_yaw_offset_rad: float = 0.0):
+                 camera_yaw_offset_rad: float = 0.0,
+                 save_matches_dir: Optional[str] = None):
         """
         Initialize VPS runner.
         
@@ -76,6 +77,7 @@ class VPSRunner:
             device: 'cuda' or 'cpu' for matcher
             camera_yaw_offset_rad: Camera-to-body yaw offset in radians
                                    (from extrinsics calibration)
+            save_matches_dir: Optional directory to save match visualization images
         """
         # Config
         if config is None:
@@ -118,6 +120,13 @@ class VPSRunner:
         
         # Debug logger (set via set_logger)
         self.logger = None
+        
+        # Save match visualizations directory
+        self.save_matches_dir = save_matches_dir
+        if save_matches_dir:
+            import os
+            os.makedirs(save_matches_dir, exist_ok=True)
+            print(f"[VPSRunner] Match visualizations will be saved to: {save_matches_dir}")
         
         # Statistics
         self.stats = {
@@ -397,6 +406,23 @@ class VPSRunner:
               f"Δ=({vps_measurement.offset_m[0]:.1f}, {vps_measurement.offset_m[1]:.1f})m, "
               f"σ={np.sqrt(vps_measurement.R_vps[0,0]):.2f}m, "
               f"time={processing_time_ms:.0f}ms")
+        
+        # Save match visualization if directory is set
+        if self.save_matches_dir and frame_idx >= 0:
+            try:
+                import os
+                output_path = os.path.join(
+                    self.save_matches_dir, 
+                    f"vps_match_{frame_idx:06d}_{t_cam:.2f}s.jpg"
+                )
+                self.matcher.visualize_matches(
+                    drone_img=preprocessed_img,
+                    sat_img=map_patch.image,
+                    result=match_result,
+                    output_path=output_path
+                )
+            except Exception as e:
+                print(f"[VPS] Failed to save match visualization: {e}")
         
         return vps_measurement
     
