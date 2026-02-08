@@ -558,6 +558,18 @@ class VIORunner:
                     if hasattr(self, 'vps_matches_dir') and self.vps_matches_dir:
                         self.vps_runner.save_matches_dir = self.vps_matches_dir
                         print(f"[VPS] Match visualizations will be saved")
+                    
+                    # Initialize VPS delayed update manager (stochastic cloning)
+                    # CRITICAL: Must be created HERE, not lazily, so clone_state works
+                    from vps import VPSDelayedUpdateManager
+                    vps_delay_cfg = vps_cfg.get('delayed_update', {})
+                    self.vps_clone_manager = VPSDelayedUpdateManager(
+                        max_delay_sec=vps_delay_cfg.get('max_delay_sec', 0.5),
+                        max_clones=vps_delay_cfg.get('max_clones', 3)
+                    )
+                    # Tell VPSRunner that stochastic cloning is active for logging
+                    self.vps_runner.delayed_update_enabled = True
+                    print(f"[VPS] Delayed update manager initialized (stochastic cloning enabled)")
                 else:
                     print(f"[WARNING] VPS enabled but MBTiles not found: {mbtiles_path}")
                     print(f"          Please create MBTiles using: python -m vps.tile_prefetcher")

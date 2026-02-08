@@ -128,6 +128,9 @@ class VPSRunner:
             os.makedirs(save_matches_dir, exist_ok=True)
             print(f"[VPSRunner] Match visualizations will be saved to: {save_matches_dir}")
         
+        # Flag for delayed update (stochastic cloning) - set by caller
+        self.delayed_update_enabled = False
+        
         # Statistics
         self.stats = {
             'total_attempts': 0,
@@ -396,7 +399,7 @@ class VPSRunner:
                 num_inliers=match_result.num_inliers,
                 confidence=match_result.confidence,
                 tile_zoom=19,  # Default zoom level
-                delayed_update=False  # Set by caller if using stochastic cloning
+                delayed_update=self.delayed_update_enabled  # From stochastic cloning setup
             )
         
         # Console log
