@@ -525,35 +525,6 @@ def load_images(images_dir: Optional[str], index_csv: Optional[str],
     return items
 
 
-def load_vps_csv(path: Optional[str]) -> List[VPSItem]:
-    """Load VPS data from CSV file."""
-    if not path or not os.path.exists(path):
-        return []
-    
-    items = []
-    try:
-        df = pd.read_csv(path)
-        tcol = next((c for c in df.columns if c.lower().startswith("t")), None)
-        latcol = next((c for c in df.columns if c.lower().startswith("lat")), None)
-        loncol = next((c for c in df.columns if c.lower().startswith("lon")), None)
-        
-        if tcol and latcol and loncol:
-            for _, r in df.iterrows():
-                items.append(VPSItem(float(r[tcol]), float(r[latcol]), float(r[loncol])))
-    except Exception:
-        # Fallback: raw text parsing
-        with open(path, "r") as f:
-            for line in f:
-                p = [x.strip() for x in line.strip().split(",")]
-                if len(p) >= 3:
-                    try:
-                        items.append(VPSItem(float(p[0]), float(p[1]), float(p[2])))
-                    except Exception:
-                        continue
-    
-    items.sort(key=lambda x: x.t)
-    return items
-
 
 def load_ppk_initial_state(path: str) -> Optional[PPKInitialState]:
     """Load initial state from PPK ground truth file (.pos).

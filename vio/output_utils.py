@@ -577,7 +577,7 @@ def build_calibration_params(global_config: Dict, vio_config: Any,
     Returns:
         Dict with all parameters needed for save_calibration_log
     """
-    from .camera import CAMERA_VIEW_CONFIGS
+    from .config import CAMERA_VIEW_CONFIGS
     
     # Get camera view config
     view_cfg = global_config.get('CAMERA_VIEW_CONFIGS', {}).get(
@@ -683,7 +683,7 @@ def save_calibration_log(output_path: str, camera_view: str, view_cfg: Dict,
                 f.write(f"  quarry_path: {getattr(vio_config, 'quarry_path', 'N/A')}\n")
                 f.write(f"  images_dir: {getattr(vio_config, 'images_dir', None) or 'None'}\n")
                 f.write(f"  images_index_csv: {getattr(vio_config, 'images_index_csv', None) or 'None'}\n")
-                f.write(f"  vps_csv: {getattr(vio_config, 'vps_csv', None) or 'None'}\n")
+                f.write(f"  mbtiles_path: {getattr(vio_config, 'mbtiles_path', None) or 'None'}\n")
                 f.write(f"  mag_csv: {getattr(vio_config, 'mag_csv', None) or 'None'}\n")
                 f.write(f"  dem_path: {getattr(vio_config, 'dem_path', None) or 'None'}\n")
                 f.write(f"  ground_truth_path: {getattr(vio_config, 'ground_truth_path', None) or 'None'}\n")
@@ -815,6 +815,25 @@ def save_calibration_log(output_path: str, camera_view: str, view_cfg: Dict,
             for key, val in mag_params.items():
                 f.write(f"  {key}: {val}\n")
             f.write("\n")
+            
+            # VPS Configuration
+            if global_config:
+                vps_cfg = global_config.get('vps', {})
+                if vps_cfg:
+                    f.write("[VPS Configuration]\n")
+                    f.write(f"  Enabled: {vps_cfg.get('enabled', False)}\n")
+                    if vps_cfg.get('enabled', False):
+                        f.write(f"  MBTiles path: {vps_cfg.get('mbtiles_path', 'N/A')}\n")
+                        f.write(f"  Camera view: {vps_cfg.get('camera_view', 'nadir')}\n")
+                        f.write(f"  Min inliers: {vps_cfg.get('min_inliers', 20)}\n")
+                        f.write(f"  Min confidence: {vps_cfg.get('min_confidence', 0.3)}\n")
+                        f.write(f"  Max reproj error: {vps_cfg.get('max_reproj_error', 5.0)} px\n")
+                        f.write(f"  Altitude range: {vps_cfg.get('min_altitude', 30)} - {vps_cfg.get('max_altitude', 500)} m\n")
+                        f.write(f"  Min update interval: {vps_cfg.get('min_update_interval', 0.5)} sec\n")
+                        f.write(f"  Max latency: {vps_cfg.get('max_delay_sec', 0.5)} sec (stochastic cloning)\n")
+                        f.write(f"  Max clones: {vps_cfg.get('max_clones', 3)}\n")
+                        f.write(f"  Device: {vps_cfg.get('device', 'cpu')}\n")
+                    f.write("\n")
             
             f.write("[Initial State]\n")
             for key, val in initial_state.items():

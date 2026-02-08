@@ -130,6 +130,8 @@ Examples:
                         help="Path to camera timeref.csv (time_ref for unified clock)")
     parser.add_argument("--vps", type=str, default=None, 
                         help="Path to VPS results CSV")
+    parser.add_argument("--vps_tiles", type=str, default=None,
+                        help="Path to MBTiles file for VPS real-time processing")
     parser.add_argument("--mag", type=str, default=None, 
                         help="Path to magnetometer CSV")
     parser.add_argument("--dem", type=str, default=None, 
@@ -193,6 +195,10 @@ def main():
             config.dem_path = args.dem
         if args.ground_truth:
             config.ground_truth_path = args.ground_truth
+        
+        # MBTiles path for VPS
+        if args.vps_tiles:
+            config.mbtiles_path = args.vps_tiles
         
         # Debug flags (CLI flags enable if specified)
         if args.save_debug_data:

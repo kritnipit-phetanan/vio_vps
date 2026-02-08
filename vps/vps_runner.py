@@ -116,6 +116,9 @@ class VPSRunner:
         self.last_update_time = 0.0
         self.last_result: Optional[VPSMeasurement] = None
         
+        # Debug logger (set via set_logger)
+        self.logger = None
+        
         # Statistics
         self.stats = {
             'total_attempts': 0,
@@ -240,7 +243,8 @@ class VPSRunner:
                       est_lat: float,
                       est_lon: float,
                       est_yaw: float,
-                      est_alt: float) -> Optional[VPSMeasurement]:
+                      est_alt: float,
+                      frame_idx: int = -1) -> Optional[VPSMeasurement]:
         """
         Process single camera frame for VPS position.
         
@@ -257,6 +261,9 @@ class VPSRunner:
             
         Returns:
             VPSMeasurement if successful, None otherwise
+        
+        Note:
+            frame_idx: Optional frame index from VIO for logging. Default -1 if not provided.
         """
         t_start = time.time()
         self.stats['total_attempts'] += 1
@@ -331,6 +338,16 @@ class VPSRunner:
         
         if vps_measurement is None:
             self.stats['fail_match'] += 1
+            # Log failed attempt
+            if self.logger:
+                import math
+                self.logger.log_attempt(
+                    t=t_cam, frame=frame_idx,
+                    est_lat=est_lat, est_lon=est_lon, est_alt=est_alt,
+                    est_yaw_deg=math.degrees(est_yaw),
+                    success=False, reason="pose_estimation_failed",
+                    processing_time_ms=(time.time() - t_start) * 1000.0
+                )
             return None
         
         # Success!
@@ -338,14 +355,48 @@ class VPSRunner:
         self.last_update_time = t_cam
         self.last_result = vps_measurement
         
-        # Log
-        processing_time = time.time() - t_start
+        # Log processing time
+        processing_time_ms = (time.time() - t_start) * 1000.0
+        
+        # Debug logging
+        if self.logger:
+            import math
+            # Log attempt (success)
+            self.logger.log_attempt(
+                t=t_cam,
+                frame=frame_idx,
+                est_lat=est_lat,
+                est_lon=est_lon,
+                est_alt=est_alt,
+                est_yaw_deg=math.degrees(est_yaw),
+                success=True,
+                reason="matched",
+                processing_time_ms=processing_time_ms
+            )
+            
+            # Log match details
+            self.logger.log_match(
+                t=t_cam,
+                frame=frame_idx,
+                vps_lat=vps_measurement.lat,
+                vps_lon=vps_measurement.lon,
+                innovation_x=vps_measurement.offset_m[0],
+                innovation_y=vps_measurement.offset_m[1],
+                innovation_mag=float(np.linalg.norm(vps_measurement.offset_m)),
+                num_features=match_result.num_matches,
+                num_inliers=match_result.num_inliers,
+                confidence=match_result.confidence,
+                tile_zoom=19,  # Default zoom level
+                delayed_update=False  # Set by caller if using stochastic cloning
+            )
+        
+        # Console log
         print(f"[VPS] t={t_cam:.2f}: "
               f"inliers={match_result.num_inliers}, "
               f"err={match_result.reproj_error:.2f}px, "
               f"Δ=({vps_measurement.offset_m[0]:.1f}, {vps_measurement.offset_m[1]:.1f})m, "
               f"σ={np.sqrt(vps_measurement.R_vps[0,0]):.2f}m, "
-              f"time={processing_time*1000:.0f}ms")
+              f"time={processing_time_ms:.0f}ms")
         
         return vps_measurement
     
@@ -371,8 +422,17 @@ class VPSRunner:
         print(f"  Match failed: {stats['fail_match']}")
         print(f"  Quality reject: {stats['fail_quality']}")
     
+    def set_logger(self, logger):
+        """
+        Attach debug logger for VPS processing.
+        
+        Args:
+            logger: VPSDebugLogger instance
+        """
+        self.logger = logger
+    
     def close(self):
-        """Clean up resources."""
+        """Release resources."""
         self.tile_cache.close()
     
     def __enter__(self):
@@ -386,16 +446,48 @@ def test_vps_runner():
     """Test VPS runner with proper camera config."""
     import sys
     import os
+    import argparse
     
-    if len(sys.argv) < 2:
-        print("Usage: python vps_runner.py <mbtiles_path> [config_path] [lat] [lon]")
-        print("Skipping test (no mbtiles file provided)")
-        return
+    # Parse arguments using argparse (consistent with run_vio.py)
+    parser = argparse.ArgumentParser(
+        description="VPS Runner Test Script",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Basic usage with defaults:
+  python -m vps.vps_runner --mbtiles mission.mbtiles
+  
+  # With custom config:
+  python -m vps.vps_runner --mbtiles mission.mbtiles --config configs/config.yaml
+  
+  # With custom position:
+  python -m vps.vps_runner --mbtiles mission.mbtiles --lat 45.315 --lon -75.670
+        """
+    )
     
-    mbtiles_path = sys.argv[1]
-    config_path = sys.argv[2] if len(sys.argv) > 2 else "configs/config_bell412_dataset3.yaml"
-    test_lat = float(sys.argv[3]) if len(sys.argv) > 3 else 45.315721787845
-    test_lon = float(sys.argv[4]) if len(sys.argv) > 4 else -75.670671305696
+    parser.add_argument("--mbtiles", type=str, 
+                        default="mission.mbtiles",
+                        help="Path to MBTiles file (default: mission.mbtiles)")
+    parser.add_argument("--config", type=str,
+                        default="configs/config_bell412_dataset3.yaml",
+                        help="Path to YAML config file (default: configs/config_bell412_dataset3.yaml)")
+    parser.add_argument("--lat", type=float,
+                        default=45.315721787845,
+                        help="Test latitude (default: 45.315721787845)")
+    parser.add_argument("--lon", type=float,
+                        default=-75.670671305696,
+                        help="Test longitude (default: -75.670671305696)")
+    parser.add_argument("--device", type=str,
+                        default="cpu",
+                        choices=["cpu", "cuda"],
+                        help="Device for matcher (default: cpu)")
+    
+    args = parser.parse_args()
+    
+    mbtiles_path = args.mbtiles
+    config_path = args.config
+    test_lat = args.lat
+    test_lon = args.lon
     
     print("=" * 60)
     print("Testing VPSRunner with Real Camera Config")
@@ -403,6 +495,14 @@ def test_vps_runner():
     print(f"  MBTiles: {mbtiles_path}")
     print(f"  Config:  {config_path}")
     print(f"  Test position: ({test_lat:.6f}, {test_lon:.6f})")
+    print(f"  Device: {args.device}")
+    
+    # Check if mbtiles exists
+    if not os.path.exists(mbtiles_path):
+        print(f"\n❌ Error: MBTiles file not found: {mbtiles_path}")
+        print("Please provide a valid MBTiles file or create one using:")
+        print("  python -m vps.tile_prefetcher --center LAT,LON --radius 500 -o mission.mbtiles")
+        return
     
     # Try to load real image from bell412 dataset
     images_dir = "/Users/france/Downloads/vio_dataset/bell412_dataset3/extracted_data_new/cam_data/camera__image_mono/images"
@@ -429,11 +529,11 @@ def test_vps_runner():
         vps = VPSRunner.create_from_config(
             mbtiles_path=mbtiles_path,
             config_path=config_path,
-            device='cpu'
+            device=args.device
         )
     else:
         print(f"Config not found, using defaults")
-        vps = VPSRunner(mbtiles_path, device='cpu')
+        vps = VPSRunner(mbtiles_path, device=args.device)
     
     with vps:
         result = vps.process_frame(

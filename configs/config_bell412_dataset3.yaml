@@ -403,7 +403,6 @@ trn:
 # ============================================================================
 vps:
   enabled: true
-  mbtiles_path: "mission.mbtiles"  # Path to pre-cached satellite tiles
   
   # Processing parameters
   output_size: [512, 512]          # Output patch size for matching
@@ -422,5 +421,10 @@ vps:
   # Timing
   min_update_interval: 0.5         # Minimum seconds between VPS updates
   
+  # Stochastic Cloning (Latency Handling)
+  max_delay_sec: 0.5               # Maximum delay before clone expires [sec]
+  max_clones: 3                    # Maximum number of clones to maintain
+  
   # Camera selection (which extrinsics to use)
   camera_view: "nadir"             # 'nadir', 'front', or 'side'
+

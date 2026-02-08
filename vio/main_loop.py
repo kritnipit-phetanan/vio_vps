@@ -29,6 +29,7 @@ Author: VIO project
 import os
 import time
 import math
+import threading
 import numpy as np
 import pandas as pd
 import cv2
@@ -39,7 +40,7 @@ from typing import Optional, Tuple, List, Dict, Any
 # Performance-critical imports moved to top-level to avoid per-iteration overhead
 from .config import load_config, VIOConfig, CAMERA_VIEW_CONFIGS
 from .data_loaders import (
-    load_imu_csv, load_images, load_vps_csv, 
+    load_imu_csv, load_images,
     load_mag_csv, load_ppk_initial_state, load_ppk_trajectory,
     load_msl_from_gga, DEMReader, ProjectionCache
 )
@@ -189,6 +190,12 @@ class VIORunner:
         
         # Projection cache for coordinate conversion
         self.proj_cache = ProjectionCache()
+        
+        # IMU-GNSS lever arm (will be populated from config)
+        self.lever_arm = np.zeros(3)
+        
+        # VPS timing tracking
+        self.last_vps_update_time = 0.0
     
     def load_config(self) -> dict:
         """Load YAML configuration file."""
@@ -237,7 +244,6 @@ class VIORunner:
             self.config.images_index_csv,
             self.config.timeref_csv
         )
-        self.vps_list = load_vps_csv(self.config.vps_csv)
         
         # v3.2.0: use_magnetometer is already populated from YAML (magnetometer.enabled)
         # No need for redundant check - VIOConfig.use_magnetometer is the final decision
@@ -262,7 +268,6 @@ class VIORunner:
         print("=== Input check ===")
         print(f"IMU: {'OK' if len(self.imu)>0 else 'MISSING'} ({len(self.imu)} samples)")
         print(f"Images: {'OK' if len(self.imgs)>0 else 'None'} ({len(self.imgs)} frames)")
-        print(f"VPS: {'OK' if len(self.vps_list)>0 else 'None'} ({len(self.vps_list)} items)")
         print(f"Mag: {'OK' if len(self.mag_list)>0 else 'None'} ({len(self.mag_list)} samples)")
         print(f"DEM: {'OK' if self.dem.ds else 'None'}")
         print(f"PPK: {'OK' if self.ppk_state else 'None'}")
@@ -310,7 +315,7 @@ class VIORunner:
         if imu_params is None:
             raise RuntimeError("IMU_PARAMS not found in config. Check YAML file.")
         
-        lever_arm = self.global_config.get('IMU_GNSS_LEVER_ARM', np.zeros(3))
+        self.lever_arm = self.global_config.get('IMU_GNSS_LEVER_ARM', np.zeros(3))
         
         # v3.9.10: Use PPK ATTITUDE yaw for initial heading (GPS-denied compliant)
         # NOTE: This is ATTITUDE yaw from PPK, NOT velocity heading!
@@ -347,7 +352,7 @@ class VIORunner:
             ppk_state=self.ppk_state,
             imu_records=self.imu,
             imu_params=imu_params,
-            lever_arm=lever_arm,
+            lever_arm=self.lever_arm,
             lat0=self.lat0, lon0=self.lon0,
             msl0=self.msl0, dem0=self.dem0,
             v_init_enu=self.v_init,
@@ -491,6 +496,62 @@ class VIORunner:
             os.makedirs(self.keyframe_dir, exist_ok=True)
             print(f"[DEBUG] Keyframe images will be saved to: {self.keyframe_dir}")
         
+        # VPS Debug Logger (for future VPSRunner integration)
+        # When VPSRunner is integrated, attach logger via: vps_runner.set_logger(self.vps_logger)
+        self.vps_logger = None
+        if self.config.save_debug_data:
+            # Check if VPS is enabled in YAML config (nested structure)
+            vps_cfg = {}
+            if hasattr(self.config, '_yaml_config') and self.config._yaml_config:
+                vps_cfg = self.config._yaml_config.get('vps', {})
+            if vps_cfg.get('enabled', False):
+                try:
+                    from vps import VPSDebugLogger
+                    self.vps_logger = VPSDebugLogger(
+                        output_dir=self.config.output_dir,
+                        enabled=True
+                    )
+                    print(f"[DEBUG] VPS logger enabled (debug_vps_attempts.csv, debug_vps_matches.csv)")
+                except ImportError:
+                    print(f"[WARNING] VPS module not available, VPS logging disabled")
+        
+        # VPS Real-time Runner (for live VPS processing)
+        self.vps_runner = None
+        # Use _yaml_config (original YAML) not global_config (flat dict)
+        vps_cfg = {}
+        if hasattr(self.config, '_yaml_config') and self.config._yaml_config:
+            vps_cfg = self.config._yaml_config.get('vps', {})
+        
+        if vps_cfg.get('enabled', False):
+            try:
+                from vps import VPSRunner
+                
+                # Get MBTiles path
+                # Priority: 1. CLI (config.mbtiles_path), 2. YAML (vps.mbtiles_path), 3. Default
+                mbtiles_path = self.config.mbtiles_path  # From CLI
+                if not mbtiles_path:
+                    # Fallback to YAML config
+                    mbtiles_path = vps_cfg.get('mbtiles_path', 'mission.mbtiles')
+                
+                if os.path.exists(mbtiles_path):
+                    self.vps_runner = VPSRunner.create_from_config(
+                        mbtiles_path=mbtiles_path,
+                        config_path=self.config.config_yaml,
+                        device=vps_cfg.get('device', 'cpu')
+                    )
+                    
+                    # Inject logger (Dependency Injection!)
+                    if self.vps_logger is not None:
+                        self.vps_runner.set_logger(self.vps_logger)
+                        print(f"[VPS] Real-time VPS enabled with logging")
+                    else:
+                        print(f"[VPS] Real-time VPS enabled with logging")
+                else:
+                    print(f"[WARNING] VPS enabled but MBTiles not found: {mbtiles_path}")
+                    print(f"          Please create MBTiles using: python -m vps.tile_prefetcher")
+            except ImportError as e:
+                print(f"[WARNING] VPS module not available: {e}")
+        
         # Save calibration snapshot using output_utils
         if self.config.save_debug_data:
             cal_path = os.path.join(self.config.output_dir, "debug_calibration.txt")
@@ -593,76 +654,20 @@ class VIORunner:
         # Update helpers (ZUPT, mag filter)
         self._update_imu_helpers(rec, dt, imu_params)
     
-    def process_vps(self, t: float):
-        """
-        Process VPS measurements up to current time with innovation gating.
-        
-        Args:
-            t: Current timestamp
-        """
-        from .vps_integration import (
-            compute_vps_innovation, compute_vps_acceptance_threshold
-        )
-        
-        sigma_vps = self.global_config.get('SIGMA_VPS_XY', 1.0)
-        
-        while (self.state.vps_idx < len(self.vps_list) and 
-               self.vps_list[self.state.vps_idx].t <= t):
-            
-            vps = self.vps_list[self.state.vps_idx]
-            self.state.vps_idx += 1
-            
-            # Compute innovation and Mahalanobis distance
-            vps_xy, innovation, m2_test = compute_vps_innovation(
-                vps, self.kf, self.lat0, self.lon0, self.proj_cache
-            )
-            
-            # Compute adaptive acceptance threshold
-            time_since_correction = t - getattr(self.kf, 'last_absolute_correction_time', t)
-            innovation_mag = float(np.linalg.norm(innovation))
-            max_innovation_m, r_scale, tier_name = compute_vps_acceptance_threshold(
-                time_since_correction, innovation_mag
-            )
-            
-            # Chi-square threshold (2 DOF)
-            chi2_threshold = 5.99  # 95% confidence
-            
-            # Gate by innovation magnitude OR chi-square test
-            if innovation_mag > max_innovation_m:
-                print(f"[VPS] REJECTED: innovation {innovation_mag:.1f}m > {max_innovation_m:.1f}m "
-                      f"({tier_name}, drift={time_since_correction:.1f}s)")
-                continue
-            
-            if m2_test > chi2_threshold * 10:  # Very permissive for first VPS
-                print(f"[VPS] REJECTED: chi2={m2_test:.1f} >> {chi2_threshold} "
-                      f"(innovation={innovation_mag:.1f}m)")
-                continue
-            
-            # Apply update with adaptive R scaling
-            applied = apply_vps_update(
-                self.kf,
-                vps_xy=vps_xy,
-                sigma_vps=sigma_vps,
-                r_scale=r_scale
-            )
-            
-            if applied:
-                self.kf.last_absolute_correction_time = t
-                print(f"[VPS] Applied at t={t:.3f}, innovation={innovation_mag:.1f}m, "
-                      f"tier={tier_name}, R_scale={r_scale:.1f}x")
-    
     def process_vio(self, rec, t: float, ongoing_preint=None):
         """
-        Process VIO (Visual-Inertial Odometry) updates.
+        Process VIO (Visual-Inertial Odometry) + VPS updates.
         
         This handles:
-        1. Image loading and feature tracking
-        2. Loop closure detection (optional)
-        3. Preintegration application at camera frame
-        4. Camera cloning for MSCKF
-        5. MSCKF multi-view updates
-        6. VIO velocity updates with scale recovery
-        7. Plane constraint updates
+        1. Image loading and preprocessing
+        2. VPS real-time processing (satellite matching)
+        3. Feature tracking (VIO frontend)
+        4. Loop closure detection (optional)
+        5. Preintegration application at camera frame
+        6. Camera cloning for MSCKF
+        7. MSCKF multi-view updates
+        8. VIO velocity updates with scale recovery
+        9. Plane constraint updates
         
         Args:
             rec: Current IMU record (for rotation rate check)
@@ -715,6 +720,64 @@ class VIORunner:
             img_for_tracking = img
             if self.rectifier is not None:
                 img_for_tracking = self.rectifier.rectify(img)
+            
+            # ================================================================
+            # VPS Real-time Processing (Parallel with Threading)
+            # ================================================================
+            # VPS runs in background thread while VIO continues immediately
+            # This reduces total latency and utilizes multi-core CPUs
+            vps_thread = None
+            vps_result_container = [None]  # Thread-safe result storage
+            
+            if self.vps_runner is not None:
+                # Get current EKF estimates for VPS processing
+                # Extract IMU position from EKF state
+                p_imu_enu = self.kf.x[:3].flatten()  # Position in ENU
+                
+                # Extract rotation matrix from quaternion
+                q = self.kf.x[6:10].flatten()  # Quaternion [w, x, y, z]
+                from .math_utils import quat_to_rot
+                R_body_to_world = quat_to_rot(q)
+                
+                # Get GNSS position (apply lever arm)
+                # Compute lever arm in ENU world frame
+                lever_arm_world = R_body_to_world @ self.lever_arm
+                p_gnss_enu = imu_to_gnss_position(
+                    p_imu_enu, R_body_to_world, self.lever_arm
+                )
+                
+                # Convert ENU to lat/lon
+                lat, lon = self.proj_cache.xy_to_latlon(
+                    p_gnss_enu[0], p_gnss_enu[1], self.lat0, self.lon0
+                )
+                alt = p_gnss_enu[2]  # MSL altitude
+                
+                est_yaw = self.kf.x[8]  # Yaw from EKF state
+                
+                # Define VPS processing function for thread
+                def run_vps_in_thread():
+                    try:
+                        result = self.vps_runner.process_frame(
+                            img=img,  # Use original image (not rectified)
+                            t_cam=t_cam,
+                            est_lat=lat,
+                            est_lon=lon,
+                            est_yaw=est_yaw,
+                            est_alt=alt,
+                            frame_idx=self.state.img_idx
+                        )
+                        vps_result_container[0] = result
+                    except Exception as e:
+                        print(f"[VPS] Thread error: {e}")
+                        vps_result_container[0] = None
+                
+                # Start VPS processing in background thread
+                vps_thread = threading.Thread(target=run_vps_in_thread, daemon=True)
+                vps_thread.start()
+            
+            # ================================================================
+            # VIO Processing (continues immediately, parallel with VPS!)
+            # ================================================================
             
             if is_fast_rotation:
                 print(f"[VIO] SKIPPING due to fast rotation: {rotation_rate_deg_s:.1f} deg/s")
@@ -917,6 +980,44 @@ class VIORunner:
                     vo_dx, vo_dy, vo_dz, vel_vx, vel_vy, vel_vz
                 )
                 
+                # ================================================================
+                # VPS Result Collection (after VIO completes)
+                # ================================================================
+                # Wait for VPS thread to finish and apply updates
+                if vps_thread is not None:
+                    # Wait for VPS processing to complete
+                    vps_thread.join(timeout=2.0)  # Max 2 seconds wait
+                    
+                    # Get result from thread
+                    vps_result = vps_result_container[0]
+                    
+                    # Apply VPS update using stochastic cloning
+                    if vps_result is not None:
+                        from .vps_integration import apply_vps_delayed_update
+                        
+                        # Create clone manager if not exists
+                        if not hasattr(self, 'vps_clone_manager'):
+                            from vps import VPSDelayedUpdateManager
+                            self.vps_clone_manager = VPSDelayedUpdateManager(
+                                max_delay_sec=0.5,  # From config
+                                max_clones=3
+                            )
+                        
+                        # Apply delayed update with stochastic cloning
+                        clone_id = f"vps_{self.state.img_idx}"
+                        apply_vps_delayed_update(
+                            kf=self.kf,
+                            clone_manager=self.vps_clone_manager,
+                            image_id=clone_id,
+                            vps_lat=vps_result.lat,
+                            vps_lon=vps_result.lon,
+                            R_vps=vps_result.R_vps,
+                            proj_cache=self.proj_cache,
+                            lat0=self.lat0,
+                            lon0=self.lon0,
+                            time_since_last_vps=(t_cam - self.last_vps_update_time)
+                        )
+                
                 # Save keyframe image with visualization overlay
                 if self.config.save_keyframe_images and hasattr(self, 'keyframe_dir'):
                     save_keyframe_with_overlay(img, self.vio_fe.frame_idx, 
@@ -962,15 +1063,15 @@ class VIORunner:
             vio_U = float(self.kf.x[2, 0])
             
             # Ground truth is GNSS position - convert VIO (IMU) to GNSS for fair comparison
-            lever_arm = self.global_config.get('IMU_GNSS_LEVER_ARM', np.zeros(3))
-            if np.linalg.norm(lever_arm) > 0.01:
+            # Use instance lever_arm (already set in initialize_ekf)
+            if np.linalg.norm(self.lever_arm) > 0.01:
                 from scipy.spatial.transform import Rotation as R_scipy
                 q_vio = self.kf.x[6:10, 0]
                 q_xyzw = np.array([q_vio[1], q_vio[2], q_vio[3], q_vio[0]])
                 R_body_to_world = R_scipy.from_quat(q_xyzw).as_matrix()
                 
                 p_imu_enu = np.array([vio_E, vio_N, vio_U])
-                p_gnss_enu = imu_to_gnss_position(p_imu_enu, R_body_to_world, lever_arm)
+                p_gnss_enu = imu_to_gnss_position(p_imu_enu, R_body_to_world, self.lever_arm)
                 vio_E, vio_N, vio_U = p_gnss_enu[0], p_gnss_enu[1], p_gnss_enu[2]
             
             # Errors

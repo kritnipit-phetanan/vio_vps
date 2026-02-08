@@ -485,3 +485,112 @@ def compute_plane_constraint_jacobian(kf: ExtendedKalmanFilter,
     h_matrix[0, 2] = 1.0
     
     return h_matrix, predicted_altitude
+
+
+# =============================================================================
+# Stochastic Cloning - Delayed VPS Update
+# =============================================================================
+
+def apply_vps_delayed_update(
+    kf: ExtendedKalmanFilter,
+    clone_manager,  # VPSDelayedUpdateManager
+    image_id: str,
+    vps_lat: float,
+    vps_lon: float,
+    R_vps: np.ndarray,
+    proj_cache: ProjectionCache,
+    lat0: float,
+    lon0: float,
+    time_since_last_vps: float = 0.0,
+    verbose: bool = False
+) -> Tuple[bool, Optional[float], str]:
+    """
+    Apply delayed VPS update using Stochastic Cloning.
+    
+    This is the main entry point for VPS updates with latency handling.
+    Uses the VPSDelayedUpdateManager to apply updates to cloned states
+    and propagate corrections to the current state.
+    
+    Args:
+        kf: ExtendedKalmanFilter instance (will be modified)
+        clone_manager: VPSDelayedUpdateManager with pending clone
+        image_id: Image identifier from clone_state()
+        vps_lat: VPS measured latitude
+        vps_lon: VPS measured longitude
+        R_vps: 2x2 measurement covariance matrix (m²)
+        proj_cache: ProjectionCache for coordinate conversion
+        lat0: Origin latitude for local frame
+        lon0: Origin longitude for local frame
+        time_since_last_vps: Time since last VPS update (for gating)
+        verbose: Print debug information
+        
+    Returns:
+        Tuple of:
+            - success: True if update was applied
+            - innovation_mag: Innovation magnitude in meters (or None)
+            - status: Status message for logging
+            
+    Example:
+        from vps import VPSDelayedUpdateManager
+        
+        manager = VPSDelayedUpdateManager(max_clones=3)
+        
+        # At camera capture
+        manager.clone_state(kf, t_capture, image_id="frame_001")
+        
+        # ... IMU propagation loop ...
+        # manager.propagate_cross_covariance(F_k)
+        
+        # When VPS result arrives
+        success, innov, msg = apply_vps_delayed_update(
+            kf, manager, "frame_001",
+            vps_lat=45.123, vps_lon=-75.456,
+            R_vps=np.diag([1.0, 1.0]),
+            proj_cache=proj_cache, lat0=lat0, lon0=lon0
+        )
+    """
+    # Check if clone exists
+    if not clone_manager.has_pending_clone(image_id):
+        return False, None, f"REJECTED: Clone '{image_id}' not found (expired?)"
+    
+    # Get clone age for logging
+    clone_age = clone_manager.get_clone_age(image_id, t_now=0.0)  # Relative age
+    
+    # Compute expected position for gating check
+    vps_xy = proj_cache.latlon_to_xy(vps_lat, vps_lon, lat0, lon0)
+    current_xy = kf.x[0:2, 0]
+    pre_innovation = np.linalg.norm(vps_xy - current_xy)
+    
+    # Adaptive gating based on time since last VPS
+    max_innovation_m, r_scale, tier_name = compute_vps_acceptance_threshold(
+        time_since_last_vps, pre_innovation
+    )
+    
+    # Gate check
+    if pre_innovation > max_innovation_m:
+        clone_manager.clones.pop(image_id, None)  # Remove the useless clone
+        return False, pre_innovation, f"GATED: Innovation {pre_innovation:.1f}m > {max_innovation_m:.1f}m ({tier_name})"
+    
+    # Scale R_vps if needed
+    R_vps_scaled = R_vps * r_scale
+    
+    # Apply the delayed update
+    success, innovation_mag = clone_manager.apply_delayed_update(
+        kf=kf,
+        image_id=image_id,
+        vps_lat=vps_lat,
+        vps_lon=vps_lon,
+        R_vps=R_vps_scaled,
+        proj_cache=proj_cache,
+        lat0=lat0,
+        lon0=lon0
+    )
+    
+    if success:
+        status = f"APPLIED: Innovation {innovation_mag:.2f}m, R_scale={r_scale:.1f} ({tier_name})"
+        if verbose:
+            print(f"[VPS_DELAYED] {status}")
+        return True, innovation_mag, status
+    else:
+        return False, innovation_mag, f"FAILED: Update computation failed ({tier_name})"
+

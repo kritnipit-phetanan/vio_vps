@@ -245,9 +245,6 @@ def run_imu_driven_loop(runner):
             ba = runner.kf.x[13:16, 0]
             runner.debug_writers.log_state_covariance(t, runner.state.vio_frame, runner.kf, bg, ba)
         
-        # VPS updates
-        runner.process_vps(t)
-        
         # Magnetometer updates
         if runner.config.use_magnetometer:
             runner.process_magnetometer(t)

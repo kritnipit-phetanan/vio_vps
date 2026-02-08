@@ -75,6 +75,7 @@ class VIOConfig:
     images_index_csv: Optional[str] = None
     timeref_csv: Optional[str] = None
     vps_csv: Optional[str] = None
+    mbtiles_path: Optional[str] = None  # VPS MBTiles file (like dem_path)
     mag_csv: Optional[str] = None
     dem_path: Optional[str] = None
     ground_truth_path: Optional[str] = None
@@ -105,7 +106,8 @@ class VIOConfig:
     save_keyframe_images: bool = False
     
     # Internal: store the raw YAML config dict for advanced access
-    _raw_config: Dict[str, Any] = field(default_factory=dict)
+    _raw_config: Dict[str, Any] = field(default_factory=dict)  # Flat dict
+    _yaml_config: Dict[str, Any] = field(default_factory=dict)  # Original YAML
 
 
 def load_config(config_path: str) -> VIOConfig:
@@ -469,8 +471,11 @@ def load_config(config_path: str) -> VIOConfig:
         save_debug_data=False,
         save_keyframe_images=False,
         
-        # Store raw config dict for backward compatibility
-        _raw_config=result
+        # CRITICAL: Store BOTH for backward compatibility
+        # _raw_config: Flat dict for legacy code (IMU_PARAMS, KB_PARAMS, etc.)
+        # _yaml_config: Original YAML dict for new modules (VPS, TRN, etc.)
+        _raw_config=result,  # ← Flat dict (backward compatible)
+        _yaml_config=config  # ← Original YAML dict (for VPS/TRN)
     )
     
     return vio_config

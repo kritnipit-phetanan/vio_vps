@@ -42,6 +42,8 @@ try:
     from .satellite_matcher import SatelliteMatcher, MatchResult
     from .vps_pose_estimator import VPSPoseEstimator, VPSMeasurement
     from .vps_runner import VPSRunner, VPSConfig
+    from .vps_delayed_update import VPSDelayedUpdateManager, VPSStateClone
+    from .vps_logger import VPSDebugLogger
 except ImportError as e:
     _OPTIONAL_IMPORTS_AVAILABLE = False
     _IMPORT_ERROR = str(e)
@@ -57,6 +59,10 @@ except ImportError as e:
     VPSMeasurement = None
     VPSRunner = None
     VPSConfig = None
+    VPSDelayedUpdateManager = None
+    VPSStateClone = None
+    VPSDebugLogger = None
+
 
 __all__ = [
     # Always available
@@ -75,7 +81,11 @@ __all__ = [
     'VPSMeasurement',
     'VPSRunner',
     'VPSConfig',
+    'VPSDelayedUpdateManager',
+    'VPSStateClone',
+    'VPSDebugLogger',
 ]
+
 
 __version__ = '0.1.0'
 
