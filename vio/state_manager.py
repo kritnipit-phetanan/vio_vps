@@ -347,7 +347,6 @@ def initialize_ekf_state(kf,
                          lat0: float, lon0: float,
                          msl0: float, dem0: Optional[float],
                          v_init_enu: np.ndarray,
-                         z_state: str = "msl",
                          estimate_imu_bias: bool = False,
                          initial_gyro_bias: Optional[np.ndarray] = None,
                          initial_accel_bias: Optional[np.ndarray] = None,
@@ -374,7 +373,6 @@ def initialize_ekf_state(kf,
         msl0: Initial MSL altitude
         dem0: DEM elevation at origin (None if unavailable)
         v_init_enu: Initial velocity [vx, vy, vz]
-        z_state: "msl" or "agl"
         estimate_imu_bias: Enable bias estimation
         initial_gyro_bias: Config-provided gyro bias (optional)
         initial_accel_bias: Config-provided accel bias (optional)
@@ -413,12 +411,8 @@ def initialize_ekf_state(kf,
     z_lever_offset = lever_arm_world[2] if ppk_state is not None else 0.0
     agl0 = (msl0 - dem0) if dem0 is not None else msl0
     
-    if z_state.lower() == "agl" and dem0 is not None:
-        kf.x[2, 0] = agl0 - z_lever_offset
-        z_mode = "AGL"
-    else:
-        kf.x[2, 0] = msl0 - z_lever_offset
-        z_mode = "MSL"
+    kf.x[2, 0] = msl0 - z_lever_offset
+    z_mode = "MSL"
     
     print(f"[INIT] Initial Z ({z_mode}, lever-arm corrected): {kf.x[2,0]:.2f} m")
     

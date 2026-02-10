@@ -60,10 +60,10 @@ class VIOConfig:
     """
     # Required paths (set by CLI)
     imu_path: str = ""
-    quarry_path: str = ""
     output_dir: str = ""
     
     # Optional data paths (set by CLI)
+    quarry_path: Optional[str] = None
     images_dir: Optional[str] = None
     images_index_csv: Optional[str] = None
     timeref_csv: Optional[str] = None
@@ -77,8 +77,6 @@ class VIOConfig:
     # Image processing (from YAML camera section)
     downscale_size: Tuple[int, int] = (1440, 1080)
     
-    # State options (from YAML)
-    z_state: str = "msl"  # "msl" or "agl"
     camera_view: str = "nadir"  # "nadir", "front", "side"
     
     # Algorithm options (from YAML)
@@ -423,7 +421,6 @@ def load_config(config_path: str) -> VIOConfig:
         downscale_size=(cam.get('image_width', 1440), cam.get('image_height', 1080)),
         
         # State options
-        z_state="msl",  # Default, can be overridden if needed
         camera_view=result['DEFAULT_CAMERA_VIEW'],
         
         # Algorithm options from YAML

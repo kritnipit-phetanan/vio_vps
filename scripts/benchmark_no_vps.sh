@@ -31,7 +31,6 @@ COMMON_ARGS="
     --ground_truth /mnt/External_Storage/CV_team/vio_dataset/bell412_dataset3/bell412_dataset3_frl.pos
     --img_w 1440
     --img_h 1080
-    --z_state msl
     --camera_view nadir
     --use_magnetometer
     --save_debug_data

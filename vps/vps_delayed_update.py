@@ -149,9 +149,29 @@ class VPSDelayedUpdateManager:
             
             # Ensure dimension compatibility
             f_dim = min(F_k.shape[0], clone.cross_cov.shape[0])
-            cross_cov_new = F_k[:f_dim, :f_dim] @ clone.cross_cov[:f_dim, :f_dim]
             
-            # Numerical safeguard: clamp extreme values
+            # Numerical safeguard: Check for inf/nan before multiplication
+            if not np.all(np.isfinite(F_k[:f_dim, :f_dim])) or not np.all(np.isfinite(clone.cross_cov[:f_dim, :f_dim])):
+                # Propagate with identity if corrupted (fail-safe)
+                continue
+                
+            # Clamp input matrices to prevent overflow (reduced to 1e4 for safety)
+            # 1e4 * 1e4 = 1e8, well within float32 limits
+            F_k_safe = np.clip(F_k[:f_dim, :f_dim], -1e4, 1e4)
+            cross_cov_safe = np.clip(clone.cross_cov[:f_dim, :f_dim], -1e4, 1e4)
+            
+            # Safe matrix multiplication with warning suppression
+            with np.errstate(all='ignore'):
+                try:
+                    cross_cov_new = F_k_safe @ cross_cov_safe
+                    
+                    # Check result validity immediately
+                    if not np.all(np.isfinite(cross_cov_new)):
+                        cross_cov_new = cross_cov_safe
+                except Exception:
+                    cross_cov_new = cross_cov_safe  # Keep previous if failed
+            
+            # Numerical safeguard: clamp output
             cross_cov_new = np.clip(cross_cov_new, -1e10, 1e10)
             cross_cov_new = np.nan_to_num(cross_cov_new, nan=0.0, posinf=1e10, neginf=-1e10)
             

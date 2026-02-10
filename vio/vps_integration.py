@@ -191,7 +191,7 @@ def get_dem_height(dem: DEMReader, lat: float, lon: float,
 
 
 def compute_dem_measurement(kf: ExtendedKalmanFilter, dem_now: float,
-                            has_valid_dem: bool, z_state: str,
+                            has_valid_dem: bool,
                             msl_measured: Optional[float] = None,
                             msl0_m: float = 0.0) -> Tuple[float, str]:
     """
@@ -206,7 +206,6 @@ def compute_dem_measurement(kf: ExtendedKalmanFilter, dem_now: float,
         kf: Extended Kalman Filter
         dem_now: DEM height at current position
         has_valid_dem: True if DEM is available
-        z_state: State Z mode ('msl' or 'agl')
         msl_measured: MSL from flight log (if available)
         msl0_m: Initial MSL altitude
     
@@ -215,37 +214,32 @@ def compute_dem_measurement(kf: ExtendedKalmanFilter, dem_now: float,
         update_mode: Description of update strategy
     """
     if has_valid_dem:
-        if z_state.lower() == "agl":
-            agl_now = kf.x[2, 0]
-            height_m = agl_now
-            update_mode = "AGL"
+        msl_now = kf.x[2, 0]
+        agl_now = msl_now - dem_now
+        
+        if msl_measured is not None:
+            height_m = msl_measured
+            expected_agl = msl_measured - dem_now
+            update_mode = f"MSL (flight_log, AGL={expected_agl:.1f}m)"
         else:
-            msl_now = kf.x[2, 0]
-            agl_now = msl_now - dem_now
+            # Fallback without flight_log
+            min_safe_agl = 0.5
             
-            if msl_measured is not None:
-                height_m = msl_measured
-                expected_agl = msl_measured - dem_now
-                update_mode = f"MSL (flight_log, AGL={expected_agl:.1f}m)"
+            if agl_now < min_safe_agl:
+                target_agl = 2.0
+                height_m = dem_now + target_agl
+                update_mode = f"MSL (emergency lift to {target_agl}m AGL)"
+            elif agl_now < 30.0:
+                target_agl = max(agl_now, 5.0)
+                height_m = dem_now + target_agl
+                update_mode = f"MSL (low alt, AGL={target_agl:.1f}m)"
+            elif agl_now < 150.0:
+                height_m = dem_now + agl_now
+                update_mode = f"MSL (AGL={agl_now:.1f}m)"
             else:
-                # Fallback without flight_log
-                min_safe_agl = 0.5
-                
-                if agl_now < min_safe_agl:
-                    target_agl = 2.0
-                    height_m = dem_now + target_agl
-                    update_mode = f"MSL (emergency lift to {target_agl}m AGL)"
-                elif agl_now < 30.0:
-                    target_agl = max(agl_now, 5.0)
-                    height_m = dem_now + target_agl
-                    update_mode = f"MSL (low alt, AGL={target_agl:.1f}m)"
-                elif agl_now < 150.0:
-                    height_m = dem_now + agl_now
-                    update_mode = f"MSL (AGL={agl_now:.1f}m)"
-                else:
-                    fallback_agl = 100.0
-                    height_m = dem_now + fallback_agl
-                    update_mode = f"MSL (high alt, fallback AGL={fallback_agl:.0f}m)"
+                fallback_agl = 100.0
+                height_m = dem_now + fallback_agl
+                update_mode = f"MSL (high alt, fallback AGL={fallback_agl:.0f}m)"
     else:
         # No DEM
         height_m = msl_measured if msl_measured is not None else msl0_m

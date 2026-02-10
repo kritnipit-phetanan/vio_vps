@@ -35,7 +35,6 @@ COMMON_ARGS="
     --dem /mnt/External_Storage/CV_team/vio_dataset/Copernicus_DSM_10_N45_00_W076_00_DEM.tif
     --img_w 1440
     --img_h 1080
-    --z_state msl
     --use_magnetometer
     --save_debug_data
 "

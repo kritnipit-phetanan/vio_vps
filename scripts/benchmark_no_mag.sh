@@ -102,7 +102,6 @@ python3 run_vio.py \
     --output "$OUTPUT_DIR" \
     --img_w 1440 \
     --img_h 1080 \
-    --z_state msl \
     --camera_view nadir \
     # --use_magnetometer \  # DISABLED for v2.9.10.3 test
     --use_vio_velocity \

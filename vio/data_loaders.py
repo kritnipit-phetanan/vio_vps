@@ -636,23 +636,128 @@ def load_ppk_trajectory(path: str) -> Optional[pd.DataFrame]:
         print(f"[WARN] Failed to load PPK trajectory: {e}")
         return None
 
+# =============================================================================
+# MSL Loader (Barometer/GNSS)
+# =============================================================================
 
-def load_msl_from_gga(path: str) -> Optional[float]:
-    """Load initial MSL altitude from GGA file."""
-    if not os.path.exists(path):
-        return None
+@dataclass
+class MSLRecord:
+    """Single MSL altitude measurement from flight log."""
+    t: float  # timestamp (seconds)
+    msl: float  # MSL altitude (meters)
+
+
+class MSLInterpolator:
+    """Interpolator for MSL altitude history."""
+    def __init__(self, records: List[MSLRecord]):
+        # Sort by time just in case
+        records.sort(key=lambda r: r.t)
+        self.times = np.array([r.t for r in records])
+        self.msl_values = np.array([r.msl for r in records])
+        
+    def get_msl(self, t: float, max_gap: float = 1.0) -> Optional[float]:
+        """Get interpolated MSL at time t. Returns None if gap > max_gap."""
+        if len(self.times) < 2:
+            return None
+            
+        # Check bounds
+        if t < self.times[0] - max_gap or t > self.times[-1] + max_gap:
+            return None
+            
+        # Linear Interpolation
+        return float(np.interp(t, self.times, self.msl_values))
+
+
+def load_flight_log_msl(path: str, timeref_csv: Optional[str] = None) -> Optional[MSLInterpolator]:
+    """
+    Load MSL altitude from flight_log_from_gga.csv with time synchronization.
     
+    Priority: time_ref (if available via timeref_csv) > stamp_bag (ROS) > stamp_msg > stamp_log
+    
+    Args:
+        path: Path to flight_log_from_gga.csv
+        timeref_csv: Path to timeref.csv (for mapping ROS time -> Hardware time)
+        
+    Returns:
+        MSLInterpolator or None
+    """
+    if not path or not os.path.exists(path):
+        return None
+        
     try:
         df = pd.read_csv(path)
-        msl_col = next((c for c in df.columns if "altitude_msl_m" in c.lower()), None)
         
-        if msl_col is None:
+        # Determine initial timestamp column
+        if "stamp_bag" in df.columns:
+            tcol = "stamp_bag"
+            print(f"[MSL] Found stamp_bag (ROS synchronized)")
+        elif "stamp_msg" in df.columns:
+            tcol = "stamp_msg"
+            print(f"[MSL] Found stamp_msg (Sensor time)")
+        elif "stamp_log" in df.columns:
+            tcol = "stamp_log"
+            print(f"[MSL] Found stamp_log (Legacy)")
+        else:
+            print("[MSL] No valid timestamp column found")
+            return None
+            
+        # Check for altitude column (flight_log_from_gga has 'altitude_MSL_m')
+        alt_col = next((c for c in df.columns if "altitude_msl" in c.lower() or "h_msl" in c.lower()), None)
+        if not alt_col:
+            print("[MSL] No altitude column found")
             return None
         
-        msl_m = float(df[msl_col].iloc[0])
-        print(f"[GGA] Initial MSL: {msl_m:.2f}m")
-        return msl_m
+        # Handle time_ref synchronization
+        use_timeref = False
+        if timeref_csv and os.path.exists(timeref_csv) and tcol in ["stamp_bag", "stamp_msg", "stamp_log"]:
+            try:
+                # Load time_ref mapping
+                timeref_df = pd.read_csv(timeref_csv)
+                
+                # Check formatting
+                ros_col = None
+                if tcol in timeref_df.columns:
+                    ros_col = tcol
+                elif "stamp_bag" in timeref_df.columns:
+                    ros_col = "stamp_bag"
+                elif "stamp_msg" in timeref_df.columns:
+                    ros_col = "stamp_msg"
+                
+                if ros_col and "time_ref" in timeref_df.columns:
+                    time_ref_pairs = list(zip(
+                        timeref_df[ros_col].values,
+                        timeref_df["time_ref"].values
+                    ))
+                    
+                    # Convert timestamps
+                    t_ros_array = df[tcol].values
+                    t_hw_array = interpolate_time_ref(t_ros_array, time_ref_pairs)
+                    
+                    df["time_ref"] = t_hw_array
+                    tcol = "time_ref"
+                    use_timeref = True
+                    print(f"[MSL] Converted timestamps to time_ref (hardware clock) using {os.path.basename(timeref_csv)}")
+                else:
+                    print(f"[MSL] Warning: time_ref CSV missing required columns for sync")
+            except Exception as e:
+                print(f"[MSL] Warning: Failed to sync time_ref: {e}")
+
+        # Extract records
+        df = df.sort_values(tcol).reset_index(drop=True)
+        records = []
+        for _, r in df.iterrows():
+            t = float(r[tcol])
+            msl = float(r[alt_col])
+            if math.isfinite(t) and math.isfinite(msl):
+                records.append(MSLRecord(t, msl))
+                
+        if len(records) < 2:
+            return None
+            
+        print(f"[MSL] Loaded {len(records)} altitude samples using {tcol}")
+        return MSLInterpolator(records)
         
-    except Exception:
+    except Exception as e:
+        print(f"[MSL] Error loading flight log: {e}")
         return None
 

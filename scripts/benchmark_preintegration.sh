@@ -41,7 +41,6 @@ COMMON_ARGS="
     --dem DSM_10_N47_00_W054_00_AOI.tif
     --img_w 1440
     --img_h 1080
-    --z_state msl
     --camera_view nadir
     --use_magnetometer
     --disable_vio_velocity

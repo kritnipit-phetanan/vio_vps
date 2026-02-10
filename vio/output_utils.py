@@ -18,7 +18,7 @@ from typing import Optional, Dict, List, Any, Tuple, Tuple
 # Ground Truth Error Computation
 # =============================================================================
 
-def get_ground_truth_error(t: float, kf, ppk_trajectory, flight_log_df, 
+def get_ground_truth_error(t: float, kf, ppk_trajectory, 
                            lat0: float, lon0: float, proj_cache,
                            error_type: str = 'position') -> Tuple:
     """
@@ -27,8 +27,7 @@ def get_ground_truth_error(t: float, kf, ppk_trajectory, flight_log_df,
     Args:
         t: Current timestamp
         kf: Kalman filter (for state and covariance)
-        ppk_trajectory: PPK trajectory DataFrame (higher priority)
-        flight_log_df: Flight log DataFrame (fallback)
+        ppk_trajectory: PPK trajectory DataFrame (required for error calc)
         lat0, lon0: Reference origin for coordinate conversion
         proj_cache: ProjectionCache instance for coordinate conversion
         error_type: 'position', 'velocity', or 'both'
@@ -40,22 +39,17 @@ def get_ground_truth_error(t: float, kf, ppk_trajectory, flight_log_df,
         Returns (None, None) gracefully if no ground truth is available.
         This ensures the system continues to work without GT data.
     """
-    gt_df = ppk_trajectory if ppk_trajectory is not None else flight_log_df
+    gt_df = ppk_trajectory
     if gt_df is None or len(gt_df) == 0:
         return None, None
     
     try:
         gt_idx = np.argmin(np.abs(gt_df['stamp_log'].values - t))
         gt_row = gt_df.iloc[gt_idx]
-        use_ppk = ppk_trajectory is not None
         
         if error_type in ['position', 'both']:
-            # Position error
-            if use_ppk:
-                gt_lat, gt_lon, gt_alt = gt_row['lat'], gt_row['lon'], gt_row['height']
-            else:
-                gt_lat, gt_lon = gt_row['lat_dd'], gt_row['lon_dd']
-                gt_alt = gt_row['altitude_MSL_m']
+            # Position error (from PPK)
+            gt_lat, gt_lon, gt_alt = gt_row['lat'], gt_row['lon'], gt_row['height']
             
             gt_E, gt_N = proj_cache.latlon_to_xy(gt_lat, gt_lon, lat0, lon0)
             gt_pos = np.array([[gt_E], [gt_N], [gt_alt]])
@@ -74,14 +68,9 @@ def get_ground_truth_error(t: float, kf, ppk_trajectory, flight_log_df,
                 dt = gt_row_next['stamp_log'] - gt_row_prev['stamp_log']
                 
                 if dt > 0.01:
-                    if use_ppk:
-                        gt_E_prev, gt_N_prev = proj_cache.latlon_to_xy(gt_row_prev['lat'], gt_row_prev['lon'], lat0, lon0)
-                        gt_E_next, gt_N_next = proj_cache.latlon_to_xy(gt_row_next['lat'], gt_row_next['lon'], lat0, lon0)
-                        gt_U_prev, gt_U_next = gt_row_prev['height'], gt_row_next['height']
-                    else:
-                        gt_E_prev, gt_N_prev = proj_cache.latlon_to_xy(gt_row_prev['lat_dd'], gt_row_prev['lon_dd'], lat0, lon0)
-                        gt_E_next, gt_N_next = proj_cache.latlon_to_xy(gt_row_next['lat_dd'], gt_row_next['lon_dd'], lat0, lon0)
-                        gt_U_prev, gt_U_next = gt_row_prev['altitude_MSL_m'], gt_row_next['altitude_MSL_m']
+                    gt_E_prev, gt_N_prev = proj_cache.latlon_to_xy(gt_row_prev['lat'], gt_row_prev['lon'], lat0, lon0)
+                    gt_E_next, gt_N_next = proj_cache.latlon_to_xy(gt_row_next['lat'], gt_row_next['lon'], lat0, lon0)
+                    gt_U_prev, gt_U_next = gt_row_prev['height'], gt_row_next['height']
                     
                     gt_vel = np.array([[(gt_E_next - gt_E_prev) / dt],
                                       [(gt_N_next - gt_N_prev) / dt],
@@ -607,7 +596,6 @@ def build_calibration_params(global_config: Dict, vio_config: Any,
             'use_vio_velocity': vio_config.use_vio_velocity,
             'use_magnetometer': vio_config.use_magnetometer,
             'camera_view': vio_config.camera_view,
-            'z_state': vio_config.z_state,
         },
         'initial_state': {
             'lat0': lat0,
@@ -670,7 +658,6 @@ def save_calibration_log(output_path: str, camera_view: str, view_cfg: Dict,
                 f.write(f"  use_preintegration: {getattr(vio_config, 'use_preintegration', 'N/A')}\n")
                 f.write(f"  fast_mode: {getattr(vio_config, 'fast_mode', 'N/A')}\n")
                 f.write(f"  frame_skip: {getattr(vio_config, 'frame_skip', 'N/A')}\n")
-                f.write(f"  z_state: {getattr(vio_config, 'z_state', 'N/A')}\n")
                 f.write(f"  save_debug_data: {getattr(vio_config, 'save_debug_data', 'N/A')}\n")
                 f.write(f"  save_keyframe_images: {getattr(vio_config, 'save_keyframe_images', 'N/A')}\n")
                 f.write(f"  downscale_size: {getattr(vio_config, 'downscale_size', 'N/A')}\n")

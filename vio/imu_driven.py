@@ -192,6 +192,11 @@ def run_imu_driven_loop(runner):
                 imu_params=imu_params,
                 mag_params=mag_params
             )
+            # VPS Stochastic Cloning: Propagate cross-covariance
+            if hasattr(runner, 'vps_clone_manager') and runner.vps_clone_manager is not None:
+                Phi_approx = np.eye(18, dtype=float)
+                Phi_approx[0:3, 3:6] = np.eye(3) * dt_before
+                runner.vps_clone_manager.propagate_cross_covariance(Phi_approx)
             runner._update_imu_helpers(rec, dt_before, imu_params)
             runner.state.last_t = next_cam_time
             
@@ -209,6 +214,11 @@ def run_imu_driven_loop(runner):
                     imu_params=imu_params,
                     mag_params=mag_params
                 )
+                # VPS Stochastic Cloning: Propagate cross-covariance
+                if hasattr(runner, 'vps_clone_manager') and runner.vps_clone_manager is not None:
+                    Phi_approx = np.eye(18, dtype=float)
+                    Phi_approx[0:3, 3:6] = np.eye(3) * dt_after
+                    runner.vps_clone_manager.propagate_cross_covariance(Phi_approx)
                 runner._update_imu_helpers(rec, dt_after, imu_params)
             runner.state.last_t = t_current
         else:
@@ -225,6 +235,15 @@ def run_imu_driven_loop(runner):
                 imu_params=imu_params,
                 mag_params=mag_params
             )
+            
+            # VPS Stochastic Cloning: Propagate cross-covariance for delayed updates
+            # Use approximate Phi (identity for small dt) since process_imu doesn't return it
+            if hasattr(runner, 'vps_clone_manager') and runner.vps_clone_manager is not None:
+                # For small dt (~2.5ms @ 400Hz), identity is good first-order approximation
+                # Full Phi would require extracting from process_imu internals
+                Phi_approx = np.eye(18, dtype=float)
+                Phi_approx[0:3, 3:6] = np.eye(3) * dt  # d(pos)/dt = vel
+                runner.vps_clone_manager.propagate_cross_covariance(Phi_approx)
             
             # Step 3: Update mag filter variables and check ZUPT
             runner._update_imu_helpers(rec, dt, imu_params)
@@ -244,6 +263,10 @@ def run_imu_driven_loop(runner):
             bg = runner.kf.x[10:13, 0]
             ba = runner.kf.x[13:16, 0]
             runner.debug_writers.log_state_covariance(t, runner.state.vio_frame, runner.kf, bg, ba)
+            
+        # Cleanup expired VPS clones (every ~0.1s, i.e. 40 samples)
+        if i % 40 == 0 and hasattr(runner, 'vps_clone_manager') and runner.vps_clone_manager is not None:
+             runner.vps_clone_manager.cleanup_expired_clones(t)
         
         # Magnetometer updates
         if runner.config.use_magnetometer:
@@ -257,12 +280,8 @@ def run_imu_driven_loop(runner):
         dem_now = runner.dem.sample_m(lat_now, lon_now) if runner.dem.ds else 0.0
         if dem_now is None:
             dem_now = 0.0
-        if runner.config.z_state.lower() == "agl":
-            agl_now = runner.kf.x[2, 0]
-            msl_now = agl_now + dem_now
-        else:
-            msl_now = runner.kf.x[2, 0]
-            agl_now = msl_now - dem_now
+        msl_now = runner.kf.x[2, 0]
+        agl_now = msl_now - dem_now
         
         # DEM height updates (modifies kf.x[2,0], but we use pre-update values for logging)
         runner.process_dem_height(t)

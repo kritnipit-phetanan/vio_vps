@@ -1044,12 +1044,8 @@ def run_event_driven_loop(runner):
             if dem_now is None:
                 dem_now = 0.0
             
-            if runner.config.z_state.lower() == "agl":
-                agl_now = x_output[2, 0]
-                msl_now = agl_now + dem_now
-            else:
-                msl_now = x_output[2, 0]
-                agl_now = msl_now - dem_now
+            msl_now = x_output[2, 0]
+            agl_now = msl_now - dem_now
             
             # Save current fusion state and temporarily swap for logging
             x_backup = runner.kf.x.copy()

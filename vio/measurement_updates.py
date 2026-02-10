@@ -704,7 +704,7 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
                                t: float, dt_img: float, avg_flow_px: float,
                                imu_rec, global_config: dict, camera_view: str,
                                dem_reader, lat0: float, lon0: float,
-                               z_state: str, use_vio_velocity: bool,
+                               use_vio_velocity: bool,
                                proj_cache,
                                save_debug: bool = False,
                                residual_csv: Optional[str] = None,
@@ -733,7 +733,6 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
         camera_view: Camera view mode
         dem_reader: DEM reader for AGL
         lat0, lon0: Origin coordinates
-        z_state: Z state representation ("msl" or "agl")
         use_vio_velocity: Whether to apply velocity update
         proj_cache: ProjectionCache instance for coordinate conversion
         save_debug: Enable debug logging
@@ -818,10 +817,7 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
         if dem_now is None or np.isnan(dem_now):
             dem_now = 0.0
         
-        if z_state.lower() == "agl":
-            agl = abs(kf.x[2, 0])
-        else:
-            agl = abs(kf.x[2, 0] - dem_now)
+        agl = abs(kf.x[2, 0] - dem_now)
     
     agl = max(1.0, agl)
     
