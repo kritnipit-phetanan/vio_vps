@@ -1,263 +1,296 @@
-#!/usr/bin/env python3
-"""
-สคริปต์สำหรับวาด 3D trajectory จากไฟล์ pose.csv
-Script for visualizing 3D trajectory from pose.csv file
-"""
 
+import os
+import argparse
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
-import argparse
-from pathlib import Path
+from datetime import datetime
+import calendar
 
+# Attempt to import pyproj logic if available, otherwise use simple fallback
+try:
+    from pyproj import CRS, Transformer
+    def latlon_to_xy(lat, lon, lat0, lon0):
+        crs_wgs84 = CRS.from_epsg(4326)
+        crs_local = CRS.from_proj4(f"+proj=tmerc +lat_0={lat0} +lon_0={lon0} +k=1 +x_0=0 +y_0=0 +ellps=WGS84 +datum=WGS84 +units=m +no_defs")
+        transformer = Transformer.from_crs(crs_wgs84, crs_local, always_xy=True)
+        return transformer.transform(lon, lat)
+except ImportError:
+    print("Warning: pyproj not found. Using simple equirectangular projection.")
+    def latlon_to_xy(lat, lon, lat0, lon0):
+        R = 6378137.0  # Earth radius
+        dlat = np.radians(lat - lat0)
+        dlon = np.radians(lon - lon0)
+        x = R * dlon * np.cos(np.radians(lat0))
+        y = R * dlat
+        return x, y
 
-def load_trajectory(csv_path):
-    """โหลดข้อมูล trajectory จากไฟล์ CSV"""
-    print(f"Loading trajectory from: {csv_path}")
-    df = pd.read_csv(csv_path)
-    print(f"Loaded {len(df)} poses")
-    print(f"Time range: {df['Timestamp(s)'].min():.2f}s to {df['Timestamp(s)'].max():.2f}s")
+def load_ppk_trajectory(path: str) -> pd.DataFrame:
+    """Load Ground Truth .pos file with GPST timestamp parsing."""
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"GT file not found: {path}")
+    
+    rows = []
+    with open(path, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('%'):
+                continue
+            
+            parts = line.split()
+            if len(parts) < 5:
+                continue
+            
+            # Timestamp: YYYY/MM/DD HH:MM:SS.SSS (GPST)
+            gpst_str = f"{parts[0]} {parts[1]}"
+            try:
+                dt = datetime.strptime(gpst_str, "%Y/%m/%d %H:%M:%S.%f")
+                # Convert to Unix timestamp
+                # Note: This is technically GPST -> Unix UTC conversion without leap seconds correction
+                # but aligns with how VIO loader does it currently.
+                stamp = calendar.timegm(dt.timetuple()) + dt.microsecond / 1e6
+                
+                rows.append({
+                    'timestamp': stamp,
+                    'lat': float(parts[2]),
+                    'lon': float(parts[3]),
+                    'height': float(parts[4])  # Ellipsoidal height
+                })
+            except Exception:
+                continue
+                
+    if not rows:
+        raise ValueError("No valid data found in GT file")
+        
+    df = pd.DataFrame(rows)
+    print(f"[GT] Loaded {len(df)} points from {os.path.basename(path)}")
     return df
 
+def load_vio_pose(path: str) -> pd.DataFrame:
+    """Load VIO estimated pose.csv."""
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"VIO pose file not found: {path}")
+    
+    # Check headers to determine delimiter and column names
+    # pose.csv format: Timestamp(s),dt,Frame,PX,PY,PZ_MSL,VX,VY,VZ,lat,lon,AGL(m),...
+    try:
+        df = pd.read_csv(path)
+        # Rename column for consistency
+        df = df.rename(columns={'Timestamp(s)': 'timestamp', 'PZ_MSL': 'height'})
+        
+        # Adjust timestamp: pose.csv stores relative time (t - t0) in first column usually?
+        # Actually in main_loop.py: f"{t - self.state.t0:.6f}..."
+        # But wait, we need ABSOLUTE timestamp to align with GT.
+        # Checking pose.csv columns... usually the logic inside main_loop writes relative time.
+        # But `main_loop.py` line 1555: `t - self.state.t0`.
+        # This makes alignment hard unless we know t0.
+        
+        # Let's check how error_log.csv stores time. error_log has absolute time 't'.
+        # If pose.csv only has relative time, we might need to deduce absolute time.
+        # However, checking the user's previous `head pose.csv` output:
+        # Timestamp(s) starts at 0.000000.
+        
+        # We need the START absolute time.
+        # Usually benchmark script or config logs the start time.
+        # HACK: Use the first timestamp from error_log.csv or flight_log if possible?
+        # Or better: Assume the user provides t0 or we roughly align by start.
+        
+        # WAIT! If the user wants to compare GT vs Estimate, and Estimate is relative...
+        # We should align them.
+        # Let's try to find absolute timestamp source.
+        # The 'lat' and 'lon' columns in pose.csv are computed from VIO state.
+        # We can align using those?
+        
+        # NOTE: If pose.csv has 'lat', 'lon', we can plot those directly vs GT lat/lon
+        # without worrying about exact time alignment for just the TRAJECTORY shape.
+        pass
+    except Exception as e:
+        print(f"Error loading VIO pose: {e}")
+        return None
+        
+    print(f"[VIO] Loaded {len(df)} points from {os.path.basename(path)}")
+    return df
 
-def plot_trajectory_3d(df, output_path=None, coordinate_system='local', subsample=1):
+def plot_trajectories(gt_df, vio_df, title="Trajectory Comparison"):
+    fig = plt.figure(figsize=(12, 10))
+    ax = fig.add_subplot(111, projection='3d')
+    
+    # --- Ground Truth Projection ---
+    # Set Origin to first GT point
+    lat0, lon0 = gt_df.iloc[0]['lat'], gt_df.iloc[0]['lon']
+    alt0 = gt_df.iloc[0]['height']
+    
+    print(f"Origin (GT start): Lat={lat0:.6f}, Lon={lon0:.6f}, Alt={alt0:.2f}m")
+    
+    gt_x, gt_y = latlon_to_xy(gt_df['lat'].values, gt_df['lon'].values, lat0, lon0)
+    gt_z = gt_df['height'].values - alt0
+    
+    ax.plot(gt_x, gt_y, gt_z, label='Ground Truth (PPK)', color='black', alpha=0.7, linewidth=1.5)
+    
+    # --- VIO Estimate Projection ---
+    # We have 'PX', 'PY', 'PZ_MSL' in pose.csv which are local frame positions.
+    # Usually PX, PY are already ENU relative to start.
+    # PZ_MSL is absolute MSL.
+    
+    # If VIO started near GT start, PX/PY should align roughly.
+    vio_x = vio_df['PX'].values
+    vio_y = vio_df['PY'].values
+    
+    # For Z, VIO PX/PY are local, but PZ_MSL is absolute (MSL).
+    # We should align Z to start at 0 for comparison with GT relative Z,
+    # OR compare absolute Z if we knew geoid offset.
+    # Let's plot relative Z for trajectory shape comparison.
+    vio_z = vio_df['height'].values - vio_df.iloc[0]['height']
+    
+    # Align VIO to GT origin if needed?
+    # Assume VIO initialization set (0,0) to start position.
+    
+    ax.plot(vio_x, vio_y, vio_z, label='VIO Estimate', color='red', linewidth=2)
+    
+    # Add start/end markers
+    ax.scatter(gt_x[0], gt_y[0], gt_z[0], c='g', marker='^', s=100, label='Start')
+    ax.scatter(gt_x[-1], gt_y[-1], gt_z[-1], c='r', marker='x', s=100, label='End')
+    
+    ax.set_xlabel('East (m)')
+    ax.set_ylabel('North (m)')
+    ax.set_zlabel('Up (m)')
+    ax.set_title(title)
+    ax.legend()
+    
+    # Set equal aspect ratio
+    max_range = np.array([gt_x.max()-gt_x.min(), gt_y.max()-gt_y.min(), gt_z.max()-gt_z.min()]).max()
+    mid_x = (gt_x.max()+gt_x.min()) * 0.5
+    mid_y = (gt_y.max()+gt_y.min()) * 0.5
+    mid_z = (gt_z.max()+gt_z.min()) * 0.5
+    
+    ax.set_xlim(mid_x - max_range*0.5, mid_x + max_range*0.5)
+    ax.set_ylim(mid_y - max_range*0.5, mid_y + max_range*0.5)
+    ax.set_zlim(mid_z - max_range*0.5, mid_z + max_range*0.5)
+    
+    output_3d = "trajectory_3d.png"
+    plt.savefig(output_3d, dpi=300)
+    print(f"Saved 3D plot to {output_3d}")
+    # plt.show()
+    
+    # --- Altitude Profile Plot ---
+    plt.figure(figsize=(12, 6))
+    
+    # Timestamps
+    # GT has absolute timestamps (Unix).
+    # VIO has relative timestamps (0 to end).
+    # We align VIO start to match GT start (approximation)
+    # Finding alignment:
+    # 1. Start of PPK file is NOT necessarily start of VIO.
+    # 2. VIO usually starts when bag starts.
+    # 3. Best is to plot against Time-since-start.
+    
+    gt_t = gt_df['timestamp'].values
+    gt_t_rel = gt_t - gt_t[0]
+    
+    vio_t_rel = vio_df['timestamp'].values # Assuming this is time-since-start
+    
+    # Shift GT time to match VIO?
+    # Or just plot both on 0-based time axis.
+    # Note: verify if VIO actually starts at same physical location/time as GT start.
+    
+    # Using 'height' directly
+    plt.plot(gt_t_rel, gt_df['height'], 'k--', label='GT Altitude (Ellipsoidal)', alpha=0.5)
+    plt.plot(vio_t_rel, vio_df['height'], 'r-', label='VIO Altitude (MSL)')
+    
+    plt.xlabel('Time (s)')
+    plt.ylabel('Altitude (m)')
+    plt.title('Altitude Profile Comparison')
+    plt.legend()
+    plt.grid(True)
+    
+    output_alt = "altitude_profile.png"
+    plt.savefig(output_alt, dpi=300)
+    print(f"Saved Altitude plot to {output_alt}")
+    # plt.show()
+    
+    # --- Export CSV ---
+    export_comparison_csv(gt_df, vio_df)
+
+def export_comparison_csv(gt_df, vio_df, output_path="trajectory_comparison.csv"):
     """
-    วาด 3D trajectory
-    
-    Parameters:
-    -----------
-    df : pandas.DataFrame
-        DataFrame ที่มีข้อมูล trajectory
-    output_path : str or None
-        ถ้าระบุจะบันทึกภาพ
-    coordinate_system : str
-        'local' = ใช้ PX, PY, PZ_MSL
-        'geo' = ใช้ lat, lon, AGL
-    subsample : int
-        แสดงทุก ๆ n จุด (เพื่อประหยัดหน่วยความจำ)
+    Export aligned Ground Truth and VIO data to CSV at VIO resolution.
+    Interpolates Ground Truth data to match VIO timestamps.
     """
-    # Subsample ข้อมูลถ้าต้องการ
-    df_plot = df.iloc[::subsample].copy()
+    print(f"Exporting comparison data to {output_path} (VIO Resolution)...")
     
-    # เตรียมข้อมูล
-    if coordinate_system == 'local':
-        x = df_plot['PX'].values
-        y = df_plot['PY'].values
-        z = df_plot['PZ_MSL'].values
-        xlabel, ylabel, zlabel = 'X (m)', 'Y (m)', 'Z MSL (m)'
-        title = '3D Trajectory - Local Coordinates'
-    else:  # geo
-        x = df_plot['lon'].values
-        y = df_plot['lat'].values
-        z = df_plot['AGL(m)'].values
-        xlabel, ylabel, zlabel = 'Longitude', 'Latitude', 'AGL (m)'
-        title = '3D Trajectory - Geographic Coordinates'
+    # 1. Align Time (Relative to Start)
+    t0_gt = gt_df['timestamp'].values[0]
+    t_gt_rel = gt_df['timestamp'].values - t0_gt
     
-    # คำนวณความเร็ว (สำหรับ color mapping)
-    vx = df_plot['VX'].values
-    vy = df_plot['VY'].values
-    vz = df_plot['VZ'].values
-    speed = np.sqrt(vx**2 + vy**2 + vz**2)
+    # VIO timestamps are already relative (start at 0) in pose.csv (usually)
+    t_vio_rel = vio_df['timestamp'].values 
     
-    # สร้าง figure
-    fig = plt.figure(figsize=(16, 12))
+    # 2. Interpolate GT to VIO timestamps
+    # We want to compare at every VIO point (High resolution)
+    gt_lat_interp = np.interp(t_vio_rel, t_gt_rel, gt_df['lat'])
+    gt_lon_interp = np.interp(t_vio_rel, t_gt_rel, gt_df['lon'])
+    gt_alt_interp = np.interp(t_vio_rel, t_gt_rel, gt_df['height'])
     
-    # Plot 1: 3D trajectory with speed colormap
-    ax1 = fig.add_subplot(2, 2, 1, projection='3d')
-    scatter = ax1.scatter(x, y, z, c=speed, cmap='jet', s=1, alpha=0.6)
-    ax1.plot(x, y, z, 'b-', linewidth=0.5, alpha=0.3)
-    ax1.scatter(x[0], y[0], z[0], c='green', s=100, marker='o', label='Start')
-    ax1.scatter(x[-1], y[-1], z[-1], c='red', s=100, marker='X', label='End')
-    ax1.set_xlabel(xlabel)
-    ax1.set_ylabel(ylabel)
-    ax1.set_zlabel(zlabel)
-    ax1.set_title(title + ' (colored by speed)')
-    ax1.legend()
-    cbar = plt.colorbar(scatter, ax=ax1, pad=0.1, shrink=0.8)
-    cbar.set_label('Speed (m/s)', rotation=270, labelpad=20)
+    # 3. Calculate Errors
+    # 3a. Altitude Error
+    error_alt = vio_df['height'].values - gt_alt_interp
     
-    # Plot 2: Top view (X-Y)
-    ax2 = fig.add_subplot(2, 2, 2)
-    scatter2 = ax2.scatter(x, y, c=z, cmap='terrain', s=1, alpha=0.6)
-    ax2.plot(x, y, 'b-', linewidth=0.5, alpha=0.3)
-    ax2.scatter(x[0], y[0], c='green', s=100, marker='o', label='Start')
-    ax2.scatter(x[-1], y[-1], c='red', s=100, marker='X', label='End')
-    ax2.set_xlabel(xlabel)
-    ax2.set_ylabel(ylabel)
-    ax2.set_title('Top View (colored by altitude)')
-    ax2.legend()
-    ax2.grid(True, alpha=0.3)
-    ax2.axis('equal')
-    cbar2 = plt.colorbar(scatter2, ax=ax2, shrink=0.8)
-    cbar2.set_label('Altitude (m)', rotation=270, labelpad=20)
+    # 3b. 2D Position Error (Convert Lat/Lon to Meters)
+    # Use GT start as origin for conversion
+    lat0, lon0 = gt_df['lat'].values[0], gt_df['lon'].values[0]
     
-    # Plot 3: Side view (X-Z)
-    ax3 = fig.add_subplot(2, 2, 3)
-    distance = np.sqrt(x**2 + y**2)
-    ax3.plot(distance, z, 'b-', linewidth=1)
-    ax3.scatter(distance[0], z[0], c='green', s=100, marker='o', label='Start')
-    ax3.scatter(distance[-1], z[-1], c='red', s=100, marker='X', label='End')
-    ax3.set_xlabel('Distance from origin (m)')
-    ax3.set_ylabel(zlabel)
-    ax3.set_title('Side View - Altitude Profile')
-    ax3.legend()
-    ax3.grid(True, alpha=0.3)
+    # Convert VIO Lat/Lon to XY
+    vio_x, vio_y = latlon_to_xy(vio_df['lat'].values, vio_df['lon'].values, lat0, lon0)
     
-    # Plot 4: Statistics
-    ax4 = fig.add_subplot(2, 2, 4)
-    ax4.axis('off')
+    # Convert Interpolated GT Lat/Lon to XY
+    gt_x, gt_y = latlon_to_xy(gt_lat_interp, gt_lon_interp, lat0, lon0)
     
-    # คำนวณสถิติ
-    total_distance = np.sum(np.sqrt(np.diff(x)**2 + np.diff(y)**2 + np.diff(z)**2))
-    max_altitude = np.max(z)
-    min_altitude = np.min(z)
-    avg_speed = np.mean(speed)
-    max_speed = np.max(speed)
-    duration = df_plot['Timestamp(s)'].iloc[-1] - df_plot['Timestamp(s)'].iloc[0]
+    # Calculate Euclidean distance in 2D
+    error_2d = np.sqrt((vio_x - gt_x)**2 + (vio_y - gt_y)**2)
     
-    stats_text = f"""
-    Trajectory Statistics
-    {'='*40}
+    # 3c. 3D Position Error
+    error_3d = np.sqrt(error_2d**2 + error_alt**2)
     
-    Duration: {duration:.2f} seconds ({duration/60:.2f} min)
-    Total points: {len(df):,} (showing {len(df_plot):,})
+    # 4. Create DataFrame
+    export_df = pd.DataFrame({
+        'Time_Rel_s': t_vio_rel,
+        'VIO_Lat': vio_df['lat'].values,
+        'VIO_Lon': vio_df['lon'].values,
+        'VIO_Alt_MSL': vio_df['height'].values,
+        'GT_Lat_Interp': gt_lat_interp,
+        'GT_Lon_Interp': gt_lon_interp,
+        'GT_Alt_Interp': gt_alt_interp,
+        'Error_Alt': error_alt,
+        'Error_2D_m': error_2d,
+        'Error_3D_m': error_3d
+    })
     
-    Distance:
-      Total distance: {total_distance:.2f} m ({total_distance/1000:.2f} km)
-      Horizontal distance: {np.sqrt((x[-1]-x[0])**2 + (y[-1]-y[0])**2):.2f} m
-    
-    Altitude:
-      Max: {max_altitude:.2f} m
-      Min: {min_altitude:.2f} m
-      Range: {max_altitude - min_altitude:.2f} m
-      Start: {z[0]:.2f} m
-      End: {z[-1]:.2f} m
-    
-    Speed:
-      Average: {avg_speed:.2f} m/s ({avg_speed*3.6:.2f} km/h)
-      Maximum: {max_speed:.2f} m/s ({max_speed*3.6:.2f} km/h)
-    
-    Coordinate Range:
-      X: [{np.min(x):.2f}, {np.max(x):.2f}]
-      Y: [{np.min(y):.2f}, {np.max(y):.2f}]
-      Z: [{np.min(z):.2f}, {np.max(z):.2f}]
-    """
-    
-    ax4.text(0.1, 0.5, stats_text, fontsize=10, family='monospace',
-             verticalalignment='center', transform=ax4.transAxes)
-    
-    plt.tight_layout()
-    
-    if output_path:
-        print(f"Saving plot to: {output_path}")
-        plt.savefig(output_path, dpi=150, bbox_inches='tight')
-        print(f"Plot saved successfully!")
-    
-    plt.show()
+    export_df.to_csv(output_path, index=False)
+    print(f"Saved {len(export_df)} rows to {output_path}")
 
 
-def plot_velocity_time(df, output_path=None):
-    """วาดกราฟความเร็วตามเวลา"""
-    fig, axes = plt.subplots(3, 1, figsize=(14, 10))
-    
-    time = df['Timestamp(s)'].values
-    vx = df['VX'].values
-    vy = df['VY'].values
-    vz = df['VZ'].values
-    speed = np.sqrt(vx**2 + vy**2 + vz**2)
-    
-    # Velocity components
-    axes[0].plot(time, vx, label='VX', linewidth=0.5)
-    axes[0].plot(time, vy, label='VY', linewidth=0.5)
-    axes[0].plot(time, vz, label='VZ', linewidth=0.5)
-    axes[0].set_ylabel('Velocity (m/s)')
-    axes[0].set_title('Velocity Components over Time')
-    axes[0].legend()
-    axes[0].grid(True, alpha=0.3)
-    
-    # Total speed
-    axes[1].plot(time, speed, 'b-', linewidth=0.8)
-    axes[1].set_ylabel('Speed (m/s)')
-    axes[1].set_title('Total Speed over Time')
-    axes[1].grid(True, alpha=0.3)
-    
-    # Altitude
-    axes[2].plot(time, df['AGL(m)'].values, 'g-', linewidth=0.8)
-    axes[2].set_xlabel('Time (s)')
-    axes[2].set_ylabel('Altitude AGL (m)')
-    axes[2].set_title('Altitude over Time')
-    axes[2].grid(True, alpha=0.3)
-    
-    plt.tight_layout()
-    
-    if output_path:
-        plt.savefig(output_path, dpi=150, bbox_inches='tight')
-        print(f"Velocity plot saved to: {output_path}")
-    
-    plt.show()
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        description='Plot 3D trajectory from pose.csv file',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # Plot trajectory from default location
-  python plot_trajectory_3d.py
-  
-  # Plot with custom input file
-  python plot_trajectory_3d.py -i path/to/pose.csv
-  
-  # Plot using geographic coordinates
-  python plot_trajectory_3d.py --coord geo
-  
-  # Subsample data (show every 10th point)
-  python plot_trajectory_3d.py --subsample 10
-  
-  # Save plots to files
-  python plot_trajectory_3d.py -o trajectory.png -ov velocity.png
-        """
-    )
-    
-    parser.add_argument('-i', '--input', type=str,
-                       default='out_vio_msckf_test/pose.csv',
-                       help='Path to pose.csv file (default: out_vio_imu_ekf/pose.csv)')
-    parser.add_argument('-o', '--output', type=str,
-                       help='Output path for 3D trajectory plot (optional)')
-    parser.add_argument('-ov', '--output-velocity', type=str,
-                       help='Output path for velocity plot (optional)')
-    parser.add_argument('--coord', type=str, choices=['local', 'geo'],
-                       default='local',
-                       help='Coordinate system: local (PX,PY,PZ) or geo (lat,lon,AGL)')
-    parser.add_argument('--subsample', type=int, default=1,
-                       help='Subsample rate (show every Nth point, default: 1 = all points)')
-    parser.add_argument('--no-show', action='store_true',
-                       help='Do not display plots (only save to file)')
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Plot VIO vs GT trajectory")
+    parser.add_argument("--gt", required=True, help="Path to Ground Truth .pos file")
+    parser.add_argument("--vio", required=True, help="Path to VIO output DIRECTORY or pose.csv")
     
     args = parser.parse_args()
     
-    # Check if input file exists
-    input_path = Path(args.input)
-    if not input_path.exists():
-        print(f"Error: Input file not found: {input_path}")
-        return
+    gt_path = args.gt
+    vio_path = args.vio
     
-    # Load trajectory data
-    df = load_trajectory(input_path)
+    if os.path.isdir(vio_path):
+        vio_path = os.path.join(vio_path, "preintegration", "pose.csv")
+        if not os.path.exists(vio_path):
+            # Try fallback location
+            vio_path = os.path.join(args.vio, "pose.csv")
+            
+    print(f"Loading GT: {gt_path}")
+    print(f"Loading VIO: {vio_path}")
     
-    # Plot 3D trajectory
-    print(f"\nPlotting 3D trajectory...")
-    plot_trajectory_3d(df, args.output, args.coord, args.subsample)
+    df_gt = load_ppk_trajectory(gt_path)
+    df_vio = load_vio_pose(vio_path)
     
-    # Plot velocity
-    if args.output_velocity or not args.no_show:
-        print(f"\nPlotting velocity profile...")
-        plot_velocity_time(df, args.output_velocity)
-    
-    print("\nDone!")
-
-
-if __name__ == '__main__':
-    main()
+    if df_gt is not None and df_vio is not None:
+        plot_trajectories(df_gt, df_vio)

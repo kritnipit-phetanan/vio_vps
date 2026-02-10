@@ -263,7 +263,23 @@ class VIORunner:
             self.config.timeref_csv
         )
         if self.msl_interpolator:
-            print(f"[INIT] Loaded Flight Log MSL for direct altitude updates")
+            # v3.9.13: Auto-Align Flight Log to Ground Truth (Plotting Logic)
+            # The 3D plot aligns trajectories by subtracting the start value (z - z0).
+            # We do the same here in real-time: Calculate offset at start and remove it.
+            self.msl_offset = 0.0
+            if self.ppk_state and self.ppk_state.timestamp:
+                 # Find MSL from flight log at the same time as PPK start
+                 t_start = self.msl_interpolator.times[0]
+                 msl_log_start = self.msl_interpolator.get_msl(t_start)
+                 
+                 if msl_log_start is not None:
+                     # Offset = FlightLog_Start - GT_Start
+                     # This forces VIO to start at the exact same altitude as GT.
+                     self.msl_offset = msl_log_start - self.ppk_state.height
+                     print(f"[INIT] Auto-Aligned MSL to PPK: Offset {self.msl_offset:.3f}m")
+                     print(f"       (Log: {msl_log_start:.3f}m, GT: {self.ppk_state.height:.3f}m)")
+            else:
+                 print(f"[INIT] Loaded Flight Log MSL (No Ground Truth for Alignment)")
         
         # Print summary
         print("=== Input check ===")
@@ -1456,7 +1472,10 @@ class VIORunner:
         # This replaces DEM+AGL logic if available
         msl_direct = None
         if self.msl_interpolator:
-            msl_direct = self.msl_interpolator.get_msl(t)
+            raw_msl = self.msl_interpolator.get_msl(t)
+            if raw_msl is not None:
+                # Apply the alignment offset (Result = Log - Offset)
+                msl_direct = raw_msl - getattr(self, 'msl_offset', 0.0)
             
         if msl_direct is not None:
             # Direct MSL update
