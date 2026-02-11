@@ -362,7 +362,9 @@ def apply_magnetometer_update(kf,
             HJacobian=h_mag_fun,
             Hx=hx_mag_fun,
             R=r_yaw,
-            residual=angle_residual
+            residual=angle_residual,
+            update_type="MAG",
+            timestamp=timestamp
         )
         kf.last_mag_time = timestamp
         
@@ -538,7 +540,9 @@ def apply_dem_height_update(kf,
             z=np.array([[height_measurement]]),
             HJacobian=h_fun,
             Hx=hx_fun,
-            R=r_mat_inflated
+            R=r_mat_inflated,
+            update_type="DEM",
+            timestamp=timestamp
         )
         
         if residual_csv:
@@ -557,7 +561,9 @@ def apply_dem_height_update(kf,
         z=np.array([[height_measurement]]),
         HJacobian=h_fun,
         Hx=hx_fun,
-        R=r_mat
+        R=r_mat,
+        update_type="DEM",
+        timestamp=timestamp
     )
     
     # Log accepted update
@@ -682,7 +688,9 @@ def apply_velocity_update(kf,
         z=vel_meas,
         HJacobian=h_fun,
         Hx=hx_fun,
-        R=r_mat
+        R=r_mat,
+        update_type="VIO_VEL",
+        timestamp=timestamp
     )
     
     # Log accepted update
@@ -1005,7 +1013,10 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
         
         if chi2_value < chi2_threshold:
             # Accept update
-            kf.update(z=vel_meas, HJacobian=h_fun, Hx=hx_fun, R=r_mat)
+            kf.update(
+                z=vel_meas, HJacobian=h_fun, Hx=hx_fun, R=r_mat,
+                update_type="VIO_VEL", timestamp=t
+            )
             vo_mode = "VO" if (t_unit is not None and np.linalg.norm(t_unit) > 1e-6) else "OF-fallback"
             print(f"[VIO] Velocity update: speed={speed_final:.2f}m/s, vz_only={use_vz_only}, "
                   f"flow={avg_flow_px:.1f}px, R_scale={flow_quality_scale:.1f}x, mode={vo_mode}, chi2={chi2_value:.2f}")
@@ -1103,7 +1114,9 @@ def apply_plane_constraint(kf,
         z=z_altitude,
         HJacobian=h_plane_fun,
         Hx=hx_plane_fun,
-        R=R_altitude
+        R=R_altitude,
+        update_type="PLANE_ALT",
+        timestamp=0.0
     )
     
     return True, ""

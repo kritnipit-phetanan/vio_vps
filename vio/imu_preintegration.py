@@ -516,12 +516,12 @@ def compute_error_state_process_noise(dt: float, estimate_imu_bias: bool,
     q_vel = (combined_acc_noise * dt)**2
     
     # Rotation noise
-    unmodeled_gyr = 0.002  # rad/s
+    unmodeled_gyr = float(imu_params.get('sigma_unmodeled_gyr', 0.002))
     combined_gyr_noise = np.sqrt(imu_gyr_noise**2 + unmodeled_gyr**2)
     q_theta = (combined_gyr_noise * dt)**2
     
     # Minimum yaw process noise
-    min_yaw_process_noise = np.radians(3.0)
+    min_yaw_process_noise = np.radians(float(imu_params.get('min_yaw_process_noise_deg', 3.0)))
     q_theta_z_min = (min_yaw_process_noise * np.sqrt(dt))**2
     
     # Bias random walk

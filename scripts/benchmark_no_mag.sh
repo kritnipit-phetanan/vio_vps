@@ -74,7 +74,7 @@ echo "  Test ID: ${TEST_ID}"
 echo "  Output directory: ${OUTPUT_DIR}/"
 echo "  Mode: Preintegration WITHOUT VPS"
 echo "  Entry point: run_vio.py (modular)"
-echo "  VIO Velocity: ENABLED (--use_vio_velocity)"
+echo "  VIO Velocity: From YAML config"
 echo "  Loop Closure: DISABLED (no loops in outdoor flight)"
 echo "  ZUPT: DISABLED (helicopter vibration)"
 echo "  Performance: FAST MODE (--fast_mode for 60% speedup)"
@@ -103,8 +103,6 @@ python3 run_vio.py \
     --img_w 1440 \
     --img_h 1080 \
     --camera_view nadir \
-    # --use_magnetometer \  # DISABLED for v2.9.10.3 test
-    --use_vio_velocity \
     --save_debug_data 2>&1 | tee "$OUTPUT_DIR/run.log"
 
 END_TIME=$(date +%s.%N)

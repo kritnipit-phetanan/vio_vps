@@ -77,6 +77,26 @@ def run_imu_driven_loop(runner):
     
     # Initialize vibration detector
     imu_params = runner.global_config.get('IMU_PARAMS', {})
+    sigma_accel = runner.global_config.get('SIGMA_ACCEL', 0.8)
+    
+    # IMU-only stability profile:
+    # If no aiding sensors are available, use conservative process noise to prevent
+    # covariance blow-up from an aided-flight tuning profile.
+    has_images = len(runner.imgs) > 0
+    has_mag = len(runner.mag_list) > 0 and runner.config.use_magnetometer
+    has_dem = bool(runner.dem is not None and runner.dem.ds is not None)
+    has_vps = bool(getattr(runner, 'vps_runner', None) is not None)
+    imu_only_mode = not (has_images or has_mag or has_dem or has_vps)
+    if imu_only_mode:
+        imu_params = dict(imu_params)
+        sigma_accel = min(float(sigma_accel), float(imu_params.get('acc_n', 0.08)) * 1.5)
+        imu_params['gyr_w'] = min(float(imu_params.get('gyr_w', 1e-4)), 1e-5)
+        imu_params['acc_w'] = min(float(imu_params.get('acc_w', 4e-5)), 1e-5)
+        print(
+            f"[IMU-ONLY] Conservative process-noise profile enabled: "
+            f"sigma_accel={sigma_accel:.4f}, gyr_w={imu_params['gyr_w']:.2e}, "
+            f"acc_w={imu_params['acc_w']:.2e}"
+        )
     vib_buffer_size = runner.global_config.get('VIBRATION_WINDOW_SIZE', 50)
     vib_threshold_mult = runner.global_config.get('VIBRATION_THRESHOLD_MULT', 5.0)
     runner.vibration_detector = VibrationDetector(
@@ -190,7 +210,8 @@ def run_imu_driven_loop(runner):
                 estimate_imu_bias=runner.config.estimate_imu_bias,
                 t=next_cam_time, t0=runner.state.t0,
                 imu_params=imu_params,
-                mag_params=mag_params
+                mag_params=mag_params,
+                sigma_accel=sigma_accel
             )
             # VPS Stochastic Cloning: Propagate cross-covariance
             if hasattr(runner, 'vps_clone_manager') and runner.vps_clone_manager is not None:
@@ -212,7 +233,8 @@ def run_imu_driven_loop(runner):
                     estimate_imu_bias=runner.config.estimate_imu_bias,
                     t=t_current, t0=runner.state.t0,
                     imu_params=imu_params,
-                    mag_params=mag_params
+                    mag_params=mag_params,
+                    sigma_accel=sigma_accel
                 )
                 # VPS Stochastic Cloning: Propagate cross-covariance
                 if hasattr(runner, 'vps_clone_manager') and runner.vps_clone_manager is not None:
@@ -233,7 +255,8 @@ def run_imu_driven_loop(runner):
                 estimate_imu_bias=runner.config.estimate_imu_bias,
                 t=rec.t, t0=runner.state.t0,
                 imu_params=imu_params,
-                mag_params=mag_params
+                mag_params=mag_params,
+                sigma_accel=sigma_accel
             )
             
             # VPS Stochastic Cloning: Propagate cross-covariance for delayed updates
@@ -350,4 +373,3 @@ def run_imu_driven_loop(runner):
     # Print summary
     runner.print_summary()
     print(f"\n=== Finished in {toc_all - tic_all:.2f} seconds ===")
-

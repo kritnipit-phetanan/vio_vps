@@ -386,7 +386,9 @@ class LoopClosureDetector:
                 HJacobian=h_loop_fun,
                 Hx=hx_loop_fun,
                 R=R_loop,
-                residual=angle_residual
+                residual=angle_residual,
+                update_type="LOOP_CLOSURE",
+                timestamp=float('nan')
             )
             
             self.stats['yaw_corrections_applied'] += 1
@@ -594,7 +596,9 @@ def apply_loop_closure_correction(kf, relative_yaw: float, kf_idx: int,
             z=z_loop,
             HJacobian=h_loop_jacobian,
             Hx=hx_loop_fun,
-            R=R_loop
+            R=R_loop,
+            update_type="LOOP_CLOSURE",
+            timestamp=t
         )
         
         print(f"[LOOP] CORRECTION at t={t:.2f}s: Δyaw={np.degrees(yaw_error):.2f}° "
@@ -605,4 +609,3 @@ def apply_loop_closure_correction(kf, relative_yaw: float, kf_idx: int,
     except Exception as e:
         print(f"[LOOP] Failed to apply correction: {e}")
         return False
-

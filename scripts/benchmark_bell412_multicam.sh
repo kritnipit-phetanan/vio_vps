@@ -35,7 +35,6 @@ COMMON_ARGS="
     --dem /mnt/External_Storage/CV_team/vio_dataset/Copernicus_DSM_10_N45_00_W076_00_DEM.tif
     --img_w 1440
     --img_h 1080
-    --use_magnetometer
     --save_debug_data
 "
 
@@ -60,7 +59,6 @@ python3 vio_vps.py \
     --images_dir ${DATASET_BASE}/extracted_data/cam_data/camera__image_mono/images \
     --images_index ${DATASET_BASE}/extracted_data/cam_data/camera__image_mono/images_index.csv \
     --camera_view nadir \
-    --disable_vio_velocity \
     --output "$NADIR_OUT" \
     2>&1 | tee "$NADIR_OUT/run.log"
 
@@ -89,7 +87,6 @@ python3 vio_vps.py \
     --front_images_dir ${DATASET_BASE}/extracted_data/cam_data/front_camera__image_mono/images \
     --front_images_index ${DATASET_BASE}/extracted_data/cam_data/front_camera__image_mono/images_index.csv \
     --camera_view multi \
-    --disable_vio_velocity \
     --output "$MULTI_OUT" \
     2>&1 | tee "$MULTI_OUT/run.log"
 

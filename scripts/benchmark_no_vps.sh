@@ -32,7 +32,6 @@ COMMON_ARGS="
     --img_w 1440
     --img_h 1080
     --camera_view nadir
-    --use_magnetometer
     --save_debug_data
 "
 

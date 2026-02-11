@@ -1057,5 +1057,15 @@ def init_output_csvs(output_dir: str) -> Dict[str, str]:
                 "vel_error_m_s,vel_error_E,vel_error_N,vel_error_U,"
                 "alt_error_m,yaw_vio_deg,yaw_gps_deg,yaw_error_deg,"
                 "gps_lat,gps_lon,gps_alt,vio_E,vio_N,vio_U\n")
+
+    # Time synchronization debug log
+    paths['time_sync_csv'] = os.path.join(output_dir, "time_sync_debug.csv")
+    with open(paths['time_sync_csv'], "w", newline="") as f:
+        f.write("t_filter,t_gt_mapped,dt_gt,gt_idx,gt_stamp_log,matched,error_time_mode\n")
+    
+    # Covariance health debug log
+    paths['cov_health_csv'] = os.path.join(output_dir, "cov_health.csv")
+    with open(paths['cov_health_csv'], "w", newline="") as f:
+        f.write("t,update_type,stage,p_trace,p_max,p_min_eig,p_cond,growth_flag,large_flag\n")
     
     return paths

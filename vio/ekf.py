@@ -9,6 +9,7 @@ Error-State Kalman Filter (ESKF) implementation for VIO - OpenVINS style.
 import sys
 from copy import deepcopy
 from math import log, exp, sqrt
+from collections import defaultdict
 
 import numpy as np
 from numpy import dot, zeros, eye
@@ -320,6 +321,79 @@ class ExtendedKalmanFilter:
         self.P_prior = self.P.copy()
         self.x_post = self.x.copy()
         self.P_post = self.P.copy()
+        
+        # Covariance health logging
+        self._cov_health_csv = None
+        self._cov_prev_pmax = None
+        self._cov_prev_trace = None
+        self._cov_growth_stats = defaultdict(lambda: {
+            "samples": 0,
+            "growth_events": 0,
+            "large_events": 0,
+            "max_pmax": 0.0
+        })
+    
+    def enable_cov_health_logging(self, csv_path: str):
+        """Enable covariance health CSV logging."""
+        self._cov_health_csv = csv_path
+    
+    def log_cov_health(self, update_type: str, timestamp: float = float('nan'),
+                       stage: str = "post"):
+        """Record covariance health sample and update per-type counters."""
+        try:
+            p = self.P
+            p_trace = float(np.trace(p))
+            p_max = float(np.max(np.abs(p)))
+            try:
+                eigvals = np.linalg.eigvalsh((p + p.T) / 2.0)
+                p_min_eig = float(eigvals[0])
+            except Exception:
+                p_min_eig = float('nan')
+            try:
+                p_cond = float(np.linalg.cond(p))
+            except Exception:
+                p_cond = float('inf')
+            
+            growth_flag = 0
+            if self._cov_prev_pmax is not None and self._cov_prev_pmax > 0:
+                growth_flag = 1 if p_max > (1.05 * self._cov_prev_pmax) else 0
+            large_flag = 1 if p_max > 1e6 else 0
+            
+            stats = self._cov_growth_stats[update_type]
+            stats["samples"] += 1
+            stats["growth_events"] += growth_flag
+            stats["large_events"] += large_flag
+            stats["max_pmax"] = max(stats["max_pmax"], p_max)
+            
+            if self._cov_health_csv:
+                with open(self._cov_health_csv, "a", newline="") as f:
+                    f.write(
+                        f"{timestamp:.6f},{update_type},{stage},"
+                        f"{p_trace:.6e},{p_max:.6e},{p_min_eig:.6e},{p_cond:.6e},"
+                        f"{growth_flag},{large_flag}\n"
+                    )
+            
+            self._cov_prev_pmax = p_max
+            self._cov_prev_trace = p_trace
+        except Exception:
+            pass
+    
+    def get_cov_growth_summary(self):
+        """Return per-update covariance growth summary sorted by large/growth count."""
+        rows = []
+        for update_type, s in self._cov_growth_stats.items():
+            samples = max(1, int(s["samples"]))
+            rows.append({
+                "update_type": update_type,
+                "samples": int(s["samples"]),
+                "growth_events": int(s["growth_events"]),
+                "large_events": int(s["large_events"]),
+                "growth_rate": float(s["growth_events"]) / samples,
+                "large_rate": float(s["large_events"]) / samples,
+                "max_pmax": float(s["max_pmax"]),
+            })
+        rows.sort(key=lambda r: (r["large_events"], r["growth_events"], r["max_pmax"]), reverse=True)
+        return rows
     
     def _compute_error_dim(self, nominal_dim: int) -> int:
         """
@@ -445,7 +519,8 @@ class ExtendedKalmanFilter:
         self._mahalanobis = None
 
     def update(self, z, HJacobian, Hx, R=None, args=(), hx_args=(),
-               residual=np.subtract):
+               residual=np.subtract, update_type: str = "EKF_UPDATE",
+               timestamp: float = float('nan')):
         """Performs the update innovation with ESKF."""
         if z is None:
             self.z = np.array([[None]*self.dim_z]).T
@@ -542,6 +617,7 @@ class ExtendedKalmanFilter:
         self.z = deepcopy(z)
         self.x_post = self.x.copy()
         self.P_post = self.P.copy()
+        self.log_cov_health(update_type=update_type, timestamp=timestamp, stage="post_update")
     
     def _apply_error_state_correction(self, dx):
         """

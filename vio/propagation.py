@@ -35,7 +35,8 @@ def propagate_to_timestamp(kf: ExtendedKalmanFilter, target_time: float,
                            imu_params: dict,
                            estimate_imu_bias: bool = False,
                            use_preintegration: bool = True,
-                           mag_params: Optional[dict] = None) -> Tuple[bool, Optional[IMUPreintegration]]:
+                           mag_params: Optional[dict] = None,
+                           sigma_accel: Optional[float] = None) -> Tuple[bool, Optional[IMUPreintegration]]:
     """
     Propagate state to exact target timestamp using IMU measurements.
     
@@ -116,7 +117,9 @@ def propagate_to_timestamp(kf: ExtendedKalmanFilter, target_time: float,
         
         # Propagate with constant IMU (extrapolation) in small chunks
         for _ in range(num_chunks):
-            _propagate_single_imu_step(kf, last_imu, dt_chunk, estimate_imu_bias, current_time, imu_params, mag_params)
+            _propagate_single_imu_step(
+                kf, last_imu, dt_chunk, estimate_imu_bias, current_time, imu_params, mag_params, sigma_accel
+            )
         
         return True, None
     
@@ -207,7 +210,8 @@ def propagate_to_timestamp(kf: ExtendedKalmanFilter, target_time: float,
         # - This matches OpenVINS state propagation equations exactly
         # ================================================================
         dt_total = target_time - current_time
-        g_world = np.array([0.0, 0.0, -9.80665], dtype=float)
+        g_norm = float(imu_params.get('g_norm', 9.80665))
+        g_world = np.array([0.0, 0.0, -g_norm], dtype=float)
         
         # Velocity: v_new = v_old + g*dt + R_BW * delta_v
         v_new = v + g_world * dt_total + R_BW @ delta_v
@@ -306,6 +310,8 @@ def propagate_to_timestamp(kf: ExtendedKalmanFilter, target_time: float,
         # Update priors
         kf.x_prior = kf.x.copy()
         kf.P_prior = kf.P.copy()
+        if hasattr(kf, "log_cov_health"):
+            kf.log_cov_health(update_type="IMU_PROP_PREINT", timestamp=target_time, stage="post_prop")
         
         return True, preint
     
@@ -322,14 +328,18 @@ def propagate_to_timestamp(kf: ExtendedKalmanFilter, target_time: float,
                 dt = imu.t - relevant_imu[i-1].t
             
             if dt > 0:
-                _propagate_single_imu_step(kf, imu, dt, estimate_imu_bias, t_current, imu_params, mag_params)
+                _propagate_single_imu_step(
+                    kf, imu, dt, estimate_imu_bias, t_current, imu_params, mag_params, sigma_accel
+                )
                 t_current = imu.t
         
         # Check if we need to interpolate to exact target_time
         if t_current < target_time:
             last_imu = relevant_imu[-1]
             dt = target_time - t_current
-            _propagate_single_imu_step(kf, last_imu, dt, estimate_imu_bias, t_current, imu_params, mag_params)
+            _propagate_single_imu_step(
+                kf, last_imu, dt, estimate_imu_bias, t_current, imu_params, mag_params, sigma_accel
+            )
         
         # Ensure covariance validity
         kf.P = ensure_covariance_valid(
@@ -346,7 +356,8 @@ def propagate_to_timestamp(kf: ExtendedKalmanFilter, target_time: float,
 def process_imu(kf: ExtendedKalmanFilter, imu: IMURecord, dt: float,
                 estimate_imu_bias: bool = False, t: float = 0.0, 
                 t0: float = 0.0, imu_params: dict = None,
-                mag_params: Optional[dict] = None):
+                mag_params: Optional[dict] = None,
+                sigma_accel: Optional[float] = None):
     """
     Public wrapper for single IMU step propagation.
     
@@ -368,12 +379,15 @@ def process_imu(kf: ExtendedKalmanFilter, imu: IMURecord, dt: float,
     if dt <= 0:
         return
     
-    _propagate_single_imu_step(kf, imu, dt, estimate_imu_bias, t, imu_params, mag_params)
+    _propagate_single_imu_step(kf, imu, dt, estimate_imu_bias, t, imu_params, mag_params, sigma_accel)
+    if hasattr(kf, "log_cov_health"):
+        kf.log_cov_health(update_type="IMU_PROP", timestamp=t, stage="post_prop")
 
 
 def _propagate_single_imu_step(kf: ExtendedKalmanFilter, imu: IMURecord, dt: float,
                                 estimate_imu_bias: bool, t: float, imu_params: dict,
-                                mag_params: Optional[dict] = None):
+                                mag_params: Optional[dict] = None,
+                                sigma_accel: Optional[float] = None):
     """
     Propagate state by one IMU step (helper for propagate_to_timestamp).
     
@@ -406,7 +420,8 @@ def _propagate_single_imu_step(kf: ExtendedKalmanFilter, imu: IMURecord, dt: flo
     # GRAVITY COMPENSATION (must match MODE 1 preintegration approach)
     # a_corr is "specific force" (accelerometer - bias), does NOT include gravity
     # Must add gravity in world frame (ENU: [0, 0, -9.80665])
-    g_world = np.array([0.0, 0.0, -9.80665], dtype=float)
+    g_norm = float(imu_params.get('g_norm', 9.80665))
+    g_world = np.array([0.0, 0.0, -g_norm], dtype=float)
     
     # Nominal state propagation WITH gravity
     # p = p + v*dt + 0.5*(a_world + g)*dt²
@@ -441,7 +456,10 @@ def _propagate_single_imu_step(kf: ExtendedKalmanFilter, imu: IMURecord, dt: flo
     
     # ESKF covariance propagation
     Phi_err = compute_error_state_jacobian(q, a_corr, w_corr, dt, R_body_to_world)
-    Q_err = compute_error_state_process_noise(dt, estimate_imu_bias, t, 0.0, imu_params, 0.8, mag_params)
+    sigma_accel_eff = float(imu_params.get('sigma_accel', 0.8)) if sigma_accel is None else float(sigma_accel)
+    Q_err = compute_error_state_process_noise(
+        dt, estimate_imu_bias, t, 0.0, imu_params, sigma_accel_eff, mag_params
+    )
     
     num_clones = (kf.x.shape[0] - 19) // 7  # v3.9.7: 19D nominal
     kf.P = propagate_error_state_covariance(kf.P, Phi_err, Q_err, num_clones)
@@ -618,7 +636,9 @@ def apply_zupt(kf: ExtendedKalmanFilter, v_mag: float,
         z=z_zupt,
         HJacobian=h_zupt_jacobian,
         Hx=hx_zupt_fun,
-        R=R_zupt
+        R=R_zupt,
+        update_type="ZUPT",
+        timestamp=timestamp
     )
     
     v_after = kf.x[3:6, 0].copy()
@@ -1084,4 +1104,3 @@ def clone_camera_for_msckf(kf: ExtendedKalmanFilter, t: float,
     except Exception as e:
         print(f"[CLONE] Failed: {e}")
         return -1
-

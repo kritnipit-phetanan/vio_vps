@@ -9,7 +9,7 @@ Data loading utilities for IMU, MAG, VPS, DEM, and PPK files.
 import os
 import math
 from dataclasses import dataclass
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Union
 
 import numpy as np
 import pandas as pd
@@ -188,19 +188,10 @@ class DEMReader:
 # Loader Functions
 # =============================================================================
 
-def load_imu_csv(path: str) -> List[IMURecord]:
+def load_imu_csv(path: str, return_time_col: bool = False) -> Union[List[IMURecord], Tuple[List[IMURecord], str]]:
     """Load IMU data from CSV file.
     
-    v3.9.0: Uses time_ref (hardware monotonic clock) as unified timestamp.
-    time_ref = Hardware monotonic clock synchronized via PPS (Pulse Per Second)
-    stamp_msg = ROS header.stamp (may have clock offset between sensors)
-    stamp_bag = ROS bag recording time (has network/disk latency)
-    
-    Priority: time_ref (unified HW clock) > stamp_bag (ROS synchronized) > stamp_msg (has offset)
-    
-    Background: MUN-FRL dataset has clock desynchronization between IMU and Camera
-    when using stamp_msg (offset drifts 47ms over 308s), causing VIO failure.
-    time_ref solves this by providing a single hardware clock source for all sensors.
+    If return_time_col=True, also returns selected timestamp column name.
     """
     if not os.path.exists(path):
         raise FileNotFoundError(f"IMU CSV not found: {path}")
@@ -241,6 +232,8 @@ def load_imu_csv(path: str) -> List[IMURecord]:
         ))
     
     print(f"[IMU] Loaded {len(recs)} samples using {t_col}")
+    if return_time_col:
+        return recs, t_col
     return recs
 
 
@@ -268,8 +261,19 @@ def interpolate_time_ref(t_ros_array: np.ndarray,
         return t_ros_array  # Fallback: no conversion
     
     # Pre-compute arrays once (avoid list comprehension in loop)
-    t_ros_refs = np.array([pair[0] for pair in time_ref_pairs])
-    t_hw_refs = np.array([pair[1] for pair in time_ref_pairs])
+    t_ros_refs = np.array([pair[0] for pair in time_ref_pairs], dtype=float)
+    t_hw_refs = np.array([pair[1] for pair in time_ref_pairs], dtype=float)
+    
+    # Guard against unsorted inputs (required for searchsorted)
+    valid = np.isfinite(t_ros_refs) & np.isfinite(t_hw_refs)
+    t_ros_refs = t_ros_refs[valid]
+    t_hw_refs = t_hw_refs[valid]
+    if len(t_ros_refs) == 0:
+        return t_ros_array
+    
+    order = np.argsort(t_ros_refs)
+    t_ros_refs = t_ros_refs[order]
+    t_hw_refs = t_hw_refs[order]
     
     # Find insertion indices for each query timestamp
     indices = np.searchsorted(t_ros_refs, t_ros_array)
@@ -305,6 +309,72 @@ def interpolate_time_ref(t_ros_array: np.ndarray,
     return t_hw_array
 
 
+def _select_time_column(df: pd.DataFrame, prefer_msg: bool = False) -> Optional[str]:
+    """
+    Select timestamp column from a sensor dataframe.
+    
+    prefer_msg=True prioritizes stamp_msg (measurement-time closer than stamp_bag).
+    """
+    if "time_ref" in df.columns:
+        return "time_ref"
+    if prefer_msg:
+        if "stamp_msg" in df.columns:
+            return "stamp_msg"
+        if "stamp_bag" in df.columns:
+            return "stamp_bag"
+    else:
+        if "stamp_bag" in df.columns:
+            return "stamp_bag"
+        if "stamp_msg" in df.columns:
+            return "stamp_msg"
+    if "stamp_log" in df.columns:
+        return "stamp_log"
+    return None
+
+
+def _convert_to_time_ref(t_src: np.ndarray,
+                         source_col: str,
+                         timeref_df: pd.DataFrame,
+                         sensor_name: str) -> Tuple[np.ndarray, str]:
+    """
+    Convert source timestamps (stamp_msg/stamp_bag/stamp_log) to time_ref.
+    """
+    if "time_ref" not in timeref_df.columns:
+        raise ValueError("timeref CSV missing time_ref column")
+    
+    ros_candidates = [source_col, "stamp_msg", "stamp_bag", "stamp_log"]
+    ros_candidates = [c for i, c in enumerate(ros_candidates) if c and c not in ros_candidates[:i]]
+    ros_col = next((c for c in ros_candidates if c in timeref_df.columns), None)
+    if ros_col is None:
+        raise ValueError(f"timeref CSV has no ROS timestamp column for {source_col}")
+    
+    if ros_col != source_col:
+        print(f"[{sensor_name}] WARNING: Mapping {source_col} using timeref.{ros_col} (domain mismatch risk)")
+    
+    map_df = timeref_df[[ros_col, "time_ref"]].dropna().copy()
+    if len(map_df) < 2:
+        raise ValueError("timeref mapping has <2 valid rows")
+    
+    map_df[ros_col] = pd.to_numeric(map_df[ros_col], errors='coerce')
+    map_df["time_ref"] = pd.to_numeric(map_df["time_ref"], errors='coerce')
+    map_df = map_df.dropna().sort_values(ros_col).drop_duplicates(subset=[ros_col], keep='first')
+    if len(map_df) < 2:
+        raise ValueError("timeref mapping has <2 unique rows after cleanup")
+    
+    pairs = list(zip(map_df[ros_col].values, map_df["time_ref"].values))
+    t_src = np.asarray(t_src, dtype=float)
+    t_ref = interpolate_time_ref(t_src, pairs)
+    
+    # Coverage check (warn if a lot of samples are outside timeref range)
+    t_min = float(map_df[ros_col].iloc[0])
+    t_max = float(map_df[ros_col].iloc[-1])
+    outside = int(np.sum((t_src < t_min) | (t_src > t_max)))
+    if outside > 0:
+        print(f"[{sensor_name}] WARNING: {outside}/{len(t_src)} timestamps outside timeref range [{t_min:.3f}, {t_max:.3f}]")
+    
+    return t_ref, ros_col
+
+
 def load_mag_csv(path: Optional[str], timeref_csv: Optional[str] = None) -> List[MagRecord]:
     """
     Load magnetometer data from vector3.csv.
@@ -326,19 +396,18 @@ def load_mag_csv(path: Optional[str], timeref_csv: Optional[str] = None) -> List
     
     df = pd.read_csv(path)
     
-    # Find timestamp column (priority: time_ref > stamp_bag > stamp_msg)
+    has_timeref = bool(timeref_csv and os.path.exists(timeref_csv))
+    
+    # If we can map to time_ref, prefer stamp_msg as source (closest to measurement time).
     if "time_ref" in df.columns:
         tcol = "time_ref"
         print(f"[Mag] Using unified hardware clock (time_ref) - already synchronized!")
-    elif "stamp_bag" in df.columns:
-        tcol = "stamp_bag"
-        print(f"[Mag] Using stamp_bag (ROS recording time)")
-    elif "stamp_msg" in df.columns:
-        tcol = "stamp_msg"
-        print(f"[Mag] Using stamp_msg (header.stamp from sensor)")
     else:
-        print(f"[Mag] WARNING: No timestamp column found")
-        return []
+        tcol = _select_time_column(df, prefer_msg=has_timeref)
+        if tcol is None:
+            print(f"[Mag] WARNING: No timestamp column found")
+            return []
+        print(f"[Mag] Using {tcol}")
     
     if 'x' not in df.columns:
         print(f"[Mag] WARNING: vector3.csv missing magnetic field columns")
@@ -346,43 +415,15 @@ def load_mag_csv(path: Optional[str], timeref_csv: Optional[str] = None) -> List
     
     df = df.sort_values(tcol).reset_index(drop=True)
     
-    # If using stamp_msg or stamp_bag and time_ref CSV is available, convert to hardware time
-    if tcol in ["stamp_msg", "stamp_bag"] and timeref_csv and os.path.exists(timeref_csv):
+    # Convert ROS timestamps to hardware time_ref if mapping file is available
+    if tcol in ["stamp_msg", "stamp_bag", "stamp_log"] and has_timeref:
         try:
-            # Load time_ref mapping
             timeref_df = pd.read_csv(timeref_csv)
-            
-            # Try to find matching timestamp column in time_ref CSV
-            if "time_ref" in timeref_df.columns:
-                # Use the same column name that exists in timeref CSV
-                if tcol in timeref_df.columns:
-                    ros_col = tcol
-                elif "stamp_msg" in timeref_df.columns:
-                    ros_col = "stamp_msg"
-                elif "stamp_bag" in timeref_df.columns:
-                    ros_col = "stamp_bag"
-                else:
-                    ros_col = None
-                    print(f"[Mag] WARNING: time_ref CSV missing ROS timestamp column")
-                
-                if ros_col:
-                    time_ref_pairs = list(zip(
-                        timeref_df[ros_col].values,
-                        timeref_df["time_ref"].values
-                    ))
-                    
-                    # Convert all magnetometer timestamps using interpolation
-                    t_ros_array = df[tcol].values
-                    t_hw_array = interpolate_time_ref(t_ros_array, time_ref_pairs)
-                    
-                    # Replace timestamp column with hardware time
-                    df["time_ref"] = t_hw_array
-                    tcol = "time_ref"
-                    
-                    print(f"[Mag] Converted {len(df)} timestamps: {ros_col} → time_ref (hardware clock)")
-                    print(f"[Mag] Time range: {t_hw_array[0]:.3f} → {t_hw_array[-1]:.3f} s")
-            else:
-                print(f"[Mag] WARNING: time_ref CSV missing time_ref column")
+            t_ref, ros_col = _convert_to_time_ref(df[tcol].values, tcol, timeref_df, "Mag")
+            df["time_ref"] = t_ref
+            tcol = "time_ref"
+            print(f"[Mag] Converted {len(df)} timestamps: {ros_col} → time_ref (hardware clock)")
+            print(f"[Mag] Time range: {t_ref[0]:.3f} → {t_ref[-1]:.3f} s")
         except Exception as e:
             print(f"[Mag] WARNING: Failed to load time_ref mapping: {e}")
     
@@ -424,69 +465,38 @@ def load_images(images_dir: Optional[str], index_csv: Optional[str],
     # Load actual image list (4625 images)
     df_images = pd.read_csv(index_csv)
     
-    # Check if we have timeref.csv with time_ref (6149 camera triggers)
-    if timeref_csv and os.path.exists(timeref_csv):
-        print(f"[Images] Loading camera time_ref from {os.path.basename(timeref_csv)}")
-        df_timeref = pd.read_csv(timeref_csv)
-        
-        # Match each image to its closest timeref entry to get time_ref
-        if "time_ref" in df_timeref.columns and "stamp_msg" in df_timeref.columns:
-            # Use stamp_msg to match between images_index and timeref
-            match_col = "stamp_msg" if "stamp_msg" in df_images.columns else "stamp_bag"
-            
-            timestamps = []
-            filenames = []
-            fcol = next((c for c in df_images.columns if "file" in c.lower() or "name" in c.lower()), None)
-            
-            for _, img_row in df_images.iterrows():
-                img_stamp = float(img_row[match_col])
-                # Find closest timeref entry (within 50ms for 20Hz timeref @ 50ms interval)
-                time_diffs = np.abs(df_timeref["stamp_msg"].values - img_stamp)
-                closest_idx = np.argmin(time_diffs)
-                
-                if time_diffs[closest_idx] < 0.050:  # 50ms threshold (relaxed from 20ms)
-                    time_ref = float(df_timeref["time_ref"].iloc[closest_idx])
-                    timestamps.append(time_ref)
-                    filenames.append(str(img_row[fcol]).strip())
-            
-            print(f"[Images] Matched {len(timestamps)}/{len(df_images)} images to time_ref")
-            print(f"[Images] Using unified hardware clock (time_ref) - synchronized with IMU")
-            
-            # Build items using matched data
-            items = []
-            skipped = 0
-            for ts, fn_raw in zip(timestamps, filenames):
-                candidates = [
-                    os.path.join(images_dir, fn_raw),
-                    os.path.join(images_dir, os.path.basename(fn_raw)),
-                    fn_raw
-                ]
-                chosen = None
-                for cpath in candidates:
-                    if os.path.exists(cpath):
-                        chosen = cpath
-                        break
-                if chosen is None:
-                    skipped += 1
-                    continue
-                items.append(ImageItem(ts, chosen))
-            
-            items.sort(key=lambda x: x.t)
-            print(f"[Images] Loaded {len(items)} images using time_ref | Missing: {skipped}")
-            return items
+    tcol = None
+    has_timeref = bool(timeref_csv and os.path.exists(timeref_csv))
+    
+    # Preferred conversion path: image stamp_* -> time_ref via timeref CSV
+    if has_timeref:
+        try:
+            print(f"[Images] Loading camera time_ref from {os.path.basename(timeref_csv)}")
+            df_timeref = pd.read_csv(timeref_csv)
+            source_col = _select_time_column(df_images, prefer_msg=True)
+            if source_col and source_col != "time_ref":
+                t_ref, ros_col = _convert_to_time_ref(
+                    df_images[source_col].values, source_col, df_timeref, "Images"
+                )
+                df_images["time_ref"] = t_ref
+                tcol = "time_ref"
+                print(f"[Images] Converted {len(df_images)} timestamps: {ros_col} → time_ref")
+                print(f"[Images] Using unified hardware clock (time_ref) - synchronized with IMU")
+        except Exception as e:
+            print(f"[Images] WARNING: Failed to convert to time_ref: {e}")
     
     # Fallback: use timestamps directly from images_index.csv
-    # Priority: stamp_bag (ROS sync) > stamp_msg (has offset)
-    if "stamp_bag" in df_images.columns:
-        tcol = "stamp_bag"
-        print(f"[Images] Using ROS synchronized timestamp (stamp_bag)")
-    elif "stamp_msg" in df_images.columns:
-        tcol = "stamp_msg"
-        print(f"[Images] WARNING: Using stamp_msg (may have clock offset with IMU)")
-    else:
-        # Legacy: auto-detect timestamp column
-        t_cols = [c for c in df_images.columns if c.lower().startswith("stamp") or c.lower().startswith("time")]
-        tcol = t_cols[0] if t_cols else None
+    if tcol is None:
+        # Priority depends on whether timeref exists
+        direct_col = _select_time_column(df_images, prefer_msg=False)
+        if direct_col is None:
+            t_cols = [c for c in df_images.columns if c.lower().startswith("stamp") or c.lower().startswith("time")]
+            direct_col = t_cols[0] if t_cols else None
+        tcol = direct_col
+        if tcol == "stamp_bag":
+            print(f"[Images] Using ROS synchronized timestamp (stamp_bag)")
+        elif tcol == "stamp_msg":
+            print(f"[Images] WARNING: Using stamp_msg (may have clock offset with IMU)")
     
     f_cols = [c for c in df_images.columns if "file" in c.lower() or "name" in c.lower()]
     fcol = f_cols[0] if f_cols else None
@@ -591,6 +601,24 @@ def load_ppk_trajectory(path: str) -> Optional[pd.DataFrame]:
         from datetime import datetime
         import calendar
         
+        # Detect time basis from header.
+        # PPK files commonly label time as GPST; convert to UTC epoch for ROS alignment.
+        gpst_to_utc_offset = 0.0
+        with open(path, 'r') as f_hdr:
+            for _ in range(5):
+                line = f_hdr.readline()
+                if not line:
+                    break
+                up = line.upper()
+                if 'GPST' in up:
+                    gpst_to_utc_offset = 18.0  # 2022-era leap-second offset
+                    break
+                if 'UTC' in up:
+                    gpst_to_utc_offset = 0.0
+                    break
+        if gpst_to_utc_offset > 0.0:
+            print(f"[PPK] Detected GPST header, converting to UTC epoch with -{gpst_to_utc_offset:.0f}s offset")
+        
         rows = []
         with open(path, 'r') as f:
             for line in f:
@@ -606,6 +634,7 @@ def load_ppk_trajectory(path: str) -> Optional[pd.DataFrame]:
                 try:
                     dt = datetime.strptime(gpst_str, "%Y/%m/%d %H:%M:%S.%f")
                     stamp = calendar.timegm(dt.timetuple()) + dt.microsecond / 1e6
+                    stamp -= gpst_to_utc_offset
                 except Exception:
                     continue
                 
@@ -687,19 +716,15 @@ def load_flight_log_msl(path: str, timeref_csv: Optional[str] = None) -> Optiona
     try:
         df = pd.read_csv(path)
         
+        has_timeref = bool(timeref_csv and os.path.exists(timeref_csv))
+        
         # Determine initial timestamp column
-        if "stamp_bag" in df.columns:
-            tcol = "stamp_bag"
-            print(f"[MSL] Found stamp_bag (ROS synchronized)")
-        elif "stamp_msg" in df.columns:
-            tcol = "stamp_msg"
-            print(f"[MSL] Found stamp_msg (Sensor time)")
-        elif "stamp_log" in df.columns:
-            tcol = "stamp_log"
-            print(f"[MSL] Found stamp_log (Legacy)")
-        else:
+        # If converting to time_ref, prefer stamp_msg as source.
+        tcol = _select_time_column(df, prefer_msg=has_timeref)
+        if tcol is None:
             print("[MSL] No valid timestamp column found")
             return None
+        print(f"[MSL] Found {tcol}")
             
         # Check for altitude column (flight_log_from_gga has 'altitude_MSL_m')
         alt_col = next((c for c in df.columns if "altitude_msl" in c.lower() or "h_msl" in c.lower()), None)
@@ -708,37 +733,13 @@ def load_flight_log_msl(path: str, timeref_csv: Optional[str] = None) -> Optiona
             return None
         
         # Handle time_ref synchronization
-        use_timeref = False
-        if timeref_csv and os.path.exists(timeref_csv) and tcol in ["stamp_bag", "stamp_msg", "stamp_log"]:
+        if has_timeref and tcol in ["stamp_bag", "stamp_msg", "stamp_log"]:
             try:
-                # Load time_ref mapping
                 timeref_df = pd.read_csv(timeref_csv)
-                
-                # Check formatting
-                ros_col = None
-                if tcol in timeref_df.columns:
-                    ros_col = tcol
-                elif "stamp_bag" in timeref_df.columns:
-                    ros_col = "stamp_bag"
-                elif "stamp_msg" in timeref_df.columns:
-                    ros_col = "stamp_msg"
-                
-                if ros_col and "time_ref" in timeref_df.columns:
-                    time_ref_pairs = list(zip(
-                        timeref_df[ros_col].values,
-                        timeref_df["time_ref"].values
-                    ))
-                    
-                    # Convert timestamps
-                    t_ros_array = df[tcol].values
-                    t_hw_array = interpolate_time_ref(t_ros_array, time_ref_pairs)
-                    
-                    df["time_ref"] = t_hw_array
-                    tcol = "time_ref"
-                    use_timeref = True
-                    print(f"[MSL] Converted timestamps to time_ref (hardware clock) using {os.path.basename(timeref_csv)}")
-                else:
-                    print(f"[MSL] Warning: time_ref CSV missing required columns for sync")
+                t_ref, ros_col = _convert_to_time_ref(df[tcol].values, tcol, timeref_df, "MSL")
+                df["time_ref"] = t_ref
+                tcol = "time_ref"
+                print(f"[MSL] Converted timestamps: {ros_col} → time_ref using {os.path.basename(timeref_csv)}")
             except Exception as e:
                 print(f"[MSL] Warning: Failed to sync time_ref: {e}")
 
@@ -760,4 +761,3 @@ def load_flight_log_msl(path: str, timeref_csv: Optional[str] = None) -> Optiona
     except Exception as e:
         print(f"[MSL] Error loading flight log: {e}")
         return None
-

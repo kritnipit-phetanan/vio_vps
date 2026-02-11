@@ -49,7 +49,7 @@ from .state_manager import initialize_ekf_state, imu_to_gnss_position
 from .vio_frontend import VIOFrontEnd
 from .camera import make_KD_for_size
 from .propagation import (
-    process_imu, propagate_error_state_covariance, 
+    propagate_error_state_covariance, 
     augment_state_with_camera, detect_stationary, apply_zupt,
     apply_preintegration_at_camera, clone_camera_for_msckf,
     get_flight_phase  # v3.3.0: State-based phase detection
@@ -172,6 +172,8 @@ class VIORunner:
         self.pose_csv = None
         self.error_csv = None
         self.state_dbg_csv = None
+        self.time_sync_csv = None
+        self.cov_health_csv = None
         
         # Fisheye rectifier (optional)
         self.rectifier: Optional[FisheyeRectifier] = None
@@ -197,6 +199,13 @@ class VIORunner:
         
         # VPS timing tracking
         self.last_vps_update_time = 0.0
+        
+        # Timestamp base tracking (for GT/error alignment)
+        self.imu_time_col: Optional[str] = None
+        self.error_time_scale: float = 1.0
+        self.error_time_offset: float = 0.0
+        self.error_time_mode: str = "identity"
+        self._warned_gt_time_mismatch: bool = False
     
     def load_config(self) -> dict:
         """Load YAML configuration file."""
@@ -236,13 +245,17 @@ class VIORunner:
         print(f"[INIT] Using PPK ellipsoidal height: {self.msl0:.1f}m")
         
         # Load main data
-        self.imu = load_imu_csv(self.config.imu_path)
+        self.imu, self.imu_time_col = load_imu_csv(self.config.imu_path, return_time_col=True)
         # v3.9.0: Pass cam_timeref_csv for time_ref matching
         self.imgs = load_images(
             self.config.images_dir, 
             self.config.images_index_csv,
             self.config.timeref_csv
         )
+        
+        # v3.10.x: Offline VPS list path is deprecated in runtime mode
+        # Keep as empty list for compatibility with legacy checks/logging.
+        self.vps_list = []
         
         # v3.2.0: use_magnetometer is already populated from YAML (magnetometer.enabled)
         # No need for redundant check - VIOConfig.use_magnetometer is the final decision
@@ -255,6 +268,9 @@ class VIORunner:
         self.ppk_trajectory = None
         if self.config.ground_truth_path:
             self.ppk_trajectory = load_ppk_trajectory(self.config.ground_truth_path)
+        
+        # Configure mapping from filter time base -> absolute epoch for GT lookup
+        self._configure_error_time_mapping()
 
         # v3.9.12: Load Flight Log MSL for direct altitude updates (Barometer/GNSS)
         # This allows using "barometer" altitude instead of DEM+AGL logic
@@ -291,6 +307,64 @@ class VIORunner:
         
         if len(self.imu) == 0:
             raise RuntimeError("IMU is required. Aborting.")
+    
+    def _configure_error_time_mapping(self):
+        """
+        Configure timestamp mapping used by log_error().
+        
+        Goal:
+        - If filter runs on time_ref, convert filter time to absolute epoch
+          before matching with PPK stamp_log.
+        - If filter already runs on absolute timestamps, use identity mapping.
+        """
+        self.error_time_scale = 1.0
+        self.error_time_offset = 0.0
+        self.error_time_mode = "identity"
+        
+        if self.imu_time_col != "time_ref":
+            print(f"[TIME] Error/GT lookup uses direct filter time ({self.imu_time_col or 'unknown'})")
+            return
+        
+        try:
+            header_cols = pd.read_csv(self.config.imu_path, nrows=0).columns.tolist()
+            abs_col = next((c for c in ["stamp_bag", "stamp_msg", "stamp_log"] if c in header_cols), None)
+            if abs_col is None:
+                print("[TIME] WARNING: IMU has time_ref but no absolute stamp column for GT mapping")
+                return
+            
+            df = pd.read_csv(self.config.imu_path, usecols=["time_ref", abs_col])
+            df = df.replace([np.inf, -np.inf], np.nan).dropna()
+            if len(df) < 2:
+                print("[TIME] WARNING: Not enough IMU rows to fit time_ref->absolute mapping")
+                return
+            
+            t_ref = df["time_ref"].astype(float).values
+            t_abs = df[abs_col].astype(float).values
+            scale, offset = np.polyfit(t_ref, t_abs, 1)
+            pred = scale * t_ref + offset
+            rms_ms = float(np.sqrt(np.mean((pred - t_abs) ** 2)) * 1000.0)
+            
+            self.error_time_scale = float(scale)
+            self.error_time_offset = float(offset)
+            self.error_time_mode = f"time_ref_to_{abs_col}"
+            
+            print(
+                f"[TIME] GT mapping enabled: time_ref -> {abs_col} | "
+                f"scale={self.error_time_scale:.12f}, offset={self.error_time_offset:.6f}, rms={rms_ms:.3f}ms"
+            )
+        except Exception as e:
+            print(f"[TIME] WARNING: Failed to configure GT time mapping: {e}")
+            self.error_time_scale = 1.0
+            self.error_time_offset = 0.0
+            self.error_time_mode = "identity"
+    
+    def _filter_time_to_gt_time(self, t_filter: float) -> float:
+        """
+        Convert filter timestamp to GT lookup timestamp (absolute epoch).
+        """
+        if self.error_time_mode.startswith("time_ref_to_"):
+            return self.error_time_scale * t_filter + self.error_time_offset
+        return t_filter
     
     def initialize_ekf(self):
         """Initialize EKF state and covariance."""
@@ -490,9 +564,14 @@ class VIORunner:
         self.pose_csv = csv_paths['pose_csv']
         self.error_csv = csv_paths['error_csv']
         self.state_dbg_csv = csv_paths['state_dbg_csv']
+        self.time_sync_csv = csv_paths.get('time_sync_csv')
+        self.cov_health_csv = csv_paths.get('cov_health_csv')
         self.inf_csv = csv_paths['inf_csv']
         self.vo_dbg_csv = csv_paths['vo_dbg']
         self.msckf_dbg_csv = csv_paths['msckf_dbg']
+        
+        if self.kf is not None and hasattr(self.kf, "enable_cov_health_logging") and self.cov_health_csv:
+            self.kf.enable_cov_health_logging(self.cov_health_csv)
         
         # Use DebugCSVWriters for optional debug files
         self.debug_writers = DebugCSVWriters(self.config.output_dir, self.config.save_debug_data)
@@ -665,35 +744,21 @@ class VIORunner:
         self.kf.x_prior = self.kf.x.copy()
         self.kf.P_prior = self.kf.P.copy()
     
-    def process_imu_sample(self, rec, dt: float):
-        """
-        Process single IMU sample (legacy mode: propagation + helpers).
-        
-        Args:
-            rec: IMU record
-            dt: Time delta since last sample
-        """
-        imu_params = self.global_config.get('IMU_PARAMS', {'g_norm': 9.803})
-        
-        # v3.9.7: Prepare mag params for process noise
-        # v3.9.8: Include use_estimated_bias flag to freeze states when disabled
-        mag_params = {
-            'sigma_mag_bias': self.config.sigma_mag_bias,
-            'use_estimated_bias': self.config.use_mag_estimated_bias
-        }
-        
-        # Propagate state + covariance
-        process_imu(
-            self.kf, rec, dt,
-            estimate_imu_bias=self.config.estimate_imu_bias,
-            t=rec.t, t0=self.state.t0,
-            imu_params=imu_params,
-            mag_params=mag_params
-        )
-        
-        # Update helpers (ZUPT, mag filter)
-        self._update_imu_helpers(rec, dt, imu_params)
-    
+    def _log_time_sync_debug(self, t_filter: float, t_gt_mapped: float,
+                             dt_gt: float, gt_idx: int,
+                             gt_stamp_log: float, matched: int):
+        """Append one per-frame time sync debug row."""
+        if not self.time_sync_csv:
+            return
+        try:
+            with open(self.time_sync_csv, "a", newline="") as f:
+                f.write(
+                    f"{t_filter:.6f},{t_gt_mapped:.6f},{dt_gt:.6f},{gt_idx},"
+                    f"{gt_stamp_log:.6f},{matched},{self.error_time_mode}\n"
+                )
+        except Exception:
+            pass
+
     def process_vio(self, rec, t: float, ongoing_preint=None):
         """
         Process VIO (Visual-Inertial Odometry) + VPS updates.
@@ -1055,7 +1120,7 @@ class VIORunner:
                         
                         # Apply delayed update with stochastic cloning
                         clone_id = f"vps_{self.state.img_idx}"
-                        apply_vps_delayed_update(
+                        vps_applied, _, _ = apply_vps_delayed_update(
                             kf=self.kf,
                             clone_manager=self.vps_clone_manager,
                             image_id=clone_id,
@@ -1067,6 +1132,9 @@ class VIORunner:
                             lon0=self.lon0,
                             time_since_last_vps=(t_cam - self.last_vps_update_time)
                         )
+                        if vps_applied:
+                            self.last_vps_update_time = t_cam
+                            self.state.vps_idx += 1
                 
                 # Save keyframe image with visualization overlay
                 if self.config.save_keyframe_images and hasattr(self, 'keyframe_dir'):
@@ -1086,12 +1154,42 @@ class VIORunner:
         """
         gt_df = self.ppk_trajectory
         if gt_df is None or len(gt_df) == 0:
+            self._log_time_sync_debug(
+                t_filter=float(t),
+                t_gt_mapped=float("nan"),
+                dt_gt=float("nan"),
+                gt_idx=-1,
+                gt_stamp_log=float("nan"),
+                matched=0
+            )
             return
         
         try:
+            t_gt = self._filter_time_to_gt_time(t)
+            
             # Find closest ground truth
-            gt_idx = np.argmin(np.abs(gt_df['stamp_log'].values - t))
+            gt_diffs = np.abs(gt_df['stamp_log'].values - t_gt)
+            gt_idx = int(np.argmin(gt_diffs))
             gt_row = gt_df.iloc[gt_idx]
+            dt_gt = float(gt_diffs[gt_idx])
+            gt_stamp_log = float(gt_row['stamp_log']) if 'stamp_log' in gt_row else float("nan")
+            is_matched = 1 if dt_gt <= 1.0 else 0
+            self._log_time_sync_debug(
+                t_filter=float(t),
+                t_gt_mapped=float(t_gt),
+                dt_gt=dt_gt,
+                gt_idx=gt_idx,
+                gt_stamp_log=gt_stamp_log,
+                matched=is_matched
+            )
+            if dt_gt > 1.0:
+                if not self._warned_gt_time_mismatch:
+                    print(
+                        f"[ERROR_LOG] WARNING: Large GT time mismatch ({dt_gt:.3f}s). "
+                        f"mode={self.error_time_mode}. Skipping unmatched rows."
+                    )
+                    self._warned_gt_time_mismatch = True
+                return
             
             use_ppk = self.ppk_trajectory is not None
             
@@ -1433,7 +1531,7 @@ class VIORunner:
             current_phase=self.state.current_phase,
             in_convergence=in_convergence,
             has_ppk_yaw=has_ppk,
-            timestamp=t,
+            timestamp=mag_rec.t,
             residual_csv=residual_path,
             frame=self.state.vio_frame,
             yaw_override=yaw_mag_filtered,
@@ -1594,6 +1692,18 @@ class VIORunner:
         print(f"ZUPT: {self.state.zupt_applied} applied | "
               f"{self.state.zupt_rejected} rejected | "
               f"{self.state.zupt_detected} detected")
+        
+        if self.kf is not None and hasattr(self.kf, "get_cov_growth_summary"):
+            cov_summary = self.kf.get_cov_growth_summary()
+            if len(cov_summary) > 0:
+                print("\nCovariance Growth Sources (top 8):")
+                for row in cov_summary[:8]:
+                    print(
+                        f"  {row['update_type']}: samples={row['samples']}, "
+                        f"growth={row['growth_events']} ({100.0*row['growth_rate']:.1f}%), "
+                        f"largeP={row['large_events']} ({100.0*row['large_rate']:.1f}%), "
+                        f"max|P|={row['max_pmax']:.2e}"
+                    )
         
         print_msckf_stats()
         

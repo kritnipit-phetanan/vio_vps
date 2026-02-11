@@ -150,7 +150,9 @@ def apply_vps_update(kf: ExtendedKalmanFilter, vps_xy: np.ndarray,
             z=vps_xy.reshape(-1, 1),
             HJacobian=h_fun,
             Hx=hx_fun,
-            R=r_mat
+            R=r_mat,
+            update_type="VPS",
+            timestamp=float('nan')
         )
         return True
     except Exception as e:
@@ -369,7 +371,9 @@ def apply_height_update(kf: ExtendedKalmanFilter, height_m: float,
             z=np.array([[height_m]]),
             HJacobian=h_fun,
             Hx=hx_fun,
-            R=r_mat
+            R=r_mat,
+            update_type="DEM",
+            timestamp=float('nan')
         )
         return True, innovation, m2_test
     else:
@@ -587,4 +591,3 @@ def apply_vps_delayed_update(
         return True, innovation_mag, status
     else:
         return False, innovation_mag, f"FAILED: Update computation failed ({tier_name})"
-

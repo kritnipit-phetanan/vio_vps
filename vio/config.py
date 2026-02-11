@@ -258,6 +258,16 @@ def load_config(config_path: str) -> VIOConfig:
     result['SIGMA_VPS_XY'] = pn['sigma_vps_xy']
     result['SIGMA_AGL_Z'] = pn['sigma_agl_z']
     result['SIGMA_MAG_YAW'] = pn['sigma_mag_yaw']
+    result['SIGMA_UNMODELED_GYR'] = pn.get('sigma_unmodeled_gyr', 0.002)
+    result['MIN_YAW_PROCESS_NOISE_DEG'] = pn.get('min_yaw_process_noise_deg', 3.0)
+    
+    # Inject process-noise overrides into IMU param dicts for propagation modules
+    result['IMU_PARAMS']['sigma_accel'] = result['SIGMA_ACCEL']
+    result['IMU_PARAMS']['sigma_unmodeled_gyr'] = result['SIGMA_UNMODELED_GYR']
+    result['IMU_PARAMS']['min_yaw_process_noise_deg'] = result['MIN_YAW_PROCESS_NOISE_DEG']
+    result['IMU_PARAMS_PREINT']['sigma_accel'] = result['SIGMA_ACCEL']
+    result['IMU_PARAMS_PREINT']['sigma_unmodeled_gyr'] = result['SIGMA_UNMODELED_GYR']
+    result['IMU_PARAMS_PREINT']['min_yaw_process_noise_deg'] = result['MIN_YAW_PROCESS_NOISE_DEG']
     
     # VIO parameters
     vio = config['vio']

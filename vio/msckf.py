@@ -1244,6 +1244,8 @@ def msckf_measurement_update(fid: int, triangulated: dict, cam_observations: Lis
         
         kf.x_post = kf.x.copy()
         kf.P_post = kf.P.copy()
+        if hasattr(kf, "log_cov_health"):
+            kf.log_cov_health(update_type="MSCKF", timestamp=float('nan'), stage="post_update")
         
         return (True, innovation_norm, chi2_test)
     except (np.linalg.LinAlgError, ValueError):
@@ -1599,6 +1601,8 @@ def msckf_measurement_update_with_plane(fid: int, triangulated: dict,
         
         kf.x_post = kf.x.copy()
         kf.P_post = kf.P.copy()
+        if hasattr(kf, "log_cov_health"):
+            kf.log_cov_health(update_type="MSCKF_PLANE", timestamp=float('nan'), stage="post_update")
         
         return (True, innovation_norm, chi2_test)
     except (np.linalg.LinAlgError, ValueError):
@@ -1814,4 +1818,3 @@ def trigger_msckf_update(kf, cam_states: list, cam_observations: list,
             return 0
     
     return 0
-

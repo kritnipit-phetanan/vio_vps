@@ -489,6 +489,7 @@ def propagate_to_event(kf: ExtendedKalmanFilter,
             _propagate_single_step(
                 kf, imu, dt, filter_state,
                 imu_params, estimate_imu_bias,
+                sigma_accel=runner.global_config.get('SIGMA_ACCEL', 0.8),
                 target_time=imu.t
             )
         
@@ -513,6 +514,7 @@ def _propagate_single_step(kf: ExtendedKalmanFilter,
                            filter_state: FilterState,
                            imu_params: dict,
                            estimate_imu_bias: bool,
+                           sigma_accel: float = 0.8,
                            target_time: float = None):
     """
     Propagate state by single IMU step.
@@ -536,7 +538,8 @@ def _propagate_single_step(kf: ExtendedKalmanFilter,
         estimate_imu_bias=estimate_imu_bias,
         t=t_actual,  # FIXED: Use actual target time, not imu_record.t
         t0=filter_state.t0,
-        imu_params=imu_params
+        imu_params=imu_params,
+        sigma_accel=sigma_accel
     )
     
     # Accumulate preintegration for MSCKF Jacobians
