@@ -164,3 +164,16 @@ def test_gravity_sensor_policy_fields():
     assert "sigma_deg" in s
     assert "acc_norm_tolerance" in s
     assert "max_gyro_rad_s" in s
+
+
+def test_yaw_and_bias_guard_policy_fields():
+    ctl = AdaptiveController({"mode": "active"})
+    d = ctl.step(_ctx(0.0, phase=1, aiding_age=20.0))
+    y = d.sensor_scale("YAW_AID")
+    b = d.sensor_scale("BIAS_GUARD")
+    assert "sigma_deg" in y
+    assert "fail_soft_enable" in y
+    assert "hard_reject_factor" in y
+    assert "sigma_bg_rad_s" in b
+    assert "sigma_ba_m_s2" in b
+    assert "period_steps" in b

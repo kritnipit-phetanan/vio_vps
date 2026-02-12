@@ -21,7 +21,7 @@ WARNING = "WARNING"
 DEGRADED = "DEGRADED"
 RECOVERY = "RECOVERY"
 
-_KNOWN_SENSORS = ("MAG", "DEM", "VIO_VEL", "MSCKF", "ZUPT", "GRAVITY_RP")
+_KNOWN_SENSORS = ("MAG", "DEM", "VIO_VEL", "MSCKF", "ZUPT", "GRAVITY_RP", "YAW_AID", "BIAS_GUARD")
 
 
 def _clamp(value: float, lo: float, hi: float) -> float:
@@ -171,6 +171,8 @@ class AdaptiveController:
                 "MSCKF": {"chi2_scale": 1.0, "reproj_scale": 1.0},
                 "ZUPT": {"r_scale": 1.0, "chi2_scale": 1.0},
                 "GRAVITY_RP": {"r_scale": 1.0, "chi2_scale": 1.0},
+                "YAW_AID": {"r_scale": 1.0, "chi2_scale": 1.0},
+                "BIAS_GUARD": {"r_scale": 1.0, "chi2_scale": 1.0},
             },
             "clamp": {
                 "r_scale": [0.5, 10.0],
@@ -185,7 +187,17 @@ class AdaptiveController:
                     "0": {"chi2_scale": 0.80, "r_scale": 1.50, "acc_threshold_scale": 0.80, "gyro_threshold_scale": 0.80, "max_v_scale": 0.70},
                     "1": {"chi2_scale": 0.90, "r_scale": 1.20, "acc_threshold_scale": 0.90, "gyro_threshold_scale": 0.90, "max_v_scale": 0.85},
                     "2": {"chi2_scale": 1.00, "r_scale": 1.00, "acc_threshold_scale": 1.00, "gyro_threshold_scale": 1.00, "max_v_scale": 1.00},
-                }
+                },
+                "YAW_AID": {
+                    "0": {"chi2_scale": 1.05, "r_scale": 0.90},
+                    "1": {"chi2_scale": 0.90, "r_scale": 1.40},
+                    "2": {"chi2_scale": 0.95, "r_scale": 1.20},
+                },
+                "BIAS_GUARD": {
+                    "0": {"r_scale": 0.95},
+                    "1": {"r_scale": 1.05},
+                    "2": {"r_scale": 1.00},
+                },
             },
             "zupt_fail_soft": {
                 "enabled": True,
@@ -207,7 +219,9 @@ class AdaptiveController:
             },
             "gravity_alignment": {
                 "enabled_imu_only": True,
-                "phase_sigma_deg": {"0": 4.0, "1": 5.0, "2": 7.0},
+                "phase_sigma_deg": {"0": 3.5, "1": 10.0, "2": 8.5},
+                "phase_acc_norm_tolerance": {"0": 0.15, "1": 0.35, "2": 0.30},
+                "phase_max_gyro_rad_s": {"0": 0.25, "1": 0.65, "2": 0.50},
                 "health_sigma_mult": {
                     HEALTHY: 1.0,
                     WARNING: 1.2,
@@ -217,6 +231,49 @@ class AdaptiveController:
                 "acc_norm_tolerance": 0.25,
                 "max_gyro_rad_s": 0.40,
                 "chi2_scale": 1.0,
+            },
+            "yaw_aid": {
+                "enabled_imu_only": True,
+                "phase_sigma_deg": {"0": 20.0, "1": 45.0, "2": 35.0},
+                "phase_acc_norm_tolerance": {"0": 0.15, "1": 0.30, "2": 0.25},
+                "phase_max_gyro_rad_s": {"0": 0.20, "1": 0.55, "2": 0.40},
+                "health_sigma_mult": {
+                    HEALTHY: 1.0,
+                    WARNING: 1.2,
+                    DEGRADED: 1.5,
+                    RECOVERY: 1.1,
+                },
+                "chi2_scale": 1.0,
+                "ref_alpha": 0.005,
+                "dynamic_ref_alpha": 0.05,
+                "soft_fail": {
+                    "enabled": True,
+                    "hard_reject_factor": 3.0,
+                    "max_r_scale": 12.0,
+                    "inflate_power": 1.0,
+                },
+            },
+            "bias_guard": {
+                "enabled_imu_only": True,
+                "apply_when_aiding_level": ["NONE"],
+                "period_steps": 8,
+                "phase_sigma_bg_deg_s": {"0": 0.25, "1": 0.35, "2": 0.30},
+                "phase_sigma_ba_m_s2": {"0": 0.08, "1": 0.20, "2": 0.15},
+                "health_sigma_mult": {
+                    HEALTHY: 1.0,
+                    WARNING: 0.8,
+                    DEGRADED: 0.6,
+                    RECOVERY: 0.9,
+                },
+                "chi2_scale": 1.0,
+                "max_bg_norm_rad_s": 0.20,
+                "max_ba_norm_m_s2": 2.5,
+                "soft_fail": {
+                    "enabled": True,
+                    "hard_reject_factor": 4.0,
+                    "max_r_scale": 8.0,
+                    "inflate_power": 1.0,
+                },
             },
         },
         "conditioning": {
@@ -468,11 +525,17 @@ class AdaptiveController:
                     grav_cfg.get("health_sigma_mult", {}).get(self.health_state, 1.0)
                 )
                 sensor_scales["sigma_deg"] = max(0.5, sigma_deg)
+                phase_acc_tol = grav_cfg.get("phase_acc_norm_tolerance", {}).get(
+                    phase_key, grav_cfg.get("acc_norm_tolerance", 0.25)
+                )
                 sensor_scales["acc_norm_tolerance"] = max(
-                    0.05, float(grav_cfg.get("acc_norm_tolerance", 0.25))
+                    0.05, float(phase_acc_tol)
+                )
+                phase_max_gyro = grav_cfg.get("phase_max_gyro_rad_s", {}).get(
+                    phase_key, grav_cfg.get("max_gyro_rad_s", 0.40)
                 )
                 sensor_scales["max_gyro_rad_s"] = max(
-                    0.05, float(grav_cfg.get("max_gyro_rad_s", 0.40))
+                    0.05, float(phase_max_gyro)
                 )
                 sensor_scales["enabled_imu_only"] = 1.0 if bool(
                     grav_cfg.get("enabled_imu_only", True)
@@ -480,6 +543,87 @@ class AdaptiveController:
                 sensor_scales["chi2_scale"] = sensor_scales.get("chi2_scale", 1.0) * float(
                     grav_cfg.get("chi2_scale", 1.0)
                 )
+
+            if sensor == "YAW_AID":
+                yaw_cfg = meas_cfg.get("yaw_aid", {})
+                sigma_deg = float(
+                    yaw_cfg.get("phase_sigma_deg", {}).get(phase_key, yaw_cfg.get("sigma_deg", 35.0))
+                )
+                sigma_deg *= float(
+                    yaw_cfg.get("health_sigma_mult", {}).get(self.health_state, 1.0)
+                )
+                sensor_scales["sigma_deg"] = max(5.0, sigma_deg)
+                phase_acc_tol = yaw_cfg.get("phase_acc_norm_tolerance", {}).get(
+                    phase_key, yaw_cfg.get("acc_norm_tolerance", 0.25)
+                )
+                sensor_scales["acc_norm_tolerance"] = max(0.05, float(phase_acc_tol))
+                phase_max_gyro = yaw_cfg.get("phase_max_gyro_rad_s", {}).get(
+                    phase_key, yaw_cfg.get("max_gyro_rad_s", 0.40)
+                )
+                sensor_scales["max_gyro_rad_s"] = max(0.05, float(phase_max_gyro))
+                sensor_scales["enabled_imu_only"] = 1.0 if bool(
+                    yaw_cfg.get("enabled_imu_only", True)
+                ) else 0.0
+                sensor_scales["chi2_scale"] = sensor_scales.get("chi2_scale", 1.0) * float(
+                    yaw_cfg.get("chi2_scale", 1.0)
+                )
+                sensor_scales["ref_alpha"] = max(0.0, float(yaw_cfg.get("ref_alpha", 0.005)))
+                sensor_scales["dynamic_ref_alpha"] = max(
+                    0.0, float(yaw_cfg.get("dynamic_ref_alpha", 0.05))
+                )
+                yaw_soft_cfg = yaw_cfg.get("soft_fail", {})
+                sensor_scales["fail_soft_enable"] = 1.0 if bool(
+                    yaw_soft_cfg.get("enabled", True)
+                ) else 0.0
+                sensor_scales["hard_reject_factor"] = max(
+                    1.0, float(yaw_soft_cfg.get("hard_reject_factor", 3.0))
+                )
+                sensor_scales["soft_r_cap"] = max(1.0, float(yaw_soft_cfg.get("max_r_scale", 12.0)))
+                sensor_scales["soft_r_power"] = max(0.1, float(yaw_soft_cfg.get("inflate_power", 1.0)))
+
+            if sensor == "BIAS_GUARD":
+                bias_cfg = meas_cfg.get("bias_guard", {})
+                sigma_bg_deg_s = float(
+                    bias_cfg.get("phase_sigma_bg_deg_s", {}).get(
+                        phase_key, bias_cfg.get("sigma_bg_deg_s", 0.30)
+                    )
+                )
+                sigma_ba = float(
+                    bias_cfg.get("phase_sigma_ba_m_s2", {}).get(
+                        phase_key, bias_cfg.get("sigma_ba_m_s2", 0.15)
+                    )
+                )
+                sigma_mult = float(
+                    bias_cfg.get("health_sigma_mult", {}).get(self.health_state, 1.0)
+                )
+                sensor_scales["sigma_bg_rad_s"] = np.deg2rad(max(0.01, sigma_bg_deg_s)) * sigma_mult
+                sensor_scales["sigma_ba_m_s2"] = max(1e-4, sigma_ba * sigma_mult)
+                sensor_scales["period_steps"] = max(1.0, float(bias_cfg.get("period_steps", 8)))
+                sensor_scales["enabled_imu_only"] = 1.0 if bool(
+                    bias_cfg.get("enabled_imu_only", True)
+                ) else 0.0
+                allowed_levels = bias_cfg.get("apply_when_aiding_level", ["NONE"])
+                sensor_scales["enable_when_no_aiding"] = 1.0 if "NONE" in allowed_levels else 0.0
+                sensor_scales["enable_when_partial_aiding"] = 1.0 if "PARTIAL" in allowed_levels else 0.0
+                sensor_scales["enable_when_full_aiding"] = 1.0 if "FULL" in allowed_levels else 0.0
+                sensor_scales["chi2_scale"] = sensor_scales.get("chi2_scale", 1.0) * float(
+                    bias_cfg.get("chi2_scale", 1.0)
+                )
+                sensor_scales["max_bg_norm_rad_s"] = max(
+                    1e-3, float(bias_cfg.get("max_bg_norm_rad_s", 0.20))
+                )
+                sensor_scales["max_ba_norm_m_s2"] = max(
+                    1e-3, float(bias_cfg.get("max_ba_norm_m_s2", 2.5))
+                )
+                bias_soft_cfg = bias_cfg.get("soft_fail", {})
+                sensor_scales["fail_soft_enable"] = 1.0 if bool(
+                    bias_soft_cfg.get("enabled", True)
+                ) else 0.0
+                sensor_scales["hard_reject_factor"] = max(
+                    1.0, float(bias_soft_cfg.get("hard_reject_factor", 4.0))
+                )
+                sensor_scales["soft_r_cap"] = max(1.0, float(bias_soft_cfg.get("max_r_scale", 8.0)))
+                sensor_scales["soft_r_power"] = max(0.1, float(bias_soft_cfg.get("inflate_power", 1.0)))
 
             # Clamp values.
             for key in ("r_scale", "chi2_scale", "threshold_scale", "reproj_scale"):

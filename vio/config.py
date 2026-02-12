@@ -558,6 +558,8 @@ def load_config(config_path: str) -> VIOConfig:
                 'MSCKF': {'chi2_scale': 1.0, 'reproj_scale': 1.0},
                 'ZUPT': {'r_scale': 1.0, 'chi2_scale': 1.0},
                 'GRAVITY_RP': {'r_scale': 1.0, 'chi2_scale': 1.0},
+                'YAW_AID': {'r_scale': 1.0, 'chi2_scale': 1.0},
+                'BIAS_GUARD': {'r_scale': 1.0, 'chi2_scale': 1.0},
             },
             'clamp': {
                 'r_scale': [0.5, 10.0],
@@ -572,6 +574,16 @@ def load_config(config_path: str) -> VIOConfig:
                     '0': {'chi2_scale': 0.80, 'r_scale': 1.50, 'acc_threshold_scale': 0.80, 'gyro_threshold_scale': 0.80, 'max_v_scale': 0.70},
                     '1': {'chi2_scale': 0.90, 'r_scale': 1.20, 'acc_threshold_scale': 0.90, 'gyro_threshold_scale': 0.90, 'max_v_scale': 0.85},
                     '2': {'chi2_scale': 1.00, 'r_scale': 1.00, 'acc_threshold_scale': 1.00, 'gyro_threshold_scale': 1.00, 'max_v_scale': 1.00},
+                },
+                'YAW_AID': {
+                    '0': {'chi2_scale': 1.05, 'r_scale': 0.90},
+                    '1': {'chi2_scale': 0.90, 'r_scale': 1.40},
+                    '2': {'chi2_scale': 0.95, 'r_scale': 1.20},
+                },
+                'BIAS_GUARD': {
+                    '0': {'r_scale': 0.95},
+                    '1': {'r_scale': 1.05},
+                    '2': {'r_scale': 1.00},
                 },
             },
             'zupt_fail_soft': {
@@ -594,7 +606,9 @@ def load_config(config_path: str) -> VIOConfig:
             },
             'gravity_alignment': {
                 'enabled_imu_only': True,
-                'phase_sigma_deg': {'0': 4.0, '1': 5.0, '2': 7.0},
+                'phase_sigma_deg': {'0': 3.5, '1': 10.0, '2': 8.5},
+                'phase_acc_norm_tolerance': {'0': 0.15, '1': 0.35, '2': 0.30},
+                'phase_max_gyro_rad_s': {'0': 0.25, '1': 0.65, '2': 0.50},
                 'health_sigma_mult': {
                     'HEALTHY': 1.0,
                     'WARNING': 1.2,
@@ -604,6 +618,49 @@ def load_config(config_path: str) -> VIOConfig:
                 'acc_norm_tolerance': 0.25,
                 'max_gyro_rad_s': 0.40,
                 'chi2_scale': 1.0,
+            },
+            'yaw_aid': {
+                'enabled_imu_only': True,
+                'phase_sigma_deg': {'0': 20.0, '1': 45.0, '2': 35.0},
+                'phase_acc_norm_tolerance': {'0': 0.15, '1': 0.30, '2': 0.25},
+                'phase_max_gyro_rad_s': {'0': 0.20, '1': 0.55, '2': 0.40},
+                'health_sigma_mult': {
+                    'HEALTHY': 1.0,
+                    'WARNING': 1.2,
+                    'DEGRADED': 1.5,
+                    'RECOVERY': 1.1,
+                },
+                'chi2_scale': 1.0,
+                'ref_alpha': 0.005,
+                'dynamic_ref_alpha': 0.05,
+                'soft_fail': {
+                    'enabled': True,
+                    'hard_reject_factor': 3.0,
+                    'max_r_scale': 12.0,
+                    'inflate_power': 1.0,
+                },
+            },
+            'bias_guard': {
+                'enabled_imu_only': True,
+                'apply_when_aiding_level': ['NONE'],
+                'period_steps': 8,
+                'phase_sigma_bg_deg_s': {'0': 0.25, '1': 0.35, '2': 0.30},
+                'phase_sigma_ba_m_s2': {'0': 0.08, '1': 0.20, '2': 0.15},
+                'health_sigma_mult': {
+                    'HEALTHY': 1.0,
+                    'WARNING': 0.8,
+                    'DEGRADED': 0.6,
+                    'RECOVERY': 0.9,
+                },
+                'chi2_scale': 1.0,
+                'max_bg_norm_rad_s': 0.20,
+                'max_ba_norm_m_s2': 2.5,
+                'soft_fail': {
+                    'enabled': True,
+                    'hard_reject_factor': 4.0,
+                    'max_r_scale': 8.0,
+                    'inflate_power': 1.0,
+                },
             },
         },
         'conditioning': {

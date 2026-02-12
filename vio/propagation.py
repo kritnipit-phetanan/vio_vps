@@ -13,7 +13,7 @@ import numpy as np
 from typing import Tuple, List, Optional
 from scipy.spatial.transform import Rotation as R_scipy
 
-from .math_utils import skew_symmetric, safe_matrix_inverse, quat_boxplus
+from .math_utils import skew_symmetric, safe_matrix_inverse, quat_boxplus, quaternion_to_yaw
 from .imu_preintegration import (
     IMUPreintegration, 
     compute_error_state_jacobian, 
@@ -27,6 +27,11 @@ from .data_loaders import IMURecord
 # Note: propagate_nominal_state() was removed in v3.5.1
 # It was based on a misunderstanding of OpenVINS architecture.
 # Use process_imu() instead - it correctly propagates both x and P every tick.
+
+
+def _wrap_pi(angle: float) -> float:
+    """Wrap angle to [-pi, pi]."""
+    return float(np.arctan2(np.sin(angle), np.cos(angle)))
 
 
 def propagate_to_timestamp(kf: ExtendedKalmanFilter, target_time: float, 
@@ -988,6 +993,396 @@ def apply_gravity_roll_pitch_update(kf: ExtendedKalmanFilter,
             pass
 
     _set_adaptive_info(True, m2, chi2_threshold, attempted=1, reason_code="normal_accept")
+    return True, "applied"
+
+
+def apply_yaw_pseudo_update(kf: ExtendedKalmanFilter,
+                            a_raw: np.ndarray,
+                            w_corr: np.ndarray,
+                            imu_params: dict,
+                            yaw_ref_rad: float,
+                            sigma_rad: float = np.deg2rad(35.0),
+                            r_scale: float = 1.0,
+                            chi2_scale: float = 1.0,
+                            acc_norm_tolerance: float = 0.25,
+                            max_gyro_rad_s: float = 0.40,
+                            soft_fail_enable: bool = True,
+                            soft_fail_r_cap: float = 12.0,
+                            soft_fail_hard_reject_factor: float = 3.0,
+                            soft_fail_power: float = 1.0,
+                            save_debug: bool = False,
+                            residual_csv: Optional[str] = None,
+                            timestamp: float = 0.0,
+                            frame: int = -1,
+                            adaptive_info: Optional[dict] = None) -> Tuple[bool, str]:
+    """
+    Weak pseudo heading aid for IMU-only mode.
+
+    This constrains yaw with a very weak prior using a fail-soft gate:
+    - normal_accept: below base gate
+    - soft_accept: above base gate, but accepted after R inflation
+    - hard_reject: above hard gate / numerically invalid
+    """
+
+    def _set_adaptive_info(accepted: bool,
+                           chi2: Optional[float],
+                           threshold: Optional[float],
+                           attempted: int,
+                           reason_code: str,
+                           r_scale_used: Optional[float] = None,
+                           hard_threshold: Optional[float] = None):
+        if adaptive_info is None:
+            return
+        adaptive_info.clear()
+        dof = 2
+        nis_norm = np.nan
+        if chi2 is not None and np.isfinite(chi2):
+            nis_norm = float(chi2) / float(dof)
+        adaptive_info.update({
+            "sensor": "YAW_AID",
+            "attempted": int(attempted),
+            "accepted": bool(accepted),
+            "dof": int(dof),
+            "chi2": float(chi2) if chi2 is not None and np.isfinite(chi2) else np.nan,
+            "threshold": float(threshold) if threshold is not None and np.isfinite(threshold) else np.nan,
+            "hard_threshold": float(hard_threshold) if hard_threshold is not None and np.isfinite(hard_threshold) else np.nan,
+            "nis_norm": nis_norm,
+            "r_scale_used": float(max(1e-3, r_scale if r_scale_used is None else r_scale_used)),
+            "reason_code": str(reason_code),
+        })
+
+    if not np.all(np.isfinite(kf.P)):
+        _set_adaptive_info(False, None, None, attempted=1, reason_code="hard_reject")
+        return False, "P invalid"
+
+    if not np.isfinite(yaw_ref_rad):
+        _set_adaptive_info(False, None, None, attempted=0, reason_code="skip_bad_reference")
+        return False, "invalid yaw ref"
+
+    gyro_mag = float(np.linalg.norm(w_corr))
+    if gyro_mag > max(1e-3, float(max_gyro_rad_s)):
+        _set_adaptive_info(False, None, None, attempted=0, reason_code="skip_dynamic_gyro")
+        return False, "dynamic gyro"
+
+    accel_includes_gravity = bool(imu_params.get("accel_includes_gravity", True))
+    if accel_includes_gravity:
+        a_norm = float(np.linalg.norm(a_raw))
+        g_norm = float(imu_params.get("g_norm", 9.80665))
+        if (not np.isfinite(a_norm)) or a_norm < 1e-6:
+            _set_adaptive_info(False, None, None, attempted=0, reason_code="skip_bad_acc_norm")
+            return False, "invalid accel norm"
+        acc_dev_ratio = abs(a_norm - g_norm) / max(g_norm, 1e-6)
+        if acc_dev_ratio > max(0.01, float(acc_norm_tolerance)):
+            _set_adaptive_info(False, None, None, attempted=0, reason_code="skip_dynamic_acc")
+            return False, "dynamic accel"
+
+    q = kf.x[6:10, 0].reshape(4,)
+
+    def _predict_yaw_cs(q_wxyz: np.ndarray) -> np.ndarray:
+        yaw = quaternion_to_yaw(q_wxyz)
+        return np.array([[np.cos(yaw)], [np.sin(yaw)]], dtype=float)
+
+    z = np.array([[np.cos(float(yaw_ref_rad))], [np.sin(float(yaw_ref_rad))]], dtype=float)
+    h = _predict_yaw_cs(q)
+    innovation = z - h
+
+    num_clones = (kf.x.shape[0] - 19) // 7
+    err_dim = 18 + 6 * num_clones
+    H = np.zeros((2, err_dim), dtype=float)
+    eps = 1e-5
+    for axis in range(3):
+        dtheta = np.zeros(3, dtype=float)
+        dtheta[axis] = eps
+        q_plus = quat_boxplus(q, dtheta)
+        q_minus = quat_boxplus(q, -dtheta)
+        h_plus = _predict_yaw_cs(q_plus)
+        h_minus = _predict_yaw_cs(q_minus)
+        H[:, 6 + axis] = ((h_plus - h_minus) / (2.0 * eps)).reshape(2,)
+
+    sigma_eff = max(1e-4, float(sigma_rad) * max(1e-3, float(r_scale)))
+    R_meas = np.eye(2, dtype=float) * (sigma_eff ** 2)
+    r_scale_used = max(1e-3, float(r_scale))
+    chi2_threshold = 9.21 * max(1e-3, float(chi2_scale))  # 2 dof, 99%
+    hard_threshold = chi2_threshold * max(1.0, float(soft_fail_hard_reject_factor))
+    reason_code = "normal_accept"
+    gating_threshold_for_log = chi2_threshold
+
+    try:
+        S = H @ kf.P @ H.T + R_meas
+        S_inv = safe_matrix_inverse(S, damping=1e-9, method='cholesky')
+        m2 = float((innovation.T @ S_inv @ innovation).item())
+        mahal_dist = float(np.sqrt(max(0.0, m2)))
+    except Exception:
+        _set_adaptive_info(False, np.nan, np.nan, attempted=1, reason_code="hard_reject")
+        return False, "S inverse failed"
+
+    if np.isfinite(m2) and m2 > chi2_threshold:
+        if (not bool(soft_fail_enable)) or (m2 > hard_threshold):
+            reason_code = "hard_reject"
+            gating_threshold_for_log = hard_threshold if bool(soft_fail_enable) else chi2_threshold
+            if save_debug and residual_csv:
+                try:
+                    from .output_utils import log_measurement_update
+                    log_measurement_update(
+                        residual_csv, timestamp, frame, 'YAW_AID',
+                        innovation=innovation.flatten(),
+                        mahalanobis_dist=mahal_dist,
+                        chi2_threshold=gating_threshold_for_log,
+                        accepted=False,
+                        s_matrix=S,
+                        p_prior=kf.P
+                    )
+                except Exception:
+                    pass
+            _set_adaptive_info(
+                False, m2, chi2_threshold, attempted=1, reason_code=reason_code,
+                r_scale_used=r_scale_used, hard_threshold=hard_threshold
+            )
+            return False, "chi2 reject"
+
+        soft_ratio = max(1.0, float(m2) / max(chi2_threshold, 1e-9))
+        soft_factor = soft_ratio ** max(0.1, float(soft_fail_power))
+        soft_factor = min(max(1.0, float(soft_fail_r_cap)), soft_factor)
+        if soft_factor > 1.0:
+            R_meas = R_meas * soft_factor
+            r_scale_used *= soft_factor
+            try:
+                S = H @ kf.P @ H.T + R_meas
+                S_inv = safe_matrix_inverse(S, damping=1e-9, method='cholesky')
+                m2 = float((innovation.T @ S_inv @ innovation).item())
+                mahal_dist = float(np.sqrt(max(0.0, m2)))
+            except Exception:
+                _set_adaptive_info(
+                    False, np.nan, chi2_threshold, attempted=1, reason_code="hard_reject",
+                    r_scale_used=r_scale_used, hard_threshold=hard_threshold
+                )
+                return False, "S inverse failed"
+        reason_code = "soft_accept"
+    elif not np.isfinite(m2):
+        _set_adaptive_info(
+            False, m2, chi2_threshold, attempted=1, reason_code="hard_reject",
+            r_scale_used=r_scale_used, hard_threshold=hard_threshold
+        )
+        return False, "invalid chi2"
+
+    def h_jacobian(_x, h_mat=H):
+        return h_mat
+
+    def hx_fun(x_state):
+        q_state = x_state[6:10].reshape(4,)
+        return _predict_yaw_cs(q_state)
+
+    kf.update(
+        z=z,
+        HJacobian=h_jacobian,
+        Hx=hx_fun,
+        R=R_meas,
+        update_type="YAW_AID",
+        timestamp=timestamp,
+    )
+
+    if save_debug and residual_csv:
+        try:
+            from .output_utils import log_measurement_update
+            log_measurement_update(
+                residual_csv, timestamp, frame, 'YAW_AID',
+                innovation=innovation.flatten(),
+                mahalanobis_dist=mahal_dist,
+                chi2_threshold=gating_threshold_for_log,
+                accepted=True,
+                s_matrix=S,
+                p_prior=kf.P
+            )
+        except Exception:
+            pass
+
+    _set_adaptive_info(
+        True, m2, chi2_threshold, attempted=1, reason_code=reason_code,
+        r_scale_used=r_scale_used, hard_threshold=hard_threshold
+    )
+    return True, "applied"
+
+
+def apply_bias_observability_guard(kf: ExtendedKalmanFilter,
+                                   bg_ref: np.ndarray,
+                                   ba_ref: np.ndarray,
+                                   sigma_bg_rad_s: float = 0.005,
+                                   sigma_ba_m_s2: float = 0.15,
+                                   r_scale: float = 1.0,
+                                   chi2_scale: float = 1.0,
+                                   soft_fail_enable: bool = True,
+                                   soft_fail_r_cap: float = 8.0,
+                                   soft_fail_hard_reject_factor: float = 4.0,
+                                   soft_fail_power: float = 1.0,
+                                   max_bg_norm_rad_s: float = 0.20,
+                                   max_ba_norm_m_s2: float = 2.5,
+                                   save_debug: bool = False,
+                                   residual_csv: Optional[str] = None,
+                                   timestamp: float = 0.0,
+                                   frame: int = -1,
+                                   adaptive_info: Optional[dict] = None) -> Tuple[bool, str]:
+    """
+    Stabilize unobservable IMU bias states (bg, ba) with weak pseudo-measurement.
+
+    Intended for long no-aiding windows where bias covariance drifts without bounds.
+    """
+
+    def _set_adaptive_info(accepted: bool,
+                           chi2: Optional[float],
+                           threshold: Optional[float],
+                           attempted: int,
+                           reason_code: str,
+                           r_scale_used: Optional[float] = None,
+                           hard_threshold: Optional[float] = None):
+        if adaptive_info is None:
+            return
+        adaptive_info.clear()
+        dof = 6
+        nis_norm = np.nan
+        if chi2 is not None and np.isfinite(chi2):
+            nis_norm = float(chi2) / float(dof)
+        adaptive_info.update({
+            "sensor": "BIAS_GUARD",
+            "attempted": int(attempted),
+            "accepted": bool(accepted),
+            "dof": int(dof),
+            "chi2": float(chi2) if chi2 is not None and np.isfinite(chi2) else np.nan,
+            "threshold": float(threshold) if threshold is not None and np.isfinite(threshold) else np.nan,
+            "hard_threshold": float(hard_threshold) if hard_threshold is not None and np.isfinite(hard_threshold) else np.nan,
+            "nis_norm": nis_norm,
+            "r_scale_used": float(max(1e-3, r_scale if r_scale_used is None else r_scale_used)),
+            "reason_code": str(reason_code),
+        })
+
+    if not np.all(np.isfinite(kf.P)):
+        _set_adaptive_info(False, None, None, attempted=1, reason_code="hard_reject")
+        return False, "P invalid"
+
+    bg_ref = np.asarray(bg_ref, dtype=float).reshape(3,)
+    ba_ref = np.asarray(ba_ref, dtype=float).reshape(3,)
+    if not np.all(np.isfinite(bg_ref)) or not np.all(np.isfinite(ba_ref)):
+        _set_adaptive_info(False, None, None, attempted=0, reason_code="skip_bad_reference")
+        return False, "invalid bias reference"
+
+    bg_norm = float(np.linalg.norm(bg_ref))
+    ba_norm = float(np.linalg.norm(ba_ref))
+    if bg_norm > max_bg_norm_rad_s > 0:
+        bg_ref = bg_ref * (float(max_bg_norm_rad_s) / max(bg_norm, 1e-9))
+    if ba_norm > max_ba_norm_m_s2 > 0:
+        ba_ref = ba_ref * (float(max_ba_norm_m_s2) / max(ba_norm, 1e-9))
+
+    z = np.concatenate([bg_ref, ba_ref]).reshape(6, 1)
+    num_clones = (kf.x.shape[0] - 19) // 7
+    err_dim = 18 + 6 * num_clones
+    H = np.zeros((6, err_dim), dtype=float)
+    H[0:3, 9:12] = np.eye(3, dtype=float)   # δbg
+    H[3:6, 12:15] = np.eye(3, dtype=float)  # δba
+
+    def h_jacobian(_x, h_mat=H):
+        return h_mat
+
+    def hx_fun(x_state):
+        return x_state[10:16].reshape(6, 1)
+
+    innovation = z - hx_fun(kf.x)
+    sigma_bg_eff = max(1e-6, float(sigma_bg_rad_s))
+    sigma_ba_eff = max(1e-6, float(sigma_ba_m_s2))
+    R_meas = np.diag(
+        [sigma_bg_eff ** 2] * 3 + [sigma_ba_eff ** 2] * 3
+    ) * (max(1e-3, float(r_scale)) ** 2)
+    r_scale_used = max(1e-3, float(r_scale))
+
+    chi2_threshold = 16.81 * max(1e-3, float(chi2_scale))  # 6 dof, 99%
+    hard_threshold = chi2_threshold * max(1.0, float(soft_fail_hard_reject_factor))
+    reason_code = "normal_accept"
+    gating_threshold_for_log = chi2_threshold
+
+    try:
+        S = H @ kf.P @ H.T + R_meas
+        S_inv = safe_matrix_inverse(S, damping=1e-9, method='cholesky')
+        m2 = float((innovation.T @ S_inv @ innovation).item())
+        mahal_dist = float(np.sqrt(max(0.0, m2)))
+    except Exception:
+        _set_adaptive_info(False, np.nan, np.nan, attempted=1, reason_code="hard_reject")
+        return False, "S inverse failed"
+
+    if np.isfinite(m2) and m2 > chi2_threshold:
+        if (not bool(soft_fail_enable)) or (m2 > hard_threshold):
+            reason_code = "hard_reject"
+            gating_threshold_for_log = hard_threshold if bool(soft_fail_enable) else chi2_threshold
+            if save_debug and residual_csv:
+                try:
+                    from .output_utils import log_measurement_update
+                    log_measurement_update(
+                        residual_csv, timestamp, frame, 'BIAS_GUARD',
+                        innovation=innovation.flatten(),
+                        mahalanobis_dist=mahal_dist,
+                        chi2_threshold=gating_threshold_for_log,
+                        accepted=False,
+                        s_matrix=S,
+                        p_prior=kf.P
+                    )
+                except Exception:
+                    pass
+            _set_adaptive_info(
+                False, m2, chi2_threshold, attempted=1, reason_code=reason_code,
+                r_scale_used=r_scale_used, hard_threshold=hard_threshold
+            )
+            return False, "chi2 reject"
+
+        soft_ratio = max(1.0, float(m2) / max(chi2_threshold, 1e-9))
+        soft_factor = soft_ratio ** max(0.1, float(soft_fail_power))
+        soft_factor = min(max(1.0, float(soft_fail_r_cap)), soft_factor)
+        if soft_factor > 1.0:
+            R_meas = R_meas * soft_factor
+            r_scale_used *= soft_factor
+            try:
+                S = H @ kf.P @ H.T + R_meas
+                S_inv = safe_matrix_inverse(S, damping=1e-9, method='cholesky')
+                m2 = float((innovation.T @ S_inv @ innovation).item())
+                mahal_dist = float(np.sqrt(max(0.0, m2)))
+            except Exception:
+                _set_adaptive_info(
+                    False, np.nan, chi2_threshold, attempted=1, reason_code="hard_reject",
+                    r_scale_used=r_scale_used, hard_threshold=hard_threshold
+                )
+                return False, "S inverse failed"
+        reason_code = "soft_accept"
+    elif not np.isfinite(m2):
+        _set_adaptive_info(
+            False, m2, chi2_threshold, attempted=1, reason_code="hard_reject",
+            r_scale_used=r_scale_used, hard_threshold=hard_threshold
+        )
+        return False, "invalid chi2"
+
+    kf.update(
+        z=z,
+        HJacobian=h_jacobian,
+        Hx=hx_fun,
+        R=R_meas,
+        update_type="BIAS_GUARD",
+        timestamp=timestamp,
+    )
+
+    if save_debug and residual_csv:
+        try:
+            from .output_utils import log_measurement_update
+            log_measurement_update(
+                residual_csv, timestamp, frame, 'BIAS_GUARD',
+                innovation=innovation.flatten(),
+                mahalanobis_dist=mahal_dist,
+                chi2_threshold=gating_threshold_for_log,
+                accepted=True,
+                s_matrix=S,
+                p_prior=kf.P
+            )
+        except Exception:
+            pass
+
+    _set_adaptive_info(
+        True, m2, chi2_threshold, attempted=1, reason_code=reason_code,
+        r_scale_used=r_scale_used, hard_threshold=hard_threshold
+    )
     return True, "applied"
 
 

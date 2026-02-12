@@ -52,6 +52,7 @@ from .propagation import (
     propagate_error_state_covariance, 
     augment_state_with_camera, detect_stationary, apply_zupt,
     apply_gravity_roll_pitch_update,
+    apply_yaw_pseudo_update, apply_bias_observability_guard,
     apply_preintegration_at_camera, clone_camera_for_msckf,
     get_flight_phase  # v3.3.0: State-based phase detection
 )
@@ -220,6 +221,9 @@ class VIORunner:
         self._adaptive_log_enabled: bool = True
         self._legacy_covariance_cap: float = 1e8
         self.imu_only_mode: bool = False
+        self._imu_only_yaw_ref: Optional[float] = None
+        self._imu_only_bg_ref: Optional[np.ndarray] = None
+        self._imu_only_ba_ref: Optional[np.ndarray] = None
     
     def load_config(self) -> dict:
         """Load YAML configuration file."""
@@ -744,6 +748,16 @@ class VIORunner:
             "acc_norm_tolerance": 0.25,
             "max_gyro_rad_s": 0.40,
             "enabled_imu_only": 1.0,
+            "ref_alpha": 0.005,
+            "dynamic_ref_alpha": 0.05,
+            "period_steps": 8.0,
+            "sigma_bg_rad_s": np.deg2rad(0.30),
+            "sigma_ba_m_s2": 0.15,
+            "enable_when_no_aiding": 1.0,
+            "enable_when_partial_aiding": 0.0,
+            "enable_when_full_aiding": 0.0,
+            "max_bg_norm_rad_s": 0.20,
+            "max_ba_norm_m_s2": 2.5,
         }
         decision = self.current_adaptive_decision
         if decision is None:
@@ -848,7 +862,8 @@ class VIORunner:
                                     sensor: str,
                                     adaptive_info: Optional[Dict[str, Any]],
                                     timestamp: float,
-                                    policy_scales: Optional[Dict[str, float]] = None):
+                                    policy_scales: Optional[Dict[str, float]] = None,
+                                    counts_as_aiding: bool = True):
         """Feed measurement acceptance/NIS back into adaptive controller."""
         if self.adaptive_controller is None or adaptive_info is None or len(adaptive_info) == 0:
             return
@@ -866,7 +881,7 @@ class VIORunner:
             nis_norm=nis_norm,
             timestamp=float(timestamp),
         )
-        if accepted:
+        if accepted and counts_as_aiding:
             self._adaptive_last_aiding_time = float(timestamp)
 
         decision = self.current_adaptive_decision
@@ -967,6 +982,7 @@ class VIORunner:
                 adaptive_info=zupt_adaptive_info,
                 timestamp=rec.t,
                 policy_scales=zupt_policy_scales,
+                counts_as_aiding=False,
             )
             
             if applied:
@@ -977,8 +993,15 @@ class VIORunner:
         else:
             self.state.consecutive_stationary = 0
 
-        # IMU-only stabilization: gravity roll/pitch pseudo-measurement.
+        # IMU-only stabilization stack: gravity RP, weak yaw aid, bias guard.
         if getattr(self, "imu_only_mode", False):
+            if self._imu_only_yaw_ref is None:
+                self._imu_only_yaw_ref = float(quaternion_to_yaw(self.kf.x[6:10, 0].reshape(4,)))
+            if self._imu_only_bg_ref is None:
+                self._imu_only_bg_ref = self.kf.x[10:13, 0].astype(float).copy()
+            if self._imu_only_ba_ref is None:
+                self._imu_only_ba_ref = self.kf.x[13:16, 0].astype(float).copy()
+
             grav_policy_scales, grav_apply_scales = self._get_sensor_adaptive_scales("GRAVITY_RP")
             if bool(float(grav_apply_scales.get("enabled_imu_only", 1.0)) >= 0.5):
                 grav_adaptive_info: Dict[str, Any] = {}
@@ -1003,7 +1026,96 @@ class VIORunner:
                     adaptive_info=grav_adaptive_info,
                     timestamp=rec.t,
                     policy_scales=grav_policy_scales,
+                    counts_as_aiding=False,
                 )
+
+            yaw_policy_scales, yaw_apply_scales = self._get_sensor_adaptive_scales("YAW_AID")
+            if bool(float(yaw_apply_scales.get("enabled_imu_only", 1.0)) >= 0.5):
+                yaw_adaptive_info: Dict[str, Any] = {}
+                apply_yaw_pseudo_update(
+                    self.kf,
+                    a_raw=rec.lin.astype(float),
+                    w_corr=w_corr,
+                    imu_params=imu_params,
+                    yaw_ref_rad=float(self._imu_only_yaw_ref),
+                    sigma_rad=np.deg2rad(float(yaw_apply_scales.get("sigma_deg", 35.0))),
+                    r_scale=float(yaw_apply_scales.get("r_scale", 1.0)),
+                    chi2_scale=float(yaw_apply_scales.get("chi2_scale", 1.0)),
+                    acc_norm_tolerance=float(yaw_apply_scales.get("acc_norm_tolerance", 0.25)),
+                    max_gyro_rad_s=float(yaw_apply_scales.get("max_gyro_rad_s", 0.40)),
+                    soft_fail_enable=bool(float(yaw_apply_scales.get("fail_soft_enable", 0.0)) >= 0.5),
+                    soft_fail_r_cap=float(yaw_apply_scales.get("soft_r_cap", 12.0)),
+                    soft_fail_hard_reject_factor=float(yaw_apply_scales.get("hard_reject_factor", 3.0)),
+                    soft_fail_power=float(yaw_apply_scales.get("soft_r_power", 1.0)),
+                    save_debug=self.config.save_debug_data,
+                    residual_csv=getattr(self, 'residual_csv', None),
+                    timestamp=rec.t,
+                    frame=self.state.imu_propagation_count,
+                    adaptive_info=yaw_adaptive_info,
+                )
+                self.record_adaptive_measurement(
+                    "YAW_AID",
+                    adaptive_info=yaw_adaptive_info,
+                    timestamp=rec.t,
+                    policy_scales=yaw_policy_scales,
+                    counts_as_aiding=False,
+                )
+                yaw_now = float(quaternion_to_yaw(self.kf.x[6:10, 0].reshape(4,)))
+                attempted = int(yaw_adaptive_info.get("attempted", 1))
+                if attempted <= 0:
+                    yaw_alpha = float(yaw_apply_scales.get("dynamic_ref_alpha", 0.05))
+                else:
+                    yaw_alpha = float(yaw_apply_scales.get("ref_alpha", 0.005))
+                yaw_alpha = max(0.0, min(1.0, yaw_alpha))
+                self._imu_only_yaw_ref = float(np.arctan2(
+                    np.sin((1.0 - yaw_alpha) * float(self._imu_only_yaw_ref) + yaw_alpha * yaw_now),
+                    np.cos((1.0 - yaw_alpha) * float(self._imu_only_yaw_ref) + yaw_alpha * yaw_now),
+                ))
+
+            bias_policy_scales, bias_apply_scales = self._get_sensor_adaptive_scales("BIAS_GUARD")
+            bias_enabled = bool(float(bias_apply_scales.get("enabled_imu_only", 1.0)) >= 0.5)
+            period_steps = max(1, int(round(float(bias_apply_scales.get("period_steps", 8.0)))))
+            decision = self.current_adaptive_decision
+            aiding_level = decision.aiding_level if decision is not None else "FULL"
+            allow_level = (
+                (aiding_level == "NONE" and float(bias_apply_scales.get("enable_when_no_aiding", 1.0)) >= 0.5)
+                or (aiding_level == "PARTIAL" and float(bias_apply_scales.get("enable_when_partial_aiding", 0.0)) >= 0.5)
+                or (aiding_level == "FULL" and float(bias_apply_scales.get("enable_when_full_aiding", 0.0)) >= 0.5)
+            )
+            if bias_enabled and allow_level and (self.state.imu_propagation_count % period_steps == 0):
+                bias_adaptive_info: Dict[str, Any] = {}
+                apply_bias_observability_guard(
+                    self.kf,
+                    bg_ref=self._imu_only_bg_ref,
+                    ba_ref=self._imu_only_ba_ref,
+                    sigma_bg_rad_s=float(bias_apply_scales.get("sigma_bg_rad_s", np.deg2rad(0.30))),
+                    sigma_ba_m_s2=float(bias_apply_scales.get("sigma_ba_m_s2", 0.15)),
+                    r_scale=float(bias_apply_scales.get("r_scale", 1.0)),
+                    chi2_scale=float(bias_apply_scales.get("chi2_scale", 1.0)),
+                    soft_fail_enable=bool(float(bias_apply_scales.get("fail_soft_enable", 0.0)) >= 0.5),
+                    soft_fail_r_cap=float(bias_apply_scales.get("soft_r_cap", 8.0)),
+                    soft_fail_hard_reject_factor=float(bias_apply_scales.get("hard_reject_factor", 4.0)),
+                    soft_fail_power=float(bias_apply_scales.get("soft_r_power", 1.0)),
+                    max_bg_norm_rad_s=float(bias_apply_scales.get("max_bg_norm_rad_s", 0.20)),
+                    max_ba_norm_m_s2=float(bias_apply_scales.get("max_ba_norm_m_s2", 2.5)),
+                    save_debug=self.config.save_debug_data,
+                    residual_csv=getattr(self, 'residual_csv', None),
+                    timestamp=rec.t,
+                    frame=self.state.imu_propagation_count,
+                    adaptive_info=bias_adaptive_info,
+                )
+                self.record_adaptive_measurement(
+                    "BIAS_GUARD",
+                    adaptive_info=bias_adaptive_info,
+                    timestamp=rec.t,
+                    policy_scales=bias_policy_scales,
+                    counts_as_aiding=False,
+                )
+                if bool(bias_adaptive_info.get("accepted", False)):
+                    bg_now = self.kf.x[10:13, 0].astype(float)
+                    ba_now = self.kf.x[13:16, 0].astype(float)
+                    self._imu_only_bg_ref = 0.99 * self._imu_only_bg_ref + 0.01 * bg_now
+                    self._imu_only_ba_ref = 0.99 * self._imu_only_ba_ref + 0.01 * ba_now
         
         # Save priors
         self.kf.x_prior = self.kf.x.copy()
