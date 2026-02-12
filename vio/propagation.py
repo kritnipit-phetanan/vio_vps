@@ -21,7 +21,6 @@ from .imu_preintegration import (
 )
 from .ekf import ExtendedKalmanFilter, ensure_covariance_valid, propagate_error_state_covariance
 from .numerical_checks import assert_finite, check_quaternion, check_covariance_psd, check_state_validity
-from .numerical_checks import assert_finite, check_quaternion, check_covariance_psd, check_state_validity
 from .data_loaders import IMURecord
 
 
@@ -212,12 +211,16 @@ def propagate_to_timestamp(kf: ExtendedKalmanFilter, target_time: float,
         dt_total = target_time - current_time
         g_norm = float(imu_params.get('g_norm', 9.80665))
         g_world = np.array([0.0, 0.0, -g_norm], dtype=float)
+        accel_includes_gravity = bool(imu_params.get('accel_includes_gravity', True))
         
-        # Velocity: v_new = v_old + g*dt + R_BW * delta_v
-        v_new = v + g_world * dt_total + R_BW @ delta_v
+        # If accel includes gravity, preintegrated delta already contains gravity effect.
+        gravity_term = -g_world if accel_includes_gravity else g_world
         
-        # Position: p_new = p_old + v_old*dt + 0.5*g*dt² + R_BW * delta_p
-        p_new = p + v * dt_total + 0.5 * g_world * (dt_total ** 2) + R_BW @ delta_p
+        # Velocity: v_new = v_old + gravity_term*dt + R_BW * delta_v
+        v_new = v + gravity_term * dt_total + R_BW @ delta_v
+        
+        # Position: p_new = p_old + v_old*dt + 0.5*gravity_term*dt² + R_BW * delta_p
+        p_new = p + v * dt_total + 0.5 * gravity_term * (dt_total ** 2) + R_BW @ delta_p
         
         # Update nominal state
         kf.x[0:3, 0] = p_new
@@ -303,8 +306,9 @@ def propagate_to_timestamp(kf: ExtendedKalmanFilter, target_time: float,
             label="Preintegration-Propagate",
             symmetrize=True,
             check_psd=True,
-            min_eigenvalue=1e-9,
-            log_condition=False
+            min_eigenvalue=1e-7,
+            log_condition=False,
+            max_value=1e8
         )
         
         # Update priors
@@ -347,7 +351,8 @@ def propagate_to_timestamp(kf: ExtendedKalmanFilter, target_time: float,
             label="Legacy-Propagate",
             symmetrize=True,
             check_psd=True,
-            min_eigenvalue=1e-9
+            min_eigenvalue=1e-7,
+            max_value=1e8
         )
         
         return True, None
@@ -417,17 +422,20 @@ def _propagate_single_imu_step(kf: ExtendedKalmanFilter, imu: IMURecord, dt: flo
     # Rotate acceleration to world frame
     a_world = R_body_to_world @ a_corr
     
-    # GRAVITY COMPENSATION (must match MODE 1 preintegration approach)
-    # a_corr is "specific force" (accelerometer - bias), does NOT include gravity
-    # Must add gravity in world frame (ENU: [0, 0, -9.80665])
+    # GRAVITY COMPENSATION (must match preintegration approach)
+    # Supports both conventions:
+    # - accel_includes_gravity=False: a_corr is specific force => +g_world
+    # - accel_includes_gravity=True:  a_corr includes gravity => -g_world
     g_norm = float(imu_params.get('g_norm', 9.80665))
     g_world = np.array([0.0, 0.0, -g_norm], dtype=float)
+    accel_includes_gravity = bool(imu_params.get('accel_includes_gravity', True))
+    gravity_term = -g_world if accel_includes_gravity else g_world
     
     # Nominal state propagation WITH gravity
-    # p = p + v*dt + 0.5*(a_world + g)*dt²
-    # v = v + (a_world + g)*dt
-    p_new = p + v * dt + 0.5 * (a_world + g_world) * (dt**2)
-    v_new = v + (a_world + g_world) * dt
+    # p = p + v*dt + 0.5*(a_world + gravity_term)*dt²
+    # v = v + (a_world + gravity_term)*dt
+    p_new = p + v * dt + 0.5 * (a_world + gravity_term) * (dt**2)
+    v_new = v + (a_world + gravity_term) * dt
     
     # Quaternion propagation
     theta_vec = w_corr * dt
@@ -500,10 +508,10 @@ def detect_stationary(a_raw: np.ndarray, w_corr: np.ndarray, v_mag: float,
     """
     Detect if IMU is stationary based on raw measurements.
     
-    Uses acceleration deviation from gravity and gyro magnitude.
+    Uses acceleration magnitude consistency and gyro magnitude.
     
     Args:
-        a_raw: Raw acceleration from IMU (includes gravity)
+        a_raw: Raw acceleration from IMU (convention from imu_params)
         w_corr: Bias-corrected angular velocity
         v_mag: Current velocity magnitude
         imu_params: IMU parameters dict with 'g_norm'
@@ -512,11 +520,14 @@ def detect_stationary(a_raw: np.ndarray, w_corr: np.ndarray, v_mag: float,
     
     Returns:
         is_stationary: True if IMU appears stationary
-        acc_deviation: Acceleration deviation from gravity
+        acc_deviation: Acceleration deviation from expected stationary magnitude
     """
     a_raw_mag = np.linalg.norm(a_raw)
     gyro_mag = np.linalg.norm(w_corr)
-    acc_deviation = abs(a_raw_mag - imu_params.get("g_norm", 9.80665))
+    g_norm = float(imu_params.get("g_norm", 9.80665))
+    accel_includes_gravity = bool(imu_params.get('accel_includes_gravity', True))
+    expected_acc_mag = g_norm if accel_includes_gravity else 0.0
+    acc_deviation = abs(a_raw_mag - expected_acc_mag)
     
     is_stationary = (acc_deviation < acc_threshold) and (gyro_mag < gyro_threshold)
     
@@ -525,7 +536,7 @@ def detect_stationary(a_raw: np.ndarray, w_corr: np.ndarray, v_mag: float,
 
 def apply_zupt(kf: ExtendedKalmanFilter, v_mag: float,
                consecutive_stationary_count: int,
-               max_v_for_zupt: float = 500.0,
+               max_v_for_zupt: float = 20.0,
                save_debug: bool = False,
                residual_csv: Optional[str] = None,
                timestamp: float = 0.0,
@@ -624,12 +635,26 @@ def apply_zupt(kf: ExtendedKalmanFilter, v_mag: float,
     except:
         mahal_dist = float('nan')
     
-    # Decouple yaw from velocity before ZUPT
-    kf.P[3:6, 8] = 0.0
-    kf.P[8, 3:6] = 0.0
-    kf.P[3:6, 6:8] = 0.0
-    kf.P[6:8, 3:6] = 0.0
-    
+    # Innovation gating: reject if ZUPT does not match predicted velocity.
+    # 3 dof chi-square 99% threshold
+    chi2_threshold = 11.34
+    if np.isfinite(mahal_squared) and mahal_squared > chi2_threshold:
+        if save_debug and residual_csv:
+            try:
+                from .output_utils import log_measurement_update
+                log_measurement_update(
+                    residual_csv, timestamp, frame, 'ZUPT',
+                    innovation=innovation.flatten(),
+                    mahalanobis_dist=mahal_dist,
+                    chi2_threshold=chi2_threshold,
+                    accepted=False,
+                    s_matrix=S_zupt,
+                    p_prior=kf.P
+                )
+            except Exception:
+                pass
+        return False, 0.0, 0
+
     v_before = kf.x[3:6, 0].copy()
     
     kf.update(
@@ -652,7 +677,7 @@ def apply_zupt(kf: ExtendedKalmanFilter, v_mag: float,
                 residual_csv, timestamp, frame, 'ZUPT',
                 innovation=innovation.flatten(),
                 mahalanobis_dist=mahal_dist,
-                chi2_threshold=7.81,  # Chi-square 3 DOF, 95% confidence
+                chi2_threshold=chi2_threshold,
                 accepted=True,
                 s_matrix=S_zupt,
                 p_prior=kf.P

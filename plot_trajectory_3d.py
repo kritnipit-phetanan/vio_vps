@@ -26,11 +26,38 @@ except ImportError:
         y = R * dlat
         return x, y
 
+def detect_time_basis(path: str) -> float:
+    """
+    Detect GT time basis from header and return GPST->UTC offset in seconds.
+
+    Returns:
+        18.0 if header indicates GPST, else 0.0 for UTC/unknown.
+    """
+    gpst_to_utc_offset = 0.0
+    with open(path, 'r') as f:
+        for _ in range(10):
+            line = f.readline()
+            if not line:
+                break
+            up = line.upper()
+            if "GPST" in up:
+                gpst_to_utc_offset = 18.0
+                break
+            if "UTC" in up:
+                gpst_to_utc_offset = 0.0
+                break
+    return gpst_to_utc_offset
+
+
 def load_ppk_trajectory(path: str) -> pd.DataFrame:
-    """Load Ground Truth .pos file with GPST timestamp parsing."""
+    """Load Ground Truth .pos file with GPST/UTC timestamp parsing."""
     if not os.path.exists(path):
         raise FileNotFoundError(f"GT file not found: {path}")
-    
+
+    gpst_to_utc_offset = detect_time_basis(path)
+    if gpst_to_utc_offset > 0.0:
+        print(f"[GT] Detected GPST header, converting to UTC with -{gpst_to_utc_offset:.0f}s")
+
     rows = []
     with open(path, 'r') as f:
         for line in f:
@@ -46,10 +73,8 @@ def load_ppk_trajectory(path: str) -> pd.DataFrame:
             gpst_str = f"{parts[0]} {parts[1]}"
             try:
                 dt = datetime.strptime(gpst_str, "%Y/%m/%d %H:%M:%S.%f")
-                # Convert to Unix timestamp
-                # Note: This is technically GPST -> Unix UTC conversion without leap seconds correction
-                # but aligns with how VIO loader does it currently.
                 stamp = calendar.timegm(dt.timetuple()) + dt.microsecond / 1e6
+                stamp -= gpst_to_utc_offset
                 
                 rows.append({
                     'timestamp': stamp,
@@ -226,15 +251,30 @@ def export_comparison_csv(gt_df, vio_df, output_path="trajectory_comparison.csv"
     # VIO timestamps are already relative (start at 0) in pose.csv (usually)
     t_vio_rel = vio_df['timestamp'].values 
     
-    # 2. Interpolate GT to VIO timestamps
-    # We want to compare at every VIO point (High resolution)
-    gt_lat_interp = np.interp(t_vio_rel, t_gt_rel, gt_df['lat'])
-    gt_lon_interp = np.interp(t_vio_rel, t_gt_rel, gt_df['lon'])
-    gt_alt_interp = np.interp(t_vio_rel, t_gt_rel, gt_df['height'])
+    # 2. Interpolate GT to VIO timestamps (WITHOUT extrapolation)
+    #    Outside GT time range, mark as invalid to avoid end-point hold artifacts.
+    gt_t_min = float(t_gt_rel[0])
+    gt_t_max = float(t_gt_rel[-1])
+    valid_overlap = (t_vio_rel >= gt_t_min) & (t_vio_rel <= gt_t_max)
+    n_valid = int(np.sum(valid_overlap))
+    n_total = int(len(t_vio_rel))
+    if n_valid < n_total:
+        print(
+            f"[ALIGN] Using overlap-only error window: {n_valid}/{n_total} samples "
+            f"(excluded outside GT range [{gt_t_min:.3f}, {gt_t_max:.3f}]s)"
+        )
+
+    gt_lat_interp = np.full_like(t_vio_rel, np.nan, dtype=float)
+    gt_lon_interp = np.full_like(t_vio_rel, np.nan, dtype=float)
+    gt_alt_interp = np.full_like(t_vio_rel, np.nan, dtype=float)
+    gt_lat_interp[valid_overlap] = np.interp(t_vio_rel[valid_overlap], t_gt_rel, gt_df['lat'])
+    gt_lon_interp[valid_overlap] = np.interp(t_vio_rel[valid_overlap], t_gt_rel, gt_df['lon'])
+    gt_alt_interp[valid_overlap] = np.interp(t_vio_rel[valid_overlap], t_gt_rel, gt_df['height'])
     
     # 3. Calculate Errors
     # 3a. Altitude Error
-    error_alt = vio_df['height'].values - gt_alt_interp
+    error_alt = np.full_like(t_vio_rel, np.nan, dtype=float)
+    error_alt[valid_overlap] = vio_df['height'].values[valid_overlap] - gt_alt_interp[valid_overlap]
     
     # 3b. 2D Position Error (Convert Lat/Lon to Meters)
     # Use GT start as origin for conversion
@@ -244,13 +284,22 @@ def export_comparison_csv(gt_df, vio_df, output_path="trajectory_comparison.csv"
     vio_x, vio_y = latlon_to_xy(vio_df['lat'].values, vio_df['lon'].values, lat0, lon0)
     
     # Convert Interpolated GT Lat/Lon to XY
-    gt_x, gt_y = latlon_to_xy(gt_lat_interp, gt_lon_interp, lat0, lon0)
+    gt_x = np.full_like(vio_x, np.nan, dtype=float)
+    gt_y = np.full_like(vio_y, np.nan, dtype=float)
+    gt_x[valid_overlap], gt_y[valid_overlap] = latlon_to_xy(
+        gt_lat_interp[valid_overlap], gt_lon_interp[valid_overlap], lat0, lon0
+    )
     
-    # Calculate Euclidean distance in 2D
-    error_2d = np.sqrt((vio_x - gt_x)**2 + (vio_y - gt_y)**2)
+    # Calculate Euclidean distance in 2D (overlap only)
+    error_2d = np.full_like(vio_x, np.nan, dtype=float)
+    error_2d[valid_overlap] = np.sqrt(
+        (vio_x[valid_overlap] - gt_x[valid_overlap])**2 +
+        (vio_y[valid_overlap] - gt_y[valid_overlap])**2
+    )
     
     # 3c. 3D Position Error
-    error_3d = np.sqrt(error_2d**2 + error_alt**2)
+    error_3d = np.full_like(vio_x, np.nan, dtype=float)
+    error_3d[valid_overlap] = np.sqrt(error_2d[valid_overlap]**2 + error_alt[valid_overlap]**2)
     
     # 4. Create DataFrame
     export_df = pd.DataFrame({
@@ -261,6 +310,7 @@ def export_comparison_csv(gt_df, vio_df, output_path="trajectory_comparison.csv"
         'GT_Lat_Interp': gt_lat_interp,
         'GT_Lon_Interp': gt_lon_interp,
         'GT_Alt_Interp': gt_alt_interp,
+        'Valid_Overlap': valid_overlap.astype(int),
         'Error_Alt': error_alt,
         'Error_2D_m': error_2d,
         'Error_3D_m': error_3d
@@ -268,6 +318,15 @@ def export_comparison_csv(gt_df, vio_df, output_path="trajectory_comparison.csv"
     
     export_df.to_csv(output_path, index=False)
     print(f"Saved {len(export_df)} rows to {output_path}")
+    
+    if n_valid > 0:
+        err2 = error_2d[valid_overlap]
+        err3 = error_3d[valid_overlap]
+        err_alt = error_alt[valid_overlap]
+        print("[ERROR][overlap-only]")
+        print(f"  2D   RMSE={np.sqrt(np.mean(err2**2)):.3f} m, Final={err2[-1]:.3f} m")
+        print(f"  3D   RMSE={np.sqrt(np.mean(err3**2)):.3f} m, Final={err3[-1]:.3f} m")
+        print(f"  Alt  RMSE={np.sqrt(np.mean(err_alt**2)):.3f} m, Final={err_alt[-1]:.3f} m")
 
 
 if __name__ == "__main__":

@@ -38,6 +38,35 @@ import numpy as np
 from dataclasses import dataclass, field
 from typing import Dict, Any, Optional, Tuple
 
+SUPPORTED_ESTIMATOR_MODES = {
+    "imu_step_preint_cache",
+    "event_queue_output_predictor",
+}
+
+
+def _load_yaml_file(config_path: str) -> Dict[str, Any]:
+    """Read YAML file and return dict."""
+    with open(config_path, 'r') as f:
+        cfg = yaml.safe_load(f)
+    if not isinstance(cfg, dict):
+        raise ValueError(f"Config root must be a mapping (dict), got: {type(cfg)}")
+    return cfg
+
+
+def _validate_yaml_config(cfg: Dict[str, Any], config_path: str) -> None:
+    """Validate required sections and critical enum values before compilation."""
+    required_top = ["camera", "extrinsics", "imu", "magnetometer", "process_noise", "vio"]
+    missing = [k for k in required_top if k not in cfg]
+    if missing:
+        raise ValueError(f"Config missing required sections: {missing} ({config_path})")
+    
+    est_mode = cfg.get("imu", {}).get("estimator_mode", "imu_step_preint_cache")
+    if est_mode not in SUPPORTED_ESTIMATOR_MODES:
+        raise ValueError(
+            f"Invalid imu.estimator_mode='{est_mode}' in {config_path}. "
+            f"Supported: {sorted(SUPPORTED_ESTIMATOR_MODES)}"
+        )
+
 
 # =============================================================================
 # VIOConfig Dataclass - Single source of truth for VIO runtime settings
@@ -126,8 +155,8 @@ def load_config(config_path: str) -> VIOConfig:
         >>> print(f"Use magnetometer: {config.use_magnetometer}")
         >>> print(f"Camera view: {config.camera_view}")
     """
-    with open(config_path, 'r') as f:
-        config = yaml.safe_load(f)
+    config = _load_yaml_file(config_path)
+    _validate_yaml_config(config, config_path)
     
     # Convert nested dictionary to flat structure for compatibility
     result = {}
@@ -197,6 +226,7 @@ def load_config(config_path: str) -> VIOConfig:
         'acc_w': imu['acc_w'],
         'gyr_w': imu['gyr_w'],
         'g_norm': imu['g_norm'],
+        'accel_includes_gravity': imu.get('accel_includes_gravity', True),
     }
     result['IMU_PARAMS_PREINT'] = {
         'acc_n': imu['preintegration']['acc_n'],
@@ -204,6 +234,7 @@ def load_config(config_path: str) -> VIOConfig:
         'acc_w': imu['preintegration']['acc_w'],
         'gyr_w': imu['preintegration']['gyr_w'],
         'g_norm': imu['g_norm'],
+        'accel_includes_gravity': imu.get('accel_includes_gravity', True),
     }
     
     # IMU bias settings
@@ -268,6 +299,13 @@ def load_config(config_path: str) -> VIOConfig:
     result['IMU_PARAMS_PREINT']['sigma_accel'] = result['SIGMA_ACCEL']
     result['IMU_PARAMS_PREINT']['sigma_unmodeled_gyr'] = result['SIGMA_UNMODELED_GYR']
     result['IMU_PARAMS_PREINT']['min_yaw_process_noise_deg'] = result['MIN_YAW_PROCESS_NOISE_DEG']
+    
+    # Compiler metadata (for debug/traceability)
+    result['CONFIG_COMPILE_META'] = {
+        'source': os.path.abspath(config_path),
+        'estimator_mode': result['ESTIMATOR_MODE'],
+        'accel_includes_gravity': bool(result['IMU_PARAMS']['accel_includes_gravity']),
+    }
     
     # VIO parameters
     vio = config['vio']

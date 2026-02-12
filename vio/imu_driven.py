@@ -92,10 +92,15 @@ def run_imu_driven_loop(runner):
         sigma_accel = min(float(sigma_accel), float(imu_params.get('acc_n', 0.08)) * 1.5)
         imu_params['gyr_w'] = min(float(imu_params.get('gyr_w', 1e-4)), 1e-5)
         imu_params['acc_w'] = min(float(imu_params.get('acc_w', 4e-5)), 1e-5)
+        imu_params['sigma_unmodeled_gyr'] = min(float(imu_params.get('sigma_unmodeled_gyr', 0.002)), 5e-4)
+        imu_params['min_yaw_process_noise_deg'] = min(
+            float(imu_params.get('min_yaw_process_noise_deg', 3.0)), 0.5
+        )
         print(
             f"[IMU-ONLY] Conservative process-noise profile enabled: "
             f"sigma_accel={sigma_accel:.4f}, gyr_w={imu_params['gyr_w']:.2e}, "
-            f"acc_w={imu_params['acc_w']:.2e}"
+            f"acc_w={imu_params['acc_w']:.2e}, sigma_unmodeled_gyr={imu_params['sigma_unmodeled_gyr']:.2e}, "
+            f"min_yaw_q={imu_params['min_yaw_process_noise_deg']:.2f}deg"
         )
     vib_buffer_size = runner.global_config.get('VIBRATION_WINDOW_SIZE', 50)
     vib_threshold_mult = runner.global_config.get('VIBRATION_THRESHOLD_MULT', 5.0)
@@ -133,7 +138,7 @@ def run_imu_driven_loop(runner):
     runner.state.last_t = runner.state.t0
     
     # Initialize preintegration cache for MSCKF Jacobians
-    imu_params = runner.global_config.get('IMU_PARAMS', {})
+    # Keep runtime-adjusted imu_params (e.g., imu_only conservative profile).
     ongoing_preint = IMUPreintegration(
         bg=runner.kf.x[10:13, 0].reshape(3,),
         ba=runner.kf.x[13:16, 0].reshape(3,),
@@ -353,12 +358,18 @@ def run_imu_driven_loop(runner):
             quat_xyzw = np.array([q[1], q[2], q[3], q[0]])  # scipy uses [x,y,z,w]
             r_body_to_world = R_scipy.from_quat(quat_xyzw).as_matrix()
             
-            # Compute world-frame acceleration with gravity subtraction
+            # Compute world-frame kinematic acceleration for debugging.
             a_body = rec.lin - runner.kf.x[13:16, 0].flatten()  # bias-corrected
             g_norm = runner.global_config.get('IMU_PARAMS', {}).get('g_norm', 9.8066)
             g_world = np.array([0.0, 0.0, -g_norm])  # ENU: gravity points down
+            accel_includes_gravity = bool(imu_params.get('accel_includes_gravity', True))
             a_world_raw = r_body_to_world @ a_body
-            last_a_world = a_world_raw + g_world  # Subtract gravity
+            if accel_includes_gravity:
+                # Remove gravity from gravity-included acceleration.
+                last_a_world = a_world_raw - g_world
+            else:
+                # Convert specific force to kinematic acceleration.
+                last_a_world = a_world_raw + g_world
         except Exception:
             pass
         

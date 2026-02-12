@@ -18,7 +18,8 @@ Configuration Model (v3.9.9):
     - Camera view selection (default_camera_view)
     
     CLI provides:
-    - Required: --config, --imu, --quarry, --output
+    - Required: --config, --imu, --output
+    - Optional: --quarry
     - Optional: --images_dir, --images_index, --vps, --mag, --dem, --ground_truth
     - Debug flags: --save_debug_data, --save_keyframe_images
 
@@ -40,11 +41,10 @@ The modular package provides:
 Usage:
     python run_vio.py --config configs/config_bell412_dataset3.yaml \\
         --imu path/to/imu.csv \\
-        --quarry path/to/flight_log_from_gga.csv \\
         --output output_dir/
     
     # With all inputs:
-    python run_vio.py --config config.yaml --imu imu.csv --quarry gga.csv \\
+    python run_vio.py --config config.yaml --imu imu.csv \\
         --output out/ --mag mag.csv --vps vps.csv --dem dem.tif \\
         --save_debug_data
 
@@ -96,14 +96,14 @@ Settings in YAML:
 
 Examples:
   # Basic usage:
-  python run_vio.py --config config.yaml --imu imu.csv --quarry gga.csv --output out/
+  python run_vio.py --config config.yaml --imu imu.csv --output out/
   
   # With debug output:
-  python run_vio.py --config config.yaml --imu imu.csv --quarry gga.csv \\
+  python run_vio.py --config config.yaml --imu imu.csv \\
       --output out/ --save_debug_data --save_keyframe_images
   
   # With all inputs:
-  python run_vio.py --config config.yaml --imu imu.csv --quarry gga.csv \\
+  python run_vio.py --config config.yaml --imu imu.csv \\
       --output out/ --mag mag.csv --vps vps.csv --dem dem.tif --ground_truth gt.pos
         """
     )
@@ -111,8 +111,6 @@ Examples:
     # Required inputs
     parser.add_argument("--imu", type=str, required=True, 
                         help="Path to IMU CSV file")
-    parser.add_argument("--quarry", type=str, required=True, 
-                        help="Path to flight_log_from_gga.csv")
     parser.add_argument("--output", type=str, required=True, 
                         help="Output directory")
     
@@ -136,6 +134,8 @@ Examples:
                         help="Path to magnetometer CSV")
     parser.add_argument("--dem", type=str, default=None, 
                         help="Path to DEM/DSM TIF file")
+    parser.add_argument("--quarry", type=str, default=None,
+                        help="Path to flight_log_from_gga.csv for msl datasets")
     parser.add_argument("--ground_truth", type=str, default=None,
                         help="Path to PPK ground truth file")
     
@@ -214,7 +214,7 @@ def main():
         print("=" * 70)
         print(f"  Config file: {args.config}")
         print(f"  IMU path: {config.imu_path}")
-        print(f"  Quarry path: {config.quarry_path}")
+        print(f"  Quarry path: {config.quarry_path or 'None'}")
         print(f"  Output dir: {config.output_dir}")
         print(f"\nAlgorithm Settings (from YAML):")
         print(f"  camera_view: {config.camera_view}")

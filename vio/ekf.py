@@ -24,8 +24,9 @@ from .numerical_checks import assert_finite, check_quaternion, check_covariance_
 def ensure_covariance_valid(P: np.ndarray, label: str = "", 
                             symmetrize: bool = True, 
                             check_psd: bool = True,
-                            min_eigenvalue: float = 1e-9,
-                            log_condition: bool = False) -> np.ndarray:
+                            min_eigenvalue: float = 1e-7,
+                            log_condition: bool = False,
+                            max_value: float = None) -> np.ndarray:
     """
     Ensure covariance matrix is valid (symmetric + positive semi-definite).
     
@@ -40,6 +41,7 @@ def ensure_covariance_valid(P: np.ndarray, label: str = "",
         check_psd: Check and fix negative eigenvalues
         min_eigenvalue: Minimum allowed eigenvalue
         log_condition: Log condition number
+        max_value: Optional absolute clamp on covariance entries
     
     Returns:
         P_valid: Fixed covariance matrix
@@ -53,10 +55,18 @@ def ensure_covariance_valid(P: np.ndarray, label: str = "",
             print(f"[COV_CHECK] {label}: Asymmetry detected (||P - P^T|| = {asymmetry:.3e}), symmetrizing")
         P = (P + P.T) / 2.0
     
-    # 2. PSD check
+    # 1.5 Clamp very large entries (prevents overflow in eigendecomposition)
+    if max_value is not None and np.isfinite(max_value) and max_value > 0:
+        pmax = np.max(np.abs(P))
+        if pmax > max_value:
+            scale = float(max_value) / float(pmax)
+            P = P * scale
+            print(f"[COV_CHECK] {label}: Clamped covariance magnitude by scale={scale:.3e} (max={pmax:.3e})")
+    
+    # 2. PSD check / projection
     if check_psd:
         try:
-            eigvals = np.linalg.eigvalsh(P)
+            eigvals, eigvecs = np.linalg.eigh(P)
             lambda_min = eigvals[0]
             lambda_max = eigvals[-1]
             
@@ -65,11 +75,21 @@ def ensure_covariance_valid(P: np.ndarray, label: str = "",
                 if cond > 1e10:
                     print(f"[COV_CHECK] {label}: High condition number κ(P) = {cond:.3e}")
             
-            if lambda_min < min_eigenvalue:
-                jitter = abs(lambda_min) + min_eigenvalue
-                print(f"[COV_CHECK] {label}: Negative eigenvalue λ_min = {lambda_min:.3e}, "
-                      f"adding jitter ε = {jitter:.3e}")
-                P = P + jitter * np.eye(n, dtype=float)
+            eig_floor = float(min_eigenvalue)
+            eig_ceil = None
+            if max_value is not None and np.isfinite(max_value) and max_value > eig_floor:
+                eig_ceil = float(max_value)
+
+            needs_projection = np.any(eigvals < eig_floor)
+            if eig_ceil is not None:
+                needs_projection = needs_projection or np.any(eigvals > eig_ceil)
+
+            if needs_projection:
+                eigvals_proj = np.maximum(eigvals, eig_floor)
+                if eig_ceil is not None:
+                    eigvals_proj = np.minimum(eigvals_proj, eig_ceil)
+                P = eigvecs @ np.diag(eigvals_proj) @ eigvecs.T
+                P = (P + P.T) / 2.0
         
         except np.linalg.LinAlgError as e:
             print(f"[COV_CHECK] {label}: Eigenvalue computation failed: {e}")
@@ -182,14 +202,19 @@ def propagate_error_state_covariance(P: np.ndarray, Phi: np.ndarray,
     # This is MORE CORRECT than just clamping - maintains covariance meaning
     try:
         eigvals, eigvecs = np.linalg.eigh(p_new)
-        min_eigenvalue = 1e-9  # Floor for numerical stability
+        min_eigenvalue = 1e-7  # Floor for numerical stability
+        max_eigenvalue = 1e8   # Ceiling to avoid reconstruction overflow
         
-        if np.any(eigvals < min_eigenvalue):
-            num_negative = np.sum(eigvals < min_eigenvalue)
-            print(f"[EKF-PROP] Found {num_negative} eigenvalues < {min_eigenvalue:.2e}, projecting to PSD")
+        if np.any(eigvals < min_eigenvalue) or np.any(eigvals > max_eigenvalue):
+            num_negative = int(np.sum(eigvals < min_eigenvalue))
+            num_huge = int(np.sum(eigvals > max_eigenvalue))
+            print(
+                f"[EKF-PROP] Eigenvalue projection: "
+                f"{num_negative} below {min_eigenvalue:.2e}, {num_huge} above {max_eigenvalue:.2e}"
+            )
             
-            # Clamp eigenvalues to minimum
-            eigvals_clamped = np.maximum(eigvals, min_eigenvalue)
+            # Clamp eigenvalues to stable range
+            eigvals_clamped = np.clip(eigvals, min_eigenvalue, max_eigenvalue)
             
             # Reconstruct P_new = V @ Lambda @ V^T
             p_new = eigvecs @ np.diag(eigvals_clamped) @ eigvecs.T
@@ -589,7 +614,8 @@ class ExtendedKalmanFilter:
             label="EKF-Update",
             symmetrize=True,
             check_psd=True,
-            min_eigenvalue=1e-9
+            min_eigenvalue=1e-7,
+            max_value=1e8
         )
         
         # Covariance floor

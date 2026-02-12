@@ -66,13 +66,13 @@ CONFIG="configs/config_bell412_dataset3.yaml"
 DATASET_BASE="/Users/france/Downloads/vio_dataset/bell412_dataset3"
 # v3.9.0: Use imu_with_ref.csv (has time_ref for unified clock)
 IMU_PATH="${DATASET_BASE}/extracted_data_new/imu_data/imu__data_stamped/imu_with_ref.csv"
-QUARRY_PATH="${DATASET_BASE}/flight_log_from_gga1.csv"
-IMAGES_DIR="${DATASET_BASE}/extracted_data_new/cam_data/camera__image_mono/images1"
-IMAGES_INDEX="${DATASET_BASE}/extracted_data_new/cam_data/camera__image_mono/images_index1.csv"
+QUARRY_PATH="${DATASET_BASE}/flight_log_from_gga.csv"
+IMAGES_DIR="${DATASET_BASE}/extracted_data_new/cam_data/camera__image_mono/images"
+IMAGES_INDEX="${DATASET_BASE}/extracted_data_new/cam_data/camera__image_mono/images_index.csv"
 # v3.9.0: Add timeref.csv for camera time_ref matching
 TIMEREF_CSV="${DATASET_BASE}/extracted_data_new/imu_data/imu__time_ref_cam/timeref.csv"
-MAG_PATH="${DATASET_BASE}/extracted_data_new/imu_data/imu__mag/vector31.csv"
-DEM_PATH="${DATASET_BASE}/Copernicus_DSM_10_N45_00_W076_00_DEM1.tif"
+MAG_PATH="${DATASET_BASE}/extracted_data_new/imu_data/imu__mag/vector3.csv"
+DEM_PATH="${DATASET_BASE}/Copernicus_DSM_10_N45_00_W076_00_DEM.tif"
 GROUND_TRUTH="${DATASET_BASE}/bell412_dataset3_frl.pos"
 
 # Run mode
@@ -80,7 +80,7 @@ GROUND_TRUTH="${DATASET_BASE}/bell412_dataset3_frl.pos"
 #   full: require IMU+GT+CAM+MAG+DEM
 #   imu_cam: require IMU+GT+CAM
 #   imu_only: IMU+GT only
-RUN_MODE="${RUN_MODE:-auto}"
+RUN_MODE="${RUN_MODE:-imu_only}"
 
 # Output directory
 OUTPUT_DIR="benchmark_modular_${TEST_ID}/preintegration"
@@ -89,7 +89,6 @@ mkdir -p "$OUTPUT_DIR"
 # VPS Configuration (optional)
 # Uncomment to enable VPS real-time processing
 MBTILES_PATH="mission.mbtiles"
-VPS_ENABLED=true  # Set to true to enable VPS
 
 fail_fast() {
     echo "❌ $1"
@@ -99,7 +98,6 @@ fail_fast() {
 # Required inputs
 [ -f "$CONFIG" ] || fail_fast "Config not found: $CONFIG"
 [ -f "$IMU_PATH" ] || fail_fast "IMU file not found: $IMU_PATH"
-[ -f "$QUARRY_PATH" ] || fail_fast "Quarry/flight log not found: $QUARRY_PATH"
 [ -f "$GROUND_TRUTH" ] || fail_fast "Ground truth file not found: $GROUND_TRUTH"
 
 HAS_CAM=0
@@ -120,6 +118,7 @@ USE_CAM=0
 USE_MAG=0
 USE_DEM=0
 USE_TIMEREF=0
+USE_QUARRY=0
 
 case "$RUN_MODE" in
     full)
@@ -127,20 +126,21 @@ case "$RUN_MODE" in
         [ "$HAS_TIMEREF" -eq 1 ] || fail_fast "RUN_MODE=full requires timeref CSV"
         [ "$HAS_MAG" -eq 1 ] || fail_fast "RUN_MODE=full requires magnetometer CSV"
         [ "$HAS_DEM" -eq 1 ] || fail_fast "RUN_MODE=full requires DEM file"
-        USE_CAM=1; USE_MAG=1; USE_DEM=1; USE_TIMEREF=1
+        USE_CAM=1; USE_MAG=1; USE_DEM=1; USE_TIMEREF=1; USE_QUARRY=1
         ;;
     imu_cam)
         [ "$HAS_CAM" -eq 1 ] || fail_fast "RUN_MODE=imu_cam requires camera inputs"
         [ "$HAS_TIMEREF" -eq 1 ] || fail_fast "RUN_MODE=imu_cam requires timeref CSV"
-        USE_CAM=1; USE_TIMEREF=1
+        USE_CAM=1; USE_TIMEREF=1; USE_QUARRY=0
         ;;
     imu_only)
-        USE_CAM=0; USE_MAG=0; USE_DEM=0; USE_TIMEREF=0
+        USE_CAM=0; USE_MAG=0; USE_DEM=0; USE_TIMEREF=0; USE_QUARRY=0
         ;;
     auto)
         USE_CAM="$HAS_CAM"
         USE_MAG="$HAS_MAG"
         USE_DEM="$HAS_DEM"
+        USE_QUARRY="$HAS_DEM"
         if [ "$HAS_TIMEREF" -eq 1 ] && { [ "$USE_CAM" -eq 1 ] || [ "$USE_MAG" -eq 1 ]; }; then
             USE_TIMEREF=1
         fi
@@ -154,7 +154,8 @@ RUN_MODE_LABEL="IMU+GT"
 [ "$USE_CAM" -eq 1 ] && RUN_MODE_LABEL="${RUN_MODE_LABEL}+CAM"
 [ "$USE_MAG" -eq 1 ] && RUN_MODE_LABEL="${RUN_MODE_LABEL}+MAG"
 [ "$USE_DEM" -eq 1 ] && RUN_MODE_LABEL="${RUN_MODE_LABEL}+DEM"
-[ "$VPS_ENABLED" = true ] && [ -f "$MBTILES_PATH" ] && RUN_MODE_LABEL="${RUN_MODE_LABEL}+VPS"
+[ "$USE_QUARRY" -eq 1 ] && RUN_MODE_LABEL="${RUN_MODE_LABEL}+MSL"
+[ -f "$MBTILES_PATH" ] && RUN_MODE_LABEL="${RUN_MODE_LABEL}+VPS"
 
 echo "Test Configuration:"
 echo "  Test ID: ${TEST_ID}"
@@ -165,7 +166,8 @@ echo "  Active sensors: ${RUN_MODE_LABEL}"
 [ "$USE_MAG" -eq 1 ] && echo "    - Magnetometer: ${MAG_PATH}"
 [ "$USE_DEM" -eq 1 ] && echo "    - DEM: ${DEM_PATH}"
 [ "$USE_TIMEREF" -eq 1 ] && echo "    - TimeRef: ${TIMEREF_CSV}"
-if [ "$VPS_ENABLED" = true ] && [ -f "$MBTILES_PATH" ]; then
+[ "$USE_QUARRY" -eq 1 ] && echo "    - Quarry: ${QUARRY_PATH}"
+if [ -f "$MBTILES_PATH" ]; then
     echo "    - VPS Tiles: ${MBTILES_PATH}"
 fi
 echo "  Entry point: run_vio.py (modular)"
@@ -188,11 +190,14 @@ PYTHON_ARGS=(
     python3 run_vio.py
     --config "$CONFIG"
     --imu "$IMU_PATH"
-    --quarry "$QUARRY_PATH"
     --ground_truth "$GROUND_TRUTH"
     --output "$OUTPUT_DIR"
     --save_debug_data
 )
+if [ "$USE_QUARRY" -eq 1 ]; then
+    [ -f "$QUARRY_PATH" ] || fail_fast "RUN_MODE=${RUN_MODE} requires quarry file: $QUARRY_PATH"
+    PYTHON_ARGS+=(--quarry "$QUARRY_PATH")
+fi
 
 if [ "$USE_CAM" -eq 1 ]; then
     PYTHON_ARGS+=(--images_dir "$IMAGES_DIR" --images_index "$IMAGES_INDEX")
@@ -208,7 +213,7 @@ if [ "$USE_TIMEREF" -eq 1 ]; then
 fi
 
 # Add MBTiles path if VPS is enabled
-if [ "$VPS_ENABLED" = true ] && [ -f "$MBTILES_PATH" ]; then
+if [ -f "$MBTILES_PATH" ]; then
     PYTHON_ARGS+=(--vps_tiles "$MBTILES_PATH")
     echo "✅ VPS enabled with MBTiles: $MBTILES_PATH"
 fi

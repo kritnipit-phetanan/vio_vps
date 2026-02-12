@@ -126,13 +126,15 @@ def initialize_quaternion_from_ppk(ppk_state: Any) -> Tuple[np.ndarray, np.ndarr
 
 
 def initialize_quaternion_from_imu(imu_quat_xyzw: np.ndarray,
-                                   ground_truth_yaw_ned: Optional[float] = None) -> np.ndarray:
+                                   ground_truth_yaw_ned: Optional[float] = None,
+                                   ground_truth_yaw_enu: Optional[float] = None) -> np.ndarray:
     """
     Initialize quaternion from IMU measurement, optionally correcting yaw.
     
     Args:
         imu_quat_xyzw: IMU quaternion [x, y, z, w] (Body-to-ENU)
         ground_truth_yaw_ned: Optional ground truth yaw in radians (NED: 0=North)
+        ground_truth_yaw_enu: Optional ground truth yaw in radians (ENU: 0=East)
         
     Returns:
         Quaternion as [w, x, y, z]
@@ -141,9 +143,12 @@ def initialize_quaternion_from_imu(imu_quat_xyzw: np.ndarray,
     q_init = np.array([imu_quat_xyzw[3], imu_quat_xyzw[0], 
                        imu_quat_xyzw[1], imu_quat_xyzw[2]])
     
-    if ground_truth_yaw_ned is not None:
-        # Convert NED yaw to ENU: yaw_enu = 90° - yaw_ned
-        gt_yaw_enu = np.pi/2 - ground_truth_yaw_ned
+    if ground_truth_yaw_enu is not None or ground_truth_yaw_ned is not None:
+        if ground_truth_yaw_enu is not None:
+            gt_yaw_enu = ground_truth_yaw_enu
+        else:
+            # Convert NED yaw to ENU: yaw_enu = 90° - yaw_ned
+            gt_yaw_enu = np.pi/2 - ground_truth_yaw_ned
         
         # Get current yaw from quaternion
         q_xyzw = np.array([q_init[1], q_init[2], q_init[3], q_init[0]])
@@ -151,8 +156,11 @@ def initialize_quaternion_from_imu(imu_quat_xyzw: np.ndarray,
         yaw_imu = euler_imu[0]
         
         print(f"[INIT][GT] IMU initial yaw: {np.degrees(yaw_imu):.1f}° (ENU)")
-        print(f"[INIT][GT] Ground truth yaw: {np.degrees(ground_truth_yaw_ned):.1f}° (NED) = "
-              f"{np.degrees(gt_yaw_enu):.1f}° (ENU)")
+        if ground_truth_yaw_enu is not None:
+            print(f"[INIT][GT] Ground truth yaw: {np.degrees(gt_yaw_enu):.1f}° (ENU)")
+        else:
+            print(f"[INIT][GT] Ground truth yaw: {np.degrees(ground_truth_yaw_ned):.1f}° (NED) = "
+                  f"{np.degrees(gt_yaw_enu):.1f}° (ENU)")
         
         # Replace yaw while keeping roll and pitch
         euler_corrected = euler_imu.copy()
@@ -193,22 +201,41 @@ def estimate_imu_bias_from_static(imu_records: list,
     acc_body_mean = np.mean(acc_body_list, axis=0)
     gyro_mean = np.mean(gyro_list, axis=0)
     
-    # For stationary sensor: R @ (a_measured - ba) = [0, 0, -g] in ENU
-    # Therefore: ba = a_measured - R^T @ [0, 0, -g]
+    # Stationary bias model depends on accelerometer convention.
+    # accel_includes_gravity=True:  R @ (a_measured - ba) = [0, 0, -g]
+    # accel_includes_gravity=False: R @ (a_measured - ba) = [0, 0,  0]
     quat_0 = np.array([imu_records[0].q[0], imu_records[0].q[1], 
                        imu_records[0].q[2], imu_records[0].q[3]])
     R_0 = R_scipy.from_quat(quat_0).as_matrix()
     
-    # In ENU frame: gravity points DOWN, so g_world = [0, 0, -g]
-    expected_world = np.array([0, 0, -imu_params["g_norm"]])
+    accel_includes_gravity = bool(imu_params.get("accel_includes_gravity", True))
+    used_gravity_sign_flip = False
+    if accel_includes_gravity:
+        expected_world = np.array([0, 0, -imu_params["g_norm"]], dtype=float)
+    else:
+        expected_world = np.array([0.0, 0.0, 0.0], dtype=float)
     expected_body = R_0.T @ expected_world
+    
+    # Some logs carry IMU attitude in a convention that flips gravity direction
+    # relative to the acceleration columns. Resolve this by choosing the sign
+    # that best matches the measured static acceleration.
+    if accel_includes_gravity:
+        expected_body_flipped = -expected_body
+        residual_nominal = float(np.linalg.norm(acc_body_mean - expected_body))
+        residual_flipped = float(np.linalg.norm(acc_body_mean - expected_body_flipped))
+        if residual_flipped + 1e-9 < residual_nominal:
+            expected_body = expected_body_flipped
+            used_gravity_sign_flip = True
     
     ba_init = acc_body_mean - expected_body
     bg_init = gyro_mean  # Gyro should read zero when stationary
     
     print(f"[DEBUG][BIAS] Using {n_static} samples for bias estimation")
     print(f"[DEBUG][BIAS] Raw acc body mean: {acc_body_mean}")
-    print(f"[DEBUG][BIAS] Expected body (from R^T @ [0,0,-g]): {expected_body}")
+    print(f"[DEBUG][BIAS] accel_includes_gravity={accel_includes_gravity}")
+    if used_gravity_sign_flip:
+        print(f"[DEBUG][BIAS] Applied gravity sign flip for static bias alignment")
+    print(f"[DEBUG][BIAS] Expected body (from R^T @ expected_world): {expected_body}")
     print(f"[DEBUG][BIAS] Estimated ba: {ba_init}")
     print(f"[DEBUG][BIAS] Estimated bg: {bg_init}")
     
@@ -308,16 +335,17 @@ def initialize_covariance(imu_params: dict,
     # v3.9.8: Set tiny when disabled to freeze states
     # v3.9.9: Also freeze when mag_params is None (no mag data)
     if mag_params is None:
-        # No mag data - freeze mag_bias completely
-        P_mag = 1e-12
+        # No mag data - keep finite non-singular covariance for numerical stability.
+        # Very tiny values make P nearly singular and amplify conditioning issues.
+        P_mag = 1e-6
     else:
         use_estimated_bias = mag_params.get('use_estimated_bias', True)
         if use_estimated_bias:
             sigma_mag = mag_params.get('sigma_mag_bias_init', 0.1)
             P_mag = sigma_mag ** 2
         else:
-            # Freeze mag_bias by setting tiny covariance (effectively constant)
-            P_mag = 1e-12
+            # Freeze mag_bias with small but non-singular covariance.
+            P_mag = 1e-6
     
     P = np.diag([
         P_pos, P_pos, P_pos,        # δp (3)
@@ -478,13 +506,27 @@ def initialize_ekf_state(kf,
     bg_init = np.zeros(3)
     ba_init = np.zeros(3)
     
-    if initial_gyro_bias is not None and np.any(initial_gyro_bias != 0):
+    # Prefer static estimation when enabled; fall back to config-provided priors.
+    if estimate_imu_bias and len(imu_records) >= 100:
+        bg_init, ba_init = estimate_imu_bias_from_static(imu_records, imu_params)
+        # Safety gate: static bias should stay physically small.
+        if np.linalg.norm(ba_init) > 5.0 or np.max(np.abs(ba_init)) > 5.0:
+            print(
+                f"[DEBUG][BIAS] WARNING: Estimated accel bias looks invalid "
+                f"(||ba||={np.linalg.norm(ba_init):.3f}). Falling back."
+            )
+            if initial_gyro_bias is not None and np.any(initial_gyro_bias != 0):
+                bg_init = initial_gyro_bias
+                ba_init = initial_accel_bias if initial_accel_bias is not None else np.zeros(3)
+                print(f"[DEBUG][BIAS] Fallback to config-provided initial biases")
+            else:
+                ba_init = np.zeros(3, dtype=float)
+                print(f"[DEBUG][BIAS] Fallback to zero accel bias")
+        has_static_calibration = True
+    elif initial_gyro_bias is not None and np.any(initial_gyro_bias != 0):
         bg_init = initial_gyro_bias
         ba_init = initial_accel_bias if initial_accel_bias is not None else np.zeros(3)
         print(f"[DEBUG][BIAS] Using config-provided initial biases")
-        has_static_calibration = True
-    elif estimate_imu_bias and len(imu_records) >= 100:
-        bg_init, ba_init = estimate_imu_bias_from_static(imu_records, imu_params)
         has_static_calibration = True
     
     kf.x[10:13, 0] = bg_init

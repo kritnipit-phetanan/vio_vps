@@ -66,6 +66,7 @@ imu:
   acc_w: 0.00004   # Accelerometer random walk [m/s³/√Hz]
   gyr_w: 0.0001    # Gyroscope random walk [rad/s²/√Hz]
   g_norm: 9.803    # Gravity magnitude [m/s²]
+  accel_includes_gravity: true  # IMU linear acceleration includes gravity component
   
   # Initial gyro bias (estimated from static period at start)
   # CRITICAL: Raw data shows gyro mean = -2.58°/s which causes yaw drift!
@@ -402,7 +403,7 @@ trn:
 # VPS Configuration (Visual Positioning System - Satellite Matching)
 # ============================================================================
 vps:
-  enabled: true
+  enabled: false
   
   # Processing parameters
   output_size: [512, 512]          # Output patch size for matching
@@ -427,4 +428,3 @@ vps:
   
   # Camera selection (which extrinsics to use)
   camera_view: "nadir"             # 'nadir', 'front', or 'side'
-
