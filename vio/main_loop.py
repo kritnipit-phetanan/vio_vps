@@ -79,6 +79,7 @@ from .output_utils import (
     save_keyframe_with_overlay,
     log_state_debug, log_vo_debug, log_msckf_window, log_fej_consistency,
     log_adaptive_decision, log_sensor_health,
+    append_benchmark_health_summary,
     DebugCSVWriters, init_output_csvs, get_ground_truth_error,
     build_calibration_params
 )
@@ -180,6 +181,8 @@ class VIORunner:
         self.cov_health_csv = None
         self.adaptive_debug_csv = None
         self.sensor_health_csv = None
+        self.conditioning_events_csv = None
+        self.benchmark_health_summary_csv = None
         
         # Fisheye rectifier (optional)
         self.rectifier: Optional[FisheyeRectifier] = None
@@ -220,6 +223,8 @@ class VIORunner:
         self._adaptive_prev_pmax: Optional[float] = None
         self._adaptive_log_enabled: bool = True
         self._legacy_covariance_cap: float = 1e8
+        self._adaptive_last_policy_t: Optional[float] = None
+        self._conditioning_warning_sec: float = 0.0
         self.imu_only_mode: bool = False
         self._imu_only_yaw_ref: Optional[float] = None
         self._imu_only_bg_ref: Optional[np.ndarray] = None
@@ -586,12 +591,16 @@ class VIORunner:
         self.cov_health_csv = csv_paths.get('cov_health_csv')
         self.adaptive_debug_csv = csv_paths.get('adaptive_debug_csv')
         self.sensor_health_csv = csv_paths.get('sensor_health_csv')
+        self.conditioning_events_csv = csv_paths.get('conditioning_events_csv')
+        self.benchmark_health_summary_csv = csv_paths.get('benchmark_health_summary_csv')
         self.inf_csv = csv_paths['inf_csv']
         self.vo_dbg_csv = csv_paths['vo_dbg']
         self.msckf_dbg_csv = csv_paths['msckf_dbg']
         
         if self.kf is not None and hasattr(self.kf, "enable_cov_health_logging") and self.cov_health_csv:
             self.kf.enable_cov_health_logging(self.cov_health_csv)
+        if self.kf is not None and hasattr(self.kf, "enable_conditioning_event_logging") and self.conditioning_events_csv:
+            self.kf.enable_conditioning_event_logging(self.conditioning_events_csv)
         
         # Use DebugCSVWriters for optional debug files
         self.debug_writers = DebugCSVWriters(self.config.output_dir, self.config.save_debug_data)
@@ -724,6 +733,8 @@ class VIORunner:
         self.current_adaptive_decision = self.adaptive_controller.last_decision
         self._adaptive_prev_pmax = None
         self._adaptive_last_aiding_time = None
+        self._adaptive_last_policy_t = None
+        self._conditioning_warning_sec = 0.0
         self._adaptive_log_enabled = bool(
             adaptive_cfg.get("logging", {}).get("enabled", True)
         )
@@ -805,12 +816,30 @@ class VIORunner:
         decision = self.adaptive_controller.step(ctx)
         self.current_adaptive_decision = decision
 
+        if self._adaptive_last_policy_t is None:
+            dt_policy = 0.0
+        else:
+            dt_policy = max(0.0, float(t - self._adaptive_last_policy_t))
+        self._adaptive_last_policy_t = float(t)
+        if decision.health_state in ("WARNING", "DEGRADED"):
+            self._conditioning_warning_sec += dt_policy
+        else:
+            self._conditioning_warning_sec = 0.0
+
         # Keep legacy cap for off/shadow to guarantee backward compatibility.
         cov_cap = self._legacy_covariance_cap
         if decision.apply_process_noise:
             cov_cap = float(decision.conditioning_max_value)
         if hasattr(self.kf, "set_covariance_max_value"):
             self.kf.set_covariance_max_value(cov_cap)
+        if hasattr(self.kf, "conditioning_cond_hard"):
+            self.kf.conditioning_cond_hard = float(decision.conditioning_cond_hard)
+        if hasattr(self.kf, "conditioning_cond_hard_window"):
+            self.kf.conditioning_cond_hard_window = int(max(1, decision.conditioning_cond_hard_window))
+        if hasattr(self.kf, "conditioning_projection_min_interval_steps"):
+            self.kf.conditioning_projection_min_interval_steps = int(
+                max(1, decision.conditioning_projection_min_interval_steps)
+            )
 
         if self.adaptive_debug_csv and self._adaptive_log_enabled:
             log_adaptive_decision(
@@ -1001,9 +1030,15 @@ class VIORunner:
                 self._imu_only_bg_ref = self.kf.x[10:13, 0].astype(float).copy()
             if self._imu_only_ba_ref is None:
                 self._imu_only_ba_ref = self.kf.x[13:16, 0].astype(float).copy()
+            warning_backoff_active = bool(self._conditioning_warning_sec >= 1.5)
+            warning_period_mult = 2 if warning_backoff_active else 1
 
             grav_policy_scales, grav_apply_scales = self._get_sensor_adaptive_scales("GRAVITY_RP")
-            if bool(float(grav_apply_scales.get("enabled_imu_only", 1.0)) >= 0.5):
+            grav_period_steps = max(1, int(round(float(grav_apply_scales.get("period_steps", 1.0))))) * warning_period_mult
+            if (
+                bool(float(grav_apply_scales.get("enabled_imu_only", 1.0)) >= 0.5)
+                and (self.state.imu_propagation_count % grav_period_steps == 0)
+            ):
                 grav_adaptive_info: Dict[str, Any] = {}
                 apply_gravity_roll_pitch_update(
                     self.kf,
@@ -1030,7 +1065,19 @@ class VIORunner:
                 )
 
             yaw_policy_scales, yaw_apply_scales = self._get_sensor_adaptive_scales("YAW_AID")
-            if bool(float(yaw_apply_scales.get("enabled_imu_only", 1.0)) >= 0.5):
+            yaw_period_steps = max(1, int(round(float(yaw_apply_scales.get("period_steps", 8.0))))) * warning_period_mult
+            speed_ms_now = float(v_mag)
+            if speed_ms_now > float(yaw_apply_scales.get("high_speed_m_s", 1e9)):
+                yaw_period_steps = int(
+                    max(1, round(yaw_period_steps * float(yaw_apply_scales.get("high_speed_period_mult", 1.0))))
+                )
+            if (
+                bool(float(yaw_apply_scales.get("enabled_imu_only", 1.0)) >= 0.5)
+                and (self.state.imu_propagation_count % yaw_period_steps == 0)
+            ):
+                yaw_sigma_deg = float(yaw_apply_scales.get("sigma_deg", 35.0))
+                if speed_ms_now > float(yaw_apply_scales.get("high_speed_m_s", 1e9)):
+                    yaw_sigma_deg *= float(yaw_apply_scales.get("high_speed_sigma_mult", 1.0))
                 yaw_adaptive_info: Dict[str, Any] = {}
                 apply_yaw_pseudo_update(
                     self.kf,
@@ -1038,7 +1085,7 @@ class VIORunner:
                     w_corr=w_corr,
                     imu_params=imu_params,
                     yaw_ref_rad=float(self._imu_only_yaw_ref),
-                    sigma_rad=np.deg2rad(float(yaw_apply_scales.get("sigma_deg", 35.0))),
+                    sigma_rad=np.deg2rad(yaw_sigma_deg),
                     r_scale=float(yaw_apply_scales.get("r_scale", 1.0)),
                     chi2_scale=float(yaw_apply_scales.get("chi2_scale", 1.0)),
                     acc_norm_tolerance=float(yaw_apply_scales.get("acc_norm_tolerance", 0.25)),
@@ -1077,12 +1124,30 @@ class VIORunner:
             period_steps = max(1, int(round(float(bias_apply_scales.get("period_steps", 8.0)))))
             decision = self.current_adaptive_decision
             aiding_level = decision.aiding_level if decision is not None else "FULL"
+            health_state = decision.health_state if decision is not None else "HEALTHY"
+            phase_now = int(self.state.current_phase)
+            phase_period_mult = 2 if phase_now >= 1 else 1
+            health_period_mult = 2 if health_state in ("WARNING", "DEGRADED") else 1
+            period_steps = period_steps * phase_period_mult * health_period_mult * warning_period_mult
+            if speed_ms_now > float(bias_apply_scales.get("high_speed_m_s", 1e9)):
+                period_steps = int(
+                    max(1, round(period_steps * float(bias_apply_scales.get("high_speed_period_mult", 1.0))))
+                )
             allow_level = (
                 (aiding_level == "NONE" and float(bias_apply_scales.get("enable_when_no_aiding", 1.0)) >= 0.5)
                 or (aiding_level == "PARTIAL" and float(bias_apply_scales.get("enable_when_partial_aiding", 0.0)) >= 0.5)
                 or (aiding_level == "FULL" and float(bias_apply_scales.get("enable_when_full_aiding", 0.0)) >= 0.5)
             )
-            if bias_enabled and allow_level and (self.state.imu_propagation_count % period_steps == 0):
+            g_norm = float(imu_params.get("g_norm", 9.80665))
+            accel_includes_gravity = bool(imu_params.get("accel_includes_gravity", True))
+            expected_acc_mag = g_norm if accel_includes_gravity else 0.0
+            acc_dev = abs(float(np.linalg.norm(rec.lin.astype(float))) - expected_acc_mag)
+            gyro_mag = float(np.linalg.norm(w_corr))
+            low_dynamic_for_bias = (
+                acc_dev <= float(bias_apply_scales.get("acc_norm_tolerance", 0.15))
+                and gyro_mag <= float(bias_apply_scales.get("max_gyro_rad_s", 0.25))
+            )
+            if bias_enabled and allow_level and low_dynamic_for_bias and (self.state.imu_propagation_count % period_steps == 0):
                 bias_adaptive_info: Dict[str, Any] = {}
                 apply_bias_observability_guard(
                     self.kf,
@@ -2130,6 +2195,82 @@ class VIORunner:
         # Print error statistics using dedicated function
         from .output_utils import print_error_statistics
         print_error_statistics(self.error_csv)
+        self._write_benchmark_health_summary()
+
+    def _write_benchmark_health_summary(self):
+        """Write one-row benchmark health summary CSV for before/after comparison."""
+        if not self.benchmark_health_summary_csv:
+            return
+
+        projection_count = 0
+        first_projection_time = float("nan")
+        pcond_max_stats = float("nan")
+        if self.kf is not None and hasattr(self.kf, "get_conditioning_stats"):
+            try:
+                cstats = self.kf.get_conditioning_stats()
+                projection_count = int(cstats.get("projection_count", 0))
+                first_projection_time = float(cstats.get("first_projection_time", float("nan")))
+                pcond_max_stats = float(cstats.get("max_cond_seen", float("nan")))
+            except Exception:
+                pass
+
+        pcond_max_cov = float("nan")
+        pmax_max = float("nan")
+        cov_large_rate = float("nan")
+        if self.cov_health_csv and os.path.isfile(self.cov_health_csv):
+            try:
+                cov_df = pd.read_csv(self.cov_health_csv)
+                if len(cov_df) > 0:
+                    pcond_max_cov = float(pd.to_numeric(cov_df["p_cond"], errors="coerce").max())
+                    pmax_max = float(pd.to_numeric(cov_df["p_max"], errors="coerce").max())
+                    cov_large_rate = float(pd.to_numeric(cov_df["large_flag"], errors="coerce").mean())
+            except Exception:
+                pass
+
+        pcond_max = pcond_max_stats
+        if np.isfinite(pcond_max_cov):
+            pcond_max = max(pcond_max, pcond_max_cov) if np.isfinite(pcond_max) else pcond_max_cov
+
+        pos_rmse = float("nan")
+        final_pos_err = float("nan")
+        final_alt_err = float("nan")
+        if self.error_csv and os.path.isfile(self.error_csv):
+            try:
+                err_df = pd.read_csv(self.error_csv)
+                if len(err_df) > 0:
+                    pos_vals = pd.to_numeric(err_df["pos_error_m"], errors="coerce").to_numpy(dtype=float)
+                    alt_vals = pd.to_numeric(err_df["alt_error_m"], errors="coerce").to_numpy(dtype=float)
+                    pos_rmse = float(np.sqrt(np.nanmean(pos_vals ** 2)))
+                    final_pos_err = float(pos_vals[-1])
+                    final_alt_err = float(alt_vals[-1])
+            except Exception:
+                pass
+
+        output_dir_norm = os.path.normpath(self.config.output_dir)
+        if os.path.basename(output_dir_norm) == "preintegration":
+            run_id = os.path.basename(os.path.dirname(output_dir_norm))
+        else:
+            run_id = os.path.basename(output_dir_norm)
+        if not run_id:
+            run_id = output_dir_norm
+
+        append_benchmark_health_summary(
+            self.benchmark_health_summary_csv,
+            run_id=run_id,
+            projection_count=projection_count,
+            first_projection_time=first_projection_time,
+            pcond_max=pcond_max,
+            pmax_max=pmax_max,
+            cov_large_rate=cov_large_rate,
+            pos_rmse=pos_rmse,
+            final_pos_err=final_pos_err,
+            final_alt_err=final_alt_err,
+        )
+        print(
+            f"[SUMMARY] projection_count={projection_count}, "
+            f"first_projection_time={first_projection_time:.3f}, "
+            f"pcond_max={pcond_max:.2e}, cov_large_rate={cov_large_rate:.3f}"
+        )
     
     def run(self):
         """

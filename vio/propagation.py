@@ -313,7 +313,10 @@ def propagate_to_timestamp(kf: ExtendedKalmanFilter, target_time: float,
             check_psd=True,
             min_eigenvalue=1e-7,
             log_condition=False,
-            max_value=getattr(kf, "covariance_max_value", 1e8)
+            max_value=getattr(kf, "covariance_max_value", 1e8),
+            conditioner=kf,
+            timestamp=target_time,
+            stage="IMU_PROP_PREINT",
         )
         
         # Update priors
@@ -357,7 +360,10 @@ def propagate_to_timestamp(kf: ExtendedKalmanFilter, target_time: float,
             symmetrize=True,
             check_psd=True,
             min_eigenvalue=1e-7,
-            max_value=getattr(kf, "covariance_max_value", 1e8)
+            max_value=getattr(kf, "covariance_max_value", 1e8),
+            conditioner=kf,
+            timestamp=target_time,
+            stage="IMU_PROP_LEGACY",
         )
         
         return True, None
@@ -475,7 +481,15 @@ def _propagate_single_imu_step(kf: ExtendedKalmanFilter, imu: IMURecord, dt: flo
     )
     
     num_clones = (kf.x.shape[0] - 19) // 7  # v3.9.7: 19D nominal
-    kf.P = propagate_error_state_covariance(kf.P, Phi_err, Q_err, num_clones)
+    kf.P = propagate_error_state_covariance(
+        kf.P,
+        Phi_err,
+        Q_err,
+        num_clones,
+        conditioner=kf,
+        timestamp=t,
+        stage="IMU_PROP",
+    )
     
     # Update priors
     kf.x_prior = kf.x.copy()
@@ -633,7 +647,10 @@ def apply_zupt(kf: ExtendedKalmanFilter, v_mag: float,
         from .ekf import ensure_covariance_valid
         kf.P = ensure_covariance_valid(kf.P, label="ZUPT-entry",
                                        max_value=getattr(kf, "covariance_max_value", 1e8),
-                                       symmetrize=True, check_psd=True)
+                                       symmetrize=True, check_psd=True,
+                                       conditioner=kf,
+                                       timestamp=timestamp,
+                                       stage="ZUPT_PRECHECK")
     
     # Calculate dimensions
     num_clones = (kf.x.shape[0] - 19) // 7  # v3.9.7: 19D nominal

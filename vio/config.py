@@ -607,6 +607,7 @@ def load_config(config_path: str) -> VIOConfig:
             'gravity_alignment': {
                 'enabled_imu_only': True,
                 'phase_sigma_deg': {'0': 3.5, '1': 10.0, '2': 8.5},
+                'phase_period_steps': {'0': 1, '1': 2, '2': 2},
                 'phase_acc_norm_tolerance': {'0': 0.15, '1': 0.35, '2': 0.30},
                 'phase_max_gyro_rad_s': {'0': 0.25, '1': 0.65, '2': 0.50},
                 'health_sigma_mult': {
@@ -621,7 +622,12 @@ def load_config(config_path: str) -> VIOConfig:
             },
             'yaw_aid': {
                 'enabled_imu_only': True,
-                'phase_sigma_deg': {'0': 20.0, '1': 45.0, '2': 35.0},
+                'phase_sigma_deg': {'0': 20.0, '1': 50.0, '2': 38.0},
+                'phase_min_sigma_deg': {'0': 18.0, '1': 35.0, '2': 28.0},
+                'phase_period_steps': {'0': 4, '1': 24, '2': 16},
+                'max_accept_rate_for_active': 0.98,
+                'high_accept_backoff_factor': 1.5,
+                'high_accept_r_scale': 1.1,
                 'phase_acc_norm_tolerance': {'0': 0.15, '1': 0.30, '2': 0.25},
                 'phase_max_gyro_rad_s': {'0': 0.20, '1': 0.55, '2': 0.40},
                 'health_sigma_mult': {
@@ -630,6 +636,9 @@ def load_config(config_path: str) -> VIOConfig:
                     'DEGRADED': 1.5,
                     'RECOVERY': 1.1,
                 },
+                'high_speed_m_s': 180.0,
+                'high_speed_sigma_mult': 1.15,
+                'high_speed_period_mult': 1.2,
                 'chi2_scale': 1.0,
                 'ref_alpha': 0.005,
                 'dynamic_ref_alpha': 0.05,
@@ -644,8 +653,16 @@ def load_config(config_path: str) -> VIOConfig:
                 'enabled_imu_only': True,
                 'apply_when_aiding_level': ['NONE'],
                 'period_steps': 8,
-                'phase_sigma_bg_deg_s': {'0': 0.25, '1': 0.35, '2': 0.30},
-                'phase_sigma_ba_m_s2': {'0': 0.08, '1': 0.20, '2': 0.15},
+                'phase_period_steps': {'0': 8, '1': 24, '2': 20},
+                'max_accept_rate_for_active': 0.98,
+                'high_accept_backoff_factor': 1.6,
+                'high_accept_r_scale': 1.05,
+                'phase_sigma_bg_deg_s': {'0': 0.25, '1': 0.45, '2': 0.35},
+                'phase_sigma_ba_m_s2': {'0': 0.08, '1': 0.25, '2': 0.18},
+                'phase_acc_norm_tolerance': {'0': 0.20, '1': 0.20, '2': 0.22},
+                'phase_max_gyro_rad_s': {'0': 0.20, '1': 0.30, '2': 0.32},
+                'high_speed_m_s': 180.0,
+                'high_speed_period_mult': 1.2,
                 'health_sigma_mult': {
                     'HEALTHY': 1.0,
                     'WARNING': 0.8,
@@ -662,6 +679,12 @@ def load_config(config_path: str) -> VIOConfig:
                     'inflate_power': 1.0,
                 },
             },
+            'conditioning_backoff': {
+                'HEALTHY': {'period_mult': 1.0, 'r_scale_mult': 1.0},
+                'WARNING': {'period_mult': 1.2, 'r_scale_mult': 1.05},
+                'DEGRADED': {'period_mult': 1.5, 'r_scale_mult': 1.15},
+                'RECOVERY': {'period_mult': 1.1, 'r_scale_mult': 1.02},
+            },
         },
         'conditioning': {
             'caps': {
@@ -669,7 +692,25 @@ def load_config(config_path: str) -> VIOConfig:
                 'WARNING': 1e7,
                 'DEGRADED': 1e6,
                 'RECOVERY': 1e7,
-            }
+            },
+            'cond_hard': {
+                'HEALTHY': 1.2e12,
+                'WARNING': 1.2e12,
+                'DEGRADED': 1.1e12,
+                'RECOVERY': 1.2e12,
+            },
+            'cond_hard_window': {
+                'HEALTHY': 16,
+                'WARNING': 16,
+                'DEGRADED': 16,
+                'RECOVERY': 16,
+            },
+            'projection_min_interval_steps': {
+                'HEALTHY': 64,
+                'WARNING': 64,
+                'DEGRADED': 64,
+                'RECOVERY': 64,
+            },
         },
         'logging': {
             'enabled': True,

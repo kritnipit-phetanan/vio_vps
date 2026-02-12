@@ -19,7 +19,7 @@
 #   bash scripts/benchmark_modular.sh
 # ============================================================================
 
-set -e  # Exit on error
+set -Eeuo pipefail  # Fail-fast on command errors (including pipelines)
 
 echo "============================================================================"
 echo "VIO IMU PREINTEGRATION - MODULAR VERSION (v3.2.0)"
@@ -85,6 +85,13 @@ RUN_MODE="${RUN_MODE:-imu_only}"
 # Output directory
 OUTPUT_DIR="benchmark_modular_${TEST_ID}/preintegration"
 mkdir -p "$OUTPUT_DIR"
+
+# Baseline run for before/after diff.
+# Priority: explicit BASELINE_RUN > latest previous benchmark run.
+BASELINE_RUN="${BASELINE_RUN:-}"
+if [ -z "$BASELINE_RUN" ]; then
+    BASELINE_RUN="$(ls -dt benchmark_modular_*/preintegration 2>/dev/null | grep -v "^${OUTPUT_DIR}$" | head -n 1 || true)"
+fi
 
 # VPS Configuration (optional)
 # Uncomment to enable VPS real-time processing
@@ -162,6 +169,7 @@ echo "  Test ID: ${TEST_ID}"
 echo "  Output directory: ${OUTPUT_DIR}/"
 echo "  RUN_MODE: ${RUN_MODE}"
 echo "  Active sensors: ${RUN_MODE_LABEL}"
+[ -n "$BASELINE_RUN" ] && echo "  Baseline run: ${BASELINE_RUN}"
 [ "$USE_CAM" -eq 1 ] && echo "    - Camera: ${IMAGES_DIR}"
 [ "$USE_MAG" -eq 1 ] && echo "    - Magnetometer: ${MAG_PATH}"
 [ "$USE_DEM" -eq 1 ] && echo "    - DEM: ${DEM_PATH}"
@@ -218,7 +226,9 @@ if [ -f "$MBTILES_PATH" ]; then
     echo "✅ VPS enabled with MBTiles: $MBTILES_PATH"
 fi
 
-"${PYTHON_ARGS[@]}" 2>&1 | tee "$OUTPUT_DIR/run.log"
+if ! "${PYTHON_ARGS[@]}" 2>&1 | tee "$OUTPUT_DIR/run.log"; then
+    fail_fast "VIO run failed (see $OUTPUT_DIR/run.log)"
+fi
 
 END_TIME=$(date +%s.%N)
 RUNTIME=$(echo "$END_TIME - $START_TIME" | bc)
@@ -275,6 +285,190 @@ echo "=== Accuracy Analysis ==="
 analyze_errors "$OUTPUT_DIR/error_log.csv"
 echo ""
 
+CURRENT_SUMMARY="$OUTPUT_DIR/benchmark_health_summary.csv"
+BASELINE_SUMMARY=""
+if [ -n "$BASELINE_RUN" ] && [ -f "$BASELINE_RUN/benchmark_health_summary.csv" ]; then
+    BASELINE_SUMMARY="$BASELINE_RUN/benchmark_health_summary.csv"
+elif [ -n "$BASELINE_RUN" ]; then
+    BASELINE_SUMMARY="$OUTPUT_DIR/_baseline_health_summary_fallback.csv"
+    python3 - <<EOF
+import os
+import re
+import numpy as np
+import pandas as pd
+
+base_dir = "$BASELINE_RUN"
+out_csv = "$BASELINE_SUMMARY"
+
+projection_count = np.nan
+first_projection_time = np.nan
+pcond_max = np.nan
+pmax_max = np.nan
+cov_large_rate = np.nan
+pos_rmse = np.nan
+final_pos_err = np.nan
+final_alt_err = np.nan
+
+run_log = os.path.join(base_dir, "run.log")
+if os.path.isfile(run_log):
+    with open(run_log, "r", errors="ignore") as f:
+        lines = f.readlines()
+    projection_count = float(sum(1 for line in lines if ("Eigenvalue projection" in line or "[EKF-COND]" in line)))
+    for line in lines:
+        m = re.search(r"\\[EKF-COND\\]\\s+t=([0-9.+-eE]+)", line)
+        if m:
+            first_projection_time = float(m.group(1))
+            break
+
+cov_csv = os.path.join(base_dir, "cov_health.csv")
+if os.path.isfile(cov_csv):
+    cov_df = pd.read_csv(cov_csv)
+    if len(cov_df) > 0:
+        pcond_max = float(pd.to_numeric(cov_df["p_cond"], errors="coerce").max())
+        pmax_max = float(pd.to_numeric(cov_df["p_max"], errors="coerce").max())
+        cov_large_rate = float(pd.to_numeric(cov_df["large_flag"], errors="coerce").mean())
+
+err_csv = os.path.join(base_dir, "error_log.csv")
+if os.path.isfile(err_csv):
+    err_df = pd.read_csv(err_csv)
+    if len(err_df) > 0:
+        pos = pd.to_numeric(err_df["pos_error_m"], errors="coerce").to_numpy(dtype=float)
+        alt = pd.to_numeric(err_df["alt_error_m"], errors="coerce").to_numpy(dtype=float)
+        pos_rmse = float(np.sqrt(np.nanmean(pos ** 2)))
+        final_pos_err = float(pos[-1])
+        final_alt_err = float(alt[-1])
+
+run_id = os.path.basename(os.path.dirname(os.path.normpath(base_dir))) if os.path.basename(os.path.normpath(base_dir)) == "preintegration" else os.path.basename(os.path.normpath(base_dir))
+with open(out_csv, "w", newline="") as f:
+    f.write("run_id,projection_count,first_projection_time,pcond_max,pmax_max,cov_large_rate,pos_rmse,final_pos_err,final_alt_err\\n")
+    f.write(f"{run_id},{projection_count},{first_projection_time},{pcond_max},{pmax_max},{cov_large_rate},{pos_rmse},{final_pos_err},{final_alt_err}\\n")
+EOF
+    if [ ! -f "$BASELINE_SUMMARY" ]; then
+        BASELINE_SUMMARY=""
+    fi
+fi
+
+echo "=== Conditioning Health Summary ==="
+if [ -f "$CURRENT_SUMMARY" ]; then
+    python3 - <<EOF
+import pandas as pd
+import numpy as np
+
+cur = pd.read_csv("$CURRENT_SUMMARY")
+if len(cur) == 0:
+    print("❌ benchmark_health_summary.csv is empty")
+else:
+    row = cur.iloc[-1]
+    print(f"projection_count   : {int(row['projection_count'])}")
+    print(f"first_projection_t : {row['first_projection_time']:.3f} s")
+    print(f"pcond_max          : {row['pcond_max']:.3e}")
+    print(f"pmax_max           : {row['pmax_max']:.3e}")
+    print(f"cov_large_rate     : {row['cov_large_rate']:.4f}")
+    print(f"pos_rmse           : {row['pos_rmse']:.3f} m")
+    print(f"final_pos_err      : {row['final_pos_err']:.3f} m")
+    print(f"final_alt_err      : {row['final_alt_err']:.3f} m")
+EOF
+else
+    echo "❌ Missing $CURRENT_SUMMARY"
+fi
+echo ""
+
+echo "=== Before/After vs Baseline ==="
+if [ -f "$CURRENT_SUMMARY" ] && [ -n "$BASELINE_SUMMARY" ]; then
+    python3 - <<EOF
+import pandas as pd
+import numpy as np
+
+cur = pd.read_csv("$CURRENT_SUMMARY").iloc[-1]
+base = pd.read_csv("$BASELINE_SUMMARY").iloc[-1]
+metrics = [
+    "projection_count",
+    "first_projection_time",
+    "pcond_max",
+    "pmax_max",
+    "cov_large_rate",
+    "pos_rmse",
+    "final_pos_err",
+    "final_alt_err",
+]
+print(f"Baseline: $BASELINE_RUN")
+for m in metrics:
+    c = float(cur[m])
+    b = float(base[m])
+    if np.isfinite(b) and abs(b) > 1e-12:
+        pct = 100.0 * (c - b) / abs(b)
+        print(f"{m:20s}  base={b: .6e}  cur={c: .6e}  delta={pct:+7.2f}%")
+    else:
+        print(f"{m:20s}  base={b: .6e}  cur={c: .6e}  delta=   n/a")
+EOF
+else
+    echo "No baseline summary found; skipping before/after diff."
+fi
+echo ""
+
+echo "=== Sensor Health by Phase (accept-rate / NIS EWMA) ==="
+if [ -f "$OUTPUT_DIR/sensor_health.csv" ] && [ -f "$OUTPUT_DIR/adaptive_debug.csv" ]; then
+    python3 - <<EOF
+import pandas as pd
+import numpy as np
+
+sensor_df = pd.read_csv("$OUTPUT_DIR/sensor_health.csv")
+adaptive_df = pd.read_csv("$OUTPUT_DIR/adaptive_debug.csv")[["t", "phase"]]
+
+if len(sensor_df) == 0 or len(adaptive_df) == 0:
+    print("No sensor/adaptive rows for phase summary")
+else:
+    sensor_df = sensor_df.sort_values("t")
+    adaptive_df = adaptive_df.sort_values("t")
+    merged = pd.merge_asof(sensor_df, adaptive_df, on="t", direction="backward")
+    merged["phase"] = merged["phase"].fillna(-1).astype(int)
+    summary = (
+        merged.groupby(["sensor", "phase"], dropna=False)
+        .agg(
+            samples=("accepted", "count"),
+            accept_rate=("accepted", "mean"),
+            nis_ewma_mean=("nis_ewma", "mean"),
+            nis_ewma_last=("nis_ewma", "last"),
+        )
+        .reset_index()
+        .sort_values(["sensor", "phase"])
+    )
+    out_csv = "$OUTPUT_DIR/sensor_phase_summary.csv"
+    summary.to_csv(out_csv, index=False)
+    print(summary.to_string(index=False))
+    print(f"saved: {out_csv}")
+
+    baseline_sensor = "$BASELINE_RUN/sensor_health.csv"
+    baseline_adaptive = "$BASELINE_RUN/adaptive_debug.csv"
+    if "$BASELINE_RUN" and pd.notna("$BASELINE_RUN") and \
+       baseline_sensor and baseline_adaptive and \
+       __import__("os").path.isfile(baseline_sensor) and __import__("os").path.isfile(baseline_adaptive):
+        b_s = pd.read_csv(baseline_sensor)
+        b_a = pd.read_csv(baseline_adaptive)[["t", "phase"]]
+        if len(b_s) > 0 and len(b_a) > 0:
+            b_s = b_s.sort_values("t")
+            b_a = b_a.sort_values("t")
+            b_m = pd.merge_asof(b_s, b_a, on="t", direction="backward")
+            b_m["phase"] = b_m["phase"].fillna(-1).astype(int)
+            b_sum = (
+                b_m.groupby(["sensor", "phase"], dropna=False)
+                .agg(
+                    accept_rate_base=("accepted", "mean"),
+                    nis_ewma_mean_base=("nis_ewma", "mean"),
+                )
+                .reset_index()
+            )
+            joined = summary.merge(b_sum, on=["sensor", "phase"], how="left")
+            joined["accept_rate_delta"] = joined["accept_rate"] - joined["accept_rate_base"]
+            joined["nis_ewma_delta"] = joined["nis_ewma_mean"] - joined["nis_ewma_mean_base"]
+            print("\\nBaseline delta (sensor+phase):")
+            print(joined[["sensor","phase","accept_rate_delta","nis_ewma_delta"]].to_string(index=False))
+EOF
+else
+    echo "Missing sensor_health.csv or adaptive_debug.csv"
+fi
+echo ""
+
 echo "=== Runtime ==="
 echo "Time: ${RUNTIME}s"
 echo ""
@@ -285,6 +479,10 @@ echo "==========================================================================
 echo "Results saved to: ${OUTPUT_DIR}/"
 echo "  - pose.csv         : Full trajectory"
 echo "  - error_log.csv    : Error statistics"
+echo "  - cov_health.csv   : Covariance health timeline"
+echo "  - conditioning_events.csv : Conditioning fallback events"
+echo "  - benchmark_health_summary.csv : Run health one-line summary"
+echo "  - sensor_phase_summary.csv : accept-rate/NIS summary by sensor+phase"
 echo "  - run.log          : Full debug output"
 echo ""
 echo "Modular VIO package: vio/"

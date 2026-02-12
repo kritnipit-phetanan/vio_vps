@@ -272,6 +272,30 @@ def log_sensor_health(sensor_csv: Optional[str],
         pass
 
 
+def append_benchmark_health_summary(summary_csv: Optional[str],
+                                    run_id: str,
+                                    projection_count: int,
+                                    first_projection_time: float,
+                                    pcond_max: float,
+                                    pmax_max: float,
+                                    cov_large_rate: float,
+                                    pos_rmse: float,
+                                    final_pos_err: float,
+                                    final_alt_err: float):
+    """Append one benchmark-health summary row."""
+    if summary_csv is None:
+        return
+    try:
+        with open(summary_csv, "a", newline="") as f:
+            f.write(
+                f"{run_id},{int(projection_count)},{first_projection_time:.6f},"
+                f"{pcond_max:.6e},{pmax_max:.6e},{cov_large_rate:.6f},"
+                f"{pos_rmse:.6f},{final_pos_err:.6f},{final_alt_err:.6f}\n"
+            )
+    except Exception:
+        pass
+
+
 def log_fej_consistency(fej_csv: Optional[str], t: float, frame: int,
                         cam_states: List[Dict], kf: Any):
     """
@@ -1145,6 +1169,19 @@ def init_output_csvs(output_dir: str) -> Dict[str, str]:
         f.write(
             "t,sensor,accepted,nis_norm,nis_ewma,accept_rate,mode,health_state,"
             "r_scale,chi2_scale,threshold_scale,reproj_scale,reason_code\n"
+        )
+
+    # Conditioning events (trigger-only log for covariance repairs)
+    paths['conditioning_events_csv'] = os.path.join(output_dir, "conditioning_events.csv")
+    with open(paths['conditioning_events_csv'], "w", newline="") as f:
+        f.write("t,event,stage,p_min_eig,p_max,p_cond,action,notes\n")
+
+    # One-line health summary per run (for before/after benchmark diff)
+    paths['benchmark_health_summary_csv'] = os.path.join(output_dir, "benchmark_health_summary.csv")
+    with open(paths['benchmark_health_summary_csv'], "w", newline="") as f:
+        f.write(
+            "run_id,projection_count,first_projection_time,pcond_max,pmax_max,"
+            "cov_large_rate,pos_rmse,final_pos_err,final_alt_err\n"
         )
     
     return paths

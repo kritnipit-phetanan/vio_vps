@@ -21,12 +21,15 @@ from .math_utils import quat_boxplus, skew_symmetric, safe_matrix_inverse
 from .numerical_checks import assert_finite, check_quaternion, check_covariance_psd
 
 
-def ensure_covariance_valid(P: np.ndarray, label: str = "", 
-                            symmetrize: bool = True, 
+def ensure_covariance_valid(P: np.ndarray, label: str = "",
+                            symmetrize: bool = True,
                             check_psd: bool = True,
                             min_eigenvalue: float = 1e-7,
                             log_condition: bool = False,
-                            max_value: float = None) -> np.ndarray:
+                            max_value: float = None,
+                            conditioner: "ExtendedKalmanFilter" = None,
+                            timestamp: float = float("nan"),
+                            stage: str = "") -> np.ndarray:
     """
     Ensure covariance matrix is valid (symmetric + positive semi-definite).
     
@@ -47,59 +50,165 @@ def ensure_covariance_valid(P: np.ndarray, label: str = "",
         P_valid: Fixed covariance matrix
     """
     n = P.shape[0]
+    core_dim = min(CORE_ERROR_DIM, n)
+    notes = []
+    event = "NONE"
+    action = "PASS"
+    projected = False
+    reset_applied = False
+    chol_failed = False
+    if conditioner is not None:
+        conditioner._conditioning_tick()
     
     # 1. Symmetrization
     if symmetrize:
-        asymmetry = np.linalg.norm(P - P.T, ord='fro')
-        if asymmetry > 1e-6:
-            print(f"[COV_CHECK] {label}: Asymmetry detected (||P - P^T|| = {asymmetry:.3e}), symmetrizing")
+        if np.all(np.isfinite(P)):
+            asymmetry = np.linalg.norm(P - P.T, ord='fro')
+            if asymmetry > 1e-6:
+                notes.append(f"asym={asymmetry:.2e}")
         P = (P + P.T) / 2.0
-    
-    # 1.5 Clamp very large entries (prevents overflow in eigendecomposition)
-    if max_value is not None and np.isfinite(max_value) and max_value > 0:
-        pmax = np.max(np.abs(P))
-        if pmax > max_value:
-            scale = float(max_value) / float(pmax)
-            P = P * scale
-            print(f"[COV_CHECK] {label}: Clamped covariance magnitude by scale={scale:.3e} (max={pmax:.3e})")
-    
-    # 2. PSD check / projection
+
+    # 1.5 Cheap guard: finite sanitize + core diagonal floor.
+    max_abs = float(max_value) if (max_value is not None and np.isfinite(max_value) and max_value > 0) else 1e8
+    if not np.all(np.isfinite(P)):
+        notes.append("non_finite")
+        event = "NON_FINITE"
+        action = "SANITIZE_RESET"
+        P = np.nan_to_num(P, nan=0.0, posinf=max_abs, neginf=-max_abs)
+        projected = True
+        reset_applied = True
+
     if check_psd:
+        floor = float(max(min_eigenvalue, 1e-12))
+        for i in range(core_dim):
+            if not np.isfinite(P[i, i]) or P[i, i] < floor:
+                P[i, i] = floor
+
+        force_projection = projected
+        cond_hard = getattr(conditioner, "conditioning_cond_hard", 1e12) if conditioner is not None else 1e12
+        cond_window = int(max(1, getattr(conditioner, "conditioning_cond_hard_window", 8))) if conditioner is not None else 8
+
+        p_max = float(np.max(np.abs(P)))
+        p_cond = float("inf")
         try:
-            eigvals, eigvecs = np.linalg.eigh(P)
-            lambda_min = eigvals[0]
-            lambda_max = eigvals[-1]
-            
-            if log_condition and lambda_min > 1e-12:
-                cond = lambda_max / lambda_min
-                if cond > 1e10:
-                    print(f"[COV_CHECK] {label}: High condition number κ(P) = {cond:.3e}")
-            
-            eig_floor = float(min_eigenvalue)
-            eig_ceil = None
-            if max_value is not None and np.isfinite(max_value) and max_value > eig_floor:
-                eig_ceil = float(max_value)
+            p_cond = float(np.linalg.cond(P[:core_dim, :core_dim]))
+        except Exception:
+            p_cond = float("inf")
+        if conditioner is not None:
+            conditioner._update_conditioning_max_cond(p_cond)
 
-            needs_projection = np.any(eigvals < eig_floor)
-            if eig_ceil is not None:
-                needs_projection = needs_projection or np.any(eigvals > eig_ceil)
+        if max_value is not None and np.isfinite(max_value) and max_value > 0 and p_max > float(max_value):
+            notes.append(f"cap_hard={p_max:.2e}>{float(max_value):.2e}")
+            force_projection = True
+            if event == "NONE":
+                event = "HARD_CAP"
+                action = "EIGEN_PROJECT"
 
-            if needs_projection:
+        cond_over = bool(np.isfinite(p_cond) and p_cond > float(cond_hard))
+        if conditioner is not None:
+            streak = conditioner._update_conditioning_cond_streak(cond_over)
+        else:
+            streak = 1 if cond_over else 0
+        if cond_over and streak >= cond_window:
+            allow_projection = True
+            if conditioner is not None and (not conditioner._can_project_now()):
+                allow_projection = False
+                notes.append("cond_hard_cooldown")
+            if allow_projection:
+                notes.append(f"p_cond={p_cond:.2e}|th={float(cond_hard):.2e}")
+                force_projection = True
+                if event == "NONE":
+                    event = "COND_HARD"
+                    action = "EIGEN_PROJECT"
+
+        # 2) Cholesky guard: cheap PSD test before eigen projection.
+        if not force_projection:
+            chol_ok = False
+            for jitter in (0.0, floor * 1e-3, floor):
+                try:
+                    np.linalg.cholesky(P + jitter * np.eye(n, dtype=float))
+                    chol_ok = True
+                    break
+                except np.linalg.LinAlgError:
+                    continue
+            if not chol_ok:
+                chol_failed = True
+                force_projection = True
+                event = "CHOLESKY_FAIL"
+                action = "EIGEN_PROJECT"
+                notes.append("chol_fail")
+
+        # 3) Eigen fallback path only when required.
+        if force_projection:
+            projected = True
+            eig_floor = float(max(min_eigenvalue, 1e-12))
+            eig_ceil = float(max_value) if (max_value is not None and np.isfinite(max_value) and max_value > eig_floor) else None
+            try:
+                eigvals, eigvecs = np.linalg.eigh(P)
                 eigvals_proj = np.maximum(eigvals, eig_floor)
                 if eig_ceil is not None:
                     eigvals_proj = np.minimum(eigvals_proj, eig_ceil)
-                P = eigvecs @ np.diag(eigvals_proj) @ eigvecs.T
+                with np.errstate(all="ignore"):
+                    P = eigvecs @ np.diag(eigvals_proj) @ eigvecs.T
+                if not np.all(np.isfinite(P)):
+                    raise np.linalg.LinAlgError("eigen reconstruction non-finite")
                 P = (P + P.T) / 2.0
-        
-        except np.linalg.LinAlgError as e:
-            print(f"[COV_CHECK] {label}: Eigenvalue computation failed: {e}")
-            P = P + 1e-6 * np.eye(n, dtype=float)
-    
+            except np.linalg.LinAlgError:
+                reset_applied = True
+                event = "EIGEN_FAIL"
+                action = "DIAG_RESET"
+                notes.append("diag_reset")
+                reset_scale = eig_ceil if eig_ceil is not None else max(eig_floor, 1e-6)
+                P = np.eye(n, dtype=float) * float(reset_scale)
+
+        # Final finite-safe fallback.
+        if not np.all(np.isfinite(P)):
+            reset_applied = True
+            event = "POST_NON_FINITE"
+            action = "DIAG_RESET"
+            notes.append("post_non_finite")
+            P = np.eye(n, dtype=float) * float(max(min_eigenvalue, 1e-6))
+
+        # Optional condition print for coarse debugging.
+        if log_condition:
+            try:
+                cond = float(np.linalg.cond(P[:core_dim, :core_dim]))
+                if cond > 1e10:
+                    notes.append(f"cond={cond:.2e}")
+            except Exception:
+                pass
+
+    if conditioner is not None and (projected or chol_failed or reset_applied):
+        try:
+            p_min_eig = float(np.linalg.eigvalsh((P + P.T) / 2.0)[0]) if P.size > 0 else float("nan")
+        except Exception:
+            p_min_eig = float("nan")
+        try:
+            p_cond_final = float(np.linalg.cond(P[:core_dim, :core_dim])) if core_dim > 0 else float("nan")
+        except Exception:
+            p_cond_final = float("inf")
+        conditioner._record_conditioning_action(
+            timestamp=float(timestamp),
+            event=event if event != "NONE" else "PROJECTION",
+            stage=str(stage or label or "unknown"),
+            p_min_eig=p_min_eig,
+            p_max=float(np.max(np.abs(P))) if P.size > 0 else float("nan"),
+            p_cond=p_cond_final,
+            action=action,
+            notes="|".join(notes) if len(notes) > 0 else "",
+            projected=bool(projected),
+            reset_applied=bool(reset_applied),
+            chol_failed=bool(chol_failed),
+        )
+
     return P
 
 
-def propagate_error_state_covariance(P: np.ndarray, Phi: np.ndarray, 
-                                      Q: np.ndarray, num_clones: int) -> np.ndarray:
+def propagate_error_state_covariance(P: np.ndarray, Phi: np.ndarray,
+                                      Q: np.ndarray, num_clones: int,
+                                      conditioner: "ExtendedKalmanFilter" = None,
+                                      timestamp: float = float("nan"),
+                                      stage: str = "IMU_PROP") -> np.ndarray:
     """
     Propagate error-state covariance with camera clones.
     
@@ -116,13 +225,13 @@ def propagate_error_state_covariance(P: np.ndarray, Phi: np.ndarray,
     Returns:
         P_new: Propagated covariance
     """
-    from .numerical_checks import assert_finite, check_covariance_psd
+    from .numerical_checks import assert_finite
     
     err_dim = CORE_ERROR_DIM + CLONE_ERROR_DIM * num_clones
     
-    # [TRIPWIRE] Check P matrix BEFORE propagation
-    if not check_covariance_psd(P, name="ekf_P_before_prop"):
-        print(f"[EKF-PROP] CRITICAL: P not PSD before propagation, resetting")
+    # Finite guard before propagation (conditioning path handles PSD repair).
+    if not np.all(np.isfinite(P)):
+        print(f"[EKF-PROP] CRITICAL: non-finite P before propagation, resetting")
         P = np.eye(err_dim, dtype=float) * 1e-2
     
     # [DIAGNOSTIC] Check P growth - log if abnormally large
@@ -194,35 +303,19 @@ def propagate_error_state_covariance(P: np.ndarray, Phi: np.ndarray,
         print(f"[EKF-PROP] P propagation produced inf/nan, using previous P")
         p_new = P
     
-    # CRITICAL: Ensure symmetry IMMEDIATELY after propagation
-    # Floating-point errors can break symmetry, leading to negative eigenvalues
-    p_new = (p_new + p_new.T) / 2.0
-    
-    # PSD PROJECTION: Fix negative eigenvalues (numerical drift prevention)
-    # This is MORE CORRECT than just clamping - maintains covariance meaning
-    try:
-        eigvals, eigvecs = np.linalg.eigh(p_new)
-        min_eigenvalue = 1e-7  # Floor for numerical stability
-        max_eigenvalue = 1e8   # Ceiling to avoid reconstruction overflow
-        
-        if np.any(eigvals < min_eigenvalue) or np.any(eigvals > max_eigenvalue):
-            num_negative = int(np.sum(eigvals < min_eigenvalue))
-            num_huge = int(np.sum(eigvals > max_eigenvalue))
-            print(
-                f"[EKF-PROP] Eigenvalue projection: "
-                f"{num_negative} below {min_eigenvalue:.2e}, {num_huge} above {max_eigenvalue:.2e}"
-            )
-            
-            # Clamp eigenvalues to stable range
-            eigvals_clamped = np.clip(eigvals, min_eigenvalue, max_eigenvalue)
-            
-            # Reconstruct P_new = V @ Lambda @ V^T
-            p_new = eigvecs @ np.diag(eigvals_clamped) @ eigvecs.T
-            
-            # Re-symmetrize after reconstruction
-            p_new = (p_new + p_new.T) / 2.0
-    except np.linalg.LinAlgError as e:
-        print(f"[EKF-PROP] Eigenvalue decomposition failed: {e}, skipping PSD projection")
+    # Stage-aware conditioning path:
+    # 1) cheap guard (finite + diag floor), 2) Cholesky guard, 3) eigen fallback only if needed.
+    p_new = ensure_covariance_valid(
+        p_new,
+        label="EKF-Propagate",
+        symmetrize=True,
+        check_psd=True,
+        min_eigenvalue=1e-7,
+        max_value=getattr(conditioner, "covariance_max_value", 1e8) if conditioner is not None else 1e8,
+        conditioner=conditioner,
+        timestamp=timestamp,
+        stage=stage,
+    )
     
     # Covariance floor
     p_pos_min = 1.0**2
@@ -352,6 +445,23 @@ class ExtendedKalmanFilter:
         self._cov_prev_pmax = None
         self._cov_prev_trace = None
         self.covariance_max_value = 1e8
+        self.conditioning_cond_hard = 1e12
+        self.conditioning_cond_hard_window = 8
+        self.conditioning_projection_min_interval_steps = 64
+        self._conditioning_cond_streak = 0
+        self._conditioning_steps_since_projection = 10**9
+        self._conditioning_event_csv = None
+        self._conditioning_last_event = ""
+        self._conditioning_last_action = ""
+        self._conditioning_print_every = 500
+        self._conditioning_stats = {
+            "projection_count": 0,
+            "reset_count": 0,
+            "chol_fail_count": 0,
+            "first_projection_time": float("nan"),
+            "max_cond_seen": 0.0,
+        }
+        self.verbose_yaw_debug = False
         self._cov_growth_stats = defaultdict(lambda: {
             "samples": 0,
             "growth_events": 0,
@@ -363,6 +473,10 @@ class ExtendedKalmanFilter:
         """Enable covariance health CSV logging."""
         self._cov_health_csv = csv_path
 
+    def enable_conditioning_event_logging(self, csv_path: str):
+        """Enable conditioning event CSV logging."""
+        self._conditioning_event_csv = csv_path
+
     def set_covariance_max_value(self, max_value: float):
         """Set adaptive absolute cap used by covariance conditioning."""
         try:
@@ -371,6 +485,100 @@ class ExtendedKalmanFilter:
             return
         if np.isfinite(value) and value > 0:
             self.covariance_max_value = value
+
+    def _update_conditioning_cond_streak(self, is_over: bool) -> int:
+        """Track consecutive steps above hard condition-number threshold."""
+        if is_over:
+            self._conditioning_cond_streak += 1
+        else:
+            self._conditioning_cond_streak = 0
+        return int(self._conditioning_cond_streak)
+
+    def _conditioning_tick(self):
+        """Advance conditioning-step counter."""
+        self._conditioning_steps_since_projection += 1
+
+    def _can_project_now(self) -> bool:
+        """Rate-limit projection fallback to avoid projection flood."""
+        return int(self._conditioning_steps_since_projection) >= int(
+            max(1, self.conditioning_projection_min_interval_steps)
+        )
+
+    def _update_conditioning_max_cond(self, cond_value: float):
+        """Update maximum condition number seen this run."""
+        if cond_value is None:
+            return
+        try:
+            cond_val = float(cond_value)
+        except (TypeError, ValueError):
+            return
+        if np.isfinite(cond_val):
+            self._conditioning_stats["max_cond_seen"] = max(
+                float(self._conditioning_stats.get("max_cond_seen", 0.0)),
+                cond_val
+            )
+
+    def _record_conditioning_action(self,
+                                    timestamp: float,
+                                    event: str,
+                                    stage: str,
+                                    p_min_eig: float,
+                                    p_max: float,
+                                    p_cond: float,
+                                    action: str,
+                                    notes: str = "",
+                                    projected: bool = False,
+                                    reset_applied: bool = False,
+                                    chol_failed: bool = False):
+        """Record conditioning action in counters and optional CSV."""
+        if projected:
+            self._conditioning_stats["projection_count"] = int(
+                self._conditioning_stats.get("projection_count", 0)
+            ) + 1
+            self._conditioning_steps_since_projection = 0
+            if not np.isfinite(float(self._conditioning_stats.get("first_projection_time", float("nan")))):
+                if np.isfinite(timestamp):
+                    self._conditioning_stats["first_projection_time"] = float(timestamp)
+        if reset_applied:
+            self._conditioning_stats["reset_count"] = int(
+                self._conditioning_stats.get("reset_count", 0)
+            ) + 1
+        if chol_failed:
+            self._conditioning_stats["chol_fail_count"] = int(
+                self._conditioning_stats.get("chol_fail_count", 0)
+            ) + 1
+
+        self._update_conditioning_max_cond(p_cond)
+
+        if self._conditioning_event_csv:
+            try:
+                with open(self._conditioning_event_csv, "a", newline="") as f:
+                    f.write(
+                        f"{timestamp:.6f},{event},{stage},{p_min_eig:.6e},"
+                        f"{p_max:.6e},{p_cond:.6e},{action},{notes}\n"
+                    )
+            except Exception:
+                pass
+
+        projection_count = int(self._conditioning_stats.get("projection_count", 0))
+        transition = (event != self._conditioning_last_event) or (action != self._conditioning_last_action)
+        if transition or (projection_count > 0 and projection_count % int(max(1, self._conditioning_print_every)) == 0):
+            print(
+                f"[EKF-COND] t={timestamp:.3f} stage={stage} event={event} action={action} "
+                f"p_max={p_max:.2e} p_cond={p_cond:.2e} note={notes}"
+            )
+            self._conditioning_last_event = str(event)
+            self._conditioning_last_action = str(action)
+
+    def get_conditioning_stats(self) -> dict:
+        """Return runtime conditioning stats."""
+        return {
+            "projection_count": int(self._conditioning_stats.get("projection_count", 0)),
+            "reset_count": int(self._conditioning_stats.get("reset_count", 0)),
+            "chol_fail_count": int(self._conditioning_stats.get("chol_fail_count", 0)),
+            "first_projection_time": float(self._conditioning_stats.get("first_projection_time", float("nan"))),
+            "max_cond_seen": float(self._conditioning_stats.get("max_cond_seen", 0.0)),
+        }
     
     def log_cov_health(self, update_type: str, timestamp: float = float('nan'),
                        stage: str = "post"):
@@ -606,7 +814,7 @@ class ExtendedKalmanFilter:
         # Compute error-state correction (δx)
         dx = dot(self.K, self.y)
         
-        if dx.shape[0] > 8 and abs(dx[8, 0]) > 0.001:
+        if self.verbose_yaw_debug and dx.shape[0] > 8 and abs(dx[8, 0]) > 0.001:
             print(f"[ESKF-DEBUG] δx[8] (δyaw)={np.degrees(dx[8,0]):.2f}°, "
                   f"innovation={np.degrees(self.y[0,0]) if self.y.shape[0]==1 else 'N/A'}°")
         
@@ -625,7 +833,10 @@ class ExtendedKalmanFilter:
             symmetrize=True,
             check_psd=True,
             min_eigenvalue=1e-7,
-            max_value=getattr(self, "covariance_max_value", 1e8)
+            max_value=getattr(self, "covariance_max_value", 1e8),
+            conditioner=self,
+            timestamp=timestamp,
+            stage=update_type,
         )
         
         # Covariance floor

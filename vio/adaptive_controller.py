@@ -62,6 +62,9 @@ class AdaptiveDecision:
     min_yaw_scale: float = 1.0
     min_yaw_floor_deg: float = 0.05
     conditioning_max_value: float = 1e8
+    conditioning_cond_hard: float = 1e12
+    conditioning_cond_hard_window: int = 8
+    conditioning_projection_min_interval_steps: int = 64
     aiding_level: str = "FULL"
     measurement_scales: Dict[str, Dict[str, float]] = field(default_factory=dict)
     reason: str = ""
@@ -220,6 +223,7 @@ class AdaptiveController:
             "gravity_alignment": {
                 "enabled_imu_only": True,
                 "phase_sigma_deg": {"0": 3.5, "1": 10.0, "2": 8.5},
+                "phase_period_steps": {"0": 1, "1": 2, "2": 2},
                 "phase_acc_norm_tolerance": {"0": 0.15, "1": 0.35, "2": 0.30},
                 "phase_max_gyro_rad_s": {"0": 0.25, "1": 0.65, "2": 0.50},
                 "health_sigma_mult": {
@@ -234,7 +238,12 @@ class AdaptiveController:
             },
             "yaw_aid": {
                 "enabled_imu_only": True,
-                "phase_sigma_deg": {"0": 20.0, "1": 45.0, "2": 35.0},
+                "phase_sigma_deg": {"0": 20.0, "1": 50.0, "2": 38.0},
+                "phase_min_sigma_deg": {"0": 18.0, "1": 35.0, "2": 28.0},
+                "phase_period_steps": {"0": 4, "1": 24, "2": 16},
+                "max_accept_rate_for_active": 0.98,
+                "high_accept_backoff_factor": 1.5,
+                "high_accept_r_scale": 1.1,
                 "phase_acc_norm_tolerance": {"0": 0.15, "1": 0.30, "2": 0.25},
                 "phase_max_gyro_rad_s": {"0": 0.20, "1": 0.55, "2": 0.40},
                 "health_sigma_mult": {
@@ -243,6 +252,9 @@ class AdaptiveController:
                     DEGRADED: 1.5,
                     RECOVERY: 1.1,
                 },
+                "high_speed_m_s": 180.0,
+                "high_speed_sigma_mult": 1.15,
+                "high_speed_period_mult": 1.2,
                 "chi2_scale": 1.0,
                 "ref_alpha": 0.005,
                 "dynamic_ref_alpha": 0.05,
@@ -257,8 +269,16 @@ class AdaptiveController:
                 "enabled_imu_only": True,
                 "apply_when_aiding_level": ["NONE"],
                 "period_steps": 8,
-                "phase_sigma_bg_deg_s": {"0": 0.25, "1": 0.35, "2": 0.30},
-                "phase_sigma_ba_m_s2": {"0": 0.08, "1": 0.20, "2": 0.15},
+                "phase_period_steps": {"0": 8, "1": 24, "2": 20},
+                "max_accept_rate_for_active": 0.98,
+                "high_accept_backoff_factor": 1.6,
+                "high_accept_r_scale": 1.05,
+                "phase_sigma_bg_deg_s": {"0": 0.25, "1": 0.45, "2": 0.35},
+                "phase_sigma_ba_m_s2": {"0": 0.08, "1": 0.25, "2": 0.18},
+                "phase_acc_norm_tolerance": {"0": 0.20, "1": 0.20, "2": 0.22},
+                "phase_max_gyro_rad_s": {"0": 0.20, "1": 0.30, "2": 0.32},
+                "high_speed_m_s": 180.0,
+                "high_speed_period_mult": 1.2,
                 "health_sigma_mult": {
                     HEALTHY: 1.0,
                     WARNING: 0.8,
@@ -275,6 +295,12 @@ class AdaptiveController:
                     "inflate_power": 1.0,
                 },
             },
+            "conditioning_backoff": {
+                HEALTHY: {"period_mult": 1.0, "r_scale_mult": 1.0},
+                WARNING: {"period_mult": 1.2, "r_scale_mult": 1.05},
+                DEGRADED: {"period_mult": 1.5, "r_scale_mult": 1.15},
+                RECOVERY: {"period_mult": 1.1, "r_scale_mult": 1.02},
+            },
         },
         "conditioning": {
             "caps": {
@@ -282,7 +308,25 @@ class AdaptiveController:
                 WARNING: 1e7,
                 DEGRADED: 1e6,
                 RECOVERY: 1e7,
-            }
+            },
+            "cond_hard": {
+                HEALTHY: 1.2e12,
+                WARNING: 1.2e12,
+                DEGRADED: 1.1e12,
+                RECOVERY: 1.2e12,
+            },
+            "cond_hard_window": {
+                HEALTHY: 16,
+                WARNING: 16,
+                DEGRADED: 16,
+                RECOVERY: 16,
+            },
+            "projection_min_interval_steps": {
+                HEALTHY: 64,
+                WARNING: 64,
+                DEGRADED: 64,
+                RECOVERY: 64,
+            },
         },
         "logging": {
             "enabled": True,
@@ -424,6 +468,12 @@ class AdaptiveController:
 
         conditioning_caps = self.cfg["conditioning"]["caps"]
         conditioning_cap = float(conditioning_caps.get(self.health_state, 1e8))
+        cond_hard_cfg = self.cfg["conditioning"].get("cond_hard", {})
+        cond_hard = float(cond_hard_cfg.get(self.health_state, 1e12))
+        cond_window_cfg = self.cfg["conditioning"].get("cond_hard_window", {})
+        cond_hard_window = int(max(1, float(cond_window_cfg.get(self.health_state, 8))))
+        proj_interval_cfg = self.cfg["conditioning"].get("projection_min_interval_steps", {})
+        projection_min_interval = int(max(1, float(proj_interval_cfg.get(self.health_state, 64))))
 
         measurement_scales = self._build_measurement_scales()
         reason = (
@@ -443,6 +493,9 @@ class AdaptiveController:
             min_yaw_scale=min_yaw_scale,
             min_yaw_floor_deg=float(pn_cfg.get("min_yaw_floor_deg", 0.05)),
             conditioning_max_value=conditioning_cap,
+            conditioning_cond_hard=cond_hard,
+            conditioning_cond_hard_window=cond_hard_window,
+            conditioning_projection_min_interval_steps=projection_min_interval,
             aiding_level=aiding_level,
             measurement_scales=measurement_scales,
             reason=reason,
@@ -540,6 +593,10 @@ class AdaptiveController:
                 sensor_scales["enabled_imu_only"] = 1.0 if bool(
                     grav_cfg.get("enabled_imu_only", True)
                 ) else 0.0
+                grav_period = grav_cfg.get("phase_period_steps", {}).get(
+                    phase_key, grav_cfg.get("period_steps", 1)
+                )
+                sensor_scales["period_steps"] = max(1.0, float(grav_period))
                 sensor_scales["chi2_scale"] = sensor_scales.get("chi2_scale", 1.0) * float(
                     grav_cfg.get("chi2_scale", 1.0)
                 )
@@ -552,7 +609,12 @@ class AdaptiveController:
                 sigma_deg *= float(
                     yaw_cfg.get("health_sigma_mult", {}).get(self.health_state, 1.0)
                 )
-                sensor_scales["sigma_deg"] = max(5.0, sigma_deg)
+                sigma_floor = float(
+                    yaw_cfg.get("phase_min_sigma_deg", {}).get(
+                        phase_key, yaw_cfg.get("min_sigma_deg", 5.0)
+                    )
+                )
+                sensor_scales["sigma_deg"] = max(sigma_floor, sigma_deg)
                 phase_acc_tol = yaw_cfg.get("phase_acc_norm_tolerance", {}).get(
                     phase_key, yaw_cfg.get("acc_norm_tolerance", 0.25)
                 )
@@ -567,10 +629,27 @@ class AdaptiveController:
                 sensor_scales["chi2_scale"] = sensor_scales.get("chi2_scale", 1.0) * float(
                     yaw_cfg.get("chi2_scale", 1.0)
                 )
+                sensor_scales["high_speed_m_s"] = max(1.0, float(yaw_cfg.get("high_speed_m_s", 60.0)))
+                sensor_scales["high_speed_sigma_mult"] = max(
+                    1.0, float(yaw_cfg.get("high_speed_sigma_mult", 1.0))
+                )
+                sensor_scales["high_speed_period_mult"] = max(
+                    1.0, float(yaw_cfg.get("high_speed_period_mult", 1.0))
+                )
                 sensor_scales["ref_alpha"] = max(0.0, float(yaw_cfg.get("ref_alpha", 0.005)))
                 sensor_scales["dynamic_ref_alpha"] = max(
                     0.0, float(yaw_cfg.get("dynamic_ref_alpha", 0.05))
                 )
+                yaw_period = yaw_cfg.get("phase_period_steps", {}).get(
+                    phase_key, yaw_cfg.get("period_steps", 8)
+                )
+                max_accept = float(yaw_cfg.get("max_accept_rate_for_active", 1.01))
+                if accept_rate >= max_accept:
+                    yaw_period = float(yaw_period) * float(yaw_cfg.get("high_accept_backoff_factor", 1.5))
+                    sensor_scales["r_scale"] = sensor_scales.get("r_scale", 1.0) * float(
+                        yaw_cfg.get("high_accept_r_scale", 1.1)
+                    )
+                sensor_scales["period_steps"] = max(1.0, float(yaw_period))
                 yaw_soft_cfg = yaw_cfg.get("soft_fail", {})
                 sensor_scales["fail_soft_enable"] = 1.0 if bool(
                     yaw_soft_cfg.get("enabled", True)
@@ -598,7 +677,36 @@ class AdaptiveController:
                 )
                 sensor_scales["sigma_bg_rad_s"] = np.deg2rad(max(0.01, sigma_bg_deg_s)) * sigma_mult
                 sensor_scales["sigma_ba_m_s2"] = max(1e-4, sigma_ba * sigma_mult)
-                sensor_scales["period_steps"] = max(1.0, float(bias_cfg.get("period_steps", 8)))
+                sensor_scales["acc_norm_tolerance"] = max(
+                    0.01,
+                    float(
+                        bias_cfg.get("phase_acc_norm_tolerance", {}).get(
+                            phase_key, bias_cfg.get("acc_norm_tolerance", 0.15)
+                        )
+                    ),
+                )
+                sensor_scales["max_gyro_rad_s"] = max(
+                    0.01,
+                    float(
+                        bias_cfg.get("phase_max_gyro_rad_s", {}).get(
+                            phase_key, bias_cfg.get("max_gyro_rad_s", 0.25)
+                        )
+                    ),
+                )
+                sensor_scales["high_speed_m_s"] = max(1.0, float(bias_cfg.get("high_speed_m_s", 45.0)))
+                sensor_scales["high_speed_period_mult"] = max(
+                    1.0, float(bias_cfg.get("high_speed_period_mult", 1.0))
+                )
+                base_period = bias_cfg.get("phase_period_steps", {}).get(
+                    phase_key, bias_cfg.get("period_steps", 8)
+                )
+                max_accept = float(bias_cfg.get("max_accept_rate_for_active", 1.01))
+                if accept_rate >= max_accept:
+                    base_period = float(base_period) * float(bias_cfg.get("high_accept_backoff_factor", 2.0))
+                    sensor_scales["r_scale"] = sensor_scales.get("r_scale", 1.0) * float(
+                        bias_cfg.get("high_accept_r_scale", 1.1)
+                    )
+                sensor_scales["period_steps"] = max(1.0, float(base_period))
                 sensor_scales["enabled_imu_only"] = 1.0 if bool(
                     bias_cfg.get("enabled_imu_only", True)
                 ) else 0.0
@@ -624,6 +732,14 @@ class AdaptiveController:
                 )
                 sensor_scales["soft_r_cap"] = max(1.0, float(bias_soft_cfg.get("max_r_scale", 8.0)))
                 sensor_scales["soft_r_power"] = max(0.1, float(bias_soft_cfg.get("inflate_power", 1.0)))
+
+            if sensor in ("GRAVITY_RP", "YAW_AID", "BIAS_GUARD"):
+                backoff_cfg = meas_cfg.get("conditioning_backoff", {}).get(self.health_state, {})
+                period_mult = float(backoff_cfg.get("period_mult", 1.0))
+                r_mult = float(backoff_cfg.get("r_scale_mult", 1.0))
+                if "period_steps" in sensor_scales:
+                    sensor_scales["period_steps"] = max(1.0, float(sensor_scales["period_steps"]) * period_mult)
+                sensor_scales["r_scale"] = sensor_scales.get("r_scale", 1.0) * r_mult
 
             # Clamp values.
             for key in ("r_scale", "chi2_scale", "threshold_scale", "reproj_scale"):

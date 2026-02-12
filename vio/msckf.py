@@ -1029,6 +1029,9 @@ def msckf_measurement_update(fid: int, triangulated: dict, cam_observations: Lis
             max_value=getattr(kf, "covariance_max_value", 1e8),
             symmetrize=True,
             check_psd=True,
+            conditioner=kf,
+            timestamp=float("nan"),
+            stage="MSCKF_ENTRY",
         )
     
     p_w = triangulated['p_w']
@@ -1249,8 +1252,16 @@ def msckf_measurement_update(fid: int, triangulated: dict, cam_observations: Lis
         with np.errstate(divide='ignore', over='ignore', invalid='ignore'):
             kf.P = i_kh @ kf.P @ i_kh.T + k_gain @ r_cov @ k_gain.T
         
-        kf.P = ensure_covariance_valid(kf.P, label="MSCKF-Update", 
-                                        symmetrize=True, check_psd=True)
+        kf.P = ensure_covariance_valid(
+            kf.P,
+            label="MSCKF-Update",
+            symmetrize=True,
+            check_psd=True,
+            max_value=getattr(kf, "covariance_max_value", 1e8),
+            conditioner=kf,
+            timestamp=float("nan"),
+            stage="MSCKF_UPDATE",
+        )
         
         kf.x_post = kf.x.copy()
         kf.P_post = kf.P.copy()
@@ -1307,6 +1318,9 @@ def msckf_measurement_update_with_plane(fid: int, triangulated: dict,
             max_value=getattr(kf, "covariance_max_value", 1e8),
             symmetrize=True,
             check_psd=True,
+            conditioner=kf,
+            timestamp=float("nan"),
+            stage="MSCKF_PLANE_ENTRY",
         )
     from .plane_utils import compute_plane_jacobian
     
@@ -1612,8 +1626,16 @@ def msckf_measurement_update_with_plane(fid: int, triangulated: dict,
         with np.errstate(divide='ignore', over='ignore', invalid='ignore'):
             kf.P = i_kh @ kf.P @ i_kh.T + k_gain @ R_stacked @ k_gain.T
         
-        kf.P = ensure_covariance_valid(kf.P, label="MSCKF-Plane-Update", 
-                                        symmetrize=True, check_psd=True)
+        kf.P = ensure_covariance_valid(
+            kf.P,
+            label="MSCKF-Plane-Update",
+            symmetrize=True,
+            check_psd=True,
+            max_value=getattr(kf, "covariance_max_value", 1e8),
+            conditioner=kf,
+            timestamp=float("nan"),
+            stage="MSCKF_PLANE_UPDATE",
+        )
         
         kf.x_post = kf.x.copy()
         kf.P_post = kf.P.copy()
