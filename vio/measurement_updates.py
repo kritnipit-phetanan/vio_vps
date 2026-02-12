@@ -14,7 +14,7 @@ Author: VIO project
 
 import numpy as np
 from scipy.spatial.transform import Rotation as R_scipy
-from typing import Optional, Tuple, Callable
+from typing import Optional, Tuple, Callable, Dict, Any
 import math
 
 # Import shared math utilities (avoid duplication)
@@ -73,7 +73,9 @@ def apply_magnetometer_update(kf,
                               frame: int = -1,
                               yaw_override: Optional[float] = None,
                               filter_info: Optional[dict] = None,
-                              use_estimated_bias: bool = True) -> Tuple[bool, str]:
+                              use_estimated_bias: bool = True,
+                              r_scale_extra: float = 1.0,
+                              adaptive_info: Optional[Dict[str, Any]] = None) -> Tuple[bool, str]:
     """
     Apply magnetometer heading update.
     
@@ -107,6 +109,25 @@ def apply_magnetometer_update(kf,
         Tuple of (update_applied: bool, rejection_reason: str)
     """
     global _MAG_STATE
+    extra_scale = max(1e-3, float(r_scale_extra))
+
+    def _set_adaptive_info(accepted: bool,
+                           nis_norm: Optional[float],
+                           chi2: Optional[float],
+                           threshold: Optional[float],
+                           r_scale_used: float):
+        if adaptive_info is None:
+            return
+        adaptive_info.clear()
+        adaptive_info.update({
+            "sensor": "MAG",
+            "accepted": bool(accepted),
+            "dof": 1,
+            "nis_norm": float(nis_norm) if nis_norm is not None and np.isfinite(nis_norm) else np.nan,
+            "chi2": float(chi2) if chi2 is not None and np.isfinite(chi2) else np.nan,
+            "threshold": float(threshold) if threshold is not None and np.isfinite(threshold) else np.nan,
+            "r_scale_used": float(r_scale_used),
+        })
     from .magnetometer import compute_yaw_from_mag
     
     # Track filter rejection reasons (v2.9.2)
@@ -129,6 +150,7 @@ def apply_magnetometer_update(kf,
     # Check if we're in skip period - BUT NOT during SPINUP (phase 0)
     if current_phase >= 2 and _MAG_STATE['skip_count'] > 0:
         _MAG_STATE['skip_count'] -= 1
+        _set_adaptive_info(False, None, None, None, r_scale_extra)
         return False, f"Oscillation skip (remaining: {_MAG_STATE['skip_count']})"
     elif current_phase < 2:
         # During SPINUP/EARLY: reset skip_count to ensure continuous updates
@@ -155,6 +177,7 @@ def apply_magnetometer_update(kf,
         _MAG_STATE['reject_quality'] += 1
         if _MAG_STATE['total_attempts'] % 100 == 0:
             print(f"[MAG-REJECT] Quality: {_MAG_STATE['reject_quality']}/{_MAG_STATE['total_attempts']} ({_MAG_STATE['reject_quality']/_MAG_STATE['total_attempts']*100:.1f}%)")
+        _set_adaptive_info(False, None, None, None, r_scale_extra)
         return False, f"Low quality ({quality:.3f})"
     
     # Get current yaw from state
@@ -194,7 +217,7 @@ def apply_magnetometer_update(kf,
                 
                 if _MAG_STATE['total_attempts'] % 100 == 0:
                     print(f"[MAG-OSC] Detected oscillation #{_MAG_STATE['oscillation_count']}, skipping next 2 updates")
-                
+                _set_adaptive_info(False, None, None, None, r_scale_extra)
                 return False, "Oscillation detected (skip=2)"
     else:
         # During spinup: clear history and don't track oscillations
@@ -223,10 +246,11 @@ def apply_magnetometer_update(kf,
         _MAG_STATE['reject_innovation'] += 1
         if _MAG_STATE['total_attempts'] % 100 == 0:
             print(f"[MAG-REJECT] Innovation: {_MAG_STATE['reject_innovation']}/{_MAG_STATE['total_attempts']} ({_MAG_STATE['reject_innovation']/_MAG_STATE['total_attempts']*100:.1f}%)")
+        _set_adaptive_info(False, None, None, innovation_threshold, r_scale_extra)
         return False, f"Innovation too large ({np.degrees(yaw_innov):.1f}°)"
     
     # Apply oscillation R-scaling to measurement noise (v2.9.5)
-    sigma_mag_yaw_scaled = sigma_mag_yaw * oscillation_r_scale
+    sigma_mag_yaw_scaled = sigma_mag_yaw * oscillation_r_scale * extra_scale
     
     # Build measurement model
     _MAG_STATE['total_accepted'] += 1
@@ -382,9 +406,11 @@ def apply_magnetometer_update(kf,
                 s_matrix=s_mat,
                 p_prior=getattr(kf, 'P_prior', kf.P)
             )
-        
+        m2 = mahalanobis_squared(np.array([yaw_innov]), np.array([[S_yaw]]))
+        _set_adaptive_info(True, m2, m2, np.inf, extra_scale)
         return True, ""
     except Exception as e:
+        _set_adaptive_info(False, None, None, None, extra_scale)
         return False, f"Update failed: {e}"
 
 
@@ -400,7 +426,10 @@ def apply_dem_height_update(kf,
                             save_debug: bool = False,
                             residual_csv: Optional[str] = None,
                             timestamp: float = 0.0,
-                            frame: int = -1) -> Tuple[bool, str]:
+                            frame: int = -1,
+                            threshold_scale: float = 1.0,
+                            r_scale_extra: float = 1.0,
+                            adaptive_info: Optional[Dict[str, Any]] = None) -> Tuple[bool, str]:
     """
     Apply DEM-based height update.
     
@@ -428,7 +457,26 @@ def apply_dem_height_update(kf,
     Returns:
         Tuple of (update_applied: bool, rejection_reason: str)
     """
+    def _set_adaptive_info(accepted: bool,
+                           nis_norm: Optional[float],
+                           chi2: Optional[float],
+                           threshold: Optional[float],
+                           r_scale_used: float):
+        if adaptive_info is None:
+            return
+        adaptive_info.clear()
+        adaptive_info.update({
+            "sensor": "DEM",
+            "accepted": bool(accepted),
+            "dof": 1,
+            "nis_norm": float(nis_norm) if nis_norm is not None and np.isfinite(nis_norm) else np.nan,
+            "chi2": float(chi2) if chi2 is not None and np.isfinite(chi2) else np.nan,
+            "threshold": float(threshold) if threshold is not None and np.isfinite(threshold) else np.nan,
+            "r_scale_used": float(r_scale_used),
+        })
+
     if np.isnan(height_measurement):
+        _set_adaptive_info(False, None, None, None, r_scale_extra)
         return False, "Invalid height measurement"
     
     num_clones = (kf.x.shape[0] - 19) // 7  # v3.9.7: 19D nominal
@@ -463,13 +511,15 @@ def apply_dem_height_update(kf,
     if not has_valid_dem:
         height_cov_scale *= 5.0
     
-    r_mat = np.array([[sigma_height**2 * height_cov_scale]])
+    extra_scale = max(1e-3, float(r_scale_extra))
+    r_mat = np.array([[sigma_height**2 * height_cov_scale * (extra_scale ** 2)]])
     
     # VALIDATION: Check P matrix for numerical issues before innovation computation
     # This prevents divide-by-zero and overflow from corrupted covariance
     has_invalid_p = np.any(np.isinf(kf.P)) or np.any(np.isnan(kf.P))
     if has_invalid_p:
         # P corrupted - cannot compute valid innovation, skip update
+        _set_adaptive_info(False, None, None, None, extra_scale)
         return False, "Invalid P matrix (contains inf/nan)"
     
     # Clamp large P values to prevent overflow in matmul
@@ -478,18 +528,21 @@ def apply_dem_height_update(kf,
         # Scale P down to prevent numerical explosion
         scale_factor = 1e8 / P_max
         kf.P = kf.P * scale_factor
+        _set_adaptive_info(False, None, None, None, extra_scale)
         return False, f"P matrix overflow clamped (max={P_max:.2e})"
     
     from .numerical_checks import assert_finite
     
     # [TRIPWIRE] Validate inputs before S matrix computation
     if not assert_finite("height_H", H_height, extra_info={"H_norm": np.linalg.norm(H_height)}):
+        _set_adaptive_info(False, None, None, None, extra_scale)
         return False, "H_height contains inf/nan"
     
     if not assert_finite("height_kf_P", kf.P, extra_info={
         "P_max": np.max(np.abs(kf.P)),
         "P_trace": np.trace(kf.P)
     }):
+        _set_adaptive_info(False, None, None, None, extra_scale)
         return False, "kf.P contains inf/nan before height update"
     
     # Innovation gating with overflow protection
@@ -498,6 +551,7 @@ def apply_dem_height_update(kf,
         try:
             S_mat = H_height @ kf.P @ H_height.T + r_mat
         except Exception as e:
+            _set_adaptive_info(False, None, None, None, extra_scale)
             return False, f"S_mat computation failed: {e}"
     
     # [TRIPWIRE] Check S_mat validity after computation
@@ -507,6 +561,7 @@ def apply_dem_height_update(kf,
         "H_norm": np.linalg.norm(H_height),
         "P_max": np.max(np.abs(kf.P))
     }):
+        _set_adaptive_info(False, None, None, None, extra_scale)
         return False, "S_mat contains inf/nan after computation"
     
     predicted_height = kf.x[2, 0]
@@ -528,6 +583,7 @@ def apply_dem_height_update(kf,
         threshold = 25.0  # Increased from 9.21
     else:
         threshold = 15.0  # Increased from 6.63 - chi2(1, 0.999) ≈ 10.83
+    threshold = max(1e-6, threshold * max(1e-3, float(threshold_scale)))
     
     # ALTITUDE FIX: For large innovations, apply update with increased noise
     # This prevents runaway drift while still allowing large corrections
@@ -554,6 +610,7 @@ def apply_dem_height_update(kf,
                 accepted=True,  # Still accepted but with inflated noise
                 s_matrix=S_mat
             )
+        _set_adaptive_info(True, m2_test, m2_test, threshold, extra_scale)
         return True, f"Soft gating (m2={m2_test:.2f}, inflated R by {inflation_factor:.1f}x)"
     
     # Normal update
@@ -577,7 +634,7 @@ def apply_dem_height_update(kf,
             s_matrix=S_mat,
             p_prior=getattr(kf, 'P_prior', kf.P)
         )
-    
+    _set_adaptive_info(True, m2_test, m2_test, threshold, extra_scale)
     return True, ""
 
 
@@ -719,7 +776,10 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
                                vio_frame: int = -1,
                                vio_fe=None,
                                state_error: Optional[np.ndarray] = None,
-                               state_cov: Optional[np.ndarray] = None) -> bool:
+                               state_cov: Optional[np.ndarray] = None,
+                               chi2_scale: float = 1.0,
+                               r_scale_extra: float = 1.0,
+                               adaptive_info: Optional[Dict[str, Any]] = None) -> bool:
     """
     Apply VIO velocity update with scale recovery and chi-square gating.
     
@@ -751,6 +811,28 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
     Returns:
         True if update was accepted, False otherwise
     """
+    def _set_adaptive_info(accepted: bool,
+                           dof: int,
+                           chi2: Optional[float],
+                           threshold: Optional[float],
+                           r_scale_used: float):
+        if adaptive_info is None:
+            return
+        adaptive_info.clear()
+        if chi2 is not None and np.isfinite(chi2) and dof > 0:
+            nis_norm = float(chi2) / float(dof)
+        else:
+            nis_norm = np.nan
+        adaptive_info.update({
+            "sensor": "VIO_VEL",
+            "accepted": bool(accepted),
+            "dof": int(max(1, dof)),
+            "nis_norm": nis_norm,
+            "chi2": float(chi2) if chi2 is not None and np.isfinite(chi2) else np.nan,
+            "threshold": float(threshold) if threshold is not None and np.isfinite(threshold) else np.nan,
+            "r_scale_used": float(r_scale_used),
+        })
+
     from scipy.spatial.transform import Rotation as R_scipy
     from .config import CAMERA_VIEW_CONFIGS
     from .data_loaders import ProjectionCache
@@ -911,12 +993,14 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
     num_clones = (kf.x.shape[0] - 19) // 7  # v3.9.7: 19D nominal
     err_dim = 18 + 6 * num_clones  # v3.9.7: 18D core error
     
+    extra_scale = max(1e-3, float(r_scale_extra))
     if use_vz_only:
         h_vel = np.zeros((1, err_dim), dtype=float)
         h_vel[0, 5] = 1.0
         vel_meas = np.array([[vel_world[2]]])
         # Apply flow quality scaling to uncertainty
-        r_mat = np.array([[(sigma_vo * view_cfg.get('sigma_scale_z', 2.0) * flow_quality_scale)**2]])
+        r_mat = np.array([[(sigma_vo * view_cfg.get('sigma_scale_z', 2.0) * flow_quality_scale * extra_scale)**2]])
+        dof = 1
     else:
         h_vel = np.zeros((3, err_dim), dtype=float)
         h_vel[0, 3] = 1.0
@@ -927,10 +1011,11 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
         scale_z = view_cfg.get('sigma_scale_z', 2.0)
         # Apply flow quality scaling to uncertainty (more for XY since direction is less reliable)
         r_mat = np.diag([
-            (sigma_vo * scale_xy * flow_quality_scale * 1.5)**2,  # Extra 1.5x for XY
-            (sigma_vo * scale_xy * flow_quality_scale * 1.5)**2,
-            (sigma_vo * scale_z * flow_quality_scale)**2
+            (sigma_vo * scale_xy * flow_quality_scale * 1.5 * extra_scale)**2,  # Extra 1.5x for XY
+            (sigma_vo * scale_xy * flow_quality_scale * 1.5 * extra_scale)**2,
+            (sigma_vo * scale_z * flow_quality_scale * extra_scale)**2
         ])
+        dof = 3
     
     def h_fun(x, h=h_vel):
         return h
@@ -949,6 +1034,7 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
         if has_invalid_p:
             # P corrupted - cannot compute valid innovation, skip update
             print(f"[VIO] Velocity REJECTED: P matrix contains inf/nan")
+            _set_adaptive_info(False, dof, None, None, extra_scale)
             return False
         
         # Clamp large P values to prevent overflow in matmul
@@ -958,6 +1044,7 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
             scale_factor = 1e8 / P_max
             kf.P = kf.P * scale_factor
             print(f"[VIO] Velocity REJECTED: P matrix overflow clamped (max={P_max:.2e})")
+            _set_adaptive_info(False, dof, None, None, extra_scale)
             return False
         
         from .numerical_checks import assert_finite
@@ -965,6 +1052,7 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
         # [TRIPWIRE] Validate inputs before S matrix computation
         if not assert_finite("vel_h_vel", h_vel, extra_info={"h_vel_norm": np.linalg.norm(h_vel)}):
             print(f"[VIO] Velocity REJECTED: h_vel contains inf/nan")
+            _set_adaptive_info(False, dof, None, None, extra_scale)
             return False
         
         if not assert_finite("vel_kf_P", kf.P, extra_info={
@@ -972,6 +1060,7 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
             "P_trace": np.trace(kf.P)
         }):
             print(f"[VIO] Velocity REJECTED: kf.P contains inf/nan")
+            _set_adaptive_info(False, dof, None, None, extra_scale)
             return False
         
         # Compute innovation for gating with overflow protection
@@ -984,6 +1073,7 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
                 s_mat = h_vel @ kf.P @ h_vel.T + r_mat
             except Exception as e:
                 print(f"[VIO] Velocity REJECTED: s_mat computation failed: {e}")
+                _set_adaptive_info(False, dof, None, None, extra_scale)
                 return False
         
         # [TRIPWIRE] Check s_mat validity after computation
@@ -994,6 +1084,7 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
             "P_max": np.max(np.abs(kf.P))
         }):
             print(f"[VIO] Velocity REJECTED: s_mat contains inf/nan after computation")
+            _set_adaptive_info(False, dof, None, None, extra_scale)
             return False
         
         # Chi-square test
@@ -1010,6 +1101,7 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
         # v2.9.9.7: RELAXED from 95% to 99.5% to accept more valid updates
         # Analysis: Filter overconfident (11.8σ vel error) → rejects valid VIO_VEL → divergence
         chi2_threshold = 6.63 if use_vz_only else 11.34  # 1-DOF: 99%, 3-DOF: 99.5% (was 3.84/7.81)
+        chi2_threshold *= max(1e-3, float(chi2_scale))
         
         if chi2_value < chi2_threshold:
             # Accept update
@@ -1026,6 +1118,8 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
             print(f"[VIO] Velocity REJECTED: chi2={chi2_value:.2f} > {chi2_threshold:.1f}, "
                   f"flow={avg_flow_px:.1f}px, speed={speed_final:.2f}m/s")
             accepted = False
+
+        _set_adaptive_info(accepted, dof, chi2_value, chi2_threshold, extra_scale)
         
         # Log to debug_residuals.csv (v2.9.9.8: with NEES)
         if save_debug and residual_csv:
@@ -1043,6 +1137,7 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
         
         return accepted
     
+    _set_adaptive_info(False, dof, None, None, extra_scale)
     return False
 
 

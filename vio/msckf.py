@@ -24,8 +24,9 @@ from .math_utils import quat_to_rot, quaternion_to_yaw, skew_symmetric, safe_mat
 # v2.9.10.0: Adaptive MSCKF Threshold (Priority 2)
 # =============================================================================
 
-def get_adaptive_reprojection_threshold(kf: Any, 
-                                       base_threshold: float = 12.0) -> float:
+def get_adaptive_reprojection_threshold(kf: Any,
+                                       base_threshold: float = 12.0,
+                                       reproj_scale: float = 1.0) -> float:
     """Adaptive MSCKF reprojection threshold based on filter convergence.
     
     v2.9.10.0 Priority 2: Start permissive during initialization (20px),
@@ -57,11 +58,13 @@ def get_adaptive_reprojection_threshold(kf: Any,
         else:  # Converged (vel_sigma < 0.8)
             threshold = 10.0
         
-        return threshold
+        scaled_threshold = threshold * max(1e-3, float(reproj_scale))
+        return float(np.clip(scaled_threshold, 2.0, 100.0))
         
     except Exception:
         # Fallback to permissive threshold if covariance unavailable
-        return 15.0
+        scaled_threshold = 15.0 * max(1e-3, float(reproj_scale))
+        return float(np.clip(scaled_threshold, 2.0, 100.0))
 from .ekf import ExtendedKalmanFilter, ensure_covariance_valid
 from .camera import normalized_to_unit_ray
 
@@ -494,7 +497,8 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
                         ground_altitude: float = 0.0, debug: bool = False,
                         dem_reader = None,
                         origin_lat: float = 0.0, origin_lon: float = 0.0,
-                        global_config: dict = None) -> Optional[dict]:
+                        global_config: dict = None,
+                        reproj_scale: float = 1.0) -> Optional[dict]:
     """
     Triangulate a feature using multi-view observations.
     
@@ -690,7 +694,7 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
     # Compute reprojection error (ENHANCED with pixel-level validation)
     # v2.9.10.0: Adaptive threshold based on filter convergence (Priority 2)
     # Start permissive (20px) during initialization, tighten to 10px when converged
-    MAX_REPROJ_ERROR_PX = get_adaptive_reprojection_threshold(kf)
+    MAX_REPROJ_ERROR_PX = get_adaptive_reprojection_threshold(kf, reproj_scale=reproj_scale)
     total_error = 0.0
     max_pixel_error = 0.0
     
@@ -993,6 +997,7 @@ def msckf_measurement_update(fid: int, triangulated: dict, cam_observations: Lis
                              measurement_noise: float = 1e-4,
                              huber_threshold: float = 1.345,
                              chi2_max_dof: float = 15.36,
+                             chi2_scale: float = 1.0,
                              global_config: dict = None) -> Tuple[bool, float, float]:
     """
     MSCKF measurement update with observability constraints.
@@ -1018,8 +1023,13 @@ def msckf_measurement_update(fid: int, triangulated: dict, cam_observations: Lis
     max_p_val = np.max(np.abs(kf.P))
     if max_p_val > 1e10:
         print(f"[MSCKF] WARNING: P matrix has very large values (max={max_p_val:.2e}), may overflow")
-        kf.P = ensure_covariance_valid(kf.P, label="MSCKF-entry", max_value=1e8,
-                                       symmetrize=True, check_psd=True)
+        kf.P = ensure_covariance_valid(
+            kf.P,
+            label="MSCKF-entry",
+            max_value=getattr(kf, "covariance_max_value", 1e8),
+            symmetrize=True,
+            check_psd=True,
+        )
     
     p_w = triangulated['p_w']
     obs_list = triangulated['observations']
@@ -1195,7 +1205,7 @@ def msckf_measurement_update(fid: int, triangulated: dict, cam_observations: Lis
         chi2_test = float(r_weighted.T @ s_inv @ r_weighted)
         
         dof = meas_dim
-        chi2_threshold = chi2_max_dof * dof
+        chi2_threshold = max(1e-6, float(chi2_scale) * chi2_max_dof * dof)
         
         if chi2_test > chi2_threshold:
             return (False, innovation_norm, chi2_test)
@@ -1258,6 +1268,7 @@ def msckf_measurement_update_with_plane(fid: int, triangulated: dict,
                                        kf: ExtendedKalmanFilter,
                                        plane,
                                        plane_config: dict,
+                                       chi2_scale: float = 1.0,
                                        global_config: dict = None) -> Tuple[bool, float, float]:
     """
     MSCKF measurement update with stacked plane constraint.
@@ -1290,8 +1301,13 @@ def msckf_measurement_update_with_plane(fid: int, triangulated: dict,
     max_p_val = np.max(np.abs(kf.P))
     if max_p_val > 1e10:
         print(f"[MSCKF-PLANE] WARNING: P matrix has very large values (max={max_p_val:.2e})")
-        kf.P = ensure_covariance_valid(kf.P, label="MSCKF-Plane-entry", max_value=1e8,
-                                       symmetrize=True, check_psd=True)
+        kf.P = ensure_covariance_valid(
+            kf.P,
+            label="MSCKF-Plane-entry",
+            max_value=getattr(kf, "covariance_max_value", 1e8),
+            symmetrize=True,
+            check_psd=True,
+        )
     from .plane_utils import compute_plane_jacobian
     
     # =========================================================================
@@ -1560,7 +1576,7 @@ def msckf_measurement_update_with_plane(fid: int, triangulated: dict,
         s_inv = safe_matrix_inverse(s_mat, damping=1e-9, method='cholesky')
         chi2_test = float(r_weighted.T @ s_inv @ r_weighted)
         
-        chi2_threshold = 15.36 * meas_dim_total  # Same as standard MSCKF
+        chi2_threshold = max(1e-6, float(chi2_scale) * 15.36 * meas_dim_total)
         
         if chi2_test > chi2_threshold:
             return (False, innovation_norm, chi2_test)
@@ -1617,7 +1633,10 @@ def perform_msckf_updates(vio_fe, cam_observations: List[dict],
                           origin_lat: float = 0.0, origin_lon: float = 0.0,
                           plane_detector = None,
                           plane_config: dict = None,
-                          global_config: dict = None) -> int:
+                          global_config: dict = None,
+                          chi2_scale: float = 1.0,
+                          reproj_scale: float = 1.0,
+                          stats_out: Optional[Dict[str, float]] = None) -> int:
     """
     Perform MSCKF updates for mature features.
     
@@ -1652,6 +1671,9 @@ def perform_msckf_updates(vio_fe, cam_observations: List[dict],
         mature_fids = mature_fids[:max_features]
     
     num_successful = 0
+    num_attempted = 0
+    dof_samples: List[int] = []
+    chi2_norm_samples: List[float] = []
     
     # =========================================================================
     # Plane Detection (if enabled)
@@ -1666,7 +1688,8 @@ def perform_msckf_updates(vio_fe, cam_observations: List[dict],
                                             use_plane_constraint=True, ground_altitude=0.0,
                                             debug=False,
                                             dem_reader=dem_reader,
-                                            origin_lat=origin_lat, origin_lon=origin_lon)
+                                            origin_lat=origin_lat, origin_lon=origin_lon,
+                                            reproj_scale=reproj_scale)
             if tri_result is not None:
                 triangulated_points[fid] = tri_result['p_w']
         
@@ -1690,7 +1713,8 @@ def perform_msckf_updates(vio_fe, cam_observations: List[dict],
                                           debug=enable_debug,
                                           dem_reader=dem_reader,
                                           origin_lat=origin_lat, origin_lon=origin_lon,
-                                          global_config=global_config)
+                                          global_config=global_config,
+                                          reproj_scale=reproj_scale)
         
         if triangulated is None:
             if msckf_dbg_path:
@@ -1716,19 +1740,36 @@ def perform_msckf_updates(vio_fe, cam_observations: List[dict],
                     associated_plane = plane
         
         # MSCKF update with optional plane constraint
+        num_obs = sum(
+            1 for cam_obs in cam_observations
+            for obs in cam_obs.get('observations', [])
+            if obs.get('fid') == fid
+        )
+        use_plane_constraint = (
+            associated_plane is not None
+            and plane_config is not None
+            and plane_config.get('PLANE_USE_CONSTRAINTS', True)
+        )
+        dof_est = max(1, 2 * max(1, num_obs) + (1 if use_plane_constraint else 0))
+        num_attempted += 1
+        dof_samples.append(dof_est)
+
         if associated_plane is not None and plane_config.get('PLANE_USE_CONSTRAINTS', True):
             # Stacked measurement: bearing (2D per obs) + plane constraint (1D)
             success, innovation_norm, chi2_test = msckf_measurement_update_with_plane(
-                fid, triangulated, cam_observations, cam_states, kf, associated_plane, plane_config, global_config)
+                fid, triangulated, cam_observations, cam_states, kf,
+                associated_plane, plane_config,
+                chi2_scale=chi2_scale, global_config=global_config)
         else:
             # Standard MSCKF update (bearing only)
             success, innovation_norm, chi2_test = msckf_measurement_update(
-                fid, triangulated, cam_observations, cam_states, kf, global_config=global_config)
+                fid, triangulated, cam_observations, cam_states, kf,
+                chi2_scale=chi2_scale, global_config=global_config)
+        
+        if np.isfinite(chi2_test):
+            chi2_norm_samples.append(float(chi2_test) / float(max(1, dof_est)))
         
         if msckf_dbg_path:
-            num_obs = sum(1 for cam_obs in cam_observations 
-                         for obs in cam_obs.get('observations', []) 
-                         if obs.get('fid') == fid)
             avg_reproj = triangulated.get('avg_reproj_error', np.nan)
             with open(msckf_dbg_path, "a", newline="") as mf:
                 mf.write(f"{vio_fe.frame_idx},{fid},{num_obs},1,{avg_reproj:.3f},"
@@ -1736,6 +1777,24 @@ def perform_msckf_updates(vio_fe, cam_observations: List[dict],
         
         if success:
             num_successful += 1
+    
+    if stats_out is not None:
+        stats_out.clear()
+        if len(chi2_norm_samples) > 0:
+            nis_norm = float(np.mean(chi2_norm_samples))
+        else:
+            nis_norm = np.nan
+        stats_out.update({
+            "sensor": "MSCKF",
+            "accepted": bool(num_successful > 0),
+            "dof": int(round(float(np.mean(dof_samples)))) if len(dof_samples) > 0 else 1,
+            "nis_norm": nis_norm,
+            "chi2": float(nis_norm) if np.isfinite(nis_norm) else np.nan,
+            "threshold": np.nan,
+            "r_scale_used": 1.0,
+            "attempted": int(num_attempted),
+            "accepted_count": int(num_successful),
+        })
     
     return num_successful
 
@@ -1751,7 +1810,10 @@ def trigger_msckf_update(kf, cam_states: list, cam_observations: list,
                          origin_lon: float = 0.0,
                          plane_detector=None,
                          plane_config: dict = None,
-                         global_config: dict = None) -> int:
+                         global_config: dict = None,
+                         chi2_scale: float = 1.0,
+                         reproj_scale: float = 1.0,
+                         adaptive_info: Optional[Dict[str, Any]] = None) -> int:
     """
     Trigger MSCKF multi-view geometric update.
     
@@ -1774,6 +1836,17 @@ def trigger_msckf_update(kf, cam_states: list, cam_observations: list,
         Number of successful MSCKF updates
     """
     if vio_fe is None or len(cam_states) < 2:
+        if adaptive_info is not None:
+            adaptive_info.clear()
+            adaptive_info.update({
+                "sensor": "MSCKF",
+                "accepted": False,
+                "dof": 1,
+                "nis_norm": np.nan,
+                "chi2": np.nan,
+                "threshold": np.nan,
+                "r_scale_used": 1.0,
+            })
         return 0
     
     # Count mature features
@@ -1795,6 +1868,7 @@ def trigger_msckf_update(kf, cam_states: list, cam_observations: list,
     
     if should_update:
         try:
+            stats = {}
             num_updates = perform_msckf_updates(
                 vio_fe,
                 cam_observations,
@@ -1808,13 +1882,51 @@ def trigger_msckf_update(kf, cam_states: list, cam_observations: list,
                 origin_lon=origin_lon,
                 plane_detector=plane_detector,
                 plane_config=plane_config,
-                global_config=global_config
+                global_config=global_config,
+                chi2_scale=chi2_scale,
+                reproj_scale=reproj_scale,
+                stats_out=stats,
             )
+            if adaptive_info is not None:
+                adaptive_info.clear()
+                adaptive_info.update(stats if len(stats) > 0 else {
+                    "sensor": "MSCKF",
+                    "accepted": bool(num_updates > 0),
+                    "dof": 1,
+                    "nis_norm": np.nan,
+                    "chi2": np.nan,
+                    "threshold": np.nan,
+                    "r_scale_used": 1.0,
+                })
             if num_updates > 0:
                 print(f"[MSCKF] Updated {num_updates} features at t={t:.3f}s")
             return num_updates
         except Exception as e:
             print(f"[MSCKF] Error: {e}")
+            if adaptive_info is not None:
+                adaptive_info.clear()
+                adaptive_info.update({
+                    "sensor": "MSCKF",
+                    "accepted": False,
+                    "dof": 1,
+                    "nis_norm": np.nan,
+                    "chi2": np.nan,
+                    "threshold": np.nan,
+                    "r_scale_used": 1.0,
+                })
             return 0
+    
+    if adaptive_info is not None:
+        adaptive_info.clear()
+        adaptive_info.update({
+            "sensor": "MSCKF",
+            "accepted": False,
+            "dof": 1,
+            "nis_norm": np.nan,
+            "chi2": np.nan,
+            "threshold": np.nan,
+            "r_scale_used": 1.0,
+            "attempted": 0,
+        })
     
     return 0

@@ -87,6 +87,7 @@ def run_imu_driven_loop(runner):
     has_dem = bool(runner.dem is not None and runner.dem.ds is not None)
     has_vps = bool(getattr(runner, 'vps_runner', None) is not None)
     imu_only_mode = not (has_images or has_mag or has_dem or has_vps)
+    runner.imu_only_mode = bool(imu_only_mode)
     if imu_only_mode:
         imu_params = dict(imu_params)
         sigma_accel = min(float(sigma_accel), float(imu_params.get('acc_n', 0.08)) * 1.5)
@@ -102,6 +103,8 @@ def run_imu_driven_loop(runner):
             f"acc_w={imu_params['acc_w']:.2e}, sigma_unmodeled_gyr={imu_params['sigma_unmodeled_gyr']:.2e}, "
             f"min_yaw_q={imu_params['min_yaw_process_noise_deg']:.2f}deg"
         )
+    imu_params_base = dict(imu_params)
+    sigma_accel_base = float(sigma_accel)
     vib_buffer_size = runner.global_config.get('VIBRATION_WINDOW_SIZE', 50)
     vib_threshold_mult = runner.global_config.get('VIBRATION_THRESHOLD_MULT', 5.0)
     runner.vibration_detector = VibrationDetector(
@@ -189,6 +192,11 @@ def run_imu_driven_loop(runner):
             early_velocity_sigma_thresh=runner.PHASE_EARLY_VELOCITY_SIGMA_THRESH
         )
         runner.state.current_phase = phase_num
+        runner.update_adaptive_policy(t=t, phase=phase_num)
+        imu_params_step, sigma_accel_step = runner.build_step_imu_params(
+            imu_params_base, sigma_accel_base
+        )
+        _, zupt_apply_scales = runner._get_sensor_adaptive_scales("ZUPT")
         
         # =====================================================================
         # IMU Propagation (v3.7.0: IMU-driven with sub-sample timestamp precision)
@@ -214,16 +222,16 @@ def run_imu_driven_loop(runner):
                 runner.kf, rec, dt_before,
                 estimate_imu_bias=runner.config.estimate_imu_bias,
                 t=next_cam_time, t0=runner.state.t0,
-                imu_params=imu_params,
+                imu_params=imu_params_step,
                 mag_params=mag_params,
-                sigma_accel=sigma_accel
+                sigma_accel=sigma_accel_step
             )
             # VPS Stochastic Cloning: Propagate cross-covariance
             if hasattr(runner, 'vps_clone_manager') and runner.vps_clone_manager is not None:
                 Phi_approx = np.eye(18, dtype=float)
                 Phi_approx[0:3, 3:6] = np.eye(3) * dt_before
                 runner.vps_clone_manager.propagate_cross_covariance(Phi_approx)
-            runner._update_imu_helpers(rec, dt_before, imu_params)
+            runner._update_imu_helpers(rec, dt_before, imu_params_step, zupt_scales=zupt_apply_scales)
             runner.state.last_t = next_cam_time
             
             # Process camera at exact timestamp
@@ -237,16 +245,16 @@ def run_imu_driven_loop(runner):
                     runner.kf, rec, dt_after,
                     estimate_imu_bias=runner.config.estimate_imu_bias,
                     t=t_current, t0=runner.state.t0,
-                    imu_params=imu_params,
+                    imu_params=imu_params_step,
                     mag_params=mag_params,
-                    sigma_accel=sigma_accel
+                    sigma_accel=sigma_accel_step
                 )
                 # VPS Stochastic Cloning: Propagate cross-covariance
                 if hasattr(runner, 'vps_clone_manager') and runner.vps_clone_manager is not None:
                     Phi_approx = np.eye(18, dtype=float)
                     Phi_approx[0:3, 3:6] = np.eye(3) * dt_after
                     runner.vps_clone_manager.propagate_cross_covariance(Phi_approx)
-                runner._update_imu_helpers(rec, dt_after, imu_params)
+                runner._update_imu_helpers(rec, dt_after, imu_params_step, zupt_scales=zupt_apply_scales)
             runner.state.last_t = t_current
         else:
             # Normal propagation (no camera crossing)
@@ -259,9 +267,9 @@ def run_imu_driven_loop(runner):
                 runner.kf, rec, dt,
                 estimate_imu_bias=runner.config.estimate_imu_bias,
                 t=rec.t, t0=runner.state.t0,
-                imu_params=imu_params,
+                imu_params=imu_params_step,
                 mag_params=mag_params,
-                sigma_accel=sigma_accel
+                sigma_accel=sigma_accel_step
             )
             
             # VPS Stochastic Cloning: Propagate cross-covariance for delayed updates
@@ -274,7 +282,7 @@ def run_imu_driven_loop(runner):
                 runner.vps_clone_manager.propagate_cross_covariance(Phi_approx)
             
             # Step 3: Update mag filter variables and check ZUPT
-            runner._update_imu_helpers(rec, dt, imu_params)
+            runner._update_imu_helpers(rec, dt, imu_params_step, zupt_scales=zupt_apply_scales)
             
             # Update state time
             runner.state.last_t = t
@@ -362,7 +370,7 @@ def run_imu_driven_loop(runner):
             a_body = rec.lin - runner.kf.x[13:16, 0].flatten()  # bias-corrected
             g_norm = runner.global_config.get('IMU_PARAMS', {}).get('g_norm', 9.8066)
             g_world = np.array([0.0, 0.0, -g_norm])  # ENU: gravity points down
-            accel_includes_gravity = bool(imu_params.get('accel_includes_gravity', True))
+            accel_includes_gravity = bool(imu_params_step.get('accel_includes_gravity', True))
             a_world_raw = r_body_to_world @ a_body
             if accel_includes_gravity:
                 # Remove gravity from gravity-included acceleration.

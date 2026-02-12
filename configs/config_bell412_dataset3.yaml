@@ -328,7 +328,7 @@ fast_mode:
 # DISABLED for helicopters: continuous vibration prevents true zero-velocity state.
 # Use vibration detection instead for adaptive measurement uncertainty.
 zupt:
-  enabled: false                  # DISABLED: Helicopters never truly stationary (rotor vibration)
+  enabled: true                   # Enabled for adaptive fail-soft testing (state-aware gating handles motion)
   accel_threshold: 0.5            # Acceleration threshold [m/s²] (reduced for helicopter vibration)
   gyro_threshold: 0.05            # Gyroscope threshold [rad/s] (~3°/s)
   min_duration: 2.0               # Minimum stationary duration [seconds]
@@ -369,6 +369,138 @@ vibration:
   use_vibration_detector: true
   window_size: 50             # Number of samples for vibration detection
   threshold_multiplier: 5.0   # Multiplier of acc_n for vibration threshold
+
+# ============================================================================
+# Adaptive + State-aware Policy (IMU-driven)
+# ============================================================================
+adaptive:
+  # rollout: off | shadow | active
+  mode: active
+  objective: stability_first
+
+  health:
+    warning:
+      p_cond: 1.0e10
+      p_max: 1.0e6
+      growth_ratio: 1.05
+    degraded:
+      p_cond: 1.0e12
+      p_max: 1.0e7
+      growth_ratio: 1.10
+      hold_sec: 0.25
+    recovery:
+      healthy_sec: 3.0
+      to_healthy_sec: 3.0
+    aiding_age:
+      full_sec: 0.25
+      partial_sec: 2.0
+
+  nis_feedback:
+    enabled: true
+    alpha: 0.1
+    high: 2.5
+    low: 0.5
+    accept_rate_hi: 0.85
+    window: 200
+    high_r_scale: 1.5
+    high_chi2_scale: 0.9
+    low_r_scale: 0.9
+    low_chi2_scale: 1.05
+
+  process_noise:
+    aiding_multiplier:
+      FULL: 1.0
+      PARTIAL: 0.85
+      NONE: 0.60
+    health_profile:
+      HEALTHY:
+        sigma_accel_scale: 1.0
+        gyr_w_scale: 1.0
+        acc_w_scale: 1.0
+        sigma_unmodeled_gyr_scale: 1.0
+        min_yaw_scale: 1.0
+      WARNING:
+        sigma_accel_scale: 0.85
+        gyr_w_scale: 0.70
+        acc_w_scale: 0.70
+        sigma_unmodeled_gyr_scale: 0.80
+        min_yaw_scale: 0.80
+      DEGRADED:
+        sigma_accel_scale: 0.70
+        gyr_w_scale: 0.50
+        acc_w_scale: 0.50
+        sigma_unmodeled_gyr_scale: 0.65
+        min_yaw_scale: 0.65
+      RECOVERY:
+        sigma_accel_scale: 0.90
+        gyr_w_scale: 0.80
+        acc_w_scale: 0.80
+        sigma_unmodeled_gyr_scale: 0.90
+        min_yaw_scale: 0.85
+    min_yaw_floor_deg: 0.05
+    scale_clamp:
+      sigma_accel: [0.20, 2.0]
+      gyr_w: [0.10, 2.0]
+      acc_w: [0.10, 2.0]
+      sigma_unmodeled_gyr: [0.10, 2.0]
+      min_yaw: [0.20, 2.0]
+
+  measurement:
+    sensor_defaults:
+      MAG: {r_scale: 1.0}
+      DEM: {r_scale: 1.0, threshold_scale: 1.0}
+      VIO_VEL: {r_scale: 1.0, chi2_scale: 1.0}
+      MSCKF: {chi2_scale: 1.0, reproj_scale: 1.0}
+      ZUPT: {r_scale: 1.0, chi2_scale: 1.0}
+      GRAVITY_RP: {r_scale: 1.0, chi2_scale: 1.0}
+    clamp:
+      r_scale: [0.5, 10.0]
+      chi2_scale: [0.5, 2.0]
+      threshold_scale: [0.5, 2.0]
+      reproj_scale: [0.5, 2.0]
+    degraded_r_extra: 1.2
+    degraded_chi2_extra: 0.95
+    phase_profiles:
+      ZUPT:
+        "0": {chi2_scale: 0.80, r_scale: 1.50, acc_threshold_scale: 0.80, gyro_threshold_scale: 0.80, max_v_scale: 0.70}
+        "1": {chi2_scale: 0.90, r_scale: 1.20, acc_threshold_scale: 0.90, gyro_threshold_scale: 0.90, max_v_scale: 0.85}
+        "2": {chi2_scale: 1.00, r_scale: 1.00, acc_threshold_scale: 1.00, gyro_threshold_scale: 1.00, max_v_scale: 1.00}
+    zupt_fail_soft:
+      enabled: true
+      hard_reject_factor: 3.0
+      max_r_scale: 20.0
+      inflate_power: 1.0
+      health_hard_factor:
+        HEALTHY: 1.0
+        WARNING: 1.2
+        DEGRADED: 1.5
+        RECOVERY: 1.1
+      health_r_cap_factor:
+        HEALTHY: 1.0
+        WARNING: 1.2
+        DEGRADED: 1.5
+        RECOVERY: 1.1
+    gravity_alignment:
+      enabled_imu_only: true
+      phase_sigma_deg: {"0": 4.0, "1": 5.0, "2": 7.0}
+      health_sigma_mult:
+        HEALTHY: 1.0
+        WARNING: 1.2
+        DEGRADED: 1.5
+        RECOVERY: 1.1
+      acc_norm_tolerance: 0.25
+      max_gyro_rad_s: 0.40
+      chi2_scale: 1.0
+
+  conditioning:
+    caps:
+      HEALTHY: 1.0e8
+      WARNING: 1.0e7
+      DEGRADED: 1.0e6
+      RECOVERY: 1.0e7
+
+  logging:
+    enabled: true
 
 # ============================================================================
 # NEW: Terrain Referenced Navigation (TRN) v3.3.0

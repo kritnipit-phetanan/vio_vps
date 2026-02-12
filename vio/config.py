@@ -44,6 +44,17 @@ SUPPORTED_ESTIMATOR_MODES = {
 }
 
 
+def _merge_dict_defaults(defaults: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+    """Recursively merge user config on top of defaults."""
+    merged = dict(defaults)
+    for key, value in (override or {}).items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _merge_dict_defaults(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
 def _load_yaml_file(config_path: str) -> Dict[str, Any]:
     """Read YAML file and return dict."""
     with open(config_path, 'r') as f:
@@ -256,6 +267,14 @@ def load_config(config_path: str) -> VIOConfig:
     result['PHASE_SPINUP_VIBRATION_THRESH'] = phase_detection.get('spinup_vibration_thresh', 0.3)
     result['PHASE_SPINUP_ALT_CHANGE_THRESH'] = phase_detection.get('spinup_altitude_change_thresh', 5.0)
     result['PHASE_EARLY_VELOCITY_SIGMA_THRESH'] = phase_detection.get('early_velocity_sigma_thresh', 3.0)
+
+    # ZUPT defaults (used by IMU helper path; adaptive may scale these values)
+    zupt = config.get('zupt', {})
+    result['ZUPT_ENABLED'] = bool(zupt.get('enabled', True))
+    result['ZUPT_ACCEL_THRESHOLD'] = float(zupt.get('accel_threshold', 0.5))
+    result['ZUPT_GYRO_THRESHOLD'] = float(zupt.get('gyro_threshold', 0.05))
+    result['ZUPT_VELOCITY_THRESHOLD'] = float(zupt.get('velocity_threshold', 0.3))
+    result['ZUPT_MAX_V_FOR_UPDATE'] = float(zupt.get('max_v_for_zupt', 20.0))
     
     # Magnetometer calibration
     mag = config['magnetometer']
@@ -299,13 +318,6 @@ def load_config(config_path: str) -> VIOConfig:
     result['IMU_PARAMS_PREINT']['sigma_accel'] = result['SIGMA_ACCEL']
     result['IMU_PARAMS_PREINT']['sigma_unmodeled_gyr'] = result['SIGMA_UNMODELED_GYR']
     result['IMU_PARAMS_PREINT']['min_yaw_process_noise_deg'] = result['MIN_YAW_PROCESS_NOISE_DEG']
-    
-    # Compiler metadata (for debug/traceability)
-    result['CONFIG_COMPILE_META'] = {
-        'source': os.path.abspath(config_path),
-        'estimator_mode': result['ESTIMATOR_MODE'],
-        'accel_includes_gravity': bool(result['IMU_PARAMS']['accel_includes_gravity']),
-    }
     
     # VIO parameters
     vio = config['vio']
@@ -453,6 +465,168 @@ def load_config(config_path: str) -> VIOConfig:
     else:
         result['TRN_ENABLED'] = False
         result['trn'] = {}
+
+    # =========================================================================
+    # NEW: Adaptive + State-aware control policy (IMU-driven)
+    # =========================================================================
+    adaptive_defaults = {
+        'mode': 'off',  # off | shadow | active
+        'objective': 'stability_first',
+        'health': {
+            'warning': {
+                'p_cond': 1e10,
+                'p_max': 1e6,
+                'growth_ratio': 1.05,
+            },
+            'degraded': {
+                'p_cond': 1e12,
+                'p_max': 1e7,
+                'growth_ratio': 1.10,
+                'hold_sec': 0.25,
+            },
+            'recovery': {
+                'healthy_sec': 3.0,
+                'to_healthy_sec': 3.0,
+            },
+            'aiding_age': {
+                'full_sec': 0.25,
+                'partial_sec': 2.0,
+            },
+        },
+        'nis_feedback': {
+            'enabled': True,
+            'alpha': 0.1,
+            'high': 2.5,
+            'low': 0.5,
+            'accept_rate_hi': 0.85,
+            'window': 200,
+            'high_r_scale': 1.5,
+            'high_chi2_scale': 0.9,
+            'low_r_scale': 0.9,
+            'low_chi2_scale': 1.05,
+        },
+        'process_noise': {
+            'aiding_multiplier': {
+                'FULL': 1.0,
+                'PARTIAL': 0.85,
+                'NONE': 0.60,
+            },
+            'health_profile': {
+                'HEALTHY': {
+                    'sigma_accel_scale': 1.0,
+                    'gyr_w_scale': 1.0,
+                    'acc_w_scale': 1.0,
+                    'sigma_unmodeled_gyr_scale': 1.0,
+                    'min_yaw_scale': 1.0,
+                },
+                'WARNING': {
+                    'sigma_accel_scale': 0.85,
+                    'gyr_w_scale': 0.70,
+                    'acc_w_scale': 0.70,
+                    'sigma_unmodeled_gyr_scale': 0.80,
+                    'min_yaw_scale': 0.80,
+                },
+                'DEGRADED': {
+                    'sigma_accel_scale': 0.70,
+                    'gyr_w_scale': 0.50,
+                    'acc_w_scale': 0.50,
+                    'sigma_unmodeled_gyr_scale': 0.65,
+                    'min_yaw_scale': 0.65,
+                },
+                'RECOVERY': {
+                    'sigma_accel_scale': 0.90,
+                    'gyr_w_scale': 0.80,
+                    'acc_w_scale': 0.80,
+                    'sigma_unmodeled_gyr_scale': 0.90,
+                    'min_yaw_scale': 0.85,
+                },
+            },
+            'min_yaw_floor_deg': 0.05,
+            'scale_clamp': {
+                'sigma_accel': [0.20, 2.0],
+                'gyr_w': [0.10, 2.0],
+                'acc_w': [0.10, 2.0],
+                'sigma_unmodeled_gyr': [0.10, 2.0],
+                'min_yaw': [0.20, 2.0],
+            },
+        },
+        'measurement': {
+            'sensor_defaults': {
+                'MAG': {'r_scale': 1.0},
+                'DEM': {'r_scale': 1.0, 'threshold_scale': 1.0},
+                'VIO_VEL': {'r_scale': 1.0, 'chi2_scale': 1.0},
+                'MSCKF': {'chi2_scale': 1.0, 'reproj_scale': 1.0},
+                'ZUPT': {'r_scale': 1.0, 'chi2_scale': 1.0},
+                'GRAVITY_RP': {'r_scale': 1.0, 'chi2_scale': 1.0},
+            },
+            'clamp': {
+                'r_scale': [0.5, 10.0],
+                'chi2_scale': [0.5, 2.0],
+                'threshold_scale': [0.5, 2.0],
+                'reproj_scale': [0.5, 2.0],
+            },
+            'degraded_r_extra': 1.2,
+            'degraded_chi2_extra': 0.95,
+            'phase_profiles': {
+                'ZUPT': {
+                    '0': {'chi2_scale': 0.80, 'r_scale': 1.50, 'acc_threshold_scale': 0.80, 'gyro_threshold_scale': 0.80, 'max_v_scale': 0.70},
+                    '1': {'chi2_scale': 0.90, 'r_scale': 1.20, 'acc_threshold_scale': 0.90, 'gyro_threshold_scale': 0.90, 'max_v_scale': 0.85},
+                    '2': {'chi2_scale': 1.00, 'r_scale': 1.00, 'acc_threshold_scale': 1.00, 'gyro_threshold_scale': 1.00, 'max_v_scale': 1.00},
+                },
+            },
+            'zupt_fail_soft': {
+                'enabled': True,
+                'hard_reject_factor': 3.0,
+                'max_r_scale': 20.0,
+                'inflate_power': 1.0,
+                'health_hard_factor': {
+                    'HEALTHY': 1.0,
+                    'WARNING': 1.2,
+                    'DEGRADED': 1.5,
+                    'RECOVERY': 1.1,
+                },
+                'health_r_cap_factor': {
+                    'HEALTHY': 1.0,
+                    'WARNING': 1.2,
+                    'DEGRADED': 1.5,
+                    'RECOVERY': 1.1,
+                },
+            },
+            'gravity_alignment': {
+                'enabled_imu_only': True,
+                'phase_sigma_deg': {'0': 4.0, '1': 5.0, '2': 7.0},
+                'health_sigma_mult': {
+                    'HEALTHY': 1.0,
+                    'WARNING': 1.2,
+                    'DEGRADED': 1.5,
+                    'RECOVERY': 1.1,
+                },
+                'acc_norm_tolerance': 0.25,
+                'max_gyro_rad_s': 0.40,
+                'chi2_scale': 1.0,
+            },
+        },
+        'conditioning': {
+            'caps': {
+                'HEALTHY': 1e8,
+                'WARNING': 1e7,
+                'DEGRADED': 1e6,
+                'RECOVERY': 1e7,
+            }
+        },
+        'logging': {
+            'enabled': True,
+        },
+    }
+    result['ADAPTIVE'] = _merge_dict_defaults(adaptive_defaults, config.get('adaptive', {}))
+
+    # Compiler metadata (for debug/traceability)
+    result['CONFIG_COMPILE_META'] = {
+        'source': os.path.abspath(config_path),
+        'estimator_mode': result['ESTIMATOR_MODE'],
+        'accel_includes_gravity': bool(result['IMU_PARAMS']['accel_includes_gravity']),
+        'adaptive_mode': result['ADAPTIVE']['mode'],
+    }
     
     # =========================================================================
     # Create VIOConfig dataclass from parsed YAML (v3.2.0)
@@ -541,6 +715,9 @@ SIGMA_ACCEL = 0.8
 SIGMA_VPS_XY = 1.0
 SIGMA_AGL_Z = 2.5
 SIGMA_MAG_YAW = 0.15  # ~9° measurement noise
+
+# Adaptive policy defaults (compiled from YAML adaptive section)
+ADAPTIVE = {}
 
 # VIO parameters
 MIN_PARALLAX_PX = 2.0

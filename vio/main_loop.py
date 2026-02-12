@@ -51,6 +51,7 @@ from .camera import make_KD_for_size
 from .propagation import (
     propagate_error_state_covariance, 
     augment_state_with_camera, detect_stationary, apply_zupt,
+    apply_gravity_roll_pitch_update,
     apply_preintegration_at_camera, clone_camera_for_msckf,
     get_flight_phase  # v3.3.0: State-based phase detection
 )
@@ -76,9 +77,11 @@ from .output_utils import (
     save_calibration_log, save_keyframe_image_with_overlay,
     save_keyframe_with_overlay,
     log_state_debug, log_vo_debug, log_msckf_window, log_fej_consistency,
+    log_adaptive_decision, log_sensor_health,
     DebugCSVWriters, init_output_csvs, get_ground_truth_error,
     build_calibration_params
 )
+from .adaptive_controller import AdaptiveController, AdaptiveContext, AdaptiveDecision
 from .trn import TerrainReferencedNavigation, TRNConfig, create_trn_from_config
 from .imu_driven import run_imu_driven_loop
 from .event_driven import run_event_driven_loop
@@ -174,6 +177,8 @@ class VIORunner:
         self.state_dbg_csv = None
         self.time_sync_csv = None
         self.cov_health_csv = None
+        self.adaptive_debug_csv = None
+        self.sensor_health_csv = None
         
         # Fisheye rectifier (optional)
         self.rectifier: Optional[FisheyeRectifier] = None
@@ -206,6 +211,15 @@ class VIORunner:
         self.error_time_offset: float = 0.0
         self.error_time_mode: str = "identity"
         self._warned_gt_time_mismatch: bool = False
+
+        # Adaptive controller runtime
+        self.adaptive_controller: Optional[AdaptiveController] = None
+        self.current_adaptive_decision: Optional[AdaptiveDecision] = None
+        self._adaptive_last_aiding_time: Optional[float] = None
+        self._adaptive_prev_pmax: Optional[float] = None
+        self._adaptive_log_enabled: bool = True
+        self._legacy_covariance_cap: float = 1e8
+        self.imu_only_mode: bool = False
     
     def load_config(self) -> dict:
         """Load YAML configuration file."""
@@ -566,6 +580,8 @@ class VIORunner:
         self.state_dbg_csv = csv_paths['state_dbg_csv']
         self.time_sync_csv = csv_paths.get('time_sync_csv')
         self.cov_health_csv = csv_paths.get('cov_health_csv')
+        self.adaptive_debug_csv = csv_paths.get('adaptive_debug_csv')
+        self.sensor_health_csv = csv_paths.get('sensor_health_csv')
         self.inf_csv = csv_paths['inf_csv']
         self.vo_dbg_csv = csv_paths['vo_dbg']
         self.msckf_dbg_csv = csv_paths['msckf_dbg']
@@ -686,8 +702,201 @@ class VIORunner:
             
             save_calibration_log(output_path=cal_path, **cal_params)
             print(f"[DEBUG] Calibration snapshot saved: {cal_path}")
+
+    def initialize_adaptive_controller(self):
+        """Initialize adaptive controller from compiled YAML config."""
+        adaptive_cfg = {}
+        if isinstance(self.global_config, dict):
+            adaptive_cfg = self.global_config.get("ADAPTIVE", {})
+        if self.config.estimator_mode != "imu_step_preint_cache":
+            adaptive_cfg = dict(adaptive_cfg)
+            adaptive_cfg["mode"] = "off"
+        try:
+            self.adaptive_controller = AdaptiveController(adaptive_cfg)
+        except Exception as exc:
+            print(f"[ADAPTIVE] WARNING: failed to initialize controller: {exc}")
+            self.adaptive_controller = AdaptiveController({"mode": "off"})
+
+        self.current_adaptive_decision = self.adaptive_controller.last_decision
+        self._adaptive_prev_pmax = None
+        self._adaptive_last_aiding_time = None
+        self._adaptive_log_enabled = bool(
+            adaptive_cfg.get("logging", {}).get("enabled", True)
+        )
+        mode = self.current_adaptive_decision.mode if self.current_adaptive_decision else "off"
+        print(f"[ADAPTIVE] mode={mode} (IMU-driven policy)")
+
+    def _get_sensor_adaptive_scales(self, sensor: str) -> Tuple[Dict[str, float], Dict[str, float]]:
+        """Get policy scales and applied scales for a sensor."""
+        default = {
+            "r_scale": 1.0,
+            "chi2_scale": 1.0,
+            "threshold_scale": 1.0,
+            "reproj_scale": 1.0,
+            "acc_threshold_scale": 1.0,
+            "gyro_threshold_scale": 1.0,
+            "max_v_scale": 1.0,
+            "fail_soft_enable": 0.0,
+            "hard_reject_factor": 3.0,
+            "soft_r_cap": 20.0,
+            "soft_r_power": 1.0,
+            "sigma_deg": 7.0,
+            "acc_norm_tolerance": 0.25,
+            "max_gyro_rad_s": 0.40,
+            "enabled_imu_only": 1.0,
+        }
+        decision = self.current_adaptive_decision
+        if decision is None:
+            return dict(default), dict(default)
+        policy = decision.sensor_scale(sensor)
+        applied = dict(policy) if decision.apply_measurement else dict(default)
+        return policy, applied
+
+    def update_adaptive_policy(self, t: float, phase: int) -> Optional[AdaptiveDecision]:
+        """Evaluate adaptive controller for current filter health snapshot."""
+        if self.adaptive_controller is None or self.kf is None:
+            return None
+
+        try:
+            p = self.kf.P
+            p_max = float(np.max(np.abs(p)))
+            p_trace = float(np.trace(p))
+            core_dim = min(18, p.shape[0])
+            p_cond = float(np.linalg.cond(p[:core_dim, :core_dim]))
+        except Exception:
+            p_max = float("nan")
+            p_trace = float("nan")
+            p_cond = float("inf")
+
+        if self._adaptive_prev_pmax is None or not np.isfinite(self._adaptive_prev_pmax) or self._adaptive_prev_pmax <= 0:
+            growth_ratio = 1.0
+        else:
+            growth_ratio = p_max / self._adaptive_prev_pmax if np.isfinite(p_max) else float("nan")
+        self._adaptive_prev_pmax = p_max if np.isfinite(p_max) else self._adaptive_prev_pmax
+
+        if self._adaptive_last_aiding_time is None:
+            aiding_age_sec = 1e9
+        else:
+            aiding_age_sec = max(0.0, float(t - self._adaptive_last_aiding_time))
+
+        ctx = AdaptiveContext(
+            timestamp=float(t),
+            phase=int(phase),
+            p_cond=float(p_cond),
+            p_max=float(p_max),
+            p_trace=float(p_trace),
+            p_growth_ratio=float(growth_ratio) if np.isfinite(growth_ratio) else float("nan"),
+            aiding_age_sec=float(aiding_age_sec),
+        )
+        decision = self.adaptive_controller.step(ctx)
+        self.current_adaptive_decision = decision
+
+        # Keep legacy cap for off/shadow to guarantee backward compatibility.
+        cov_cap = self._legacy_covariance_cap
+        if decision.apply_process_noise:
+            cov_cap = float(decision.conditioning_max_value)
+        if hasattr(self.kf, "set_covariance_max_value"):
+            self.kf.set_covariance_max_value(cov_cap)
+
+        if self.adaptive_debug_csv and self._adaptive_log_enabled:
+            log_adaptive_decision(
+                self.adaptive_debug_csv,
+                t=float(t),
+                mode=decision.mode,
+                health_state=decision.health_state,
+                phase=int(phase),
+                aiding_age_sec=float(aiding_age_sec),
+                p_max=float(p_max),
+                p_cond=float(p_cond),
+                p_growth_ratio=float(growth_ratio) if np.isfinite(growth_ratio) else np.nan,
+                sigma_accel_scale=float(decision.sigma_accel_scale),
+                gyr_w_scale=float(decision.gyr_w_scale),
+                acc_w_scale=float(decision.acc_w_scale),
+                sigma_unmodeled_gyr_scale=float(decision.sigma_unmodeled_gyr_scale),
+                min_yaw_scale=float(decision.min_yaw_scale),
+                conditioning_max_value=float(cov_cap),
+                reason=decision.reason,
+            )
+
+        return decision
+
+    def build_step_imu_params(self, imu_params_base: dict, sigma_accel_base: float) -> Tuple[dict, float]:
+        """Build per-step IMU params (active mode only)."""
+        imu_params_step = dict(imu_params_base)
+        sigma_accel_step = float(sigma_accel_base)
+
+        decision = self.current_adaptive_decision
+        if decision is None or not decision.apply_process_noise:
+            return imu_params_step, sigma_accel_step
+
+        sigma_accel_step *= float(decision.sigma_accel_scale)
+        if "gyr_w" in imu_params_step:
+            imu_params_step["gyr_w"] = float(imu_params_step["gyr_w"]) * float(decision.gyr_w_scale)
+        if "acc_w" in imu_params_step:
+            imu_params_step["acc_w"] = float(imu_params_step["acc_w"]) * float(decision.acc_w_scale)
+        if "sigma_unmodeled_gyr" in imu_params_step:
+            imu_params_step["sigma_unmodeled_gyr"] = (
+                float(imu_params_step["sigma_unmodeled_gyr"]) * float(decision.sigma_unmodeled_gyr_scale)
+            )
+        if "min_yaw_process_noise_deg" in imu_params_step:
+            min_yaw = float(imu_params_step["min_yaw_process_noise_deg"]) * float(decision.min_yaw_scale)
+            imu_params_step["min_yaw_process_noise_deg"] = max(float(decision.min_yaw_floor_deg), min_yaw)
+
+        return imu_params_step, sigma_accel_step
+
+    def record_adaptive_measurement(self,
+                                    sensor: str,
+                                    adaptive_info: Optional[Dict[str, Any]],
+                                    timestamp: float,
+                                    policy_scales: Optional[Dict[str, float]] = None):
+        """Feed measurement acceptance/NIS back into adaptive controller."""
+        if self.adaptive_controller is None or adaptive_info is None or len(adaptive_info) == 0:
+            return
+        attempted = int(adaptive_info.get("attempted", 1))
+        if attempted <= 0:
+            return
+
+        accepted = bool(adaptive_info.get("accepted", False))
+        nis_norm = adaptive_info.get("nis_norm", np.nan)
+        nis_norm = float(nis_norm) if nis_norm is not None and np.isfinite(nis_norm) else None
+
+        feedback = self.adaptive_controller.record_measurement(
+            sensor=sensor,
+            accepted=accepted,
+            nis_norm=nis_norm,
+            timestamp=float(timestamp),
+        )
+        if accepted:
+            self._adaptive_last_aiding_time = float(timestamp)
+
+        decision = self.current_adaptive_decision
+        mode = decision.mode if decision is not None else "off"
+        health_state = decision.health_state if decision is not None else "HEALTHY"
+        if policy_scales is None and decision is not None:
+            policy_scales = decision.sensor_scale(sensor)
+        if policy_scales is None:
+            policy_scales = {"r_scale": 1.0, "chi2_scale": 1.0, "threshold_scale": 1.0, "reproj_scale": 1.0}
+
+        if self.sensor_health_csv and self._adaptive_log_enabled:
+            log_sensor_health(
+                self.sensor_health_csv,
+                t=float(timestamp),
+                sensor=sensor,
+                accepted=accepted,
+                nis_norm=nis_norm,
+                nis_ewma=float(feedback.get("nis_ewma", 1.0)),
+                accept_rate=float(feedback.get("accept_rate", 1.0)),
+                mode=mode,
+                health_state=health_state,
+                r_scale=float(policy_scales.get("r_scale", 1.0)),
+                chi2_scale=float(policy_scales.get("chi2_scale", 1.0)),
+                threshold_scale=float(policy_scales.get("threshold_scale", 1.0)),
+                reproj_scale=float(policy_scales.get("reproj_scale", 1.0)),
+                reason_code=str(adaptive_info.get("reason_code", "")),
+            )
     
-    def _update_imu_helpers(self, rec, dt: float, imu_params: dict):
+    def _update_imu_helpers(self, rec, dt: float, imu_params: dict,
+                            zupt_scales: Optional[Dict[str, float]] = None):
         """
         Update IMU-related helper variables (ZUPT, mag filter).
         Shared by both preintegration and legacy modes.
@@ -710,26 +919,54 @@ class VIORunner:
         self.last_gyro_z = float(w_corr[2])
         self.last_imu_dt = dt
         
-        # Check for stationary (ZUPT)
+        # Check for stationary (phase-aware thresholds for ZUPT gating)
         v_mag = np.linalg.norm(x[3:6])
+        zupt_enabled = bool(self.global_config.get("ZUPT_ENABLED", True))
+        base_acc_threshold = float(self.global_config.get("ZUPT_ACCEL_THRESHOLD", 0.5))
+        base_gyro_threshold = float(self.global_config.get("ZUPT_GYRO_THRESHOLD", 0.05))
+        base_max_v_for_zupt = float(self.global_config.get("ZUPT_MAX_V_FOR_UPDATE", 20.0))
+        zupt_policy_scales, zupt_apply_scales = self._get_sensor_adaptive_scales("ZUPT")
+        if zupt_scales is not None:
+            zupt_apply_scales = dict(zupt_apply_scales)
+            zupt_apply_scales.update(zupt_scales)
+        acc_threshold = base_acc_threshold * float(zupt_apply_scales.get("acc_threshold_scale", 1.0))
+        gyro_threshold = base_gyro_threshold * float(zupt_apply_scales.get("gyro_threshold_scale", 1.0))
+
         is_stationary, _ = detect_stationary(
             a_raw=rec.lin,
             w_corr=w_corr,
             v_mag=v_mag,
-            imu_params=imu_params
+            imu_params=imu_params,
+            acc_threshold=acc_threshold,
+            gyro_threshold=gyro_threshold,
         )
         
-        if is_stationary:
+        if zupt_enabled and is_stationary:
             self.state.zupt_detected += 1
+            zupt_adaptive_info: Dict[str, Any] = {}
             
             applied, v_reduction, updated_count = apply_zupt(
                 self.kf,
                 v_mag=v_mag,
                 consecutive_stationary_count=self.state.consecutive_stationary,
+                max_v_for_zupt=base_max_v_for_zupt * float(zupt_apply_scales.get("max_v_scale", 1.0)),
                 save_debug=self.config.save_debug_data,
                 residual_csv=getattr(self, 'residual_csv', None),
                 timestamp=rec.t,
-                frame=self.state.imu_propagation_count
+                frame=self.state.imu_propagation_count,
+                r_scale=float(zupt_apply_scales.get("r_scale", 1.0)),
+                chi2_scale=float(zupt_apply_scales.get("chi2_scale", 1.0)),
+                soft_fail_enable=bool(float(zupt_apply_scales.get("fail_soft_enable", 0.0)) >= 0.5),
+                soft_fail_r_cap=float(zupt_apply_scales.get("soft_r_cap", 20.0)),
+                soft_fail_hard_reject_factor=float(zupt_apply_scales.get("hard_reject_factor", 3.0)),
+                soft_fail_power=float(zupt_apply_scales.get("soft_r_power", 1.0)),
+                adaptive_info=zupt_adaptive_info,
+            )
+            self.record_adaptive_measurement(
+                "ZUPT",
+                adaptive_info=zupt_adaptive_info,
+                timestamp=rec.t,
+                policy_scales=zupt_policy_scales,
             )
             
             if applied:
@@ -739,6 +976,34 @@ class VIORunner:
                 self.state.zupt_rejected += 1
         else:
             self.state.consecutive_stationary = 0
+
+        # IMU-only stabilization: gravity roll/pitch pseudo-measurement.
+        if getattr(self, "imu_only_mode", False):
+            grav_policy_scales, grav_apply_scales = self._get_sensor_adaptive_scales("GRAVITY_RP")
+            if bool(float(grav_apply_scales.get("enabled_imu_only", 1.0)) >= 0.5):
+                grav_adaptive_info: Dict[str, Any] = {}
+                apply_gravity_roll_pitch_update(
+                    self.kf,
+                    a_raw=rec.lin.astype(float),
+                    w_corr=w_corr,
+                    imu_params=imu_params,
+                    sigma_rad=np.deg2rad(float(grav_apply_scales.get("sigma_deg", 7.0))),
+                    r_scale=float(grav_apply_scales.get("r_scale", 1.0)),
+                    chi2_scale=float(grav_apply_scales.get("chi2_scale", 1.0)),
+                    acc_norm_tolerance=float(grav_apply_scales.get("acc_norm_tolerance", 0.25)),
+                    max_gyro_rad_s=float(grav_apply_scales.get("max_gyro_rad_s", 0.40)),
+                    save_debug=self.config.save_debug_data,
+                    residual_csv=getattr(self, 'residual_csv', None),
+                    timestamp=rec.t,
+                    frame=self.state.imu_propagation_count,
+                    adaptive_info=grav_adaptive_info,
+                )
+                self.record_adaptive_measurement(
+                    "GRAVITY_RP",
+                    adaptive_info=grav_adaptive_info,
+                    timestamp=rec.t,
+                    policy_scales=grav_policy_scales,
+                )
         
         # Save priors
         self.kf.x_prior = self.kf.x.copy()
@@ -994,6 +1259,8 @@ class VIORunner:
                     
                     # Trigger MSCKF update if enough clones
                     if len(self.state.cam_states) >= 3:
+                        msckf_policy_scales, msckf_apply_scales = self._get_sensor_adaptive_scales("MSCKF")
+                        msckf_adaptive_info: Dict[str, Any] = {}
                         num_updates = trigger_msckf_update(
                             kf=self.kf,
                             cam_states=self.state.cam_states,
@@ -1006,7 +1273,16 @@ class VIORunner:
                             origin_lon=self.lon0,
                             plane_detector=self.plane_detector,
                             plane_config=self.global_config if self.plane_detector else None,
-                            global_config=self.global_config
+                            global_config=self.global_config,
+                            chi2_scale=float(msckf_apply_scales.get("chi2_scale", 1.0)),
+                            reproj_scale=float(msckf_apply_scales.get("reproj_scale", 1.0)),
+                            adaptive_info=msckf_adaptive_info,
+                        )
+                        self.record_adaptive_measurement(
+                            "MSCKF",
+                            adaptive_info=msckf_adaptive_info,
+                            timestamp=t_cam,
+                            policy_scales=msckf_policy_scales,
                         )
                         
                         # Log FEJ consistency after MSCKF update
@@ -1027,6 +1303,8 @@ class VIORunner:
                 vel_error, vel_cov = get_ground_truth_error(
                     t_cam, self.kf, self.ppk_trajectory,
                     self.lat0, self.lon0, self.proj_cache, 'velocity')
+                vio_policy_scales, vio_apply_scales = self._get_sensor_adaptive_scales("VIO_VEL")
+                vio_adaptive_info: Dict[str, Any] = {}
                 
                 apply_vio_velocity_update(
                     kf=self.kf,
@@ -1048,7 +1326,16 @@ class VIORunner:
                     vio_frame=self.state.vio_frame,
                     vio_fe=self.vio_fe,
                     state_error=vel_error,  # For NEES calculation
-                    state_cov=vel_cov       # For NEES calculation
+                    state_cov=vel_cov,      # For NEES calculation
+                    chi2_scale=float(vio_apply_scales.get("chi2_scale", 1.0)),
+                    r_scale_extra=float(vio_apply_scales.get("r_scale", 1.0)),
+                    adaptive_info=vio_adaptive_info,
+                )
+                self.record_adaptive_measurement(
+                    "VIO_VEL",
+                    adaptive_info=vio_adaptive_info,
+                    timestamp=t_cam,
+                    policy_scales=vio_policy_scales,
                 )
                 
                 # Increment VIO frame
@@ -1365,6 +1652,8 @@ class VIORunner:
             
             # Scale measurement noise based on filter confidence
             sigma_mag_scaled = sigma_mag * r_scale
+            mag_policy_scales, mag_apply_scales = self._get_sensor_adaptive_scales("MAG")
+            mag_adaptive_info: Dict[str, Any] = {}
             
             # Use filtered yaw instead of raw calibrated mag
             has_ppk = self.ppk_state is not None
@@ -1383,12 +1672,20 @@ class VIORunner:
                 current_phase=self.state.current_phase,  # v3.4.0: state-based phase
                 in_convergence=in_convergence,
                 has_ppk_yaw=has_ppk,
-                timestamp=t,
+                timestamp=mag_rec.t,
                 residual_csv=residual_path,
                 frame=self.state.vio_frame,
                 yaw_override=yaw_mag_filtered,  # NEW: pass filtered yaw directly
                 filter_info=filter_info,  # v2.9.2: track filter rejection reasons
-                use_estimated_bias=self.config.use_mag_estimated_bias  # v3.9.8: freeze states if disabled
+                use_estimated_bias=self.config.use_mag_estimated_bias,  # v3.9.8: freeze states if disabled
+                r_scale_extra=float(mag_apply_scales.get("r_scale", 1.0)),
+                adaptive_info=mag_adaptive_info,
+            )
+            self.record_adaptive_measurement(
+                "MAG",
+                adaptive_info=mag_adaptive_info,
+                timestamp=mag_rec.t,
+                policy_scales=mag_policy_scales,
             )
             
             if applied:
@@ -1605,6 +1902,8 @@ class VIORunner:
         
         time_since_correction = t - getattr(self.kf, 'last_absolute_correction_time', t)
         speed = float(np.linalg.norm(self.kf.x[3:6, 0]))
+        dem_policy_scales, dem_apply_scales = self._get_sensor_adaptive_scales("DEM")
+        dem_adaptive_info: Dict[str, Any] = {}
         
         # Get residual_csv path if debug data is enabled
         residual_path = self.residual_csv if self.config.save_debug_data and hasattr(self, 'residual_csv') else None
@@ -1620,7 +1919,16 @@ class VIORunner:
             no_vision_corrections=(len(self.imgs) == 0 and len(self.vps_list) == 0),
             timestamp=t,
             residual_csv=residual_path,
-            frame=self.state.vio_frame
+            frame=self.state.vio_frame,
+            threshold_scale=float(dem_apply_scales.get("threshold_scale", 1.0)),
+            r_scale_extra=float(dem_apply_scales.get("r_scale", 1.0)),
+            adaptive_info=dem_adaptive_info,
+        )
+        self.record_adaptive_measurement(
+            "DEM",
+            adaptive_info=dem_adaptive_info,
+            timestamp=t,
+            policy_scales=dem_policy_scales,
         )
     
     def log_pose(self, t: float, dt: float, used_vo: bool,
@@ -1747,6 +2055,7 @@ class VIORunner:
         print(f"  estimator_mode: {self.config.estimator_mode}")
         print(f"  fast_mode: {self.config.fast_mode}")
         print(f"  frame_skip: {self.config.frame_skip}")
+        self.initialize_adaptive_controller()
         
         # =================================================================
         # Architecture Selection (v3.8.0: enum-based with full event-driven support)

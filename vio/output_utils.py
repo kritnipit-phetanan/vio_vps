@@ -210,6 +210,68 @@ def log_measurement_update(residual_csv: Optional[str], t: float, frame: int,
         pass
 
 
+def log_adaptive_decision(adaptive_csv: Optional[str],
+                          t: float,
+                          mode: str,
+                          health_state: str,
+                          phase: int,
+                          aiding_age_sec: float,
+                          p_max: float,
+                          p_cond: float,
+                          p_growth_ratio: float,
+                          sigma_accel_scale: float,
+                          gyr_w_scale: float,
+                          acc_w_scale: float,
+                          sigma_unmodeled_gyr_scale: float,
+                          min_yaw_scale: float,
+                          conditioning_max_value: float,
+                          reason: str = ""):
+    """Log one adaptive policy decision row."""
+    if adaptive_csv is None:
+        return
+    try:
+        reason_txt = str(reason).replace(",", ";")
+        with open(adaptive_csv, "a", newline="") as f:
+            f.write(
+                f"{t:.6f},{mode},{health_state},{phase},{aiding_age_sec:.3f},"
+                f"{p_max:.6e},{p_cond:.6e},{p_growth_ratio:.6f},"
+                f"{sigma_accel_scale:.4f},{gyr_w_scale:.4f},{acc_w_scale:.4f},"
+                f"{sigma_unmodeled_gyr_scale:.4f},{min_yaw_scale:.4f},"
+                f"{conditioning_max_value:.6e},{reason_txt}\n"
+            )
+    except Exception:
+        pass
+
+
+def log_sensor_health(sensor_csv: Optional[str],
+                      t: float,
+                      sensor: str,
+                      accepted: bool,
+                      nis_norm: Optional[float],
+                      nis_ewma: float,
+                      accept_rate: float,
+                      mode: str,
+                      health_state: str,
+                      r_scale: float = 1.0,
+                      chi2_scale: float = 1.0,
+                      threshold_scale: float = 1.0,
+                      reproj_scale: float = 1.0,
+                      reason_code: str = ""):
+    """Log per-sensor adaptive health/feedback row."""
+    if sensor_csv is None:
+        return
+    try:
+        nis_value = float('nan') if nis_norm is None else float(nis_norm)
+        with open(sensor_csv, "a", newline="") as f:
+            f.write(
+                f"{t:.6f},{sensor},{int(accepted)},{nis_value:.6f},{nis_ewma:.6f},"
+                f"{accept_rate:.6f},{mode},{health_state},{r_scale:.4f},"
+                f"{chi2_scale:.4f},{threshold_scale:.4f},{reproj_scale:.4f},{reason_code}\n"
+            )
+    except Exception:
+        pass
+
+
 def log_fej_consistency(fej_csv: Optional[str], t: float, frame: int,
                         cam_states: List[Dict], kf: Any):
     """
@@ -1067,5 +1129,22 @@ def init_output_csvs(output_dir: str) -> Dict[str, str]:
     paths['cov_health_csv'] = os.path.join(output_dir, "cov_health.csv")
     with open(paths['cov_health_csv'], "w", newline="") as f:
         f.write("t,update_type,stage,p_trace,p_max,p_min_eig,p_cond,growth_flag,large_flag\n")
+
+    # Adaptive policy decision log
+    paths['adaptive_debug_csv'] = os.path.join(output_dir, "adaptive_debug.csv")
+    with open(paths['adaptive_debug_csv'], "w", newline="") as f:
+        f.write(
+            "t,mode,health_state,phase,aiding_age_sec,p_max,p_cond,p_growth_ratio,"
+            "sigma_accel_scale,gyr_w_scale,acc_w_scale,sigma_unmodeled_gyr_scale,"
+            "min_yaw_scale,conditioning_max_value,reason\n"
+        )
+
+    # Per-sensor adaptive health feedback log
+    paths['sensor_health_csv'] = os.path.join(output_dir, "sensor_health.csv")
+    with open(paths['sensor_health_csv'], "w", newline="") as f:
+        f.write(
+            "t,sensor,accepted,nis_norm,nis_ewma,accept_rate,mode,health_state,"
+            "r_scale,chi2_scale,threshold_scale,reproj_scale,reason_code\n"
+        )
     
     return paths

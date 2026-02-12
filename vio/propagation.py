@@ -13,7 +13,7 @@ import numpy as np
 from typing import Tuple, List, Optional
 from scipy.spatial.transform import Rotation as R_scipy
 
-from .math_utils import skew_symmetric, safe_matrix_inverse
+from .math_utils import skew_symmetric, safe_matrix_inverse, quat_boxplus
 from .imu_preintegration import (
     IMUPreintegration, 
     compute_error_state_jacobian, 
@@ -308,7 +308,7 @@ def propagate_to_timestamp(kf: ExtendedKalmanFilter, target_time: float,
             check_psd=True,
             min_eigenvalue=1e-7,
             log_condition=False,
-            max_value=1e8
+            max_value=getattr(kf, "covariance_max_value", 1e8)
         )
         
         # Update priors
@@ -352,7 +352,7 @@ def propagate_to_timestamp(kf: ExtendedKalmanFilter, target_time: float,
             symmetrize=True,
             check_psd=True,
             min_eigenvalue=1e-7,
-            max_value=1e8
+            max_value=getattr(kf, "covariance_max_value", 1e8)
         )
         
         return True, None
@@ -504,7 +504,8 @@ def _quat_normalize(q: np.ndarray) -> np.ndarray:
 def detect_stationary(a_raw: np.ndarray, w_corr: np.ndarray, v_mag: float,
                       imu_params: dict,
                       acc_threshold: float = 0.5,
-                      gyro_threshold: float = 0.05) -> Tuple[bool, float]:
+                      gyro_threshold: float = 0.05,
+                      vel_threshold: float = float("inf")) -> Tuple[bool, float]:
     """
     Detect if IMU is stationary based on raw measurements.
     
@@ -517,6 +518,7 @@ def detect_stationary(a_raw: np.ndarray, w_corr: np.ndarray, v_mag: float,
         imu_params: IMU parameters dict with 'g_norm'
         acc_threshold: Acceleration deviation threshold (m/s²)
         gyro_threshold: Gyro magnitude threshold (rad/s)
+        vel_threshold: Optional velocity threshold (m/s), use inf to disable
     
     Returns:
         is_stationary: True if IMU appears stationary
@@ -529,7 +531,15 @@ def detect_stationary(a_raw: np.ndarray, w_corr: np.ndarray, v_mag: float,
     expected_acc_mag = g_norm if accel_includes_gravity else 0.0
     acc_deviation = abs(a_raw_mag - expected_acc_mag)
     
-    is_stationary = (acc_deviation < acc_threshold) and (gyro_mag < gyro_threshold)
+    velocity_ok = True
+    if np.isfinite(float(vel_threshold)):
+        velocity_ok = (float(v_mag) < float(vel_threshold))
+
+    is_stationary = (
+        (acc_deviation < acc_threshold)
+        and (gyro_mag < gyro_threshold)
+        and velocity_ok
+    )
     
     return is_stationary, acc_deviation
 
@@ -540,7 +550,14 @@ def apply_zupt(kf: ExtendedKalmanFilter, v_mag: float,
                save_debug: bool = False,
                residual_csv: Optional[str] = None,
                timestamp: float = 0.0,
-               frame: int = -1) -> Tuple[bool, float, int]:
+               frame: int = -1,
+               r_scale: float = 1.0,
+               chi2_scale: float = 1.0,
+               soft_fail_enable: bool = False,
+               soft_fail_r_cap: float = 20.0,
+               soft_fail_hard_reject_factor: float = 3.0,
+               soft_fail_power: float = 1.0,
+               adaptive_info: Optional[dict] = None) -> Tuple[bool, float, int]:
     """
     Apply Zero Velocity Update to constrain velocity to zero.
     
@@ -564,11 +581,44 @@ def apply_zupt(kf: ExtendedKalmanFilter, v_mag: float,
             - updated_consecutive_count: Updated stationary count
     """
     # CRITICAL: Check P matrix validity BEFORE any computation (Step 1: catch explosion early)
+    def _set_adaptive_info(accepted: bool,
+                           chi2: Optional[float],
+                           threshold: Optional[float],
+                           dof: int = 3,
+                           attempted: int = 1,
+                           reason_code: str = "",
+                           r_scale_used: Optional[float] = None,
+                           hard_threshold: Optional[float] = None):
+        if adaptive_info is None:
+            return
+        adaptive_info.clear()
+        if chi2 is not None and np.isfinite(chi2) and dof > 0:
+            nis_norm = float(chi2) / float(dof)
+        else:
+            nis_norm = np.nan
+        if r_scale_used is None:
+            r_scale_used = max(1e-3, float(r_scale))
+        adaptive_info.update({
+            "sensor": "ZUPT",
+            "attempted": int(attempted),
+            "accepted": bool(accepted),
+            "dof": int(dof),
+            "chi2": float(chi2) if chi2 is not None and np.isfinite(chi2) else np.nan,
+            "threshold": float(threshold) if threshold is not None and np.isfinite(threshold) else np.nan,
+            "hard_threshold": float(hard_threshold) if hard_threshold is not None and np.isfinite(hard_threshold) else np.nan,
+            "nis_norm": nis_norm,
+            "r_scale_used": float(r_scale_used),
+            "reason_code": str(reason_code),
+        })
+
+    # CRITICAL: Check P matrix validity BEFORE any computation (Step 1: catch explosion early)
     if not np.all(np.isfinite(kf.P)):
         print(f"[ZUPT] CRITICAL: P matrix contains inf/nan, skipping ZUPT")
+        _set_adaptive_info(False, None, None, attempted=1, reason_code="hard_reject")
         return False, 0.0, consecutive_stationary_count
     
     if v_mag >= max_v_for_zupt:
+        _set_adaptive_info(False, None, None, attempted=0, reason_code="skip_high_velocity")
         return False, 0.0, 0
     
     # Check for large P values that will cause overflow
@@ -576,7 +626,8 @@ def apply_zupt(kf: ExtendedKalmanFilter, v_mag: float,
     if max_p_val > 1e10:
         print(f"[ZUPT] WARNING: P matrix has very large values (max={max_p_val:.2e}), clamping")
         from .ekf import ensure_covariance_valid
-        kf.P = ensure_covariance_valid(kf.P, label="ZUPT-entry", max_value=1e8,
+        kf.P = ensure_covariance_valid(kf.P, label="ZUPT-entry",
+                                       max_value=getattr(kf, "covariance_max_value", 1e8),
                                        symmetrize=True, check_psd=True)
     
     # Calculate dimensions
@@ -607,6 +658,7 @@ def apply_zupt(kf: ExtendedKalmanFilter, v_mag: float,
     # Strengthen for sustained stationary periods
     consecutive_factor = max(1.0, min(10.0, consecutive_stationary_count / 100.0))
     R_zupt = np.diag([base_r / consecutive_factor] * 3)
+    R_zupt *= max(1e-3, float(r_scale)) ** 2
     
     # Compute innovation and Mahalanobis distance for logging
     predicted_vel = kf.x[3:6, 0].reshape(3, 1)
@@ -615,6 +667,7 @@ def apply_zupt(kf: ExtendedKalmanFilter, v_mag: float,
     # CRITICAL: Check P and compute S_zupt with overflow protection
     if not np.all(np.isfinite(kf.P)):
         print(f"[ZUPT] CRITICAL: P matrix contains inf/nan before S_zupt computation")
+        _set_adaptive_info(False, None, None, attempted=1, reason_code="hard_reject")
         return False, 0.0, consecutive_stationary_count
     
     try:
@@ -622,23 +675,91 @@ def apply_zupt(kf: ExtendedKalmanFilter, v_mag: float,
             S_zupt = H_zupt @ kf.P @ H_zupt.T + R_zupt
     except (FloatingPointError, RuntimeWarning) as e:
         print(f"[ZUPT] WARNING: Matmul overflow in S matrix: {e}")
+        _set_adaptive_info(False, None, None, attempted=1, reason_code="hard_reject")
         return False, 0.0, consecutive_stationary_count
     
     if not np.all(np.isfinite(S_zupt)):
         print(f"[ZUPT] WARNING: S_zupt matrix contains inf/nan")
+        _set_adaptive_info(False, None, None, attempted=1, reason_code="hard_reject")
         return False, 0.0, consecutive_stationary_count
     
+    mahal_squared = np.nan
+    mahal_dist = np.nan
     try:
         S_zupt_inv = safe_matrix_inverse(S_zupt, damping=1e-9, method='cholesky')
-        mahal_squared = float(innovation.T @ S_zupt_inv @ innovation)
+        mahal_squared = float((innovation.T @ S_zupt_inv @ innovation).item())
         mahal_dist = np.sqrt(mahal_squared)
-    except:
-        mahal_dist = float('nan')
+    except Exception:
+        mahal_squared = np.nan
+        mahal_dist = np.nan
     
-    # Innovation gating: reject if ZUPT does not match predicted velocity.
-    # 3 dof chi-square 99% threshold
-    chi2_threshold = 11.34
+    # Innovation gating:
+    # - normal_accept: below base threshold
+    # - soft_accept: above base but below hard threshold, with R inflation
+    # - hard_reject: above hard threshold or numerically invalid
+    chi2_threshold = 11.34 * max(1e-3, float(chi2_scale))
+    hard_threshold = chi2_threshold * max(1.0, float(soft_fail_hard_reject_factor))
+    reason_code = "normal_accept"
+    r_scale_used = max(1e-3, float(r_scale))
+    gating_threshold_for_log = chi2_threshold
+
     if np.isfinite(mahal_squared) and mahal_squared > chi2_threshold:
+        if (not bool(soft_fail_enable)) or (mahal_squared > hard_threshold):
+            gating_threshold_for_log = hard_threshold if bool(soft_fail_enable) else chi2_threshold
+            reason_code = "hard_reject"
+            if save_debug and residual_csv:
+                try:
+                    from .output_utils import log_measurement_update
+                    log_measurement_update(
+                        residual_csv, timestamp, frame, 'ZUPT',
+                        innovation=innovation.flatten(),
+                        mahalanobis_dist=mahal_dist,
+                        chi2_threshold=gating_threshold_for_log,
+                        accepted=False,
+                        s_matrix=S_zupt,
+                        p_prior=kf.P
+                    )
+                except Exception:
+                    pass
+            _set_adaptive_info(
+                False,
+                mahal_squared,
+                chi2_threshold,
+                attempted=1,
+                reason_code=reason_code,
+                r_scale_used=r_scale_used,
+                hard_threshold=hard_threshold,
+            )
+            return False, 0.0, 0
+
+        # Fail-soft mode: inflate R as innovation grows, but keep bounded.
+        soft_ratio = max(1.0, float(mahal_squared) / max(chi2_threshold, 1e-9))
+        soft_factor = soft_ratio ** max(0.1, float(soft_fail_power))
+        soft_factor = min(max(1.0, float(soft_fail_r_cap)), soft_factor)
+        if soft_factor > 1.0:
+            R_zupt = R_zupt * soft_factor
+            r_scale_used *= soft_factor
+            try:
+                S_zupt = H_zupt @ kf.P @ H_zupt.T + R_zupt
+                S_zupt_inv = safe_matrix_inverse(S_zupt, damping=1e-9, method='cholesky')
+                mahal_squared = float((innovation.T @ S_zupt_inv @ innovation).item())
+                mahal_dist = np.sqrt(mahal_squared)
+            except Exception:
+                reason_code = "hard_reject"
+                _set_adaptive_info(
+                    False,
+                    np.nan,
+                    chi2_threshold,
+                    attempted=1,
+                    reason_code=reason_code,
+                    r_scale_used=r_scale_used,
+                    hard_threshold=hard_threshold,
+                )
+                return False, 0.0, 0
+        reason_code = "soft_accept"
+
+    elif not np.isfinite(mahal_squared):
+        reason_code = "hard_reject"
         if save_debug and residual_csv:
             try:
                 from .output_utils import log_measurement_update
@@ -646,13 +767,22 @@ def apply_zupt(kf: ExtendedKalmanFilter, v_mag: float,
                     residual_csv, timestamp, frame, 'ZUPT',
                     innovation=innovation.flatten(),
                     mahalanobis_dist=mahal_dist,
-                    chi2_threshold=chi2_threshold,
+                    chi2_threshold=hard_threshold,
                     accepted=False,
                     s_matrix=S_zupt,
                     p_prior=kf.P
                 )
             except Exception:
                 pass
+        _set_adaptive_info(
+            False,
+            mahal_squared,
+            chi2_threshold,
+            attempted=1,
+            reason_code=reason_code,
+            r_scale_used=r_scale_used,
+            hard_threshold=hard_threshold,
+        )
         return False, 0.0, 0
 
     v_before = kf.x[3:6, 0].copy()
@@ -677,7 +807,7 @@ def apply_zupt(kf: ExtendedKalmanFilter, v_mag: float,
                 residual_csv, timestamp, frame, 'ZUPT',
                 innovation=innovation.flatten(),
                 mahalanobis_dist=mahal_dist,
-                chi2_threshold=chi2_threshold,
+                chi2_threshold=gating_threshold_for_log,
                 accepted=True,
                 s_matrix=S_zupt,
                 p_prior=kf.P
@@ -685,9 +815,180 @@ def apply_zupt(kf: ExtendedKalmanFilter, v_mag: float,
         except Exception as e:
             print(f"[ZUPT] Warning: Failed to log to debug_residuals.csv: {e}")
     
+    _set_adaptive_info(
+        True,
+        mahal_squared,
+        chi2_threshold,
+        attempted=1,
+        reason_code=reason_code,
+        r_scale_used=r_scale_used,
+        hard_threshold=hard_threshold,
+    )
     updated_count = consecutive_stationary_count + 1
     
     return True, v_reduction, updated_count
+
+
+def apply_gravity_roll_pitch_update(kf: ExtendedKalmanFilter,
+                                    a_raw: np.ndarray,
+                                    w_corr: np.ndarray,
+                                    imu_params: dict,
+                                    sigma_rad: float = np.deg2rad(7.0),
+                                    r_scale: float = 1.0,
+                                    chi2_scale: float = 1.0,
+                                    acc_norm_tolerance: float = 0.25,
+                                    max_gyro_rad_s: float = 0.40,
+                                    save_debug: bool = False,
+                                    residual_csv: Optional[str] = None,
+                                    timestamp: float = 0.0,
+                                    frame: int = -1,
+                                    adaptive_info: Optional[dict] = None) -> Tuple[bool, str]:
+    """
+    Pseudo-measurement for roll/pitch stabilization using gravity direction.
+
+    Notes:
+    - Intended for IMU-only mode where no external aiding is available.
+    - Uses only gravity direction (2D projection), so yaw remains effectively free.
+    """
+
+    def _set_adaptive_info(accepted: bool,
+                           chi2: Optional[float],
+                           threshold: Optional[float],
+                           attempted: int,
+                           reason_code: str):
+        if adaptive_info is None:
+            return
+        adaptive_info.clear()
+        dof = 2
+        nis_norm = np.nan
+        if chi2 is not None and np.isfinite(chi2):
+            nis_norm = float(chi2) / float(dof)
+        adaptive_info.update({
+            "sensor": "GRAVITY_RP",
+            "attempted": int(attempted),
+            "accepted": bool(accepted),
+            "dof": int(dof),
+            "chi2": float(chi2) if chi2 is not None and np.isfinite(chi2) else np.nan,
+            "threshold": float(threshold) if threshold is not None and np.isfinite(threshold) else np.nan,
+            "nis_norm": nis_norm,
+            "r_scale_used": float(max(1e-3, r_scale)),
+            "reason_code": str(reason_code),
+        })
+
+    if not np.all(np.isfinite(kf.P)):
+        _set_adaptive_info(False, None, None, attempted=1, reason_code="hard_reject")
+        return False, "P invalid"
+
+    accel_includes_gravity = bool(imu_params.get("accel_includes_gravity", True))
+    if not accel_includes_gravity:
+        _set_adaptive_info(False, None, None, attempted=0, reason_code="skip_no_gravity_signal")
+        return False, "accel_includes_gravity=false"
+
+    a_norm = float(np.linalg.norm(a_raw))
+    gyro_mag = float(np.linalg.norm(w_corr))
+    g_norm = float(imu_params.get("g_norm", 9.80665))
+    if (not np.isfinite(a_norm)) or a_norm < 1e-6:
+        _set_adaptive_info(False, None, None, attempted=0, reason_code="skip_bad_acc_norm")
+        return False, "invalid accel norm"
+
+    acc_dev_ratio = abs(a_norm - g_norm) / max(g_norm, 1e-6)
+    if acc_dev_ratio > max(0.01, float(acc_norm_tolerance)):
+        _set_adaptive_info(False, None, None, attempted=0, reason_code="skip_dynamic_acc")
+        return False, "dynamic accel"
+    if gyro_mag > max(1e-3, float(max_gyro_rad_s)):
+        _set_adaptive_info(False, None, None, attempted=0, reason_code="skip_dynamic_gyro")
+        return False, "dynamic gyro"
+
+    q = kf.x[6:10, 0].reshape(4,)
+    g_world_unit = np.array([0.0, 0.0, -1.0], dtype=float)
+
+    def _predict_gravity_xy_from_q(q_wxyz: np.ndarray) -> np.ndarray:
+        q_xyzw = np.array([q_wxyz[1], q_wxyz[2], q_wxyz[3], q_wxyz[0]], dtype=float)
+        R_wb = R_scipy.from_quat(q_xyzw).as_matrix()  # world -> body
+        g_body = R_wb @ g_world_unit
+        return g_body[0:2].reshape(2, 1)
+
+    z = (a_raw.reshape(3,) / a_norm)[0:2].reshape(2, 1)
+    h = _predict_gravity_xy_from_q(q)
+    innovation = z - h
+
+    num_clones = (kf.x.shape[0] - 19) // 7
+    err_dim = 18 + 6 * num_clones
+    H = np.zeros((2, err_dim), dtype=float)
+    eps = 1e-5
+    for axis in range(3):
+        dtheta = np.zeros(3, dtype=float)
+        dtheta[axis] = eps
+        q_plus = quat_boxplus(q, dtheta)
+        q_minus = quat_boxplus(q, -dtheta)
+        h_plus = _predict_gravity_xy_from_q(q_plus)
+        h_minus = _predict_gravity_xy_from_q(q_minus)
+        H[:, 6 + axis] = ((h_plus - h_minus) / (2.0 * eps)).reshape(2,)
+
+    sigma_eff = max(1e-4, float(sigma_rad) * max(1e-3, float(r_scale)))
+    R_meas = np.eye(2, dtype=float) * (sigma_eff ** 2)
+
+    try:
+        S = H @ kf.P @ H.T + R_meas
+        S_inv = safe_matrix_inverse(S, damping=1e-9, method='cholesky')
+        m2 = float((innovation.T @ S_inv @ innovation).item())
+        mahal_dist = float(np.sqrt(max(0.0, m2)))
+    except Exception:
+        _set_adaptive_info(False, np.nan, np.nan, attempted=1, reason_code="hard_reject")
+        return False, "S inverse failed"
+
+    chi2_threshold = 9.21 * max(1e-3, float(chi2_scale))  # 2 dof, 99%
+    if np.isfinite(m2) and m2 > chi2_threshold:
+        if save_debug and residual_csv:
+            try:
+                from .output_utils import log_measurement_update
+                log_measurement_update(
+                    residual_csv, timestamp, frame, 'GRAVITY_RP',
+                    innovation=innovation.flatten(),
+                    mahalanobis_dist=mahal_dist,
+                    chi2_threshold=chi2_threshold,
+                    accepted=False,
+                    s_matrix=S,
+                    p_prior=kf.P
+                )
+            except Exception:
+                pass
+        _set_adaptive_info(False, m2, chi2_threshold, attempted=1, reason_code="hard_reject")
+        return False, "chi2 reject"
+
+    def h_jacobian(_x, h_mat=H):
+        return h_mat
+
+    def hx_fun(x_state):
+        q_state = x_state[6:10].reshape(4,)
+        return _predict_gravity_xy_from_q(q_state)
+
+    kf.update(
+        z=z,
+        HJacobian=h_jacobian,
+        Hx=hx_fun,
+        R=R_meas,
+        update_type="GRAVITY_RP",
+        timestamp=timestamp,
+    )
+
+    if save_debug and residual_csv:
+        try:
+            from .output_utils import log_measurement_update
+            log_measurement_update(
+                residual_csv, timestamp, frame, 'GRAVITY_RP',
+                innovation=innovation.flatten(),
+                mahalanobis_dist=mahal_dist,
+                chi2_threshold=chi2_threshold,
+                accepted=True,
+                s_matrix=S,
+                p_prior=kf.P
+            )
+        except Exception:
+            pass
+
+    _set_adaptive_info(True, m2, chi2_threshold, attempted=1, reason_code="normal_accept")
+    return True, "applied"
 
 
 # =============================================================================

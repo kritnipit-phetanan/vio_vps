@@ -351,6 +351,7 @@ class ExtendedKalmanFilter:
         self._cov_health_csv = None
         self._cov_prev_pmax = None
         self._cov_prev_trace = None
+        self.covariance_max_value = 1e8
         self._cov_growth_stats = defaultdict(lambda: {
             "samples": 0,
             "growth_events": 0,
@@ -361,6 +362,15 @@ class ExtendedKalmanFilter:
     def enable_cov_health_logging(self, csv_path: str):
         """Enable covariance health CSV logging."""
         self._cov_health_csv = csv_path
+
+    def set_covariance_max_value(self, max_value: float):
+        """Set adaptive absolute cap used by covariance conditioning."""
+        try:
+            value = float(max_value)
+        except (TypeError, ValueError):
+            return
+        if np.isfinite(value) and value > 0:
+            self.covariance_max_value = value
     
     def log_cov_health(self, update_type: str, timestamp: float = float('nan'),
                        stage: str = "post"):
@@ -615,7 +625,7 @@ class ExtendedKalmanFilter:
             symmetrize=True,
             check_psd=True,
             min_eigenvalue=1e-7,
-            max_value=1e8
+            max_value=getattr(self, "covariance_max_value", 1e8)
         )
         
         # Covariance floor
