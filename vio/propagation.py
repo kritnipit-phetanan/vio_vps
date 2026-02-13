@@ -726,8 +726,8 @@ def apply_zupt(kf: ExtendedKalmanFilter, v_mag: float,
     gating_threshold_for_log = chi2_threshold
 
     if np.isfinite(mahal_squared) and mahal_squared > chi2_threshold:
-        if (not bool(soft_fail_enable)) or (mahal_squared > hard_threshold):
-            gating_threshold_for_log = hard_threshold if bool(soft_fail_enable) else chi2_threshold
+        if not bool(soft_fail_enable):
+            gating_threshold_for_log = chi2_threshold
             reason_code = "hard_reject"
             if save_debug and residual_csv:
                 try:
@@ -754,7 +754,8 @@ def apply_zupt(kf: ExtendedKalmanFilter, v_mag: float,
             )
             return False, 0.0, 0
 
-        # Fail-soft mode: inflate R as innovation grows, but keep bounded.
+        # Fail-soft mode: always try bounded R inflation first, even when
+        # raw chi2 is above hard threshold, then decide hard reject.
         soft_ratio = max(1.0, float(mahal_squared) / max(chi2_threshold, 1e-9))
         soft_factor = soft_ratio ** max(0.1, float(soft_fail_power))
         soft_factor = min(max(1.0, float(soft_fail_r_cap)), soft_factor)
@@ -778,6 +779,34 @@ def apply_zupt(kf: ExtendedKalmanFilter, v_mag: float,
                     hard_threshold=hard_threshold,
                 )
                 return False, 0.0, 0
+
+        if (not np.isfinite(mahal_squared)) or (mahal_squared > hard_threshold):
+            gating_threshold_for_log = hard_threshold
+            reason_code = "hard_reject"
+            if save_debug and residual_csv:
+                try:
+                    from .output_utils import log_measurement_update
+                    log_measurement_update(
+                        residual_csv, timestamp, frame, 'ZUPT',
+                        innovation=innovation.flatten(),
+                        mahalanobis_dist=mahal_dist,
+                        chi2_threshold=gating_threshold_for_log,
+                        accepted=False,
+                        s_matrix=S_zupt,
+                        p_prior=kf.P
+                    )
+                except Exception:
+                    pass
+            _set_adaptive_info(
+                False,
+                mahal_squared,
+                chi2_threshold,
+                attempted=1,
+                reason_code=reason_code,
+                r_scale_used=r_scale_used,
+                hard_threshold=hard_threshold,
+            )
+            return False, 0.0, 0
         reason_code = "soft_accept"
 
     elif not np.isfinite(mahal_squared):
@@ -1018,11 +1047,17 @@ def apply_yaw_pseudo_update(kf: ExtendedKalmanFilter,
                             w_corr: np.ndarray,
                             imu_params: dict,
                             yaw_ref_rad: float,
+                            velocity_enu: Optional[np.ndarray] = None,
                             sigma_rad: float = np.deg2rad(35.0),
                             r_scale: float = 1.0,
                             chi2_scale: float = 1.0,
                             acc_norm_tolerance: float = 0.25,
                             max_gyro_rad_s: float = 0.40,
+                            motion_consistency_enable: bool = False,
+                            motion_min_speed_m_s: float = 20.0,
+                            motion_speed_full_m_s: float = 90.0,
+                            motion_weight_max: float = 0.18,
+                            motion_max_yaw_error_deg: float = 70.0,
                             soft_fail_enable: bool = True,
                             soft_fail_r_cap: float = 12.0,
                             soft_fail_hard_reject_factor: float = 3.0,
@@ -1039,6 +1074,8 @@ def apply_yaw_pseudo_update(kf: ExtendedKalmanFilter,
     - normal_accept: below base gate
     - soft_accept: above base gate, but accepted after R inflation
     - hard_reject: above hard gate / numerically invalid
+    - optional motion consistency blend: nudges yaw_ref toward velocity heading
+      only when horizontal speed is sufficiently high and heading disagreement is small
     """
 
     def _set_adaptive_info(accepted: bool,
@@ -1099,7 +1136,26 @@ def apply_yaw_pseudo_update(kf: ExtendedKalmanFilter,
         yaw = quaternion_to_yaw(q_wxyz)
         return np.array([[np.cos(yaw)], [np.sin(yaw)]], dtype=float)
 
-    z = np.array([[np.cos(float(yaw_ref_rad))], [np.sin(float(yaw_ref_rad))]], dtype=float)
+    yaw_target_rad = float(yaw_ref_rad)
+    if motion_consistency_enable and velocity_enu is not None:
+        vel = np.asarray(velocity_enu, dtype=float).reshape(-1)
+        if vel.size >= 2 and np.all(np.isfinite(vel[:2])):
+            speed_xy = float(np.linalg.norm(vel[:2]))
+            min_speed = max(0.1, float(motion_min_speed_m_s))
+            if speed_xy >= min_speed:
+                yaw_motion = float(np.arctan2(vel[1], vel[0]))
+                yaw_delta = float(np.arctan2(np.sin(yaw_motion - yaw_target_rad), np.cos(yaw_motion - yaw_target_rad)))
+                yaw_delta_max = np.deg2rad(max(1.0, float(motion_max_yaw_error_deg)))
+                if abs(yaw_delta) <= yaw_delta_max:
+                    full_speed = max(min_speed + 1e-3, float(motion_speed_full_m_s))
+                    speed_gain = min(1.0, max(0.0, (speed_xy - min_speed) / (full_speed - min_speed)))
+                    blend = min(0.5, max(0.0, float(motion_weight_max))) * speed_gain
+                    yaw_target_rad = float(np.arctan2(
+                        np.sin(yaw_target_rad + blend * yaw_delta),
+                        np.cos(yaw_target_rad + blend * yaw_delta),
+                    ))
+
+    z = np.array([[np.cos(yaw_target_rad)], [np.sin(yaw_target_rad)]], dtype=float)
     h = _predict_yaw_cs(q)
     innovation = z - h
 

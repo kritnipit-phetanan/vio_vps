@@ -95,6 +95,12 @@ imu:
     spinup_vibration_thresh: 0.3       # rad/s - gyro std above this = high vibration
     spinup_altitude_change_thresh: 5.0 # m - altitude change below this = still on ground
     early_velocity_sigma_thresh: 3.0   # m/s - velocity uncertainty above this = unconverged
+    hysteresis_enabled: true
+    up_hold_sec: 0.75
+    down_hold_sec: 6.0
+    allow_normal_to_early: true
+    revert_max_speed: 18.0
+    revert_max_alt_change: 60.0
   
   # Preintegration-specific (v3.7.2: REDUCE bias random walk to prevent divergence)
   # Previous v2.9.9.10 with 3× increase caused MASSIVE bias drift:
@@ -477,18 +483,18 @@ adaptive:
         "2": {r_scale: 1.00}
     zupt_fail_soft:
       enabled: true
-      hard_reject_factor: 3.0
-      max_r_scale: 20.0
+      hard_reject_factor: 4.5
+      max_r_scale: 40.0
       inflate_power: 1.0
       health_hard_factor:
         HEALTHY: 1.0
-        WARNING: 1.2
-        DEGRADED: 1.5
+        WARNING: 1.15
+        DEGRADED: 1.35
         RECOVERY: 1.1
       health_r_cap_factor:
         HEALTHY: 1.0
         WARNING: 1.2
-        DEGRADED: 1.5
+        DEGRADED: 1.4
         RECOVERY: 1.1
     gravity_alignment:
       enabled_imu_only: true
@@ -518,6 +524,11 @@ adaptive:
       high_speed_m_s: 180.0
       high_speed_sigma_mult: 1.15
       high_speed_period_mult: 1.2
+      motion_consistency_enable: true
+      motion_min_speed_m_s: 20.0
+      motion_speed_full_m_s: 90.0
+      motion_weight_max: 0.18
+      motion_max_yaw_error_deg: 70.0
       health_sigma_mult:
         HEALTHY: 1.0
         WARNING: 1.2
@@ -624,7 +635,7 @@ trn:
 # VPS Configuration (Visual Positioning System - Satellite Matching)
 # ============================================================================
 vps:
-  enabled: false
+  enabled: true                    # Enable VPS module
   
   # Processing parameters
   output_size: [512, 512]          # Output patch size for matching

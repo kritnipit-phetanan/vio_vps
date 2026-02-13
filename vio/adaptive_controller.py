@@ -204,19 +204,19 @@ class AdaptiveController:
             },
             "zupt_fail_soft": {
                 "enabled": True,
-                "hard_reject_factor": 3.0,
-                "max_r_scale": 20.0,
+                "hard_reject_factor": 4.5,
+                "max_r_scale": 40.0,
                 "inflate_power": 1.0,
                 "health_hard_factor": {
                     HEALTHY: 1.0,
-                    WARNING: 1.2,
-                    DEGRADED: 1.5,
+                    WARNING: 1.15,
+                    DEGRADED: 1.35,
                     RECOVERY: 1.1,
                 },
                 "health_r_cap_factor": {
                     HEALTHY: 1.0,
                     WARNING: 1.2,
-                    DEGRADED: 1.5,
+                    DEGRADED: 1.4,
                     RECOVERY: 1.1,
                 },
             },
@@ -255,6 +255,11 @@ class AdaptiveController:
                 "high_speed_m_s": 180.0,
                 "high_speed_sigma_mult": 1.15,
                 "high_speed_period_mult": 1.2,
+                "motion_consistency_enable": True,
+                "motion_min_speed_m_s": 20.0,
+                "motion_speed_full_m_s": 90.0,
+                "motion_weight_max": 0.18,
+                "motion_max_yaw_error_deg": 70.0,
                 "chi2_scale": 1.0,
                 "ref_alpha": 0.005,
                 "dynamic_ref_alpha": 0.05,
@@ -635,6 +640,22 @@ class AdaptiveController:
                 )
                 sensor_scales["high_speed_period_mult"] = max(
                     1.0, float(yaw_cfg.get("high_speed_period_mult", 1.0))
+                )
+                sensor_scales["motion_consistency_enable"] = 1.0 if bool(
+                    yaw_cfg.get("motion_consistency_enable", False)
+                ) else 0.0
+                sensor_scales["motion_min_speed_m_s"] = max(
+                    0.1, float(yaw_cfg.get("motion_min_speed_m_s", 20.0))
+                )
+                sensor_scales["motion_speed_full_m_s"] = max(
+                    float(sensor_scales["motion_min_speed_m_s"]) + 1e-3,
+                    float(yaw_cfg.get("motion_speed_full_m_s", 90.0)),
+                )
+                sensor_scales["motion_weight_max"] = _clamp(
+                    float(yaw_cfg.get("motion_weight_max", 0.18)), 0.0, 0.5
+                )
+                sensor_scales["motion_max_yaw_error_deg"] = _clamp(
+                    float(yaw_cfg.get("motion_max_yaw_error_deg", 70.0)), 5.0, 179.0
                 )
                 sensor_scales["ref_alpha"] = max(0.0, float(yaw_cfg.get("ref_alpha", 0.005)))
                 sensor_scales["dynamic_ref_alpha"] = max(

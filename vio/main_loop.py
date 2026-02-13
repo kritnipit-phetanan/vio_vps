@@ -113,6 +113,10 @@ class VIOState:
     
     # Flight phase
     current_phase: int = 0  # 0=SPINUP, 1=EARLY, 2=NORMAL
+    phase_initialized: bool = False
+    phase_raw: int = 0
+    phase_candidate: int = -1
+    phase_candidate_hold_sec: float = 0.0
     
     # Feature tracking
     cam_states: List[dict] = field(default_factory=list)
@@ -151,6 +155,12 @@ class VIORunner:
         self.PHASE_SPINUP_VIBRATION_THRESH = 0.3
         self.PHASE_SPINUP_ALT_CHANGE_THRESH = 5.0
         self.PHASE_EARLY_VELOCITY_SIGMA_THRESH = 3.0
+        self.PHASE_HYSTERESIS_ENABLED = True
+        self.PHASE_UP_HOLD_SEC = 0.75
+        self.PHASE_DOWN_HOLD_SEC = 6.0
+        self.PHASE_ALLOW_NORMAL_TO_EARLY = True
+        self.PHASE_REVERT_MAX_SPEED = 18.0
+        self.PHASE_REVERT_MAX_ALT_CHANGE = 60.0
         
         # These will be initialized in run()
         self.kf = None
@@ -241,6 +251,12 @@ class VIORunner:
             self.PHASE_SPINUP_VIBRATION_THRESH = cfg.get('PHASE_SPINUP_VIBRATION_THRESH', 0.3)
             self.PHASE_SPINUP_ALT_CHANGE_THRESH = cfg.get('PHASE_SPINUP_ALT_CHANGE_THRESH', 5.0)
             self.PHASE_EARLY_VELOCITY_SIGMA_THRESH = cfg.get('PHASE_EARLY_VELOCITY_SIGMA_THRESH', 3.0)
+            self.PHASE_HYSTERESIS_ENABLED = bool(cfg.get('PHASE_HYSTERESIS_ENABLED', True))
+            self.PHASE_UP_HOLD_SEC = float(cfg.get('PHASE_UP_HOLD_SEC', 0.75))
+            self.PHASE_DOWN_HOLD_SEC = float(cfg.get('PHASE_DOWN_HOLD_SEC', 6.0))
+            self.PHASE_ALLOW_NORMAL_TO_EARLY = bool(cfg.get('PHASE_ALLOW_NORMAL_TO_EARLY', True))
+            self.PHASE_REVERT_MAX_SPEED = float(cfg.get('PHASE_REVERT_MAX_SPEED', 18.0))
+            self.PHASE_REVERT_MAX_ALT_CHANGE = float(cfg.get('PHASE_REVERT_MAX_ALT_CHANGE', 60.0))
             
             return cfg
         return {}
@@ -762,6 +778,11 @@ class VIORunner:
             "ref_alpha": 0.005,
             "dynamic_ref_alpha": 0.05,
             "period_steps": 8.0,
+            "motion_consistency_enable": 0.0,
+            "motion_min_speed_m_s": 8.0,
+            "motion_speed_full_m_s": 90.0,
+            "motion_weight_max": 0.20,
+            "motion_max_yaw_error_deg": 75.0,
             "sigma_bg_rad_s": np.deg2rad(0.30),
             "sigma_ba_m_s2": 0.15,
             "enable_when_no_aiding": 1.0,
@@ -776,6 +797,80 @@ class VIORunner:
         policy = decision.sensor_scale(sensor)
         applied = dict(policy) if decision.apply_measurement else dict(default)
         return policy, applied
+
+    def estimate_flight_phase(self,
+                              velocity: Optional[np.ndarray],
+                              velocity_sigma: Optional[float],
+                              vibration_level: Optional[float],
+                              altitude_change: Optional[float],
+                              dt: float) -> int:
+        """
+        Estimate flight phase with hysteresis / one-way protection.
+
+        This avoids frequent NORMAL->EARLY regression when velocity covariance
+        momentarily spikes late in flight.
+        """
+        raw_phase, _ = get_flight_phase(
+            velocity=velocity,
+            velocity_sigma=velocity_sigma,
+            vibration_level=vibration_level,
+            altitude_change=altitude_change,
+            spinup_velocity_thresh=self.PHASE_SPINUP_VELOCITY_THRESH,
+            spinup_vibration_thresh=self.PHASE_SPINUP_VIBRATION_THRESH,
+            spinup_alt_change_thresh=self.PHASE_SPINUP_ALT_CHANGE_THRESH,
+            early_velocity_sigma_thresh=self.PHASE_EARLY_VELOCITY_SIGMA_THRESH,
+        )
+        raw_phase = int(raw_phase)
+        self.state.phase_raw = raw_phase
+
+        if not self.state.phase_initialized:
+            self.state.current_phase = raw_phase
+            self.state.phase_initialized = True
+            self.state.phase_candidate = -1
+            self.state.phase_candidate_hold_sec = 0.0
+            return self.state.current_phase
+
+        if not bool(self.PHASE_HYSTERESIS_ENABLED):
+            self.state.current_phase = raw_phase
+            self.state.phase_candidate = -1
+            self.state.phase_candidate_hold_sec = 0.0
+            return self.state.current_phase
+
+        current_phase = int(self.state.current_phase)
+        target_phase = raw_phase
+        speed_xy = float(np.linalg.norm(velocity[:2])) if velocity is not None and len(velocity) >= 2 else 0.0
+        alt_abs = abs(float(altitude_change)) if altitude_change is not None and np.isfinite(altitude_change) else 0.0
+
+        # One-way protection: keep NORMAL unless we have sustained landing-like motion.
+        if current_phase == 2 and raw_phase < 2:
+            allow_revert = bool(self.PHASE_ALLOW_NORMAL_TO_EARLY)
+            allow_revert = allow_revert and speed_xy <= max(0.1, float(self.PHASE_REVERT_MAX_SPEED))
+            allow_revert = allow_revert and alt_abs <= max(0.1, float(self.PHASE_REVERT_MAX_ALT_CHANGE))
+            if not allow_revert:
+                target_phase = 2
+
+        # Avoid jumping SPINUP->NORMAL directly.
+        if current_phase == 0 and target_phase == 2:
+            target_phase = 1
+
+        dt_eff = max(0.0, float(dt))
+        if target_phase != current_phase:
+            if int(self.state.phase_candidate) != int(target_phase):
+                self.state.phase_candidate = int(target_phase)
+                self.state.phase_candidate_hold_sec = dt_eff
+            else:
+                self.state.phase_candidate_hold_sec += dt_eff
+
+            hold_sec = float(self.PHASE_UP_HOLD_SEC) if target_phase > current_phase else float(self.PHASE_DOWN_HOLD_SEC)
+            if self.state.phase_candidate_hold_sec >= max(0.0, hold_sec):
+                self.state.current_phase = int(target_phase)
+                self.state.phase_candidate = -1
+                self.state.phase_candidate_hold_sec = 0.0
+        else:
+            self.state.phase_candidate = -1
+            self.state.phase_candidate_hold_sec = 0.0
+
+        return int(self.state.current_phase)
 
     def update_adaptive_policy(self, t: float, phase: int) -> Optional[AdaptiveDecision]:
         """Evaluate adaptive controller for current filter health snapshot."""
@@ -1085,11 +1180,17 @@ class VIORunner:
                     w_corr=w_corr,
                     imu_params=imu_params,
                     yaw_ref_rad=float(self._imu_only_yaw_ref),
+                    velocity_enu=x[3:6].astype(float),
                     sigma_rad=np.deg2rad(yaw_sigma_deg),
                     r_scale=float(yaw_apply_scales.get("r_scale", 1.0)),
                     chi2_scale=float(yaw_apply_scales.get("chi2_scale", 1.0)),
                     acc_norm_tolerance=float(yaw_apply_scales.get("acc_norm_tolerance", 0.25)),
                     max_gyro_rad_s=float(yaw_apply_scales.get("max_gyro_rad_s", 0.40)),
+                    motion_consistency_enable=bool(float(yaw_apply_scales.get("motion_consistency_enable", 0.0)) >= 0.5),
+                    motion_min_speed_m_s=float(yaw_apply_scales.get("motion_min_speed_m_s", 20.0)),
+                    motion_speed_full_m_s=float(yaw_apply_scales.get("motion_speed_full_m_s", 90.0)),
+                    motion_weight_max=float(yaw_apply_scales.get("motion_weight_max", 0.18)),
+                    motion_max_yaw_error_deg=float(yaw_apply_scales.get("motion_max_yaw_error_deg", 70.0)),
                     soft_fail_enable=bool(float(yaw_apply_scales.get("fail_soft_enable", 0.0)) >= 0.5),
                     soft_fail_r_cap=float(yaw_apply_scales.get("soft_r_cap", 12.0)),
                     soft_fail_hard_reject_factor=float(yaw_apply_scales.get("hard_reject_factor", 3.0)),

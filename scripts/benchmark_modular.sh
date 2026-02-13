@@ -80,7 +80,7 @@ GROUND_TRUTH="${DATASET_BASE}/bell412_dataset3_frl.pos"
 #   full: require IMU+GT+CAM+MAG+DEM
 #   imu_cam: require IMU+GT+CAM
 #   imu_only: IMU+GT only
-RUN_MODE="${RUN_MODE:-imu_only}"
+RUN_MODE="${RUN_MODE:-auto}"
 
 # Output directory
 OUTPUT_DIR="benchmark_modular_${TEST_ID}/preintegration"

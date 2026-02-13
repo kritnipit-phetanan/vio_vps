@@ -267,6 +267,12 @@ def load_config(config_path: str) -> VIOConfig:
     result['PHASE_SPINUP_VIBRATION_THRESH'] = phase_detection.get('spinup_vibration_thresh', 0.3)
     result['PHASE_SPINUP_ALT_CHANGE_THRESH'] = phase_detection.get('spinup_altitude_change_thresh', 5.0)
     result['PHASE_EARLY_VELOCITY_SIGMA_THRESH'] = phase_detection.get('early_velocity_sigma_thresh', 3.0)
+    result['PHASE_HYSTERESIS_ENABLED'] = bool(phase_detection.get('hysteresis_enabled', True))
+    result['PHASE_UP_HOLD_SEC'] = float(phase_detection.get('up_hold_sec', 0.75))
+    result['PHASE_DOWN_HOLD_SEC'] = float(phase_detection.get('down_hold_sec', 6.0))
+    result['PHASE_ALLOW_NORMAL_TO_EARLY'] = bool(phase_detection.get('allow_normal_to_early', True))
+    result['PHASE_REVERT_MAX_SPEED'] = float(phase_detection.get('revert_max_speed', 18.0))
+    result['PHASE_REVERT_MAX_ALT_CHANGE'] = float(phase_detection.get('revert_max_alt_change', 60.0))
 
     # ZUPT defaults (used by IMU helper path; adaptive may scale these values)
     zupt = config.get('zupt', {})
@@ -588,19 +594,19 @@ def load_config(config_path: str) -> VIOConfig:
             },
             'zupt_fail_soft': {
                 'enabled': True,
-                'hard_reject_factor': 3.0,
-                'max_r_scale': 20.0,
+                'hard_reject_factor': 4.5,
+                'max_r_scale': 40.0,
                 'inflate_power': 1.0,
                 'health_hard_factor': {
                     'HEALTHY': 1.0,
-                    'WARNING': 1.2,
-                    'DEGRADED': 1.5,
+                    'WARNING': 1.15,
+                    'DEGRADED': 1.35,
                     'RECOVERY': 1.1,
                 },
                 'health_r_cap_factor': {
                     'HEALTHY': 1.0,
                     'WARNING': 1.2,
-                    'DEGRADED': 1.5,
+                    'DEGRADED': 1.4,
                     'RECOVERY': 1.1,
                 },
             },
@@ -639,6 +645,11 @@ def load_config(config_path: str) -> VIOConfig:
                 'high_speed_m_s': 180.0,
                 'high_speed_sigma_mult': 1.15,
                 'high_speed_period_mult': 1.2,
+                'motion_consistency_enable': True,
+                'motion_min_speed_m_s': 20.0,
+                'motion_speed_full_m_s': 90.0,
+                'motion_weight_max': 0.18,
+                'motion_max_yaw_error_deg': 70.0,
                 'chi2_scale': 1.0,
                 'ref_alpha': 0.005,
                 'dynamic_ref_alpha': 0.05,

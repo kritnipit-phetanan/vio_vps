@@ -12,7 +12,7 @@ from scipy.spatial.transform import Rotation as R_scipy
 
 from .imu_preintegration import IMUPreintegration
 from .propagation import (
-    process_imu, get_flight_phase, VibrationDetector
+    process_imu, VibrationDetector
 )
 from .magnetometer import reset_mag_filter_state, set_mag_constants
 from .trn import create_trn_from_config
@@ -180,16 +180,13 @@ def run_imu_driven_loop(runner):
         
         altitude_change = runner.kf.x[2, 0] - runner.initial_msl if runner.kf is not None else 0.0
         
-        # Get flight phase (v3.4.0: pure state-based with config thresholds)
-        phase_num, _ = get_flight_phase(
+        # Flight phase with hysteresis/one-way protection.
+        phase_num = runner.estimate_flight_phase(
             velocity=velocity,
             velocity_sigma=velocity_sigma,
             vibration_level=vibration_level,
             altitude_change=altitude_change,
-            spinup_velocity_thresh=runner.PHASE_SPINUP_VELOCITY_THRESH,
-            spinup_vibration_thresh=runner.PHASE_SPINUP_VIBRATION_THRESH,
-            spinup_alt_change_thresh=runner.PHASE_SPINUP_ALT_CHANGE_THRESH,
-            early_velocity_sigma_thresh=runner.PHASE_EARLY_VELOCITY_SIGMA_THRESH
+            dt=dt,
         )
         runner.state.current_phase = phase_num
         runner.update_adaptive_policy(t=t, phase=phase_num)
