@@ -105,26 +105,6 @@ def quaternion_from_rotation(R: np.ndarray) -> np.ndarray:
     return np.array([q_xyzw[3], q_xyzw[0], q_xyzw[1], q_xyzw[2]])
 
 
-def initialize_quaternion_from_ppk(ppk_state: Any) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Initialize quaternion from PPK ground truth attitude.
-    
-    Args:
-        ppk_state: PPKInitialState object with roll, pitch, yaw
-        
-    Returns:
-        Tuple of (quaternion [w,x,y,z], R_body_to_world 3x3)
-    """
-    R_BW = build_rotation_from_ppk(ppk_state.roll, ppk_state.pitch, ppk_state.yaw)
-    q_init = quaternion_from_rotation(R_BW)
-    
-    # Verify body Z direction (should be negative for FRD body)
-    body_z_world = R_BW[:, 2]
-    print(f"[PPK→FRD] Body Z in world: {body_z_world}, Z-component: {body_z_world[2]:.4f}")
-    
-    return q_init, R_BW
-
-
 def initialize_quaternion_from_imu(imu_quat_xyzw: np.ndarray,
                                    ground_truth_yaw_ned: Optional[float] = None,
                                    ground_truth_yaw_enu: Optional[float] = None) -> np.ndarray:
@@ -583,22 +563,6 @@ def get_num_clones(kf) -> int:
     return (kf.x.shape[0] - 19) // 7
 
 
-def get_error_state_dim(kf) -> int:
-    """
-    Get error state dimension (18 + 6*M).
-    
-    v3.9.7: Updated for 18D core error state
-    
-    Args:
-        kf: ExtendedKalmanFilter instance
-        
-    Returns:
-        Error state dimension
-    """
-    num_clones = get_num_clones(kf)
-    return 18 + 6 * num_clones
-
-
 # ===============================
 # IMU-GNSS Lever Arm Compensation
 # ===============================
@@ -648,16 +612,3 @@ def imu_to_gnss_position(p_imu_enu: np.ndarray,
     p_gnss = p_imu_enu + lever_arm_world
     return p_gnss
 
-
-def load_ground_truth_initial_yaw(path: str) -> Optional[float]:
-    """
-    Load initial yaw (heading) from PPK ground truth file.
-    (Legacy function - use load_ppk_initial_state() for comprehensive data)
-    
-    Returns yaw in radians (NED convention: 0=North, positive=CW) or None if not found.
-    """
-    from .data_loaders import load_ppk_initial_state
-    state = load_ppk_initial_state(path)
-    if state is not None:
-        return state.yaw
-    return None
