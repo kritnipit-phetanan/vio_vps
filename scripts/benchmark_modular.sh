@@ -19,6 +19,15 @@
 #   bash scripts/benchmark_modular.sh
 # ============================================================================
 
+# Ensure script is executed by bash (not sh/zsh/source)
+if [ -z "${BASH_VERSION:-}" ]; then
+    exec /usr/bin/env bash "$0" "$@"
+fi
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+    echo "❌ Please run (not source): bash ${BASH_SOURCE[0]}"
+    return 1 2>/dev/null || exit 1
+fi
+
 set -Eeuo pipefail  # Fail-fast on command errors (including pipelines)
 
 echo "============================================================================"
@@ -81,7 +90,8 @@ GROUND_TRUTH="${DATASET_BASE}/bell412_dataset3_frl.pos"
 #   imu_cam: require IMU+GT+CAM
 #   imu_only: IMU+GT only
 RUN_MODE="${RUN_MODE:-auto}"
-SAVE_DEBUG_DATA="${SAVE_DEBUG_DATA:-0}"  # 1 => pass --save_debug_data (heavy CSV logs)
+SAVE_DEBUG_DATA="${SAVE_DEBUG_DATA:-1}"  # 1 => pass --save_debug_data (heavy CSV logs)
+SAVE_KEYFRAME_IMAGES="${SAVE_KEYFRAME_IMAGES:-1}"  # 1 => pass --save_keyframe_images (keyframe JPGs)
 
 # Output directory
 OUTPUT_DIR="benchmark_modular_${TEST_ID}/preintegration"
@@ -158,6 +168,20 @@ case "$RUN_MODE" in
         ;;
 esac
 
+case "$SAVE_DEBUG_DATA" in
+    0|1) ;;
+    *) fail_fast "SAVE_DEBUG_DATA must be 0 or 1 (got '$SAVE_DEBUG_DATA')" ;;
+esac
+case "$SAVE_KEYFRAME_IMAGES" in
+    0|1) ;;
+    *) fail_fast "SAVE_KEYFRAME_IMAGES must be 0 or 1 (got '$SAVE_KEYFRAME_IMAGES')" ;;
+esac
+
+if [ "$SAVE_KEYFRAME_IMAGES" = "1" ] && [ "$USE_CAM" -ne 1 ]; then
+    echo "⚠️  SAVE_KEYFRAME_IMAGES=1 ignored (camera input not enabled in RUN_MODE=${RUN_MODE})"
+    SAVE_KEYFRAME_IMAGES=0
+fi
+
 RUN_MODE_LABEL="IMU+GT"
 [ "$USE_CAM" -eq 1 ] && RUN_MODE_LABEL="${RUN_MODE_LABEL}+CAM"
 [ "$USE_MAG" -eq 1 ] && RUN_MODE_LABEL="${RUN_MODE_LABEL}+MAG"
@@ -170,6 +194,7 @@ echo "  Test ID: ${TEST_ID}"
 echo "  Output directory: ${OUTPUT_DIR}/"
 echo "  RUN_MODE: ${RUN_MODE}"
 echo "  SAVE_DEBUG_DATA: ${SAVE_DEBUG_DATA}"
+echo "  SAVE_KEYFRAME_IMAGES: ${SAVE_KEYFRAME_IMAGES}"
 echo "  Active sensors: ${RUN_MODE_LABEL}"
 [ -n "$BASELINE_RUN" ] && echo "  Baseline run: ${BASELINE_RUN}"
 [ "$USE_CAM" -eq 1 ] && echo "    - Camera: ${IMAGES_DIR}"
@@ -204,6 +229,9 @@ PYTHON_ARGS=(
 )
 if [ "$SAVE_DEBUG_DATA" = "1" ]; then
     PYTHON_ARGS+=(--save_debug_data)
+fi
+if [ "$SAVE_KEYFRAME_IMAGES" = "1" ]; then
+    PYTHON_ARGS+=(--save_keyframe_images)
 fi
 if [ "$USE_QUARRY" -eq 1 ]; then
     [ -f "$QUARRY_PATH" ] || fail_fast "RUN_MODE=${RUN_MODE} requires quarry file: $QUARRY_PATH"
@@ -400,10 +428,20 @@ metrics = [
     "final_pos_err",
     "final_alt_err",
 ]
+missing_cur = [m for m in metrics if m not in cur_df.columns]
+missing_base = [m for m in metrics if m not in base_df.columns]
+if missing_cur or missing_base:
+    print("Summary schema mismatch; skipping before/after diff.")
+    if missing_cur:
+        print(f"  missing in current: {missing_cur}")
+    if missing_base:
+        print(f"  missing in baseline: {missing_base}")
+    raise SystemExit(0)
+
 print(f"Baseline: $BASELINE_RUN")
 for m in metrics:
-    c = float(cur[m])
-    b = float(base[m])
+    c = float(pd.to_numeric(cur[m], errors="coerce"))
+    b = float(pd.to_numeric(base[m], errors="coerce"))
     if np.isfinite(b) and abs(b) > 1e-12:
         pct = 100.0 * (c - b) / abs(b)
         print(f"{m:20s}  base={b: .6e}  cur={c: .6e}  delta={pct:+7.2f}%")
@@ -516,7 +554,12 @@ else:
         merged.groupby(["sensor", "phase"], dropna=False)
         .agg(
             samples=("accepted", "count"),
-            accept_rate=("accepted", "mean"),
+            # With light debug mode accepted rows are downsampled, so keep both:
+            # 1) logged_accept_ratio: raw ratio inside logged rows (can be biased low)
+            # 2) accept_rate_mean/last: controller-side accept rate reported at runtime
+            logged_accept_ratio=("accepted", "mean"),
+            accept_rate_mean=("accept_rate", "mean"),
+            accept_rate_last=("accept_rate", "last"),
             nis_ewma_mean=("nis_ewma", "mean"),
             nis_ewma_last=("nis_ewma", "last"),
         )
@@ -543,16 +586,29 @@ else:
             b_sum = (
                 b_m.groupby(["sensor", "phase"], dropna=False)
                 .agg(
-                    accept_rate_base=("accepted", "mean"),
+                    logged_accept_ratio_base=("accepted", "mean"),
+                    accept_rate_mean_base=("accept_rate", "mean"),
+                    accept_rate_last_base=("accept_rate", "last"),
                     nis_ewma_mean_base=("nis_ewma", "mean"),
                 )
                 .reset_index()
             )
             joined = summary.merge(b_sum, on=["sensor", "phase"], how="left")
-            joined["accept_rate_delta"] = joined["accept_rate"] - joined["accept_rate_base"]
+            joined["accept_rate_mean_delta"] = joined["accept_rate_mean"] - joined["accept_rate_mean_base"]
+            joined["accept_rate_last_delta"] = joined["accept_rate_last"] - joined["accept_rate_last_base"]
             joined["nis_ewma_delta"] = joined["nis_ewma_mean"] - joined["nis_ewma_mean_base"]
             print("\\nBaseline delta (sensor+phase):")
-            print(joined[["sensor","phase","accept_rate_delta","nis_ewma_delta"]].to_string(index=False))
+            print(
+                joined[
+                    [
+                        "sensor",
+                        "phase",
+                        "accept_rate_mean_delta",
+                        "accept_rate_last_delta",
+                        "nis_ewma_delta",
+                    ]
+                ].to_string(index=False)
+            )
 EOF
 else
     echo "Missing sensor_health.csv or adaptive_debug.csv"

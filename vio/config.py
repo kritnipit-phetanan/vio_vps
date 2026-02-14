@@ -307,6 +307,39 @@ def load_config(config_path: str) -> VIOConfig:
     result['MAG_MAX_YAW_RATE_DEG'] = mag.get('max_yaw_rate_deg', 30.0)
     result['MAG_GYRO_THRESHOLD_DEG'] = mag.get('gyro_consistency_threshold_deg', 10.0)
     result['MAG_R_INFLATE'] = mag.get('r_inflate', 5.0)
+    result['MAG_VISION_HEADING_CONSISTENCY_ENABLE'] = bool(
+        mag.get('vision_heading_consistency_enable', True)
+    )
+    result['MAG_VISION_HEADING_MAX_AGE_SEC'] = float(
+        mag.get('vision_heading_max_age_sec', 1.0)
+    )
+    result['MAG_VISION_HEADING_MIN_QUALITY'] = float(
+        mag.get('vision_heading_min_quality', 0.15)
+    )
+    result['MAG_VISION_HEADING_SOFT_DEG'] = float(
+        mag.get('vision_heading_soft_deg', 30.0)
+    )
+    result['MAG_VISION_HEADING_HARD_DEG'] = float(
+        mag.get('vision_heading_hard_deg', 85.0)
+    )
+    result['MAG_VISION_HEADING_R_INFLATE_MAX'] = float(
+        mag.get('vision_heading_r_inflate_max', 6.0)
+    )
+    result['MAG_VISION_HEADING_STRONG_QUALITY'] = float(
+        mag.get('vision_heading_strong_quality', 0.60)
+    )
+    result['VISION_HEADING_MIN_INLIERS'] = int(
+        mag.get('vision_heading_min_inliers', 25)
+    )
+    result['VISION_HEADING_MIN_PARALLAX_PX'] = float(
+        mag.get('vision_heading_min_parallax_px', 1.0)
+    )
+    result['VISION_HEADING_MAX_DELTA_DEG'] = float(
+        mag.get('vision_heading_max_delta_deg', 20.0)
+    )
+    result['VISION_HEADING_QUALITY_DECAY'] = float(
+        mag.get('vision_heading_quality_decay', 0.92)
+    )
     
     # Process noise
     pn = config['process_noise']

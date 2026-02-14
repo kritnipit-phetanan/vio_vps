@@ -187,7 +187,28 @@ class SatelliteMatcher:
                 m, n = m_list
                 if m.distance < self.ratio_test_threshold * n.distance:
                     good_matches.append(m)
-        
+
+        if len(good_matches) < 4:
+            return np.array([]), np.array([]), np.array([])
+
+        # Enforce one-to-one correspondence on satellite keypoints.
+        # KNN+ratio can still produce many-to-one matches (multiple drone points
+        # mapping to the same satellite keypoint), which causes degenerate
+        # homography and misleading debug visualizations.
+        best_by_train: Dict[int, Any] = {}
+        for m in good_matches:
+            prev = best_by_train.get(int(m.trainIdx))
+            if prev is None or m.distance < prev.distance:
+                best_by_train[int(m.trainIdx)] = m
+
+        # Keep best per query index as an additional safety guard.
+        best_by_query: Dict[int, Any] = {}
+        for m in best_by_train.values():
+            prev = best_by_query.get(int(m.queryIdx))
+            if prev is None or m.distance < prev.distance:
+                best_by_query[int(m.queryIdx)] = m
+
+        good_matches = sorted(best_by_query.values(), key=lambda mm: mm.distance)
         if len(good_matches) < 4:
             return np.array([]), np.array([]), np.array([])
         
@@ -355,6 +376,35 @@ class SatelliteMatcher:
                 keypoints_sat=pts_sat
             )
         
+        # Reject inlier sets that are too spatially concentrated.
+        # This avoids false "good" matches where many correspondences collapse
+        # to (almost) one map point.
+        inlier_pts_drone = pts_drone[inlier_mask] if len(inlier_mask) > 0 else np.empty((0, 2))
+        inlier_pts_sat = pts_sat[inlier_mask] if len(inlier_mask) > 0 else np.empty((0, 2))
+        if len(inlier_pts_drone) >= 4 and len(inlier_pts_sat) >= 4:
+            min_span_px = max(8.0, 0.02 * float(min(sat_img.shape[0], sat_img.shape[1])))
+            span_sat_x = float(np.ptp(inlier_pts_sat[:, 0]))
+            span_sat_y = float(np.ptp(inlier_pts_sat[:, 1]))
+            span_drone_x = float(np.ptp(inlier_pts_drone[:, 0]))
+            span_drone_y = float(np.ptp(inlier_pts_drone[:, 1]))
+            unique_sat = int(len(np.unique(np.round(inlier_pts_sat, 1), axis=0)))
+
+            sat_collapsed = (span_sat_x < min_span_px) and (span_sat_y < min_span_px)
+            drone_collapsed = (span_drone_x < min_span_px) and (span_drone_y < min_span_px)
+            low_uniqueness = unique_sat < max(4, int(0.35 * num_inliers))
+            if sat_collapsed or drone_collapsed or low_uniqueness:
+                return MatchResult(
+                    success=False,
+                    H=H,
+                    num_matches=num_matches,
+                    num_inliers=num_inliers,
+                    reproj_error=reproj_error,
+                    confidence=0.0,
+                    offset_px=(0.0, 0.0),
+                    keypoints_drone=inlier_pts_drone,
+                    keypoints_sat=inlier_pts_sat
+                )
+
         # Compute center offset
         drone_size = (drone_img.shape[1], drone_img.shape[0])
         try:

@@ -214,6 +214,23 @@ magnetometer:
   max_yaw_rate_deg: 150.0       # Maximum expected yaw rate [deg/s] (was 30.0, too low for helicopter)
   gyro_consistency_threshold_deg: 30.0  # Max deviation from gyro integration [deg] (was 10.0)
   r_inflate: 2.0                # R inflation factor for inconsistent measurements (was 5.0)
+
+  # MAG + Vision heading consistency (full sensor mode, fail-soft)
+  # Uses VO relative yaw as weak consistency reference:
+  # - mismatch <= soft_deg: normal MAG update
+  # - soft_deg < mismatch < hard_deg: inflate R
+  # - mismatch >= hard_deg: skip MAG update for this sample
+  vision_heading_consistency_enable: true
+  vision_heading_max_age_sec: 0.8
+  vision_heading_min_quality: 0.30
+  vision_heading_soft_deg: 30.0
+  vision_heading_hard_deg: 85.0
+  vision_heading_r_inflate_max: 4.0
+  vision_heading_strong_quality: 0.65
+  vision_heading_min_inliers: 25
+  vision_heading_min_parallax_px: 1.0
+  vision_heading_max_delta_deg: 20.0
+  vision_heading_quality_decay: 0.92
   
   # ===== NEW: Online Mag Bias Estimation (v3.9.7) =====
   # Mag bias (hard iron) is now estimated online in EKF state

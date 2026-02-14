@@ -45,6 +45,46 @@ class VIOService:
             "sat_ratio": sat_ratio,
         }
 
+    def _update_visual_heading_reference(self,
+                                         t_cam: float,
+                                         yaw_delta_deg: float,
+                                         num_inliers: int,
+                                         avg_flow_px: float,
+                                         accepted: bool):
+        """
+        Maintain a weak visual-heading reference from VO rotation increments.
+
+        This is used by MAG service as a consistency aid in full-sensor mode.
+        """
+        runner = self.runner
+        decay = float(runner.global_config.get("VISION_HEADING_QUALITY_DECAY", 0.92))
+        decay = min(0.999, max(0.0, decay))
+        if not accepted:
+            runner._vision_heading_quality *= decay
+            return
+
+        if not np.isfinite(yaw_delta_deg):
+            runner._vision_heading_quality *= decay
+            return
+
+        max_delta_deg = float(runner.global_config.get("VISION_HEADING_MAX_DELTA_DEG", 20.0))
+        min_inliers = int(runner.global_config.get("VISION_HEADING_MIN_INLIERS", 25))
+        min_parallax = float(runner.global_config.get("VISION_HEADING_MIN_PARALLAX_PX", 1.0))
+        if abs(float(yaw_delta_deg)) > max_delta_deg or int(num_inliers) < min_inliers or float(avg_flow_px) < min_parallax:
+            runner._vision_heading_quality *= decay
+            return
+
+        if runner._vision_yaw_ref is None:
+            runner._vision_yaw_ref = float(quaternion_to_yaw(runner.kf.x[6:10, 0]))
+        yaw_next = float(runner._vision_yaw_ref) + float(np.deg2rad(yaw_delta_deg))
+        runner._vision_yaw_ref = float(np.arctan2(np.sin(yaw_next), np.cos(yaw_next)))
+        runner._vision_yaw_last_t = float(t_cam)
+
+        q_inlier = min(1.0, float(num_inliers) / 120.0)
+        q_parallax = min(1.0, float(avg_flow_px) / 10.0)
+        q_now = q_inlier * q_parallax
+        runner._vision_heading_quality = float(np.clip(0.85 * runner._vision_heading_quality + 0.15 * q_now, 0.0, 1.0))
+
     def _should_run_vps(self, t_cam: float, img: np.ndarray) -> Tuple[bool, str]:
         """
         Decide whether to invoke VPS matcher on this frame.
@@ -465,6 +505,13 @@ class VIOService:
                     vo_dx, vo_dy, vo_dz = float(t_norm[0]), float(t_norm[1]), float(t_norm[2])
                     r_eul = R_scipy.from_matrix(r_vo_mat).as_euler("zyx", degrees=True)
                     vo_y, vo_p, vo_r = float(r_eul[0]), float(r_eul[1]), float(r_eul[2])
+                    self._update_visual_heading_reference(
+                        t_cam=t_cam,
+                        yaw_delta_deg=vo_y,
+                        num_inliers=num_inliers,
+                        avg_flow_px=avg_flow_px,
+                        accepted=True,
+                    )
 
                     vo_data = {
                         "dx": vo_dx, "dy": vo_dy, "dz": vo_dz,
@@ -477,6 +524,13 @@ class VIOService:
                     vo_dx = vo_dy = vo_dz = 0.0
                     vo_r = vo_p = vo_y = 0.0
                     vo_data = None
+                    self._update_visual_heading_reference(
+                        t_cam=t_cam,
+                        yaw_delta_deg=0.0,
+                        num_inliers=num_inliers,
+                        avg_flow_px=avg_flow_px,
+                        accepted=False,
+                    )
                     rot_angle_deg = 0.0
 
                 # Log VO debug
@@ -587,7 +641,13 @@ class VIOService:
 
                 # Save keyframe image with visualization overlay
                 if runner.config.save_keyframe_images and hasattr(runner, "keyframe_dir"):
-                    save_keyframe_with_overlay(img, runner.vio_fe.frame_idx, runner.keyframe_dir, runner.vio_fe)
+                    # Overlay should use the same image domain as tracking (rectified if enabled).
+                    save_keyframe_with_overlay(
+                        img_for_tracking,
+                        runner.vio_fe.frame_idx,
+                        runner.keyframe_dir,
+                        runner.vio_fe,
+                    )
 
             runner.state.img_idx += 1
 

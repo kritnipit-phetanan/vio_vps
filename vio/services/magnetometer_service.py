@@ -16,6 +16,76 @@ class MagnetometerService:
     def __init__(self, runner: Any):
         self.runner = runner
 
+    @staticmethod
+    def _wrap_angle(rad: float) -> float:
+        return float(np.arctan2(np.sin(float(rad)), np.cos(float(rad))))
+
+    def _apply_visual_heading_consistency(self,
+                                          yaw_mag_filtered: float,
+                                          sigma_mag_scaled: float,
+                                          timestamp: float) -> tuple[bool, float, str]:
+        """
+        Fail-soft MAG heading consistency with VO-derived heading reference.
+
+        Returns:
+            (skip_update, sigma_scaled, reason_code)
+        """
+        runner = self.runner
+        cfg = runner.global_config
+        if not bool(cfg.get("MAG_VISION_HEADING_CONSISTENCY_ENABLE", True)):
+            return False, float(sigma_mag_scaled), ""
+        if bool(getattr(runner, "imu_only_mode", False)):
+            return False, float(sigma_mag_scaled), ""
+
+        vis_yaw = getattr(runner, "_vision_yaw_ref", None)
+        vis_t = getattr(runner, "_vision_yaw_last_t", None)
+        vis_q = float(getattr(runner, "_vision_heading_quality", 0.0))
+        if vis_yaw is None or vis_t is None:
+            return False, float(sigma_mag_scaled), ""
+
+        max_age = float(cfg.get("MAG_VISION_HEADING_MAX_AGE_SEC", 1.0))
+        age = float(timestamp) - float(vis_t)
+        if age < 0.0 or age > max_age:
+            return False, float(sigma_mag_scaled), ""
+
+        min_quality = float(cfg.get("MAG_VISION_HEADING_MIN_QUALITY", 0.15))
+        if vis_q < min_quality:
+            return False, float(sigma_mag_scaled), ""
+
+        yaw_diff = self._wrap_angle(float(yaw_mag_filtered) - float(vis_yaw))
+        yaw_diff_deg = abs(float(np.degrees(yaw_diff)))
+
+        soft_deg = float(cfg.get("MAG_VISION_HEADING_SOFT_DEG", 30.0))
+        hard_deg = max(soft_deg + 1.0, float(cfg.get("MAG_VISION_HEADING_HARD_DEG", 85.0)))
+        max_r = max(1.0, float(cfg.get("MAG_VISION_HEADING_R_INFLATE_MAX", 6.0)))
+        strong_quality = float(cfg.get("MAG_VISION_HEADING_STRONG_QUALITY", 0.60))
+        strong_quality = max(min_quality, min(1.0, strong_quality))
+
+        runner.output_reporting.log_convention_check(
+            t=float(timestamp),
+            sensor="MAG",
+            check="vision_heading_delta_deg",
+            value=float(yaw_diff_deg),
+            threshold=float(hard_deg),
+            status="PASS" if yaw_diff_deg <= hard_deg else "WARN",
+            note=f"vision_quality={vis_q:.3f}",
+        )
+
+        if yaw_diff_deg >= hard_deg:
+            # Fail-soft: only hard reject when vision heading confidence is truly strong.
+            # Otherwise keep MAG update alive with aggressive R inflation.
+            if vis_q >= strong_quality:
+                return True, float(sigma_mag_scaled), "skip_vision_heading_mismatch"
+            sigma_scaled = float(sigma_mag_scaled) * float(max_r)
+            return False, sigma_scaled, "vision_heading_hard_soften"
+        if yaw_diff_deg <= soft_deg:
+            return False, float(sigma_mag_scaled), ""
+
+        frac = (yaw_diff_deg - soft_deg) / max(1e-6, hard_deg - soft_deg)
+        r_inflate = 1.0 + frac * (max_r - 1.0)
+        sigma_scaled = float(sigma_mag_scaled) * float(r_inflate)
+        return False, sigma_scaled, "vision_heading_soft_inflate"
+
     def process_magnetometer(self, t: float):
         """
         Process magnetometer measurements up to current time.
@@ -112,6 +182,31 @@ class MagnetometerService:
             sigma_mag_scaled = sigma_mag * r_scale
             mag_policy_scales, mag_apply_scales = self.runner.adaptive_service.get_sensor_adaptive_scales("MAG")
             mag_adaptive_info: Dict[str, Any] = {}
+            skip_mag, sigma_mag_scaled, consistency_reason = self._apply_visual_heading_consistency(
+                yaw_mag_filtered=yaw_mag_filtered,
+                sigma_mag_scaled=sigma_mag_scaled,
+                timestamp=float(mag_rec.t),
+            )
+            if skip_mag:
+                mag_adaptive_info = {
+                    "sensor": "MAG",
+                    "accepted": False,
+                    "attempted": 1,
+                    "dof": 1,
+                    "nis_norm": np.nan,
+                    "chi2": np.nan,
+                    "threshold": np.nan,
+                    "r_scale_used": float(max(1e-6, sigma_mag_scaled / max(1e-6, sigma_mag))),
+                    "reason_code": consistency_reason,
+                }
+                self.runner.adaptive_service.record_adaptive_measurement(
+                    "MAG",
+                    adaptive_info=mag_adaptive_info,
+                    timestamp=float(mag_rec.t),
+                    policy_scales=mag_policy_scales,
+                )
+                self.runner.state.mag_rejects += 1
+                continue
 
             # Use filtered yaw instead of raw calibrated mag
             has_ppk = self.runner.ppk_state is not None
@@ -143,6 +238,8 @@ class MagnetometerService:
                 r_scale_extra=float(mag_apply_scales.get("r_scale", 1.0)),
                 adaptive_info=mag_adaptive_info,
             )
+            if consistency_reason:
+                mag_adaptive_info["reason_code"] = consistency_reason
             self.runner.adaptive_service.record_adaptive_measurement(
                 "MAG",
                 adaptive_info=mag_adaptive_info,
@@ -221,6 +318,14 @@ class MagnetometerService:
 
         # Scale measurement noise based on filter confidence
         sigma_mag_scaled = sigma_mag * r_scale
+        skip_mag, sigma_mag_scaled, _ = self._apply_visual_heading_consistency(
+            yaw_mag_filtered=yaw_mag_filtered,
+            sigma_mag_scaled=sigma_mag_scaled,
+            timestamp=float(mag_rec.t),
+        )
+        if skip_mag:
+            self.runner.state.mag_rejects += 1
+            return
 
         # Use filtered yaw instead of raw calibrated mag
         has_ppk = self.runner.ppk_state is not None

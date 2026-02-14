@@ -129,6 +129,33 @@ def print_msckf_stats():
             print(f"  {key}: {val} ({100*val/total:.1f}%)")
 
 
+def _get_active_body_to_camera_transform(global_config: Optional[dict]) -> np.ndarray:
+    """
+    Resolve active body->camera extrinsic from compiled config.
+
+    Falls back to BODY_T_CAMDOWN for backward compatibility.
+    """
+    if isinstance(global_config, dict):
+        try:
+            camera_view = str(global_config.get("DEFAULT_CAMERA_VIEW", "nadir"))
+            view_cfgs = global_config.get("CAMERA_VIEW_CONFIGS", {})
+            if isinstance(view_cfgs, dict):
+                view_cfg = view_cfgs.get(camera_view, {})
+                extr_key = view_cfg.get("extrinsics", None) if isinstance(view_cfg, dict) else None
+                if isinstance(extr_key, str) and extr_key in global_config:
+                    T = np.asarray(global_config.get(extr_key), dtype=np.float64)
+                    if T.shape == (4, 4):
+                        return T
+            T_down = np.asarray(global_config.get("BODY_T_CAMDOWN", np.eye(4)), dtype=np.float64)
+            if T_down.shape == (4, 4):
+                return T_down
+        except Exception:
+            pass
+
+    from .config import BODY_T_CAMDOWN
+    return np.asarray(BODY_T_CAMDOWN, dtype=np.float64)
+
+
 def imu_pose_to_camera_pose(q_imu: np.ndarray, p_imu: np.ndarray, 
                             T_body_cam: np.ndarray = None,
                             global_config: dict = None) -> Tuple[np.ndarray, np.ndarray]:
@@ -146,12 +173,7 @@ def imu_pose_to_camera_pose(q_imu: np.ndarray, p_imu: np.ndarray,
         p_cam: Camera position [x,y,z] in world frame
     """
     if T_body_cam is None:
-        if global_config is not None:
-            T_body_cam = global_config.get('BODY_T_CAMDOWN', np.eye(4))
-        else:
-            # Fallback: import from config (will use hardcoded default if not loaded)
-            from .config import BODY_T_CAMDOWN
-            T_body_cam = BODY_T_CAMDOWN
+        T_body_cam = _get_active_body_to_camera_transform(global_config)
     
     # Extract Body→Camera transform
     R_BC = T_body_cam[:3, :3]
@@ -191,9 +213,11 @@ def get_feature_multi_view_observations(fid: int, cam_observations: List[dict]) 
         if 'observations' in obs_record:
             for obs in obs_record['observations']:
                 if obs['fid'] == fid:
+                    pt_pixel = obs.get('pt_pixel', obs.get('pt_px', None))
                     multi_view_obs.append({
                         'cam_id': obs_record['cam_id'],
-                        'pt_pixel': obs['pt_pixel'],
+                        'pt_pixel': pt_pixel,
+                        'pt_px': pt_pixel,
                         'pt_norm': obs['pt_norm'],
                         'quality': obs['quality'],
                         'frame': obs_record.get('frame', -1),
@@ -205,12 +229,21 @@ def get_feature_multi_view_observations(fid: int, cam_observations: List[dict]) 
                     multi_view_obs.append({
                         'cam_id': obs_record['cam_id'],
                         'pt_pixel': pt,
+                        'pt_px': pt,
                         'pt_norm': pt,
                         'quality': 1.0,
                         'frame': -1,
                         't': 0.0
                     })
-    return multi_view_obs
+    # Keep one observation per cam clone (latest timestamp wins) and sort by time.
+    by_cam: Dict[int, dict] = {}
+    for obs in multi_view_obs:
+        cam_id = int(obs.get('cam_id', -1))
+        prev = by_cam.get(cam_id)
+        if prev is None or float(obs.get('t', 0.0)) >= float(prev.get('t', 0.0)):
+            by_cam[cam_id] = obs
+
+    return sorted(by_cam.values(), key=lambda o: (float(o.get('t', 0.0)), int(o.get('cam_id', -1))))
 
 
 def find_mature_features_for_msckf(vio_fe, cam_observations: List[dict], 
@@ -338,7 +371,8 @@ def triangulate_point_linear(observations: List[dict], cam_states: List[dict]) -
 
 def triangulate_point_nonlinear(observations: List[dict], cam_states: List[dict], 
                                 p_init: np.ndarray, kf: ExtendedKalmanFilter,
-                                max_iters: int = 10, debug: bool = False) -> Optional[np.ndarray]:
+                                max_iters: int = 10, debug: bool = False,
+                                global_config: Optional[dict] = None) -> Optional[np.ndarray]:
     """
     Nonlinear triangulation refinement using Gauss-Newton.
     
@@ -359,6 +393,7 @@ def triangulate_point_nonlinear(observations: List[dict], cam_states: List[dict]
     for iteration in range(max_iters):
         H = []
         r = []
+        valid_views = 0
         
         for obs in observations:
             cam_id = obs['cam_id']
@@ -371,7 +406,7 @@ def triangulate_point_nonlinear(observations: List[dict], cam_states: List[dict]
             
             q_imu = kf.x[q_idx:q_idx+4, 0]
             p_imu = kf.x[p_idx:p_idx+3, 0]
-            q_cam, p_cam = imu_pose_to_camera_pose(q_imu, p_imu)
+            q_cam, p_cam = imu_pose_to_camera_pose(q_imu, p_imu, global_config=global_config)
             
             # Transform point to camera frame
             q_xyzw = np.array([q_cam[1], q_cam[2], q_cam[3], q_cam[0]])
@@ -380,9 +415,10 @@ def triangulate_point_nonlinear(observations: List[dict], cam_states: List[dict]
             
             p_c = R_wc @ (p - p_cam)
             
-            # v2.9.9.10: REVERT to v2.9.9.8 stricter check
+            # Skip invalid views instead of failing the entire feature.
             if p_c[2] <= 0.1:
-                return None
+                continue
+            valid_views += 1
             
             # Project to normalized plane
             x_pred = p_c[0] / p_c[2]
@@ -404,7 +440,7 @@ def triangulate_point_nonlinear(observations: List[dict], cam_states: List[dict]
             J = J_proj @ R_wc
             H.append(J)
         
-        if len(r) < 4:
+        if len(r) < 4 or valid_views < 2:
             return None
         
         H = np.vstack(H)
@@ -441,68 +477,69 @@ def triangulate_point_nonlinear(observations: List[dict], cam_states: List[dict]
 # v2.9.10.0: Multi-Baseline Triangulation (Priority 3)
 # =============================================================================
 
-def select_best_baseline_pairs(observations: List[dict], 
+def select_best_baseline_pairs(observations: List[dict],
                                cam_states: List[dict],
-                               min_pairs: int = 3,
-                               max_pairs: int = 5) -> List[Tuple[int, int]]:
-    """Select observation pairs with maximum baseline for triangulation.
-    
-    v2.9.10.0 Priority 3: Use 3+ frames instead of just 2 for better
-    triangulation geometry. This improves accuracy and reduces depth errors.
-    
-    Args:
-        observations: List of feature observations
-        cam_states: List of camera states
-        min_pairs: Minimum number of pairs to select
-        max_pairs: Maximum number of pairs to select
-    
-    Returns:
-        List of (i, j) observation index pairs sorted by baseline (largest first)
+                               kf: ExtendedKalmanFilter,
+                               global_config: Optional[dict] = None,
+                               max_pairs: int = 6) -> List[Tuple[int, int]]:
+    """
+    Select observation pairs with best triangulation geometry.
+
+    Score combines baseline, parallax angle, and temporal/frame separation.
     """
     if len(observations) < 2:
         return []
-    
-    # Compute baseline distances for all pairs
-    baselines = []
-    
+
+    pose_cache: Dict[int, Tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+    for obs in observations:
+        cam_id = int(obs.get("cam_id", -1))
+        if cam_id < 0 or cam_id >= len(cam_states) or cam_id in pose_cache:
+            continue
+        cs = cam_states[cam_id]
+        q_imu = kf.x[cs['q_idx']:cs['q_idx']+4, 0]
+        p_imu = kf.x[cs['p_idx']:cs['p_idx']+3, 0]
+        q_cam, p_cam = imu_pose_to_camera_pose(q_imu, p_imu, global_config=global_config)
+        q_xyzw = np.array([q_cam[1], q_cam[2], q_cam[3], q_cam[0]], dtype=float)
+        R_cw = R_scipy.from_quat(q_xyzw).as_matrix()
+        pose_cache[cam_id] = (p_cam, R_cw, q_cam)
+
+    MAX_NORM_COORD = 2.5
+    scored_pairs: List[Tuple[float, int, int]] = []
     for i in range(len(observations)):
         for j in range(i + 1, len(observations)):
             obs_i = observations[i]
             obs_j = observations[j]
-            
-            # Find matching camera states
-            cs_i = None
-            cs_j = None
-            
-            for cs in cam_states:
-                if cs.get('frame_idx') == obs_i.get('frame_idx'):
-                    cs_i = cs
-                if cs.get('frame_idx') == obs_j.get('frame_idx'):
-                    cs_j = cs
-            
-            if cs_i is None or cs_j is None:
+            cam_i = int(obs_i.get("cam_id", -1))
+            cam_j = int(obs_j.get("cam_id", -1))
+            if cam_i == cam_j or cam_i not in pose_cache or cam_j not in pose_cache:
                 continue
-            
-            # Compute baseline distance
-            p_i = cs_i['p']
-            p_j = cs_j['p']
-            baseline = np.linalg.norm(p_j - p_i)
-            
-            baselines.append((i, j, baseline))
-    
-    if len(baselines) == 0:
-        return []
-    
-    # Sort by baseline (largest first)
-    baselines.sort(key=lambda x: x[2], reverse=True)
-    
-    # Select top N pairs (min_pairs to max_pairs)
-    n_select = min(len(baselines), max_pairs)
-    n_select = max(n_select, min(len(baselines), min_pairs))
-    
-    selected_pairs = [(b[0], b[1]) for b in baselines[:n_select]]
-    
-    return selected_pairs
+
+            xi, yi = obs_i['pt_norm']
+            xj, yj = obs_j['pt_norm']
+            if np.hypot(xi, yi) > MAX_NORM_COORD or np.hypot(xj, yj) > MAX_NORM_COORD:
+                continue
+
+            p_i, R_i_cw, _ = pose_cache[cam_i]
+            p_j, R_j_cw, _ = pose_cache[cam_j]
+            baseline = float(np.linalg.norm(p_j - p_i))
+            if baseline < MIN_MSCKF_BASELINE * 0.5:
+                continue
+
+            ray_i = R_i_cw @ normalized_to_unit_ray(float(xi), float(yi))
+            ray_j = R_j_cw @ normalized_to_unit_ray(float(xj), float(yj))
+            ray_i /= max(1e-9, np.linalg.norm(ray_i))
+            ray_j /= max(1e-9, np.linalg.norm(ray_j))
+            parallax_deg = float(np.degrees(np.arccos(np.clip(np.dot(ray_i, ray_j), -1.0, 1.0))))
+            if parallax_deg < MIN_PARALLAX_ANGLE_DEG * 0.5:
+                continue
+
+            frame_gap = abs(int(obs_j.get("frame", -1)) - int(obs_i.get("frame", -1)))
+            time_gap = abs(float(obs_j.get("t", 0.0)) - float(obs_i.get("t", 0.0)))
+            score = baseline * max(parallax_deg, 1e-3) * (1.0 + 0.05 * frame_gap + 0.02 * time_gap)
+            scored_pairs.append((score, i, j))
+
+    scored_pairs.sort(key=lambda item: item[0], reverse=True)
+    return [(i, j) for _, i, j in scored_pairs[:max_pairs]]
 
 
 def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List[dict],
@@ -536,147 +573,125 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
         MSCKF_STATS['fail_few_obs'] += 1
         return None
     
-    # Get first two camera poses
-    obs0 = obs_list[0]
-    obs1 = obs_list[1]
-    
-    cam_id0 = obs0['cam_id']
-    cam_id1 = obs1['cam_id']
-    
-    if cam_id0 >= len(cam_states) or cam_id1 >= len(cam_states):
-        return None
-    
-    cs0 = cam_states[cam_id0]
-    cs1 = cam_states[cam_id1]
-    
-    # EARLY REJECTION v2.9.9.6: Estimate baseline BEFORE expensive pose computation
-    # Use IMU positions as proxy for camera positions (error < 0.3m, acceptable for rejection)
-    # This saves ~40% MSCKF time by rejecting 19.5% fail_baseline early
-    p_imu0_quick = kf.x[cs0['p_idx']:cs0['p_idx']+3, 0]
-    p_imu1_quick = kf.x[cs1['p_idx']:cs1['p_idx']+3, 0]
-    baseline_estimate = np.linalg.norm(p_imu1_quick - p_imu0_quick)
-    
-    # Reject if estimated baseline too small (with 20% margin for camera offset)
-    if baseline_estimate < MIN_MSCKF_BASELINE * 0.8:
+    candidate_pairs = select_best_baseline_pairs(
+        obs_list,
+        cam_states,
+        kf,
+        global_config=global_config,
+        max_pairs=6,
+    )
+    if len(candidate_pairs) == 0:
         MSCKF_STATS['fail_baseline'] += 1
         return None
-    
-    # Extract poses
-    q_imu0 = kf.x[cs0['q_idx']:cs0['q_idx']+4, 0]
-    p_imu0 = kf.x[cs0['p_idx']:cs0['p_idx']+3, 0]
-    q0, p0 = imu_pose_to_camera_pose(q_imu0, p_imu0, global_config=global_config)
-    
-    q_imu1 = kf.x[cs1['q_idx']:cs1['q_idx']+4, 0]
-    p_imu1 = kf.x[cs1['p_idx']:cs1['p_idx']+3, 0]
-    q1, p1 = imu_pose_to_camera_pose(q_imu1, p_imu1, global_config=global_config)
-    
-    c0, c1 = p0, p1
-    
-    # Check baseline
-    baseline = np.linalg.norm(c1 - c0)
-    if baseline < MIN_MSCKF_BASELINE:
-        MSCKF_STATS['fail_baseline'] += 1
-        return None
-    
-    # Ray directions
-    q0_xyzw = np.array([q0[1], q0[2], q0[3], q0[0]])
-    R0_cw = R_scipy.from_quat(q0_xyzw).as_matrix()
-    
-    q1_xyzw = np.array([q1[1], q1[2], q1[3], q1[0]])
-    R1_cw = R_scipy.from_quat(q1_xyzw).as_matrix()
-    
-    # CRITICAL FIX: For fisheye cameras, normalized coords can be very large (|x| > 1)
-    # Using [x,y,1]/norm gives WRONG direction! Must use arctan to get proper ray angle.
-    x0, y0 = obs0['pt_norm']
-    x1, y1 = obs1['pt_norm']
-    
-    # Filter extreme fisheye angles: |norm| > 2 corresponds to angle > 63 degrees
-    # For nadir camera, extreme angles give near-horizontal rays that fail triangulation
-    # RELAXED v2.9.8: 1.5 → 2.5 (~68°) to allow more edge features
-    # Rationale: Calibrated Kannala-Brandt handles distortion well, was rejecting 32% as fail_other
-    MAX_NORM_COORD = 2.5  # ~68 degrees from optical axis (was 1.5/56°)
-    if np.sqrt(x0*x0 + y0*y0) > MAX_NORM_COORD or np.sqrt(x1*x1 + y1*y1) > MAX_NORM_COORD:
-        MSCKF_STATS['fail_other'] += 1  # Use 'other' for now, can add specific counter later
-        return None
-    
-    ray0_c = normalized_to_unit_ray(x0, y0)
-    ray1_c = normalized_to_unit_ray(x1, y1)
-    
-    ray0_w = R0_cw @ ray0_c
-    ray0_w = ray0_w / np.linalg.norm(ray0_w)
-    
-    ray1_w = R1_cw @ ray1_c
-    ray1_w = ray1_w / np.linalg.norm(ray1_w)
-    
-    # Check parallax angle
-    ray_angle_rad = np.arccos(np.clip(np.dot(ray0_w, ray1_w), -1, 1))
-    ray_angle_deg = np.degrees(ray_angle_rad)
-    
-    if ray_angle_deg < MIN_PARALLAX_ANGLE_DEG:
-        MSCKF_STATS['fail_parallax'] += 1
-        return None
-    
-    # Mid-point method
-    w = c0 - c1
-    a = np.dot(ray0_w, ray0_w)
-    b = np.dot(ray0_w, ray1_w)
-    c = np.dot(ray1_w, ray1_w)
-    d = np.dot(ray0_w, w)
-    e = np.dot(ray1_w, w)
-    
-    denom = a * c - b * b
-    if abs(denom) < 1e-6:
-        MSCKF_STATS['fail_solver'] += 1
-        return None
-    
-    s = (b * e - c * d) / denom
-    t = (a * e - b * d) / denom
-    
-    p_ray0 = c0 + s * ray0_w
-    p_ray1 = c1 + t * ray1_w
-    p_init = (p_ray0 + p_ray1) / 2.0
-    
-    # Validate midpoint
-    midpoint_valid = (s > 0 and t > 0 and p_init[2] <= c0[2])
-    
-    # Check depth
-    depth0 = np.dot(p_init - c0, ray0_w)
-    depth1 = np.dot(p_init - c1, ray1_w)
-    
-    # v3.5.0: RELAXED depth check to handle high position uncertainty
-    # When P_pos is large (42m σ), triangulation becomes very noisy
-    # Allow small negative depths (-0.5m) for numerical tolerance
-    # Quality over quantity BUT account for filter divergence
-    if depth0 < -0.5 or depth1 < -0.5:
-        MSCKF_STATS['fail_depth_sign'] += 1
-        
-        # [DIAGNOSTIC] Log first 10 failures + every 5000th to diagnose root cause
-        should_log = (MSCKF_STATS['fail_depth_sign'] <= 10 or 
-                     MSCKF_STATS['fail_depth_sign'] % 5000 == 1)
-        if should_log and debug:
-            print(f"[MSCKF-DIAG] fail_depth_sign #{MSCKF_STATS['fail_depth_sign']}:")
-            print(f"  depth0={depth0:.3f}m, depth1={depth1:.3f}m")
-            print(f"  baseline={baseline:.3f}m, ray_angle={ray_angle_deg:.1f}°")
-            
-            # Geometry diagnosis
-            if baseline < 0.1:
-                print(f"  → POOR GEOMETRY: baseline < 0.1m (too close)")
-            elif ray_angle_deg < 5.0:
-                print(f"  → POOR GEOMETRY: ray_angle < 5° (insufficient parallax)")
-            elif depth0 < 0 and depth1 < 0:
-                print(f"  → BOTH NEGATIVE: Likely camera frame flip or pt_norm mismatch")
-            else:
-                print(f"  → SINGLE NEGATIVE: Likely geometry issue or time misalignment")
-        
-        return None
-    
-    # Maximum depth check
-    if depth0 > 500.0 or depth1 > 500.0:
-        MSCKF_STATS['fail_depth_large'] += 1
+
+    p_init = None
+    best_pair_score = -np.inf
+    fail_counts = {"baseline": 0, "parallax": 0, "solver": 0, "depth": 0, "other": 0}
+    MAX_NORM_COORD = 2.5
+
+    for obs_idx0, obs_idx1 in candidate_pairs:
+        obs0 = obs_list[obs_idx0]
+        obs1 = obs_list[obs_idx1]
+        cam_id0 = int(obs0['cam_id'])
+        cam_id1 = int(obs1['cam_id'])
+        if cam_id0 >= len(cam_states) or cam_id1 >= len(cam_states) or cam_id0 == cam_id1:
+            fail_counts["other"] += 1
+            continue
+
+        cs0 = cam_states[cam_id0]
+        cs1 = cam_states[cam_id1]
+        p_imu0_quick = kf.x[cs0['p_idx']:cs0['p_idx']+3, 0]
+        p_imu1_quick = kf.x[cs1['p_idx']:cs1['p_idx']+3, 0]
+        baseline_estimate = np.linalg.norm(p_imu1_quick - p_imu0_quick)
+        if baseline_estimate < MIN_MSCKF_BASELINE * 0.8:
+            fail_counts["baseline"] += 1
+            continue
+
+        q_imu0 = kf.x[cs0['q_idx']:cs0['q_idx']+4, 0]
+        p_imu0 = kf.x[cs0['p_idx']:cs0['p_idx']+3, 0]
+        q0, p0 = imu_pose_to_camera_pose(q_imu0, p_imu0, global_config=global_config)
+
+        q_imu1 = kf.x[cs1['q_idx']:cs1['q_idx']+4, 0]
+        p_imu1 = kf.x[cs1['p_idx']:cs1['p_idx']+3, 0]
+        q1, p1 = imu_pose_to_camera_pose(q_imu1, p_imu1, global_config=global_config)
+
+        baseline = float(np.linalg.norm(p1 - p0))
+        if baseline < MIN_MSCKF_BASELINE:
+            fail_counts["baseline"] += 1
+            continue
+
+        x0, y0 = obs0['pt_norm']
+        x1, y1 = obs1['pt_norm']
+        if np.hypot(x0, y0) > MAX_NORM_COORD or np.hypot(x1, y1) > MAX_NORM_COORD:
+            fail_counts["other"] += 1
+            continue
+
+        q0_xyzw = np.array([q0[1], q0[2], q0[3], q0[0]], dtype=float)
+        q1_xyzw = np.array([q1[1], q1[2], q1[3], q1[0]], dtype=float)
+        R0_cw = R_scipy.from_quat(q0_xyzw).as_matrix()
+        R1_cw = R_scipy.from_quat(q1_xyzw).as_matrix()
+        ray0_w = R0_cw @ normalized_to_unit_ray(float(x0), float(y0))
+        ray1_w = R1_cw @ normalized_to_unit_ray(float(x1), float(y1))
+        ray0_w /= max(1e-9, np.linalg.norm(ray0_w))
+        ray1_w /= max(1e-9, np.linalg.norm(ray1_w))
+        ray_angle_deg = float(np.degrees(np.arccos(np.clip(np.dot(ray0_w, ray1_w), -1.0, 1.0))))
+        if ray_angle_deg < MIN_PARALLAX_ANGLE_DEG:
+            fail_counts["parallax"] += 1
+            continue
+
+        w = p0 - p1
+        a = np.dot(ray0_w, ray0_w)
+        b = np.dot(ray0_w, ray1_w)
+        c = np.dot(ray1_w, ray1_w)
+        d = np.dot(ray0_w, w)
+        e = np.dot(ray1_w, w)
+        denom = a * c - b * b
+        if abs(denom) < 1e-6:
+            fail_counts["solver"] += 1
+            continue
+
+        s = (b * e - c * d) / denom
+        t_pair = (a * e - b * d) / denom
+        p_ray0 = p0 + s * ray0_w
+        p_ray1 = p1 + t_pair * ray1_w
+        p_candidate = 0.5 * (p_ray0 + p_ray1)
+
+        depth0 = float(np.dot(p_candidate - p0, ray0_w))
+        depth1 = float(np.dot(p_candidate - p1, ray1_w))
+        if depth0 < -0.5 or depth1 < -0.5:
+            fail_counts["depth"] += 1
+            continue
+        if depth0 > 500.0 or depth1 > 500.0:
+            fail_counts["depth"] += 1
+            continue
+
+        pair_score = baseline * max(ray_angle_deg, 1e-3)
+        if pair_score > best_pair_score:
+            best_pair_score = pair_score
+            p_init = p_candidate
+
+    if p_init is None:
+        if fail_counts["depth"] > 0:
+            MSCKF_STATS['fail_depth_sign'] += 1
+        elif fail_counts["parallax"] > 0:
+            MSCKF_STATS['fail_parallax'] += 1
+        elif fail_counts["baseline"] > 0:
+            MSCKF_STATS['fail_baseline'] += 1
+        elif fail_counts["solver"] > 0:
+            MSCKF_STATS['fail_solver'] += 1
+        else:
+            MSCKF_STATS['fail_other'] += 1
         return None
     
     # Nonlinear refinement
-    p_refined = triangulate_point_nonlinear(obs_list, cam_states, p_init, kf, debug=debug)
+    p_refined = triangulate_point_nonlinear(
+        obs_list,
+        cam_states,
+        p_init,
+        kf,
+        debug=debug,
+        global_config=global_config,
+    )
     
     if p_refined is None:
         MSCKF_STATS['fail_nonlinear'] += 1
@@ -693,8 +708,14 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
     # Attempt to get camera intrinsics (K, D) from global config
     # If not available, fall back to normalized coordinate reprojection
     use_pixel_reprojection = False
+    K = None
+    D = None
     try:
-        from .config import KB_PARAMS
+        KB_PARAMS = {}
+        if isinstance(global_config, dict):
+            KB_PARAMS = global_config.get('KB_PARAMS', {}) or {}
+        if not KB_PARAMS:
+            from .config import KB_PARAMS
         if KB_PARAMS:
             # Reconstruct K and D from KB params
             K, D = make_KD_for_size(KB_PARAMS, 
@@ -710,6 +731,29 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
     MAX_REPROJ_ERROR_PX = get_adaptive_reprojection_threshold(kf, reproj_scale=reproj_scale)
     total_error = 0.0
     max_pixel_error = 0.0
+    valid_obs: List[dict] = []
+    depth_rejects = 0
+    reproj_rejects = 0
+
+    norm_scale_px = 120.0
+    try:
+        if use_pixel_reprojection and K is not None and np.isfinite(float(K[0, 0])) and float(K[0, 0]) > 1e-3:
+            norm_scale_px = float(K[0, 0])
+        else:
+            kb_cfg = {}
+            if isinstance(global_config, dict):
+                kb_cfg = global_config.get('KB_PARAMS', {}) or {}
+            if not kb_cfg:
+                from .config import KB_PARAMS as _KB_PARAMS
+                kb_cfg = _KB_PARAMS or {}
+            fx_guess = float(kb_cfg.get('mu', kb_cfg.get('fx', norm_scale_px))) if kb_cfg else norm_scale_px
+            if np.isfinite(fx_guess) and fx_guess > 1e-3:
+                norm_scale_px = fx_guess
+    except Exception:
+        pass
+    norm_threshold = MAX_REPROJ_ERROR_PX / max(1e-6, norm_scale_px)
+    ray_threshold_deg = float(np.degrees(np.arctan(MAX_REPROJ_ERROR_PX / max(1e-6, norm_scale_px))))
+    ray_threshold_deg = float(np.clip(ray_threshold_deg, 0.3, 8.0))
     
     for obs in obs_list:
         cam_id = obs['cam_id']
@@ -719,7 +763,7 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
         cs = cam_states[cam_id]
         q_imu = kf.x[cs['q_idx']:cs['q_idx']+4, 0]
         p_imu = kf.x[cs['p_idx']:cs['p_idx']+3, 0]
-        q_cam, p_cam = imu_pose_to_camera_pose(q_imu, p_imu)
+        q_cam, p_cam = imu_pose_to_camera_pose(q_imu, p_imu, global_config=global_config)
         
         q_xyzw = np.array([q_cam[1], q_cam[2], q_cam[3], q_cam[0]])
         R_cw = R_scipy.from_quat(q_xyzw).as_matrix()
@@ -738,25 +782,8 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
         min_depth_threshold = 0.05 + min(0.45, pos_sigma * 0.01)
         
         if p_c[2] < min_depth_threshold:
-            MSCKF_STATS['fail_depth_sign'] += 1
-            
-            # [DIAGNOSTIC] Log to detect camera frame issues
-            should_log = (MSCKF_STATS['fail_depth_sign'] <= 10 or 
-                         MSCKF_STATS['fail_depth_sign'] % 5000 == 1)
-            if should_log and debug:
-                print(f"[MSCKF-DIAG] Camera-frame depth failure #{MSCKF_STATS['fail_depth_sign']}:")
-                print(f"  p_c=[{p_c[0]:.2f}, {p_c[1]:.2f}, {p_c[2]:.2f}] (camera frame)")
-                print(f"  threshold={min_depth_threshold:.3f}m (adaptive, pos_sigma={pos_sigma:.1f}m)")
-                
-                # Diagnosis
-                if p_c[2] < 0:
-                    print(f"  → NEGATIVE DEPTH: Camera frame axis may be flipped (check extrinsics)")
-                elif pos_sigma > 20:
-                    print(f"  → HIGH UNCERTAINTY: pos_sigma={pos_sigma:.1f}m → threshold relaxed but still failing")
-                else:
-                    print(f"  → MARGINAL: depth slightly below threshold, likely geometry issue")
-            
-            return None
+            depth_rejects += 1
+            continue
         
         # Compute normalized coordinates (legacy method - always used)
         x_pred = p_c[0] / p_c[2]
@@ -764,7 +791,15 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
         
         x_obs, y_obs = obs['pt_norm']
         norm_error = np.sqrt((x_obs - x_pred)**2 + (y_obs - y_pred)**2)
-        total_error += norm_error
+
+        # Ray-angle validation is more stable for fisheye than pure pixel/normalized residuals.
+        ray_pred = p_c.reshape(3,)
+        ray_pred /= max(1e-9, np.linalg.norm(ray_pred))
+        ray_obs = normalized_to_unit_ray(float(x_obs), float(y_obs))
+        ray_err_deg = float(np.degrees(np.arccos(np.clip(np.dot(ray_pred, ray_obs), -1.0, 1.0))))
+        if ray_err_deg > ray_threshold_deg:
+            reproj_rejects += 1
+            continue
         
         # NEW: Pixel-level reprojection validation (if K, D available)
         if use_pixel_reprojection:
@@ -773,7 +808,7 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
             
             if pts_reproj.size > 0:
                 # Get observed pixel coordinates (if stored in obs)
-                if 'pt_px' in obs:
+                if 'pt_px' in obs and obs['pt_px'] is not None:
                     pt_obs_px = np.array(obs['pt_px'])
                     pt_pred_px = pts_reproj[0]
                     
@@ -783,26 +818,22 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
                     # Reject if pixel error exceeds adaptive threshold
                     # v2.9.10.0: Use same adaptive threshold as normalized error
                     if pixel_error > MAX_REPROJ_ERROR_PX:
-                        MSCKF_STATS['fail_reproj_error'] += 1
-                        if debug:
-                            print(f"[MSCKF-TRI] REJECT: pixel_error={pixel_error:.2f}px > {MAX_REPROJ_ERROR_PX:.1f}px (adaptive)")
-                        return None
-    
-    avg_error = total_error / len(obs_list)
-    norm_scale_px = 120.0
-    try:
-        if use_pixel_reprojection and np.isfinite(float(K[0, 0])) and float(K[0, 0]) > 1e-3:
-            norm_scale_px = float(K[0, 0])
+                        reproj_rejects += 1
+                        continue
+
+        total_error += float(norm_error)
+        valid_obs.append(obs)
+
+    if len(valid_obs) < 2:
+        if depth_rejects >= reproj_rejects:
+            MSCKF_STATS['fail_depth_sign'] += 1
         else:
-            from .config import KB_PARAMS as _KB_PARAMS
-            fx_guess = float(_KB_PARAMS.get('mu', _KB_PARAMS.get('fx', norm_scale_px))) if _KB_PARAMS else norm_scale_px
-            if np.isfinite(fx_guess) and fx_guess > 1e-3:
-                norm_scale_px = fx_guess
-    except Exception:
-        pass
-    norm_threshold = MAX_REPROJ_ERROR_PX / max(1e-6, norm_scale_px)
+            MSCKF_STATS['fail_reproj_error'] += 1
+        return None
+
+    avg_error = total_error / len(valid_obs)
     
-    if avg_error > norm_threshold:
+    if avg_error > (1.5 * norm_threshold):
         MSCKF_STATS['fail_reproj_error'] += 1
         
         # [DIAGNOSTIC] Log reprojection failures to identify root cause
@@ -818,9 +849,11 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
     MSCKF_STATS['success'] += 1
     result = {
         'p_w': p_refined,
-        'observations': obs_list,
+        'observations': valid_obs,
         'quality': 1.0 / (1.0 + avg_error * 100.0),
-        'avg_reproj_error': avg_error
+        'avg_reproj_error': avg_error,
+        'num_obs_used': len(valid_obs),
+        'num_obs_total': len(obs_list),
     }
     
     # Add pixel-level error if available
@@ -863,11 +896,7 @@ def compute_measurement_jacobian(p_w: np.ndarray, cam_state: dict,
     Returns: (H_cam, H_feat)
     """
     if T_cam_imu is None:
-        if global_config is not None:
-            T_cam_imu = global_config.get('BODY_T_CAMDOWN', np.eye(4))
-        else:
-            from .config import BODY_T_CAMDOWN
-            T_cam_imu = BODY_T_CAMDOWN
+        T_cam_imu = _get_active_body_to_camera_transform(global_config)
     
     R_cam_imu = T_cam_imu[:3, :3]
     t_cam_imu = T_cam_imu[:3, 3]
@@ -1081,7 +1110,7 @@ def msckf_measurement_update(fid: int, triangulated: dict, cam_observations: Lis
         # Predicted measurement
         q_imu = kf.x[cs['q_idx']:cs['q_idx']+4, 0]
         p_imu = kf.x[cs['p_idx']:cs['p_idx']+3, 0]
-        q_cam, p_cam = imu_pose_to_camera_pose(q_imu, p_imu)
+        q_cam, p_cam = imu_pose_to_camera_pose(q_imu, p_imu, global_config=global_config)
         
         q_xyzw = np.array([q_cam[1], q_cam[2], q_cam[3], q_cam[0]])
         r_cw = R_scipy.from_quat(q_xyzw).as_matrix()
@@ -1375,7 +1404,7 @@ def msckf_measurement_update_with_plane(fid: int, triangulated: dict,
         q_imu = kf.x[cs['q_idx']:cs['q_idx']+4, 0]
         p_imu = kf.x[cs['p_idx']:cs['p_idx']+3, 0]
         
-        q_cam, p_cam = imu_pose_to_camera_pose(q_imu, p_imu)
+        q_cam, p_cam = imu_pose_to_camera_pose(q_imu, p_imu, global_config=global_config)
         q_xyzw = np.array([q_cam[1], q_cam[2], q_cam[3], q_cam[0]])
         R_cw = R_scipy.from_quat(q_xyzw).as_matrix()
         R_wc = R_cw.T
@@ -1447,11 +1476,11 @@ def msckf_measurement_update_with_plane(fid: int, triangulated: dict,
             # Camera poses
             q_imu0 = kf.x[cs0['q_idx']:cs0['q_idx']+4, 0]
             p_imu0 = kf.x[cs0['p_idx']:cs0['p_idx']+3, 0]
-            q0, c0 = imu_pose_to_camera_pose(q_imu0, p_imu0)
+            q0, c0 = imu_pose_to_camera_pose(q_imu0, p_imu0, global_config=global_config)
             
             q_imu1 = kf.x[cs1['q_idx']:cs1['q_idx']+4, 0]
             p_imu1 = kf.x[cs1['p_idx']:cs1['p_idx']+3, 0]
-            q1, c1 = imu_pose_to_camera_pose(q_imu1, p_imu1)
+            q1, c1 = imu_pose_to_camera_pose(q_imu1, p_imu1, global_config=global_config)
             
             # Ray directions in world frame
             q0_xyzw = np.array([q0[1], q0[2], q0[3], q0[0]])
@@ -1528,7 +1557,7 @@ def msckf_measurement_update_with_plane(fid: int, triangulated: dict,
                     q_imu = kf.x[cs['q_idx']:cs['q_idx']+4, 0]
                     p_imu = kf.x[cs['p_idx']:cs['p_idx']+3, 0]
                     
-                    q_cam, p_cam = imu_pose_to_camera_pose(q_imu, p_imu)
+                    q_cam, p_cam = imu_pose_to_camera_pose(q_imu, p_imu, global_config=global_config)
                     q_xyzw = np.array([q_cam[1], q_cam[2], q_cam[3], q_cam[0]])
                     R_cw = R_scipy.from_quat(q_xyzw).as_matrix()
                     R_wc = R_cw.T

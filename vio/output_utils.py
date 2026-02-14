@@ -419,14 +419,29 @@ def save_keyframe_image_with_overlay(image: np.ndarray, features: Optional[np.nd
         
         # Draw all features (green)
         if features is not None and len(features) > 0:
+            h_vis, w_vis = vis.shape[:2]
             for pt in features:
-                cv2.circle(vis, tuple(pt.astype(int)), 3, (0, 255, 0), 1)
+                if not np.all(np.isfinite(pt)):
+                    continue
+                x, y = int(round(float(pt[0]))), int(round(float(pt[1])))
+                if x < 0 or y < 0 or x >= w_vis or y >= h_vis:
+                    continue
+                cv2.circle(vis, (x, y), 3, (0, 255, 0), 1)
         
         # Draw inliers (blue, thicker)
         if features is not None and inliers is not None and len(features) > 0:
-            inlier_pts = features[inliers]
+            safe_mask = np.asarray(inliers, dtype=bool).reshape(-1)
+            if len(safe_mask) == len(features):
+                inlier_pts = features[safe_mask]
+            else:
+                inlier_pts = np.empty((0, 2), dtype=float)
             for pt in inlier_pts:
-                cv2.circle(vis, tuple(pt.astype(int)), 4, (255, 0, 0), 2)
+                if not np.all(np.isfinite(pt)):
+                    continue
+                x, y = int(round(float(pt[0]))), int(round(float(pt[1])))
+                if x < 0 or y < 0 or x >= vis.shape[1] or y >= vis.shape[0]:
+                    continue
+                cv2.circle(vis, (x, y), 4, (255, 0, 0), 2)
         
         # Draw reprojection errors (red lines)
         if reprojections is not None and features is not None and len(features) > 0:
@@ -440,29 +455,32 @@ def save_keyframe_image_with_overlay(image: np.ndarray, features: Optional[np.nd
         # Text overlay
         font = cv2.FONT_HERSHEY_SIMPLEX
         y_offset = 30
-        cv2.putText(vis, f"Frame: {frame_id}", (10, y_offset), font, 0.7, (255, 255, 255), 2)
+        cv2.putText(vis, f"Frame: {frame_id}", (10, y_offset), font, 0.7, (0, 0, 0), 3)
         
         if tracking_stats:
+            num_features = int(tracking_stats.get('num_features', tracking_stats.get('num_tracked', 0)))
+            num_inliers = int(tracking_stats.get('num_inliers', 0))
+            parallax_px = float(tracking_stats.get('parallax_px', tracking_stats.get('mean_parallax', 0.0)))
             y_offset += 30
-            cv2.putText(vis, f"Features: {tracking_stats.get('num_features', 0)}",
-                        (10, y_offset), font, 0.6, (255, 255, 255), 1)
+            cv2.putText(vis, f"Features: {num_features}",
+                        (10, y_offset), font, 0.6, (0, 0, 0), 2)
             y_offset += 25
-            cv2.putText(vis, f"Inliers: {tracking_stats.get('num_inliers', 0)}",
-                        (10, y_offset), font, 0.6, (255, 255, 255), 1)
+            cv2.putText(vis, f"Inliers: {num_inliers}",
+                        (10, y_offset), font, 0.6, (0, 0, 0), 2)
             y_offset += 25
-            cv2.putText(vis, f"Parallax: {tracking_stats.get('parallax_px', 0):.1f}px",
-                        (10, y_offset), font, 0.6, (255, 255, 255), 1)
+            cv2.putText(vis, f"Parallax: {parallax_px:.1f}px",
+                        (10, y_offset), font, 0.6, (0, 0, 0), 2)
         
         # Legend
         y_offset = vis.shape[0] - 60
         cv2.circle(vis, (20, y_offset), 3, (0, 255, 0), 1)
-        cv2.putText(vis, "Tracked", (30, y_offset + 5), font, 0.5, (255, 255, 255), 1)
+        cv2.putText(vis, "Tracked", (30, y_offset + 5), font, 0.5, (0, 0, 0), 2)
         y_offset += 20
         cv2.circle(vis, (20, y_offset), 4, (255, 0, 0), 2)
-        cv2.putText(vis, "Inlier", (30, y_offset + 5), font, 0.5, (255, 255, 255), 1)
+        cv2.putText(vis, "Inlier", (30, y_offset + 5), font, 0.5, (0, 0, 0), 2)
         y_offset += 20
         cv2.line(vis, (15, y_offset), (25, y_offset), (0, 0, 255), 1)
-        cv2.putText(vis, "Reproj Error", (30, y_offset + 5), font, 0.5, (255, 255, 255), 1)
+        cv2.putText(vis, "Reproj Error", (30, y_offset + 5), font, 0.5, (0, 0, 0), 2)
         
         cv2.imwrite(output_path, vis)
     except Exception as e:
@@ -489,21 +507,71 @@ def save_keyframe_with_overlay(img_gray: np.ndarray, frame_id: int, keyframe_dir
         if vio_fe is not None:
             # Get current tracked points (KLT features)
             if hasattr(vio_fe, 'last_pts_for_klt') and vio_fe.last_pts_for_klt is not None:
-                # Convert from normalized coordinates to pixel coordinates
-                focal = vio_fe.K[0, 0]  # Assume fx = fy
-                cx = vio_fe.K[0, 2]
-                cy = vio_fe.K[1, 2]
-                features = vio_fe.last_pts_for_klt * focal + np.array([[cx, cy]])
-            
-            # Get inlier mask if available
+                pts = np.asarray(vio_fe.last_pts_for_klt, dtype=float).reshape(-1, 2)
+                if len(pts) > 0:
+                    # last_pts_for_klt is pixel coordinates in this codebase, but keep a
+                    # compatibility fallback for normalized [-~1,~1] coordinates.
+                    max_abs = float(np.nanmax(np.abs(pts)))
+                    if max_abs < 5.0 and hasattr(vio_fe, 'K'):
+                        fx = float(vio_fe.K[0, 0])
+                        fy = float(vio_fe.K[1, 1])
+                        cx = float(vio_fe.K[0, 2])
+                        cy = float(vio_fe.K[1, 2])
+                        pts = np.column_stack((pts[:, 0] * fx + cx, pts[:, 1] * fy + cy))
+
+                    h_img, w_img = img_gray.shape[:2]
+                    finite = np.isfinite(pts).all(axis=1)
+                    in_bounds = (
+                        (pts[:, 0] >= 0.0)
+                        & (pts[:, 0] < float(w_img))
+                        & (pts[:, 1] >= 0.0)
+                        & (pts[:, 1] < float(h_img))
+                    )
+                    valid = finite & in_bounds
+                    features = pts[valid]
+                else:
+                    features = np.empty((0, 2), dtype=float)
+
+            # Get inlier mask (primary: explicit mask, fallback: track history flag)
             if hasattr(vio_fe, 'last_inlier_mask') and vio_fe.last_inlier_mask is not None:
-                inliers = vio_fe.last_inlier_mask
-            
+                mask = np.asarray(vio_fe.last_inlier_mask, dtype=bool).reshape(-1)
+                if features is not None and len(mask) == len(features):
+                    inliers = mask
+            elif features is not None and hasattr(vio_fe, 'last_fids_for_klt') and vio_fe.last_fids_for_klt is not None:
+                fids = np.asarray(vio_fe.last_fids_for_klt).reshape(-1)
+                pts_all = np.asarray(vio_fe.last_pts_for_klt, dtype=float).reshape(-1, 2)
+                if len(fids) == len(pts_all):
+                    h_img, w_img = img_gray.shape[:2]
+                    finite = np.isfinite(pts_all).all(axis=1)
+                    in_bounds = (
+                        (pts_all[:, 0] >= 0.0)
+                        & (pts_all[:, 0] < float(w_img))
+                        & (pts_all[:, 1] >= 0.0)
+                        & (pts_all[:, 1] < float(h_img))
+                    )
+                    valid = finite & in_bounds
+                    valid_fids = fids[valid]
+
+                    frame_now = int(getattr(vio_fe, 'frame_idx', -1))
+                    tracks = getattr(vio_fe, 'tracks', {}) if hasattr(vio_fe, 'tracks') else {}
+                    inlier_list = []
+                    for fid in valid_fids:
+                        hist = tracks.get(int(fid), [])
+                        is_in = bool(
+                            len(hist) > 0
+                            and int(hist[-1].get('frame', -1)) == frame_now
+                            and bool(hist[-1].get('is_inlier', False))
+                        )
+                        inlier_list.append(is_in)
+                    inliers = np.asarray(inlier_list, dtype=bool)
+
             # Get tracking stats
             tracking_stats = {
-                'num_tracked': vio_fe.last_num_tracked,
-                'num_inliers': vio_fe.last_num_inliers,
-                'mean_parallax': vio_fe.mean_parallax,
+                'num_features': int(getattr(vio_fe, 'last_num_tracked', 0)),
+                'num_tracked': int(getattr(vio_fe, 'last_num_tracked', 0)),
+                'num_inliers': int(getattr(vio_fe, 'last_num_inliers', 0)),
+                'parallax_px': float(getattr(vio_fe, 'mean_parallax', 0.0)),
+                'mean_parallax': float(getattr(vio_fe, 'mean_parallax', 0.0)),
             }
         else:
             tracking_stats = None

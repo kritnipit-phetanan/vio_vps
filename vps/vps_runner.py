@@ -312,6 +312,31 @@ class VPSRunner:
                     pose_ms=pose_ms,
                 )
             return processing_time_ms
+
+        def _save_match_visualization(tag: str,
+                                      preprocess_result: Optional[PreprocessResult] = None,
+                                      map_patch: Optional[MapPatch] = None,
+                                      match_result: Optional[MatchResult] = None):
+            """Persist VPS matching visualization for both success and failure cases."""
+            if not self.save_matches_dir or frame_idx < 0:
+                return
+            if preprocess_result is None or map_patch is None or match_result is None:
+                return
+            try:
+                import os
+                safe_tag = "".join(ch if (ch.isalnum() or ch in "_-") else "_" for ch in str(tag))
+                output_path = os.path.join(
+                    self.save_matches_dir,
+                    f"vps_{safe_tag}_{frame_idx:06d}_{t_cam:.2f}s.jpg",
+                )
+                self.matcher.visualize_matches(
+                    drone_img=preprocess_result.image,
+                    sat_img=map_patch.image,
+                    result=match_result,
+                    output_path=output_path,
+                )
+            except Exception as e:
+                print(f"[VPS] Failed to save match visualization ({tag}): {e}")
         
         # 1. Check update interval
         if t_cam - self.last_update_time < self.config.min_update_interval:
@@ -398,22 +423,26 @@ class VPSRunner:
         
         if not match_result.success:
             self.stats['fail_match'] += 1
+            _save_match_visualization("match_failed", preprocess_result, map_patch, match_result)
             _log_attempt_and_profile(False, "match_failed")
             return None
         
         # 7. Quality check
         if match_result.num_inliers < self.config.min_inliers:
             self.stats['fail_quality'] += 1
+            _save_match_visualization("quality_inliers", preprocess_result, map_patch, match_result)
             _log_attempt_and_profile(False, "quality_inliers")
             return None
         
         if match_result.reproj_error > self.config.max_reproj_error:
             self.stats['fail_quality'] += 1
+            _save_match_visualization("quality_reproj", preprocess_result, map_patch, match_result)
             _log_attempt_and_profile(False, "quality_reproj")
             return None
         
         if match_result.confidence < self.config.min_confidence:
             self.stats['fail_quality'] += 1
+            _save_match_visualization("quality_confidence", preprocess_result, map_patch, match_result)
             _log_attempt_and_profile(False, "quality_confidence")
             return None
         
@@ -435,6 +464,7 @@ class VPSRunner:
         
         if vps_measurement is None:
             self.stats['fail_match'] += 1
+            _save_match_visualization("pose_failed", preprocess_result, map_patch, match_result)
             _log_attempt_and_profile(False, "pose_estimation_failed")
             return None
         
@@ -473,21 +503,7 @@ class VPSRunner:
               f"time={processing_time_ms:.0f}ms")
         
         # Save match visualization if directory is set
-        if self.save_matches_dir and frame_idx >= 0:
-            try:
-                import os
-                output_path = os.path.join(
-                    self.save_matches_dir, 
-                    f"vps_match_{frame_idx:06d}_{t_cam:.2f}s.jpg"
-                )
-                self.matcher.visualize_matches(
-                    drone_img=preprocess_result.image,
-                    sat_img=map_patch.image,
-                    result=match_result,
-                    output_path=output_path
-                )
-            except Exception as e:
-                print(f"[VPS] Failed to save match visualization: {e}")
+        _save_match_visualization("matched", preprocess_result, map_patch, match_result)
         
         return vps_measurement
     

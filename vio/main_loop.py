@@ -175,6 +175,9 @@ class VIORunner:
         self._imu_only_yaw_ref: Optional[float] = None
         self._imu_only_bg_ref: Optional[np.ndarray] = None
         self._imu_only_ba_ref: Optional[np.ndarray] = None
+        self._vision_yaw_ref: Optional[float] = None
+        self._vision_yaw_last_t: Optional[float] = None
+        self._vision_heading_quality: float = 0.0
         self._convention_warn_counts: Dict[str, int] = {}
         self.phase_service = PhaseService(self)
         self.adaptive_service = AdaptiveService(self)
