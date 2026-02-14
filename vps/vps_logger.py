@@ -43,6 +43,7 @@ class VPSDebugLogger:
         
         self.attempts_csv = None
         self.matches_csv = None
+        self.profile_csv = None
         
         if self.enabled:
             self._init_files()
@@ -61,6 +62,11 @@ class VPSDebugLogger:
         with open(self.matches_csv, "w", newline="") as f:
             f.write("t,frame,vps_lat,vps_lon,innovation_x,innovation_y,innovation_mag,"
                    "num_features,num_inliers,confidence,tile_zoom,delayed_update\n")
+
+        # VPS Stage Profile CSV (tile/preprocess/match/pose breakdown)
+        self.profile_csv = os.path.join(self.output_dir, "debug_vps_profile.csv")
+        with open(self.profile_csv, "w", newline="") as f:
+            f.write("t,frame,success,reason,total_ms,tile_ms,preprocess_ms,match_ms,pose_ms\n")
     
     def log_attempt(self, 
                    t: float,
@@ -135,5 +141,28 @@ class VPSDebugLogger:
                        f"{innovation_x:.3f},{innovation_y:.3f},{innovation_mag:.3f},"
                        f"{num_features},{num_inliers},{confidence:.3f},"
                        f"{tile_zoom},{int(delayed_update)}\n")
+        except Exception:
+            pass
+
+    def log_profile(self,
+                    t: float,
+                    frame: int,
+                    success: bool,
+                    reason: str,
+                    total_ms: float,
+                    tile_ms: float,
+                    preprocess_ms: float,
+                    match_ms: float,
+                    pose_ms: float):
+        """Log per-stage VPS processing time for profiling."""
+        if not self.enabled or self.profile_csv is None:
+            return
+        try:
+            with open(self.profile_csv, "a", newline="") as f:
+                f.write(
+                    f"{t:.6f},{frame},{int(success)},{reason},"
+                    f"{total_ms:.2f},{tile_ms:.2f},{preprocess_ms:.2f},"
+                    f"{match_ms:.2f},{pose_ms:.2f}\n"
+                )
         except Exception:
             pass

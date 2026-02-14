@@ -54,18 +54,10 @@ from .propagation import (
     apply_gravity_roll_pitch_update,
     apply_yaw_pseudo_update, apply_bias_observability_guard,
     apply_preintegration_at_camera, clone_camera_for_msckf,
-    get_flight_phase  # v3.3.0: State-based phase detection
 )
-from .vps_integration import apply_vps_update, compute_vps_innovation
-from .msckf import perform_msckf_updates, print_msckf_stats, trigger_msckf_update
+from .msckf import perform_msckf_updates, trigger_msckf_update
 from .plane_detection import PlaneDetector
-from .measurement_updates import (
-    apply_magnetometer_update, apply_dem_height_update, apply_vio_velocity_update
-)
-from .magnetometer import (
-    calibrate_magnetometer, reset_mag_filter_state, 
-    set_mag_constants, apply_mag_filter
-)
+from .measurement_updates import apply_vio_velocity_update
 from .math_utils import quaternion_to_yaw, skew_symmetric
 from .loop_closure import (
     get_loop_detector, init_loop_closure, LoopClosureDetector,
@@ -78,15 +70,19 @@ from .output_utils import (
     save_calibration_log, save_keyframe_image_with_overlay,
     save_keyframe_with_overlay,
     log_state_debug, log_vo_debug, log_msckf_window, log_fej_consistency,
-    log_adaptive_decision, log_sensor_health,
-    append_benchmark_health_summary,
     DebugCSVWriters, init_output_csvs, get_ground_truth_error,
     build_calibration_params
 )
-from .adaptive_controller import AdaptiveController, AdaptiveContext, AdaptiveDecision
+from .adaptive_controller import AdaptiveController, AdaptiveDecision
 from .trn import TerrainReferencedNavigation, TRNConfig, create_trn_from_config
 from .imu_driven import run_imu_driven_loop
 from .event_driven import run_event_driven_loop
+from .services.adaptive_service import AdaptiveService
+from .services.output_reporting_service import OutputReportingService
+from .services.phase_service import PhaseService
+from .services.magnetometer_service import MagnetometerService
+from .services.dem_service import DEMService
+from .services.vps_service import VPSService
 
 @dataclass
 class VIOState:
@@ -186,9 +182,13 @@ class VIORunner:
         # Output file handles
         self.pose_csv = None
         self.error_csv = None
+        self.inf_csv = None
         self.state_dbg_csv = None
+        self.vo_dbg_csv = None
+        self.msckf_dbg_csv = None
         self.time_sync_csv = None
         self.cov_health_csv = None
+        self.convention_csv = None
         self.adaptive_debug_csv = None
         self.sensor_health_csv = None
         self.conditioning_events_csv = None
@@ -232,6 +232,8 @@ class VIORunner:
         self._adaptive_last_aiding_time: Optional[float] = None
         self._adaptive_prev_pmax: Optional[float] = None
         self._adaptive_log_enabled: bool = True
+        self._sensor_health_log_stride: int = 1
+        self._sensor_health_log_counts: Dict[str, int] = {}
         self._legacy_covariance_cap: float = 1e8
         self._adaptive_last_policy_t: Optional[float] = None
         self._conditioning_warning_sec: float = 0.0
@@ -239,6 +241,13 @@ class VIORunner:
         self._imu_only_yaw_ref: Optional[float] = None
         self._imu_only_bg_ref: Optional[np.ndarray] = None
         self._imu_only_ba_ref: Optional[np.ndarray] = None
+        self._convention_warn_counts: Dict[str, int] = {}
+        self.phase_service = PhaseService(self)
+        self.adaptive_service = AdaptiveService(self)
+        self.output_reporting = OutputReportingService(self)
+        self.magnetometer_service = MagnetometerService(self)
+        self.dem_service = DEMService(self)
+        self.vps_service = VPSService(self)
     
     def load_config(self) -> dict:
         """Load YAML configuration file."""
@@ -598,20 +607,24 @@ class VIORunner:
         """
         os.makedirs(self.config.output_dir, exist_ok=True)
         
-        # Use output_utils to initialize core CSVs
-        csv_paths = init_output_csvs(self.config.output_dir)
+        # Use output_utils to initialize CSVs. Heavy debug files are opt-in.
+        csv_paths = init_output_csvs(
+            self.config.output_dir,
+            save_debug_data=bool(self.config.save_debug_data),
+        )
         self.pose_csv = csv_paths['pose_csv']
         self.error_csv = csv_paths['error_csv']
-        self.state_dbg_csv = csv_paths['state_dbg_csv']
+        self.state_dbg_csv = csv_paths.get('state_dbg_csv')
         self.time_sync_csv = csv_paths.get('time_sync_csv')
         self.cov_health_csv = csv_paths.get('cov_health_csv')
+        self.convention_csv = csv_paths.get('convention_csv')
         self.adaptive_debug_csv = csv_paths.get('adaptive_debug_csv')
         self.sensor_health_csv = csv_paths.get('sensor_health_csv')
         self.conditioning_events_csv = csv_paths.get('conditioning_events_csv')
         self.benchmark_health_summary_csv = csv_paths.get('benchmark_health_summary_csv')
         self.inf_csv = csv_paths['inf_csv']
-        self.vo_dbg_csv = csv_paths['vo_dbg']
-        self.msckf_dbg_csv = csv_paths['msckf_dbg']
+        self.vo_dbg_csv = csv_paths.get('vo_dbg')
+        self.msckf_dbg_csv = csv_paths.get('msckf_dbg')
         
         if self.kf is not None and hasattr(self.kf, "enable_cov_health_logging") and self.cov_health_csv:
             self.kf.enable_cov_health_logging(self.cov_health_csv)
@@ -630,6 +643,8 @@ class VIORunner:
         self.keyframe_dir = None
         if self.config.save_debug_data:
             print(f"[DEBUG] Debug data logging enabled")
+        else:
+            print("[DEBUG] Debug tier=light (heavy CSV debug disabled)")
         
         if self.config.save_keyframe_images:
             self.keyframe_dir = os.path.join(self.config.output_dir, "debug_keyframes")
@@ -734,69 +749,11 @@ class VIORunner:
 
     def initialize_adaptive_controller(self):
         """Initialize adaptive controller from compiled YAML config."""
-        adaptive_cfg = {}
-        if isinstance(self.global_config, dict):
-            adaptive_cfg = self.global_config.get("ADAPTIVE", {})
-        if self.config.estimator_mode != "imu_step_preint_cache":
-            adaptive_cfg = dict(adaptive_cfg)
-            adaptive_cfg["mode"] = "off"
-        try:
-            self.adaptive_controller = AdaptiveController(adaptive_cfg)
-        except Exception as exc:
-            print(f"[ADAPTIVE] WARNING: failed to initialize controller: {exc}")
-            self.adaptive_controller = AdaptiveController({"mode": "off"})
-
-        self.current_adaptive_decision = self.adaptive_controller.last_decision
-        self._adaptive_prev_pmax = None
-        self._adaptive_last_aiding_time = None
-        self._adaptive_last_policy_t = None
-        self._conditioning_warning_sec = 0.0
-        self._adaptive_log_enabled = bool(
-            adaptive_cfg.get("logging", {}).get("enabled", True)
-        )
-        mode = self.current_adaptive_decision.mode if self.current_adaptive_decision else "off"
-        print(f"[ADAPTIVE] mode={mode} (IMU-driven policy)")
+        self.adaptive_service.initialize_adaptive_controller()
 
     def _get_sensor_adaptive_scales(self, sensor: str) -> Tuple[Dict[str, float], Dict[str, float]]:
         """Get policy scales and applied scales for a sensor."""
-        default = {
-            "r_scale": 1.0,
-            "chi2_scale": 1.0,
-            "threshold_scale": 1.0,
-            "reproj_scale": 1.0,
-            "acc_threshold_scale": 1.0,
-            "gyro_threshold_scale": 1.0,
-            "max_v_scale": 1.0,
-            "fail_soft_enable": 0.0,
-            "hard_reject_factor": 3.0,
-            "soft_r_cap": 20.0,
-            "soft_r_power": 1.0,
-            "sigma_deg": 7.0,
-            "acc_norm_tolerance": 0.25,
-            "max_gyro_rad_s": 0.40,
-            "enabled_imu_only": 1.0,
-            "ref_alpha": 0.005,
-            "dynamic_ref_alpha": 0.05,
-            "period_steps": 8.0,
-            "motion_consistency_enable": 0.0,
-            "motion_min_speed_m_s": 8.0,
-            "motion_speed_full_m_s": 90.0,
-            "motion_weight_max": 0.20,
-            "motion_max_yaw_error_deg": 75.0,
-            "sigma_bg_rad_s": np.deg2rad(0.30),
-            "sigma_ba_m_s2": 0.15,
-            "enable_when_no_aiding": 1.0,
-            "enable_when_partial_aiding": 0.0,
-            "enable_when_full_aiding": 0.0,
-            "max_bg_norm_rad_s": 0.20,
-            "max_ba_norm_m_s2": 2.5,
-        }
-        decision = self.current_adaptive_decision
-        if decision is None:
-            return dict(default), dict(default)
-        policy = decision.sensor_scale(sensor)
-        applied = dict(policy) if decision.apply_measurement else dict(default)
-        return policy, applied
+        return self.adaptive_service.get_sensor_adaptive_scales(sensor=sensor)
 
     def estimate_flight_phase(self,
                               velocity: Optional[np.ndarray],
@@ -810,177 +767,24 @@ class VIORunner:
         This avoids frequent NORMAL->EARLY regression when velocity covariance
         momentarily spikes late in flight.
         """
-        raw_phase, _ = get_flight_phase(
+        return self.phase_service.estimate_flight_phase(
             velocity=velocity,
             velocity_sigma=velocity_sigma,
             vibration_level=vibration_level,
             altitude_change=altitude_change,
-            spinup_velocity_thresh=self.PHASE_SPINUP_VELOCITY_THRESH,
-            spinup_vibration_thresh=self.PHASE_SPINUP_VIBRATION_THRESH,
-            spinup_alt_change_thresh=self.PHASE_SPINUP_ALT_CHANGE_THRESH,
-            early_velocity_sigma_thresh=self.PHASE_EARLY_VELOCITY_SIGMA_THRESH,
+            dt=dt,
         )
-        raw_phase = int(raw_phase)
-        self.state.phase_raw = raw_phase
-
-        if not self.state.phase_initialized:
-            self.state.current_phase = raw_phase
-            self.state.phase_initialized = True
-            self.state.phase_candidate = -1
-            self.state.phase_candidate_hold_sec = 0.0
-            return self.state.current_phase
-
-        if not bool(self.PHASE_HYSTERESIS_ENABLED):
-            self.state.current_phase = raw_phase
-            self.state.phase_candidate = -1
-            self.state.phase_candidate_hold_sec = 0.0
-            return self.state.current_phase
-
-        current_phase = int(self.state.current_phase)
-        target_phase = raw_phase
-        speed_xy = float(np.linalg.norm(velocity[:2])) if velocity is not None and len(velocity) >= 2 else 0.0
-        alt_abs = abs(float(altitude_change)) if altitude_change is not None and np.isfinite(altitude_change) else 0.0
-
-        # One-way protection: keep NORMAL unless we have sustained landing-like motion.
-        if current_phase == 2 and raw_phase < 2:
-            allow_revert = bool(self.PHASE_ALLOW_NORMAL_TO_EARLY)
-            allow_revert = allow_revert and speed_xy <= max(0.1, float(self.PHASE_REVERT_MAX_SPEED))
-            allow_revert = allow_revert and alt_abs <= max(0.1, float(self.PHASE_REVERT_MAX_ALT_CHANGE))
-            if not allow_revert:
-                target_phase = 2
-
-        # Avoid jumping SPINUP->NORMAL directly.
-        if current_phase == 0 and target_phase == 2:
-            target_phase = 1
-
-        dt_eff = max(0.0, float(dt))
-        if target_phase != current_phase:
-            if int(self.state.phase_candidate) != int(target_phase):
-                self.state.phase_candidate = int(target_phase)
-                self.state.phase_candidate_hold_sec = dt_eff
-            else:
-                self.state.phase_candidate_hold_sec += dt_eff
-
-            hold_sec = float(self.PHASE_UP_HOLD_SEC) if target_phase > current_phase else float(self.PHASE_DOWN_HOLD_SEC)
-            if self.state.phase_candidate_hold_sec >= max(0.0, hold_sec):
-                self.state.current_phase = int(target_phase)
-                self.state.phase_candidate = -1
-                self.state.phase_candidate_hold_sec = 0.0
-        else:
-            self.state.phase_candidate = -1
-            self.state.phase_candidate_hold_sec = 0.0
-
-        return int(self.state.current_phase)
 
     def update_adaptive_policy(self, t: float, phase: int) -> Optional[AdaptiveDecision]:
         """Evaluate adaptive controller for current filter health snapshot."""
-        if self.adaptive_controller is None or self.kf is None:
-            return None
-
-        try:
-            p = self.kf.P
-            p_max = float(np.max(np.abs(p)))
-            p_trace = float(np.trace(p))
-            core_dim = min(18, p.shape[0])
-            p_cond = float(np.linalg.cond(p[:core_dim, :core_dim]))
-        except Exception:
-            p_max = float("nan")
-            p_trace = float("nan")
-            p_cond = float("inf")
-
-        if self._adaptive_prev_pmax is None or not np.isfinite(self._adaptive_prev_pmax) or self._adaptive_prev_pmax <= 0:
-            growth_ratio = 1.0
-        else:
-            growth_ratio = p_max / self._adaptive_prev_pmax if np.isfinite(p_max) else float("nan")
-        self._adaptive_prev_pmax = p_max if np.isfinite(p_max) else self._adaptive_prev_pmax
-
-        if self._adaptive_last_aiding_time is None:
-            aiding_age_sec = 1e9
-        else:
-            aiding_age_sec = max(0.0, float(t - self._adaptive_last_aiding_time))
-
-        ctx = AdaptiveContext(
-            timestamp=float(t),
-            phase=int(phase),
-            p_cond=float(p_cond),
-            p_max=float(p_max),
-            p_trace=float(p_trace),
-            p_growth_ratio=float(growth_ratio) if np.isfinite(growth_ratio) else float("nan"),
-            aiding_age_sec=float(aiding_age_sec),
-        )
-        decision = self.adaptive_controller.step(ctx)
-        self.current_adaptive_decision = decision
-
-        if self._adaptive_last_policy_t is None:
-            dt_policy = 0.0
-        else:
-            dt_policy = max(0.0, float(t - self._adaptive_last_policy_t))
-        self._adaptive_last_policy_t = float(t)
-        if decision.health_state in ("WARNING", "DEGRADED"):
-            self._conditioning_warning_sec += dt_policy
-        else:
-            self._conditioning_warning_sec = 0.0
-
-        # Keep legacy cap for off/shadow to guarantee backward compatibility.
-        cov_cap = self._legacy_covariance_cap
-        if decision.apply_process_noise:
-            cov_cap = float(decision.conditioning_max_value)
-        if hasattr(self.kf, "set_covariance_max_value"):
-            self.kf.set_covariance_max_value(cov_cap)
-        if hasattr(self.kf, "conditioning_cond_hard"):
-            self.kf.conditioning_cond_hard = float(decision.conditioning_cond_hard)
-        if hasattr(self.kf, "conditioning_cond_hard_window"):
-            self.kf.conditioning_cond_hard_window = int(max(1, decision.conditioning_cond_hard_window))
-        if hasattr(self.kf, "conditioning_projection_min_interval_steps"):
-            self.kf.conditioning_projection_min_interval_steps = int(
-                max(1, decision.conditioning_projection_min_interval_steps)
-            )
-
-        if self.adaptive_debug_csv and self._adaptive_log_enabled:
-            log_adaptive_decision(
-                self.adaptive_debug_csv,
-                t=float(t),
-                mode=decision.mode,
-                health_state=decision.health_state,
-                phase=int(phase),
-                aiding_age_sec=float(aiding_age_sec),
-                p_max=float(p_max),
-                p_cond=float(p_cond),
-                p_growth_ratio=float(growth_ratio) if np.isfinite(growth_ratio) else np.nan,
-                sigma_accel_scale=float(decision.sigma_accel_scale),
-                gyr_w_scale=float(decision.gyr_w_scale),
-                acc_w_scale=float(decision.acc_w_scale),
-                sigma_unmodeled_gyr_scale=float(decision.sigma_unmodeled_gyr_scale),
-                min_yaw_scale=float(decision.min_yaw_scale),
-                conditioning_max_value=float(cov_cap),
-                reason=decision.reason,
-            )
-
-        return decision
+        return self.adaptive_service.update_adaptive_policy(t=t, phase=phase)
 
     def build_step_imu_params(self, imu_params_base: dict, sigma_accel_base: float) -> Tuple[dict, float]:
         """Build per-step IMU params (active mode only)."""
-        imu_params_step = dict(imu_params_base)
-        sigma_accel_step = float(sigma_accel_base)
-
-        decision = self.current_adaptive_decision
-        if decision is None or not decision.apply_process_noise:
-            return imu_params_step, sigma_accel_step
-
-        sigma_accel_step *= float(decision.sigma_accel_scale)
-        if "gyr_w" in imu_params_step:
-            imu_params_step["gyr_w"] = float(imu_params_step["gyr_w"]) * float(decision.gyr_w_scale)
-        if "acc_w" in imu_params_step:
-            imu_params_step["acc_w"] = float(imu_params_step["acc_w"]) * float(decision.acc_w_scale)
-        if "sigma_unmodeled_gyr" in imu_params_step:
-            imu_params_step["sigma_unmodeled_gyr"] = (
-                float(imu_params_step["sigma_unmodeled_gyr"]) * float(decision.sigma_unmodeled_gyr_scale)
-            )
-        if "min_yaw_process_noise_deg" in imu_params_step:
-            min_yaw = float(imu_params_step["min_yaw_process_noise_deg"]) * float(decision.min_yaw_scale)
-            imu_params_step["min_yaw_process_noise_deg"] = max(float(decision.min_yaw_floor_deg), min_yaw)
-
-        return imu_params_step, sigma_accel_step
+        return self.adaptive_service.build_step_imu_params(
+            imu_params_base=imu_params_base,
+            sigma_accel_base=sigma_accel_base,
+        )
 
     def record_adaptive_measurement(self,
                                     sensor: str,
@@ -989,50 +793,13 @@ class VIORunner:
                                     policy_scales: Optional[Dict[str, float]] = None,
                                     counts_as_aiding: bool = True):
         """Feed measurement acceptance/NIS back into adaptive controller."""
-        if self.adaptive_controller is None or adaptive_info is None or len(adaptive_info) == 0:
-            return
-        attempted = int(adaptive_info.get("attempted", 1))
-        if attempted <= 0:
-            return
-
-        accepted = bool(adaptive_info.get("accepted", False))
-        nis_norm = adaptive_info.get("nis_norm", np.nan)
-        nis_norm = float(nis_norm) if nis_norm is not None and np.isfinite(nis_norm) else None
-
-        feedback = self.adaptive_controller.record_measurement(
+        self.adaptive_service.record_adaptive_measurement(
             sensor=sensor,
-            accepted=accepted,
-            nis_norm=nis_norm,
-            timestamp=float(timestamp),
+            adaptive_info=adaptive_info,
+            timestamp=timestamp,
+            policy_scales=policy_scales,
+            counts_as_aiding=counts_as_aiding,
         )
-        if accepted and counts_as_aiding:
-            self._adaptive_last_aiding_time = float(timestamp)
-
-        decision = self.current_adaptive_decision
-        mode = decision.mode if decision is not None else "off"
-        health_state = decision.health_state if decision is not None else "HEALTHY"
-        if policy_scales is None and decision is not None:
-            policy_scales = decision.sensor_scale(sensor)
-        if policy_scales is None:
-            policy_scales = {"r_scale": 1.0, "chi2_scale": 1.0, "threshold_scale": 1.0, "reproj_scale": 1.0}
-
-        if self.sensor_health_csv and self._adaptive_log_enabled:
-            log_sensor_health(
-                self.sensor_health_csv,
-                t=float(timestamp),
-                sensor=sensor,
-                accepted=accepted,
-                nis_norm=nis_norm,
-                nis_ewma=float(feedback.get("nis_ewma", 1.0)),
-                accept_rate=float(feedback.get("accept_rate", 1.0)),
-                mode=mode,
-                health_state=health_state,
-                r_scale=float(policy_scales.get("r_scale", 1.0)),
-                chi2_scale=float(policy_scales.get("chi2_scale", 1.0)),
-                threshold_scale=float(policy_scales.get("threshold_scale", 1.0)),
-                reproj_scale=float(policy_scales.get("reproj_scale", 1.0)),
-                reason_code=str(adaptive_info.get("reason_code", "")),
-            )
     
     def _update_imu_helpers(self, rec, dt: float, imu_params: dict,
                             zupt_scales: Optional[Dict[str, float]] = None):
@@ -1291,16 +1058,37 @@ class VIORunner:
                              dt_gt: float, gt_idx: int,
                              gt_stamp_log: float, matched: int):
         """Append one per-frame time sync debug row."""
-        if not self.time_sync_csv:
-            return
-        try:
-            with open(self.time_sync_csv, "a", newline="") as f:
-                f.write(
-                    f"{t_filter:.6f},{t_gt_mapped:.6f},{dt_gt:.6f},{gt_idx},"
-                    f"{gt_stamp_log:.6f},{matched},{self.error_time_mode}\n"
-                )
-        except Exception:
-            pass
+        self.output_reporting.log_time_sync_debug(
+            t_filter=t_filter,
+            t_gt_mapped=t_gt_mapped,
+            dt_gt=dt_gt,
+            gt_idx=gt_idx,
+            gt_stamp_log=gt_stamp_log,
+            matched=matched,
+        )
+
+    def _log_convention_check(self,
+                              t: float,
+                              sensor: str,
+                              check: str,
+                              value: float,
+                              threshold: float,
+                              status: str,
+                              note: str = ""):
+        """Soft-monitor for frame/time convention consistency (never fail-fast)."""
+        self.output_reporting.log_convention_check(
+            t=t,
+            sensor=sensor,
+            check=check,
+            value=value,
+            threshold=threshold,
+            status=status,
+            note=note,
+        )
+
+    def _run_bootstrap_convention_checks(self):
+        """One-shot frame/convention sanity checks after EKF init."""
+        self.output_reporting.run_bootstrap_convention_checks()
 
     def process_vio(self, rec, t: float, ongoing_preint=None):
         """
@@ -1346,6 +1134,17 @@ class VIORunner:
             # Get camera timestamp (CRITICAL: use this instead of IMU time t)
             # Prevents timestamp mismatch when cloning/resetting preintegration
             t_cam = self.imgs[self.state.img_idx].t
+            cam_lag = abs(float(t) - float(t_cam))
+            cam_sync_threshold = float(self.global_config.get("CAM_TIME_SYNC_THRESHOLD_SEC", 0.10))
+            self._log_convention_check(
+                t=float(t_cam),
+                sensor="CAM",
+                check="imu_cam_abs_dt",
+                value=float(cam_lag),
+                threshold=float(cam_sync_threshold),
+                status="PASS" if cam_lag <= cam_sync_threshold else "WARN",
+                note=f"t_imu={float(t):.6f}",
+            )
             
             # FRAME SKIP (v2.9.9): Process every N frames for speedup
             # frame_skip=1 → all frames, frame_skip=2 → every other frame (50% faster)
@@ -1406,7 +1205,8 @@ class VIORunner:
                     dem_height = 0.0
                 agl = alt - dem_height
                 
-                est_yaw = self.kf.x[8]  # Yaw from EKF state
+                q_wxyz = self.kf.x[6:10, 0].astype(float)
+                est_yaw = float(quaternion_to_yaw(q_wxyz))
                 
                 # Define VPS processing function for thread
                 def run_vps_in_thread():
@@ -1652,13 +1452,14 @@ class VIORunner:
                 vio_config = self.global_config.get('vio', {})
                 use_vz_only = vio_config.get('use_vz_only', use_vz_only_default)
                 
-                log_vo_debug(
-                    self.vo_dbg_csv, self.vio_fe.frame_idx, num_inliers, rot_angle_deg,
-                    0.0,  # alignment_deg
-                    rotation_rate_deg_s, use_vz_only,
-                    not used_vo,  # skip_vo (True if using OF-velocity fallback)
-                    vo_dx, vo_dy, vo_dz, vel_vx, vel_vy, vel_vz
-                )
+                if self.vo_dbg_csv:
+                    log_vo_debug(
+                        self.vo_dbg_csv, self.vio_fe.frame_idx, num_inliers, rot_angle_deg,
+                        0.0,  # alignment_deg
+                        rotation_rate_deg_s, use_vz_only,
+                        not used_vo,  # skip_vo (True if using OF-velocity fallback)
+                        vo_dx, vo_dy, vo_dz, vel_vx, vel_vy, vel_vz
+                    )
                 
                 # ================================================================
                 # VPS Result Collection (after VIO completes)
@@ -1674,6 +1475,19 @@ class VIORunner:
                     # Apply VPS update using stochastic cloning
                     if vps_result is not None:
                         from .vps_integration import apply_vps_delayed_update
+                        vps_policy_scales, vps_apply_scales = self._get_sensor_adaptive_scales("VPS")
+                        vps_adaptive_info: Dict[str, Any] = {}
+                        vps_sync_threshold = float(self.global_config.get("VPS_TIME_SYNC_THRESHOLD_SEC", 0.25))
+                        vps_dt = abs(float(getattr(vps_result, "t_measurement", t_cam)) - float(t_cam))
+                        self._log_convention_check(
+                            t=float(t_cam),
+                            sensor="VPS",
+                            check="cam_vps_abs_dt",
+                            value=float(vps_dt),
+                            threshold=float(vps_sync_threshold),
+                            status="PASS" if vps_dt <= vps_sync_threshold else "WARN",
+                            note=f"vps_t={float(getattr(vps_result, 't_measurement', t_cam)):.6f}",
+                        )
                         
                         # Create clone manager if not exists
                         if not hasattr(self, 'vps_clone_manager'):
@@ -1685,17 +1499,46 @@ class VIORunner:
                         
                         # Apply delayed update with stochastic cloning
                         clone_id = f"vps_{self.state.img_idx}"
-                        vps_applied, _, _ = apply_vps_delayed_update(
+                        vps_applied, vps_innovation_m, vps_status = apply_vps_delayed_update(
                             kf=self.kf,
                             clone_manager=self.vps_clone_manager,
                             image_id=clone_id,
                             vps_lat=vps_result.lat,
                             vps_lon=vps_result.lon,
-                            R_vps=vps_result.R_vps,
+                            R_vps=np.array(vps_result.R_vps, dtype=float) * float(vps_apply_scales.get("r_scale", 1.0)),
                             proj_cache=self.proj_cache,
                             lat0=self.lat0,
                             lon0=self.lon0,
                             time_since_last_vps=(t_cam - self.last_vps_update_time)
+                        )
+                        reason_code = "normal_accept" if vps_applied else "hard_reject"
+                        nis_norm_vps = np.nan
+                        if isinstance(vps_status, str):
+                            status_lower = vps_status.lower()
+                            if "clone" in status_lower:
+                                reason_code = "skip_missing_clone"
+                            elif "gated" in status_lower:
+                                reason_code = "gated"
+                            elif "failed" in status_lower:
+                                reason_code = "hard_reject"
+                            elif "applied" in status_lower:
+                                reason_code = "normal_accept"
+                        vps_adaptive_info.update({
+                            "sensor": "VPS",
+                            "accepted": bool(vps_applied),
+                            "attempted": 1,
+                            "dof": 2,
+                            "nis_norm": nis_norm_vps,
+                            "chi2": float(vps_innovation_m) if vps_innovation_m is not None and np.isfinite(float(vps_innovation_m)) else np.nan,
+                            "threshold": np.nan,
+                            "r_scale_used": float(vps_apply_scales.get("r_scale", 1.0)),
+                            "reason_code": reason_code,
+                        })
+                        self.record_adaptive_measurement(
+                            "VPS",
+                            adaptive_info=vps_adaptive_info,
+                            timestamp=float(t_cam),
+                            policy_scales=vps_policy_scales,
                         )
                         if vps_applied:
                             self.last_vps_update_time = t_cam
@@ -1717,158 +1560,7 @@ class VIORunner:
         Args:
             t: Current timestamp
         """
-        gt_df = self.ppk_trajectory
-        if gt_df is None or len(gt_df) == 0:
-            self._log_time_sync_debug(
-                t_filter=float(t),
-                t_gt_mapped=float("nan"),
-                dt_gt=float("nan"),
-                gt_idx=-1,
-                gt_stamp_log=float("nan"),
-                matched=0
-            )
-            return
-        
-        try:
-            t_gt = self._filter_time_to_gt_time(t)
-            
-            # Find closest ground truth
-            gt_diffs = np.abs(gt_df['stamp_log'].values - t_gt)
-            gt_idx = int(np.argmin(gt_diffs))
-            gt_row = gt_df.iloc[gt_idx]
-            dt_gt = float(gt_diffs[gt_idx])
-            gt_stamp_log = float(gt_row['stamp_log']) if 'stamp_log' in gt_row else float("nan")
-            is_matched = 1 if dt_gt <= 1.0 else 0
-            self._log_time_sync_debug(
-                t_filter=float(t),
-                t_gt_mapped=float(t_gt),
-                dt_gt=dt_gt,
-                gt_idx=gt_idx,
-                gt_stamp_log=gt_stamp_log,
-                matched=is_matched
-            )
-            if dt_gt > 1.0:
-                if not self._warned_gt_time_mismatch:
-                    print(
-                        f"[ERROR_LOG] WARNING: Large GT time mismatch ({dt_gt:.3f}s). "
-                        f"mode={self.error_time_mode}. Skipping unmatched rows."
-                    )
-                    self._warned_gt_time_mismatch = True
-                return
-            
-            use_ppk = self.ppk_trajectory is not None
-            
-            if use_ppk:
-                gt_lat = gt_row['lat']
-                gt_lon = gt_row['lon']
-                gt_alt = gt_row['height']
-            else:
-                gt_lat = gt_row['lat_dd']
-                gt_lon = gt_row['lon_dd']
-                gt_alt = gt_row['altitude_MSL_m']
-            
-            gt_E, gt_N = self.proj_cache.latlon_to_xy(gt_lat, gt_lon, self.lat0, self.lon0)
-            gt_U = gt_alt
-            
-            # VIO prediction (IMU position)
-            vio_E = float(self.kf.x[0, 0])
-            vio_N = float(self.kf.x[1, 0])
-            vio_U = float(self.kf.x[2, 0])
-            
-            # Ground truth is GNSS position - convert VIO (IMU) to GNSS for fair comparison
-            # Use instance lever_arm (already set in initialize_ekf)
-            if np.linalg.norm(self.lever_arm) > 0.01:
-                from scipy.spatial.transform import Rotation as R_scipy
-                q_vio = self.kf.x[6:10, 0]
-                q_xyzw = np.array([q_vio[1], q_vio[2], q_vio[3], q_vio[0]])
-                R_body_to_world = R_scipy.from_quat(q_xyzw).as_matrix()
-                
-                p_imu_enu = np.array([vio_E, vio_N, vio_U])
-                p_gnss_enu = imu_to_gnss_position(p_imu_enu, R_body_to_world, self.lever_arm)
-                vio_E, vio_N, vio_U = p_gnss_enu[0], p_gnss_enu[1], p_gnss_enu[2]
-            
-            # Errors
-            err_E = vio_E - gt_E
-            err_N = vio_N - gt_N
-            err_U = vio_U - gt_U
-            pos_error = np.sqrt(err_E**2 + err_N**2 + err_U**2)
-            
-            # Velocity error (compute from consecutive GPS positions)
-            # FIX v3.9.3: Use PPK velocity columns directly instead of position difference
-            # Position difference method fails when gt_idx doesn't change between samples
-            vel_error = 0.0
-            vel_err_E = vel_err_N = vel_err_U = 0.0
-            
-            if use_ppk and 've' in gt_row and 'vn' in gt_row and 'vu' in gt_row:
-                # PPK provides direct velocity measurements
-                gt_vel_E = float(gt_row['ve'])
-                gt_vel_N = float(gt_row['vn'])
-                gt_vel_U = float(gt_row['vu'])
-                
-                # VIO velocity
-                vio_vel_E = float(self.kf.x[3, 0])
-                vio_vel_N = float(self.kf.x[4, 0])
-                vio_vel_U = float(self.kf.x[5, 0])
-                
-                # Velocity error
-                vel_err_E = vio_vel_E - gt_vel_E
-                vel_err_N = vio_vel_N - gt_vel_N
-                vel_err_U = vio_vel_U - gt_vel_U
-                vel_error = np.sqrt(vel_err_E**2 + vel_err_N**2 + vel_err_U**2)
-            elif gt_idx > 0 and gt_idx < len(gt_df) - 1:
-                # Fallback: compute from consecutive GPS positions (for flight_log)
-                gt_row_prev = gt_df.iloc[gt_idx - 1]
-                gt_row_next = gt_df.iloc[gt_idx + 1]
-                
-                dt = gt_row_next['stamp_log'] - gt_row_prev['stamp_log']
-                if dt > 0.01:  # Avoid division by zero
-                    if use_ppk:
-                        gt_E_prev, gt_N_prev = self.proj_cache.latlon_to_xy(gt_row_prev['lat'], gt_row_prev['lon'], self.lat0, self.lon0)
-                        gt_E_next, gt_N_next = self.proj_cache.latlon_to_xy(gt_row_next['lat'], gt_row_next['lon'], self.lat0, self.lon0)
-                        gt_U_prev = gt_row_prev['height']
-                        gt_U_next = gt_row_next['height']
-                    else:
-                        gt_E_prev, gt_N_prev = self.proj_cache.latlon_to_xy(gt_row_prev['lat_dd'], gt_row_prev['lon_dd'], self.lat0, self.lon0)
-                        gt_E_next, gt_N_next = self.proj_cache.latlon_to_xy(gt_row_next['lat_dd'], gt_row_next['lon_dd'], self.lat0, self.lon0)
-                        gt_U_prev = gt_row_prev['altitude_MSL_m']
-                        gt_U_next = gt_row_next['altitude_MSL_m']
-                    
-                    # Ground truth velocity
-                    gt_vel_E = (gt_E_next - gt_E_prev) / dt
-                    gt_vel_N = (gt_N_next - gt_N_prev) / dt
-                    gt_vel_U = (gt_U_next - gt_U_prev) / dt
-                    
-                    # VIO velocity
-                    vio_vel_E = float(self.kf.x[3, 0])
-                    vio_vel_N = float(self.kf.x[4, 0])
-                    vio_vel_U = float(self.kf.x[5, 0])
-                    
-                    # Velocity error
-                    vel_err_E = vio_vel_E - gt_vel_E
-                    vel_err_N = vio_vel_N - gt_vel_N
-                    vel_err_U = vio_vel_U - gt_vel_U
-                    vel_error = np.sqrt(vel_err_E**2 + vel_err_N**2 + vel_err_U**2)
-            
-            # Yaw
-            q_vio = self.kf.x[6:10, 0]
-            yaw_vio = np.rad2deg(quaternion_to_yaw(q_vio))
-            
-            yaw_gt = np.nan
-            yaw_error = np.nan
-            if use_ppk and 'yaw' in gt_row:
-                yaw_gt = 90.0 - np.rad2deg(gt_row['yaw'])
-                yaw_error = ((yaw_vio - yaw_gt + 180) % 360) - 180
-            
-            with open(self.error_csv, "a", newline="") as ef:
-                ef.write(
-                    f"{t:.6f},{pos_error:.3f},{err_E:.3f},{err_N:.3f},{err_U:.3f},"
-                    f"{vel_error:.3f},{vel_err_E:.3f},{vel_err_N:.3f},{vel_err_U:.3f},"
-                    f"{err_U:.3f},{yaw_vio:.2f},{yaw_gt:.2f},{yaw_error:.2f},"
-                    f"{gt_lat:.8f},{gt_lon:.8f},{gt_alt:.3f},"
-                    f"{vio_E:.3f},{vio_N:.3f},{vio_U:.3f}\n"
-                )
-        except Exception:
-            pass
+        self.output_reporting.log_error(t=t)
     
     def process_magnetometer(self, t: float):
         """
@@ -1877,99 +1569,7 @@ class VIORunner:
         Args:
             t: Current timestamp
         """
-        sigma_mag = self.global_config.get('SIGMA_MAG_YAW', 0.15)
-        declination = self.global_config.get('MAG_DECLINATION', 0.0)
-        use_raw = self.global_config.get('MAG_USE_RAW_HEADING', True)
-        rate_limit = self.global_config.get('MAG_UPDATE_RATE_LIMIT', 1)
-        
-        while (self.state.mag_idx < len(self.mag_list) and 
-               self.mag_list[self.state.mag_idx].t <= t):
-            
-            mag_rec = self.mag_list[self.state.mag_idx]
-            self.state.mag_idx += 1
-            
-            # Rate limiting
-            if (self.state.mag_idx - 1) % rate_limit != 0:
-                continue
-            
-            # v3.9.7: Use EKF estimated mag_bias instead of static config hard_iron
-            # This enables online hard iron estimation for time-varying interference
-            if self.config.use_mag_estimated_bias:
-                # Use EKF state mag_bias (indices 16:19) as hard iron
-                hard_iron = self.kf.x[16:19, 0].flatten()
-            else:
-                # Fallback to static config hard iron
-                hard_iron = self.global_config.get('MAG_HARD_IRON_OFFSET', None)
-            soft_iron = self.global_config.get('MAG_SOFT_IRON_MATRIX', None)
-            mag_cal = calibrate_magnetometer(mag_rec.mag, hard_iron=hard_iron, soft_iron=soft_iron)
-            
-            # Compute raw yaw from calibrated magnetometer
-            from .magnetometer import compute_yaw_from_mag
-            q_current = self.kf.x[6:10, 0].flatten()
-            yaw_mag_raw, quality = compute_yaw_from_mag(
-                mag_body=mag_cal,
-                q_wxyz=q_current,
-                mag_declination=declination,
-                use_raw_heading=use_raw
-            )
-            
-            # Apply magnetometer filter (EMA smoothing + gyro consistency check)
-            # v3.4.0: Use phase-based convergence (state-based, not time-based)
-            in_convergence = self.state.current_phase < 2  # SPINUP or EARLY phase
-            yaw_mag_filtered, r_scale, filter_info = apply_mag_filter(
-                yaw_mag=yaw_mag_raw,
-                yaw_t=mag_rec.t,
-                gyro_z=self.last_gyro_z,
-                dt_imu=self.last_imu_dt,
-                in_convergence=in_convergence,
-                mag_max_yaw_rate=self.global_config.get('MAG_MAX_YAW_RATE_DEG', 30.0) * np.pi / 180.0,
-                mag_gyro_threshold=self.global_config.get('MAG_GYRO_THRESHOLD_DEG', 10.0) * np.pi / 180.0,
-                mag_ema_alpha=self.global_config.get('MAG_EMA_ALPHA', 0.3),
-                mag_consistency_r_inflate=self.global_config.get('MAG_R_INFLATE', 5.0)
-            )
-            
-            # Scale measurement noise based on filter confidence
-            sigma_mag_scaled = sigma_mag * r_scale
-            mag_policy_scales, mag_apply_scales = self._get_sensor_adaptive_scales("MAG")
-            mag_adaptive_info: Dict[str, Any] = {}
-            
-            # Use filtered yaw instead of raw calibrated mag
-            has_ppk = self.ppk_state is not None
-            
-            # Get residual_csv path if debug data is enabled
-            residual_path = self.residual_csv if self.config.save_debug_data and hasattr(self, 'residual_csv') else None
-            
-            # Apply magnetometer update using FILTERED yaw
-            # CRITICAL: Pass filtered yaw directly instead of raw mag
-            applied, reason = apply_magnetometer_update(
-                self.kf,
-                mag_calibrated=mag_cal,  # Still needed for compute_yaw_from_mag inside
-                mag_declination=declination,
-                use_raw_heading=use_raw,
-                sigma_mag_yaw=sigma_mag_scaled,  # Use scaled sigma
-                current_phase=self.state.current_phase,  # v3.4.0: state-based phase
-                in_convergence=in_convergence,
-                has_ppk_yaw=has_ppk,
-                timestamp=mag_rec.t,
-                residual_csv=residual_path,
-                frame=self.state.vio_frame,
-                yaw_override=yaw_mag_filtered,  # NEW: pass filtered yaw directly
-                filter_info=filter_info,  # v2.9.2: track filter rejection reasons
-                use_estimated_bias=self.config.use_mag_estimated_bias,  # v3.9.8: freeze states if disabled
-                r_scale_extra=float(mag_apply_scales.get("r_scale", 1.0)),
-                adaptive_info=mag_adaptive_info,
-            )
-            self.record_adaptive_measurement(
-                "MAG",
-                adaptive_info=mag_adaptive_info,
-                timestamp=mag_rec.t,
-                policy_scales=mag_policy_scales,
-            )
-            
-            if applied:
-                self.state.mag_updates += 1
-            else:
-                self.state.mag_rejects += 1
+        self.magnetometer_service.process_magnetometer(t=t)
     
     def _process_single_vps(self, vps, t: float):
         """
@@ -1979,50 +1579,7 @@ class VIORunner:
             vps: VPS record with lat, lon, etc.
             t: VPS timestamp
         """
-        from .vps_integration import (
-            compute_vps_innovation, compute_vps_acceptance_threshold
-        )
-        
-        sigma_vps = self.global_config.get('SIGMA_VPS_XY', 1.0)
-        
-        # Compute innovation and Mahalanobis distance
-        vps_xy, innovation, m2_test = compute_vps_innovation(
-            vps, self.kf, self.lat0, self.lon0, self.proj_cache
-        )
-        
-        # Compute adaptive acceptance threshold
-        time_since_correction = t - getattr(self.kf, 'last_absolute_correction_time', t)
-        innovation_mag = float(np.linalg.norm(innovation))
-        max_innovation_m, r_scale, tier_name = compute_vps_acceptance_threshold(
-            time_since_correction, innovation_mag
-        )
-        
-        # Chi-square threshold (2 DOF)
-        chi2_threshold = 5.99  # 95% confidence
-        
-        # Gate by innovation magnitude OR chi-square test
-        if innovation_mag > max_innovation_m:
-            print(f"[VPS] REJECTED: innovation {innovation_mag:.1f}m > {max_innovation_m:.1f}m "
-                  f"({tier_name}, drift={time_since_correction:.1f}s)")
-            return
-        
-        if m2_test > chi2_threshold * 10:  # Very permissive for first VPS
-            print(f"[VPS] REJECTED: chi2={m2_test:.1f} >> {chi2_threshold} "
-                  f"(innovation={innovation_mag:.1f}m)")
-            return
-        
-        # Apply update with adaptive R scaling
-        applied = apply_vps_update(
-            self.kf,
-            vps_xy=vps_xy,
-            sigma_vps=sigma_vps,
-            r_scale=r_scale
-        )
-        
-        if applied:
-            self.kf.last_absolute_correction_time = t
-            print(f"[VPS] Applied at t={t:.3f}, innovation={innovation_mag:.1f}m, "
-                  f"tier={tier_name}, R_scale={r_scale:.1f}x")
+        self.vps_service.process_single_vps(vps=vps, t=t)
     
     def _process_single_mag(self, mag_rec, t: float):
         """
@@ -2047,77 +1604,7 @@ class VIORunner:
             mag_rec: Magnetometer record with hardware-synchronized timestamp
             t: Current IMU timestamp (after propagation)
         """
-        # Check time synchronization (should be very close if time_ref works)
-        if abs(t - mag_rec.t) > 0.05:  # 50ms threshold
-            print(f"[Mag] WARNING: Large time difference {t - mag_rec.t:.3f}s - may indicate clock sync issue")
-        
-        sigma_mag = self.global_config.get('SIGMA_MAG_YAW', 0.15)
-        declination = self.global_config.get('MAG_DECLINATION', 0.0)
-        use_raw = self.global_config.get('MAG_USE_RAW_HEADING', True)
-        
-        # v3.9.7: Use EKF estimated mag_bias instead of static config hard_iron
-        if self.config.use_mag_estimated_bias:
-            hard_iron = self.kf.x[16:19, 0].flatten()
-        else:
-            hard_iron = self.global_config.get('MAG_HARD_IRON_OFFSET', None)
-        soft_iron = self.global_config.get('MAG_SOFT_IRON_MATRIX', None)
-        mag_cal = calibrate_magnetometer(mag_rec.mag, hard_iron=hard_iron, soft_iron=soft_iron)
-        
-        # Compute raw yaw from calibrated magnetometer
-        from .magnetometer import compute_yaw_from_mag
-        q_current = self.kf.x[6:10, 0].flatten()
-        yaw_mag_raw, quality = compute_yaw_from_mag(
-            mag_body=mag_cal,
-            q_wxyz=q_current,
-            mag_declination=declination,
-            use_raw_heading=use_raw
-        )
-        
-        # Apply magnetometer filter (EMA smoothing + gyro consistency check)
-        in_convergence = self.state.current_phase < 2  # SPINUP or EARLY phase
-        yaw_mag_filtered, r_scale, filter_info = apply_mag_filter(
-            yaw_mag=yaw_mag_raw,
-            yaw_t=mag_rec.t,
-            gyro_z=self.last_gyro_z,
-            dt_imu=self.last_imu_dt,
-            in_convergence=in_convergence,
-            mag_max_yaw_rate=self.global_config.get('MAG_MAX_YAW_RATE_DEG', 30.0) * np.pi / 180.0,
-            mag_gyro_threshold=self.global_config.get('MAG_GYRO_THRESHOLD_DEG', 10.0) * np.pi / 180.0,
-            mag_ema_alpha=self.global_config.get('MAG_EMA_ALPHA', 0.3),
-            mag_consistency_r_inflate=self.global_config.get('MAG_R_INFLATE', 5.0)
-        )
-        
-        # Scale measurement noise based on filter confidence
-        sigma_mag_scaled = sigma_mag * r_scale
-        
-        # Use filtered yaw instead of raw calibrated mag
-        has_ppk = self.ppk_state is not None
-        
-        # Get residual_csv path if debug data is enabled
-        residual_path = self.residual_csv if self.config.save_debug_data and hasattr(self, 'residual_csv') else None
-        
-        # Apply magnetometer update using FILTERED yaw
-        applied, reason = apply_magnetometer_update(
-            self.kf,
-            mag_calibrated=mag_cal,
-            mag_declination=declination,
-            use_raw_heading=use_raw,
-            sigma_mag_yaw=sigma_mag_scaled,
-            current_phase=self.state.current_phase,
-            in_convergence=in_convergence,
-            has_ppk_yaw=has_ppk,
-            timestamp=mag_rec.t,
-            residual_csv=residual_path,
-            frame=self.state.vio_frame,
-            yaw_override=yaw_mag_filtered,
-            filter_info=filter_info,
-            use_estimated_bias=self.config.use_mag_estimated_bias  # v3.9.8: freeze states if disabled
-        )
-        
-        if applied:
-            self.state.mag_updates += 1
-        else:
-            self.state.mag_rejects += 1
+        self.magnetometer_service.process_single_mag(mag_rec=mag_rec, t=t)
     
     def process_dem_height(self, t: float):
         """
@@ -2126,88 +1613,7 @@ class VIORunner:
         Args:
             t: Current timestamp
         """
-        sigma_height = self.global_config.get('SIGMA_AGL_Z', 2.5)
-        
-        # Get current position
-        lat_now, lon_now = self.proj_cache.xy_to_latlon(
-            self.kf.x[0, 0], self.kf.x[1, 0],
-            self.lat0, self.lon0
-        )
-        
-        # Sample DEM
-        dem_now = self.dem.sample_m(lat_now, lon_now) if self.dem.ds else None
-        
-        if dem_now is None or np.isnan(dem_now):
-            return
-        
-        # Compute height measurement
-        # v3.9.12: Try Direct MSL from Flight Log (Barometer/GNSS) first
-        # This replaces DEM+AGL logic if available
-        msl_direct = None
-        if self.msl_interpolator:
-            raw_msl = self.msl_interpolator.get_msl(t)
-            if raw_msl is not None:
-                # Apply the alignment offset (Result = Log - Offset)
-                msl_direct = raw_msl - getattr(self, 'msl_offset', 0.0)
-            
-        if msl_direct is not None:
-            # Direct MSL update
-            height_m = msl_direct
-            # Disable XY uncertainty scaling (baro/GNSS doesn't depend on XY)
-            xy_uncertainty = 0.0 
-            has_valid_dem = True # Treat as valid measurement
-        else:
-            # Fallback: Compute height measurement from DEM + estimated AGL
-            # CRITICAL FIX v3.9.2: DO NOT use GPS MSL - that causes innovation=0!
-            # DEM update must constrain drift by comparing: (DEM + estimated_AGL) vs state
-            # State is MSL, measurement = DEM + estimated_AGL
-            
-            # Estimate AGL from current MSL state and DEM
-            current_msl = self.kf.x[2, 0]
-            estimated_agl = current_msl - dem_now
-            
-            # Clamp AGL to reasonable range (helicopter doesn't fly underground or >500m AGL)
-            estimated_agl = np.clip(estimated_agl, 0.0, 500.0)
-            
-            # Reconstruct MSL measurement from DEM + estimated AGL
-            height_m = dem_now + estimated_agl
-            has_valid_dem = True # Since we checked dem_now is not None/NaN before
-        
-        # Compute uncertainties
-        if msl_direct is None:
-            # Only use XY uncertainty for DEM-based update
-            xy_uncertainty = float(np.trace(self.kf.P[0:2, 0:2]))
-        
-        time_since_correction = t - getattr(self.kf, 'last_absolute_correction_time', t)
-        speed = float(np.linalg.norm(self.kf.x[3:6, 0]))
-        dem_policy_scales, dem_apply_scales = self._get_sensor_adaptive_scales("DEM")
-        dem_adaptive_info: Dict[str, Any] = {}
-        
-        # Get residual_csv path if debug data is enabled
-        residual_path = self.residual_csv if self.config.save_debug_data and hasattr(self, 'residual_csv') else None
-        
-        applied, reason = apply_dem_height_update(
-            self.kf,
-            height_measurement=height_m,
-            sigma_height=sigma_height,
-            xy_uncertainty=xy_uncertainty,
-            time_since_correction=time_since_correction,
-            speed_ms=speed,
-            has_valid_dem=True,
-            no_vision_corrections=(len(self.imgs) == 0 and len(self.vps_list) == 0),
-            timestamp=t,
-            residual_csv=residual_path,
-            frame=self.state.vio_frame,
-            threshold_scale=float(dem_apply_scales.get("threshold_scale", 1.0)),
-            r_scale_extra=float(dem_apply_scales.get("r_scale", 1.0)),
-            adaptive_info=dem_adaptive_info,
-        )
-        self.record_adaptive_measurement(
-            "DEM",
-            adaptive_info=dem_adaptive_info,
-            timestamp=t,
-            policy_scales=dem_policy_scales,
-        )
+        self.dem_service.process_dem_height(t=t)
     
     def log_pose(self, t: float, dt: float, used_vo: bool,
                  vo_data: Optional[Dict] = None,
@@ -2228,150 +1634,24 @@ class VIORunner:
             lat_now: Pre-computed latitude (optional)
             lon_now: Pre-computed longitude (optional)
         """
-        # Use pre-computed values if provided, otherwise compute from current state
-        if lat_now is None or lon_now is None:
-            lat_now, lon_now = self.proj_cache.xy_to_latlon(
-                self.kf.x[0, 0], self.kf.x[1, 0],
-                self.lat0, self.lon0
-            )
-        
-        if msl_now is None or agl_now is None:
-            # Compute MSL/AGL from current state (post-DEM update)
-            dem_now = self.dem.sample_m(lat_now, lon_now) if self.dem.ds else 0.0
-            if dem_now is None:
-                dem_now = 0.0
-            
-            msl_now = self.kf.x[2, 0]
-            agl_now = msl_now - dem_now
-        
-        frame_str = str(self.state.vio_frame) if used_vo else ""
-        
-        vo_dx = vo_data.get('dx', np.nan) if vo_data else np.nan
-        vo_dy = vo_data.get('dy', np.nan) if vo_data else np.nan
-        vo_dz = vo_data.get('dz', np.nan) if vo_data else np.nan
-        vo_r = vo_data.get('roll', np.nan) if vo_data else np.nan
-        vo_p = vo_data.get('pitch', np.nan) if vo_data else np.nan
-        vo_y = vo_data.get('yaw', np.nan) if vo_data else np.nan
-        
-        with open(self.pose_csv, "a", newline="") as f:
-            f.write(
-                f"{t - self.state.t0:.6f},{dt:.6f},{frame_str},"
-                f"{self.kf.x[0,0]:.3f},{self.kf.x[1,0]:.3f},{msl_now:.3f},"
-                f"{self.kf.x[3,0]:.3f},{self.kf.x[4,0]:.3f},{self.kf.x[5,0]:.3f},"
-                f"{lat_now:.8f},{lon_now:.8f},{agl_now:.3f},"
-                f"{'' if np.isnan(vo_dx) else f'{vo_dx:.6f}'},"
-                f"{'' if np.isnan(vo_dy) else f'{vo_dy:.6f}'},"
-                f"{'' if np.isnan(vo_dz) else f'{vo_dz:.6f}'},"
-                f"{'' if np.isnan(vo_r) else f'{vo_r:.3f}'},"
-                f"{'' if np.isnan(vo_p) else f'{vo_p:.3f}'},"
-                f"{'' if np.isnan(vo_y) else f'{vo_y:.3f}'}\n"
-            )
+        self.output_reporting.log_pose(
+            t=t,
+            dt=dt,
+            used_vo=used_vo,
+            vo_data=vo_data,
+            msl_now=msl_now,
+            agl_now=agl_now,
+            lat_now=lat_now,
+            lon_now=lon_now,
+        )
     
     def print_summary(self):
         """Print final summary statistics."""
-        print("\n\n--- Done ---")
-        print(f"Total IMU samples: {len(self.imu)}")
-        print(f"Images used: {self.state.vio_frame}")
-        print(f"VPS used: {self.state.vps_idx}")
-        print(f"Magnetometer: {self.state.mag_updates} updates | "
-              f"{self.state.mag_rejects} rejected")
-        print(f"ZUPT: {self.state.zupt_applied} applied | "
-              f"{self.state.zupt_rejected} rejected | "
-              f"{self.state.zupt_detected} detected")
-        
-        if self.kf is not None and hasattr(self.kf, "get_cov_growth_summary"):
-            cov_summary = self.kf.get_cov_growth_summary()
-            if len(cov_summary) > 0:
-                print("\nCovariance Growth Sources (top 8):")
-                for row in cov_summary[:8]:
-                    print(
-                        f"  {row['update_type']}: samples={row['samples']}, "
-                        f"growth={row['growth_events']} ({100.0*row['growth_rate']:.1f}%), "
-                        f"largeP={row['large_events']} ({100.0*row['large_rate']:.1f}%), "
-                        f"max|P|={row['max_pmax']:.2e}"
-                    )
-        
-        print_msckf_stats()
-        
-        # Print error statistics using dedicated function
-        from .output_utils import print_error_statistics
-        print_error_statistics(self.error_csv)
-        self._write_benchmark_health_summary()
+        self.output_reporting.print_summary()
 
     def _write_benchmark_health_summary(self):
         """Write one-row benchmark health summary CSV for before/after comparison."""
-        if not self.benchmark_health_summary_csv:
-            return
-
-        projection_count = 0
-        first_projection_time = float("nan")
-        pcond_max_stats = float("nan")
-        if self.kf is not None and hasattr(self.kf, "get_conditioning_stats"):
-            try:
-                cstats = self.kf.get_conditioning_stats()
-                projection_count = int(cstats.get("projection_count", 0))
-                first_projection_time = float(cstats.get("first_projection_time", float("nan")))
-                pcond_max_stats = float(cstats.get("max_cond_seen", float("nan")))
-            except Exception:
-                pass
-
-        pcond_max_cov = float("nan")
-        pmax_max = float("nan")
-        cov_large_rate = float("nan")
-        if self.cov_health_csv and os.path.isfile(self.cov_health_csv):
-            try:
-                cov_df = pd.read_csv(self.cov_health_csv)
-                if len(cov_df) > 0:
-                    pcond_max_cov = float(pd.to_numeric(cov_df["p_cond"], errors="coerce").max())
-                    pmax_max = float(pd.to_numeric(cov_df["p_max"], errors="coerce").max())
-                    cov_large_rate = float(pd.to_numeric(cov_df["large_flag"], errors="coerce").mean())
-            except Exception:
-                pass
-
-        pcond_max = pcond_max_stats
-        if np.isfinite(pcond_max_cov):
-            pcond_max = max(pcond_max, pcond_max_cov) if np.isfinite(pcond_max) else pcond_max_cov
-
-        pos_rmse = float("nan")
-        final_pos_err = float("nan")
-        final_alt_err = float("nan")
-        if self.error_csv and os.path.isfile(self.error_csv):
-            try:
-                err_df = pd.read_csv(self.error_csv)
-                if len(err_df) > 0:
-                    pos_vals = pd.to_numeric(err_df["pos_error_m"], errors="coerce").to_numpy(dtype=float)
-                    alt_vals = pd.to_numeric(err_df["alt_error_m"], errors="coerce").to_numpy(dtype=float)
-                    pos_rmse = float(np.sqrt(np.nanmean(pos_vals ** 2)))
-                    final_pos_err = float(pos_vals[-1])
-                    final_alt_err = float(alt_vals[-1])
-            except Exception:
-                pass
-
-        output_dir_norm = os.path.normpath(self.config.output_dir)
-        if os.path.basename(output_dir_norm) == "preintegration":
-            run_id = os.path.basename(os.path.dirname(output_dir_norm))
-        else:
-            run_id = os.path.basename(output_dir_norm)
-        if not run_id:
-            run_id = output_dir_norm
-
-        append_benchmark_health_summary(
-            self.benchmark_health_summary_csv,
-            run_id=run_id,
-            projection_count=projection_count,
-            first_projection_time=first_projection_time,
-            pcond_max=pcond_max,
-            pmax_max=pmax_max,
-            cov_large_rate=cov_large_rate,
-            pos_rmse=pos_rmse,
-            final_pos_err=final_pos_err,
-            final_alt_err=final_alt_err,
-        )
-        print(
-            f"[SUMMARY] projection_count={projection_count}, "
-            f"first_projection_time={first_projection_time:.3f}, "
-            f"pcond_max={pcond_max:.2e}, cov_large_rate={cov_large_rate:.3f}"
-        )
+        self.output_reporting.write_benchmark_health_summary()
     
     def run(self):
         """

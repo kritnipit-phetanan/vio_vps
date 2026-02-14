@@ -397,6 +397,15 @@ def apply_vps_delayed_update(
     # Check if clone exists
     if not clone_manager.has_pending_clone(image_id):
         return False, None, f"REJECTED: Clone '{image_id}' not found (expired?)"
+
+    try:
+        r_check = np.array(R_vps, dtype=float)
+        if r_check.shape != (2, 2) or not np.all(np.isfinite(r_check)):
+            return False, None, "REJECTED: Invalid R_vps"
+        if float(np.min(np.diag(r_check))) <= 0.0:
+            return False, None, "REJECTED: Non-positive R_vps diag"
+    except Exception:
+        return False, None, "REJECTED: Bad R_vps"
     
     # Get clone age for logging
     clone_age = clone_manager.get_clone_age(image_id, t_now=0.0)  # Relative age
@@ -405,6 +414,9 @@ def apply_vps_delayed_update(
     vps_xy = proj_cache.latlon_to_xy(vps_lat, vps_lon, lat0, lon0)
     current_xy = kf.x[0:2, 0]
     pre_innovation = np.linalg.norm(vps_xy - current_xy)
+    if not np.isfinite(pre_innovation):
+        clone_manager.clones.pop(image_id, None)
+        return False, None, "REJECTED: Non-finite innovation"
     
     # Adaptive gating based on time since last VPS
     max_innovation_m, r_scale, tier_name = compute_vps_acceptance_threshold(

@@ -277,6 +277,9 @@ class TileCache:
         Returns:
             MapPatch with image and metadata, or None if no coverage
         """
+        if int(patch_size_px) <= 0:
+            return None
+
         # Get center tile
         center_tile_x, center_tile_y = lat_lon_to_tile(center_lat, center_lon, self.zoom)
         
@@ -329,6 +332,10 @@ class TileCache:
         y2 = min(canvas_h, y2)
         
         patch = canvas[y1:y2, x1:x2]
+
+        # Degenerate patch can happen near bounds after clamping.
+        if patch.size == 0 or patch.shape[0] <= 1 or patch.shape[1] <= 1:
+            return None
         
         # Resize if needed (edge case)
         if patch.shape[0] != patch_size_px or patch.shape[1] != patch_size_px:

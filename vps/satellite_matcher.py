@@ -253,11 +253,19 @@ class SatelliteMatcher:
             ones = np.ones((len(inlier_pts_drone), 1))
             pts_h = np.hstack([inlier_pts_drone, ones])
             projected = (H @ pts_h.T).T
-            projected = projected[:, :2] / projected[:, 2:3]
+            denom = projected[:, 2]
+            valid_proj = np.isfinite(denom) & (np.abs(denom) > 1e-9)
+            if not np.any(valid_proj):
+                return None, np.array([]), float('inf')
+            projected_xy = np.full((len(projected), 2), np.nan, dtype=float)
+            projected_xy[valid_proj] = projected[valid_proj, :2] / denom[valid_proj, None]
             
             # Compute error
-            errors = np.linalg.norm(projected - inlier_pts_sat, axis=1)
-            reproj_error = np.mean(errors)
+            valid_err = valid_proj & np.all(np.isfinite(inlier_pts_sat), axis=1)
+            if not np.any(valid_err):
+                return None, np.array([]), float('inf')
+            errors = np.linalg.norm(projected_xy[valid_err] - inlier_pts_sat[valid_err], axis=1)
+            reproj_error = float(np.mean(errors))
         else:
             reproj_error = float('inf')
         
@@ -283,8 +291,13 @@ class SatelliteMatcher:
         
         # Transform to satellite space
         sat_point = (H @ drone_center.T).T
-        sat_x = sat_point[0, 0] / sat_point[0, 2]
-        sat_y = sat_point[0, 1] / sat_point[0, 2]
+        w_h = float(sat_point[0, 2])
+        if (not np.isfinite(w_h)) or abs(w_h) <= 1e-9:
+            raise ValueError("Degenerate homography center projection (w≈0)")
+        sat_x = float(sat_point[0, 0] / w_h)
+        sat_y = float(sat_point[0, 1] / w_h)
+        if not (np.isfinite(sat_x) and np.isfinite(sat_y)):
+            raise ValueError("Non-finite center projection")
         
         # Offset from satellite image center (assuming same size)
         offset_x = sat_x - w / 2
@@ -344,7 +357,20 @@ class SatelliteMatcher:
         
         # Compute center offset
         drone_size = (drone_img.shape[1], drone_img.shape[0])
-        offset_px = self.compute_center_offset(H, drone_size)
+        try:
+            offset_px = self.compute_center_offset(H, drone_size)
+        except ValueError:
+            return MatchResult(
+                success=False,
+                H=H,
+                num_matches=num_matches,
+                num_inliers=num_inliers,
+                reproj_error=float('inf'),
+                confidence=0.0,
+                offset_px=(0.0, 0.0),
+                keypoints_drone=pts_drone,
+                keypoints_sat=pts_sat
+            )
         
         # Compute confidence
         inlier_ratio = num_inliers / num_matches if num_matches > 0 else 0

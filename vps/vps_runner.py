@@ -279,6 +279,39 @@ class VPSRunner:
         """
         t_start = time.time()
         self.stats['total_attempts'] += 1
+        t_tile_start = t_start
+        t_preprocess_start = t_start
+        t_match_start = t_start
+        t_pose_start = t_start
+        tile_ms = preprocess_ms = match_ms = pose_ms = 0.0
+
+        def _log_attempt_and_profile(success: bool, reason: str):
+            processing_time_ms = (time.time() - t_start) * 1000.0
+            if self.logger:
+                import math
+                self.logger.log_attempt(
+                    t=t_cam,
+                    frame=frame_idx,
+                    est_lat=est_lat,
+                    est_lon=est_lon,
+                    est_alt=est_alt,
+                    est_yaw_deg=math.degrees(est_yaw),
+                    success=success,
+                    reason=reason,
+                    processing_time_ms=processing_time_ms,
+                )
+                self.logger.log_profile(
+                    t=t_cam,
+                    frame=frame_idx,
+                    success=success,
+                    reason=reason,
+                    total_ms=processing_time_ms,
+                    tile_ms=tile_ms,
+                    preprocess_ms=preprocess_ms,
+                    match_ms=match_ms,
+                    pose_ms=pose_ms,
+                )
+            return processing_time_ms
         
         # 1. Check update interval
         if t_cam - self.last_update_time < self.config.min_update_interval:
@@ -291,75 +324,118 @@ class VPSRunner:
         # 3. Check tile coverage
         if not self.tile_cache.is_position_in_cache(est_lat, est_lon):
             self.stats['fail_no_coverage'] += 1
+            _log_attempt_and_profile(False, "no_coverage")
             return None
         
         # 4. Get satellite map patch
+        t_tile_start = time.time()
         map_patch = self.tile_cache.get_map_patch(
             est_lat, est_lon, 
             patch_size_px=self.config.output_size[0]
         )
+        tile_ms = (time.time() - t_tile_start) * 1000.0
         
         if map_patch is None:
             self.stats['fail_no_coverage'] += 1
+            _log_attempt_and_profile(False, "no_map_patch")
+            return None
+        if map_patch.image is None or map_patch.image.size == 0:
+            self.stats['fail_match'] += 1
+            _log_attempt_and_profile(False, "empty_map_patch")
+            return None
+        if map_patch.image.shape[0] <= 1 or map_patch.image.shape[1] <= 1:
+            self.stats['fail_match'] += 1
+            _log_attempt_and_profile(False, "degenerate_map_patch")
+            return None
+        if not np.isfinite(float(map_patch.meters_per_pixel)) or float(map_patch.meters_per_pixel) <= 0.0:
+            self.stats['fail_match'] += 1
+            _log_attempt_and_profile(False, "invalid_map_gsd")
+            return None
+        if img is None or getattr(img, "size", 0) == 0:
+            self.stats['fail_match'] += 1
+            _log_attempt_and_profile(False, "empty_input_image")
             return None
         
         # 5. Preprocess drone image
         # Apply camera-body yaw offset (from extrinsics calibration)
         camera_yaw = est_yaw + self.camera_yaw_offset_rad
-        
-        preprocess_result = self.preprocessor.preprocess(
-            img=img,
-            yaw_rad=camera_yaw,
-            altitude_m=est_alt,
-            target_gsd=map_patch.meters_per_pixel,
-            grayscale=True
-        )
+        t_preprocess_start = time.time()
+        try:
+            preprocess_result = self.preprocessor.preprocess(
+                img=img,
+                yaw_rad=camera_yaw,
+                altitude_m=est_alt,
+                target_gsd=map_patch.meters_per_pixel,
+                grayscale=True
+            )
+        except Exception:
+            self.stats['fail_match'] += 1
+            _log_attempt_and_profile(False, "preprocess_failed")
+            return None
+        preprocess_ms = (time.time() - t_preprocess_start) * 1000.0
+        if preprocess_result.image is None or preprocess_result.image.size == 0:
+            self.stats['fail_match'] += 1
+            _log_attempt_and_profile(False, "empty_preprocessed")
+            return None
+        if preprocess_result.image.shape[0] <= 1 or preprocess_result.image.shape[1] <= 1:
+            self.stats['fail_match'] += 1
+            _log_attempt_and_profile(False, "degenerate_preprocessed")
+            return None
         
         # 6. Match against satellite
-        match_result = self.matcher.match_with_homography(
-            drone_img=preprocess_result.image,
-            sat_img=map_patch.image if len(map_patch.image.shape) == 2 
-                    else map_patch.image[:,:,0]  # Use single channel
-        )
+        t_match_start = time.time()
+        try:
+            match_result = self.matcher.match_with_homography(
+                drone_img=preprocess_result.image,
+                sat_img=map_patch.image if len(map_patch.image.shape) == 2 
+                        else map_patch.image[:,:,0]  # Use single channel
+            )
+        except Exception:
+            self.stats['fail_match'] += 1
+            _log_attempt_and_profile(False, "matcher_failed")
+            return None
+        match_ms = (time.time() - t_match_start) * 1000.0
         
         if not match_result.success:
             self.stats['fail_match'] += 1
+            _log_attempt_and_profile(False, "match_failed")
             return None
         
         # 7. Quality check
         if match_result.num_inliers < self.config.min_inliers:
             self.stats['fail_quality'] += 1
+            _log_attempt_and_profile(False, "quality_inliers")
             return None
         
         if match_result.reproj_error > self.config.max_reproj_error:
             self.stats['fail_quality'] += 1
+            _log_attempt_and_profile(False, "quality_reproj")
             return None
         
         if match_result.confidence < self.config.min_confidence:
             self.stats['fail_quality'] += 1
+            _log_attempt_and_profile(False, "quality_confidence")
             return None
         
         # 8. Compute VPS measurement
-        vps_measurement = self.pose_estimator.compute_vps_measurement(
-            match_result=match_result,
-            map_gsd=map_patch.meters_per_pixel,
-            map_center_lat=map_patch.center_lat,
-            map_center_lon=map_patch.center_lon,
-            t_cam=t_cam
-        )
+        t_pose_start = time.time()
+        try:
+            vps_measurement = self.pose_estimator.compute_vps_measurement(
+                match_result=match_result,
+                map_gsd=map_patch.meters_per_pixel,
+                map_center_lat=map_patch.center_lat,
+                map_center_lon=map_patch.center_lon,
+                t_cam=t_cam
+            )
+        except Exception:
+            self.stats['fail_match'] += 1
+            _log_attempt_and_profile(False, "pose_estimation_exception")
+            return None
+        pose_ms = (time.time() - t_pose_start) * 1000.0
         
         if vps_measurement is None:
             self.stats['fail_match'] += 1
-            # Log failed attempt
-            if self.logger:
-                import math
-                self.logger.log_attempt(
-                    t=t_cam, frame=frame_idx,
-                    est_lat=est_lat, est_lon=est_lon, est_alt=est_alt,
-                    est_yaw_deg=math.degrees(est_yaw),
-                    success=False, reason="pose_estimation_failed",
-                    processing_time_ms=(time.time() - t_start) * 1000.0
-                )
+            _log_attempt_and_profile(False, "pose_estimation_failed")
             return None
         
         # Success!
@@ -368,24 +444,10 @@ class VPSRunner:
         self.last_result = vps_measurement
         
         # Log processing time
-        processing_time_ms = (time.time() - t_start) * 1000.0
+        processing_time_ms = _log_attempt_and_profile(True, "matched")
         
         # Debug logging
         if self.logger:
-            import math
-            # Log attempt (success)
-            self.logger.log_attempt(
-                t=t_cam,
-                frame=frame_idx,
-                est_lat=est_lat,
-                est_lon=est_lon,
-                est_alt=est_alt,
-                est_yaw_deg=math.degrees(est_yaw),
-                success=True,
-                reason="matched",
-                processing_time_ms=processing_time_ms
-            )
-            
             # Log match details
             self.logger.log_match(
                 t=t_cam,
@@ -419,7 +481,7 @@ class VPSRunner:
                     f"vps_match_{frame_idx:06d}_{t_cam:.2f}s.jpg"
                 )
                 self.matcher.visualize_matches(
-                    drone_img=preprocessed_img,
+                    drone_img=preprocess_result.image,
                     sat_img=map_patch.image,
                     result=match_result,
                     output_path=output_path

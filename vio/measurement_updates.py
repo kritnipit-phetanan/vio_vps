@@ -12,6 +12,7 @@ These updates are applied asynchronously during the main VIO loop.
 Author: VIO project
 """
 
+import os
 import numpy as np
 from scipy.spatial.transform import Rotation as R_scipy
 from typing import Optional, Tuple, Callable, Dict, Any
@@ -56,6 +57,17 @@ _MAG_STATE = {
     'oscillation_count': 0,    # Number of oscillations detected
     'skip_count': 0,           # Remaining updates to skip
 }
+
+_VIO_VEL_LOG_EVERY_N = max(1, int(os.getenv("VIO_VEL_LOG_EVERY_N", "25")))
+_VIO_VEL_LOG_COUNTER = 0
+
+
+def _log_vio_vel_update(message: str):
+    """Throttle very chatty VIO velocity INFO logs to reduce runtime overhead."""
+    global _VIO_VEL_LOG_COUNTER
+    _VIO_VEL_LOG_COUNTER += 1
+    if _VIO_VEL_LOG_COUNTER <= 3 or _VIO_VEL_LOG_COUNTER % _VIO_VEL_LOG_EVERY_N == 0:
+        print(message)
 
 
 def apply_magnetometer_update(kf,
@@ -983,8 +995,10 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
                 update_type="VIO_VEL", timestamp=t
             )
             vo_mode = "VO" if (t_unit is not None and np.linalg.norm(t_unit) > 1e-6) else "OF-fallback"
-            print(f"[VIO] Velocity update: speed={speed_final:.2f}m/s, vz_only={use_vz_only}, "
-                  f"flow={avg_flow_px:.1f}px, R_scale={flow_quality_scale:.1f}x, mode={vo_mode}, chi2={chi2_value:.2f}")
+            _log_vio_vel_update(
+                f"[VIO] Velocity update: speed={speed_final:.2f}m/s, vz_only={use_vz_only}, "
+                f"flow={avg_flow_px:.1f}px, R_scale={flow_quality_scale:.1f}x, mode={vo_mode}, chi2={chi2_value:.2f}"
+            )
             accepted = True
         else:
             # Reject outlier
@@ -1012,4 +1026,3 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
     
     _set_adaptive_info(False, dof, None, None, extra_scale)
     return False
-

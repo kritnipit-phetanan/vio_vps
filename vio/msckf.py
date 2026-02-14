@@ -13,11 +13,24 @@ References:
 Author: VIO project
 """
 
+import os
 import numpy as np
 from typing import Optional, Tuple, List, Dict, Any
 from scipy.spatial.transform import Rotation as R_scipy
 
 from .math_utils import quat_to_rot, quaternion_to_yaw, skew_symmetric, safe_matrix_inverse
+
+
+_MSCKF_LOG_EVERY_N = max(1, int(os.getenv("MSCKF_LOG_EVERY_N", "20")))
+_MSCKF_LOG_COUNTER = 0
+
+
+def _log_msckf_update(message: str):
+    """Throttle frequent MSCKF update info logs to reduce console overhead."""
+    global _MSCKF_LOG_COUNTER
+    _MSCKF_LOG_COUNTER += 1
+    if _MSCKF_LOG_COUNTER <= 3 or _MSCKF_LOG_COUNTER % _MSCKF_LOG_EVERY_N == 0:
+        print(message)
 
 
 # =============================================================================
@@ -643,12 +656,12 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
         if should_log and debug:
             print(f"[MSCKF-DIAG] fail_depth_sign #{MSCKF_STATS['fail_depth_sign']}:")
             print(f"  depth0={depth0:.3f}m, depth1={depth1:.3f}m")
-            print(f"  baseline={baseline:.3f}m, ray_angle={np.degrees(ray_angle):.1f}°")
+            print(f"  baseline={baseline:.3f}m, ray_angle={ray_angle_deg:.1f}°")
             
             # Geometry diagnosis
             if baseline < 0.1:
                 print(f"  → POOR GEOMETRY: baseline < 0.1m (too close)")
-            elif np.degrees(ray_angle) < 5.0:
+            elif ray_angle_deg < 5.0:
                 print(f"  → POOR GEOMETRY: ray_angle < 5° (insufficient parallax)")
             elif depth0 < 0 and depth1 < 0:
                 print(f"  → BOTH NEGATIVE: Likely camera frame flip or pt_norm mismatch")
@@ -776,7 +789,18 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
                         return None
     
     avg_error = total_error / len(obs_list)
-    norm_threshold = MAX_REPROJ_ERROR_PX / 120.0
+    norm_scale_px = 120.0
+    try:
+        if use_pixel_reprojection and np.isfinite(float(K[0, 0])) and float(K[0, 0]) > 1e-3:
+            norm_scale_px = float(K[0, 0])
+        else:
+            from .config import KB_PARAMS as _KB_PARAMS
+            fx_guess = float(_KB_PARAMS.get('mu', _KB_PARAMS.get('fx', norm_scale_px))) if _KB_PARAMS else norm_scale_px
+            if np.isfinite(fx_guess) and fx_guess > 1e-3:
+                norm_scale_px = fx_guess
+    except Exception:
+        pass
+    norm_threshold = MAX_REPROJ_ERROR_PX / max(1e-6, norm_scale_px)
     
     if avg_error > norm_threshold:
         MSCKF_STATS['fail_reproj_error'] += 1
@@ -787,7 +811,7 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
         #         3) high uncertainty / poor triangulation geometry
         if MSCKF_STATS['fail_reproj_error'] % 500 == 1 and debug:
             print(f"[MSCKF-DIAG] fail_reproj_error #{MSCKF_STATS['fail_reproj_error']}: fid={fid}, avg_norm_error={avg_error:.4f}, threshold={norm_threshold:.4f}")
-            print(f"  WARNING: Using /120.0 scaling - should use /fx for proper threshold!")
+            print(f"  norm_scale_px={norm_scale_px:.2f}")
         
         return None
     
@@ -1921,7 +1945,7 @@ def trigger_msckf_update(kf, cam_states: list, cam_observations: list,
                     "r_scale_used": 1.0,
                 })
             if num_updates > 0:
-                print(f"[MSCKF] Updated {num_updates} features at t={t:.3f}s")
+                _log_msckf_update(f"[MSCKF] Updated {num_updates} features at t={t:.3f}s")
             return num_updates
         except Exception as e:
             print(f"[MSCKF] Error: {e}")

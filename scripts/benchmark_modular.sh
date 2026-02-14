@@ -81,6 +81,7 @@ GROUND_TRUTH="${DATASET_BASE}/bell412_dataset3_frl.pos"
 #   imu_cam: require IMU+GT+CAM
 #   imu_only: IMU+GT only
 RUN_MODE="${RUN_MODE:-auto}"
+SAVE_DEBUG_DATA="${SAVE_DEBUG_DATA:-0}"  # 1 => pass --save_debug_data (heavy CSV logs)
 
 # Output directory
 OUTPUT_DIR="benchmark_modular_${TEST_ID}/preintegration"
@@ -168,6 +169,7 @@ echo "Test Configuration:"
 echo "  Test ID: ${TEST_ID}"
 echo "  Output directory: ${OUTPUT_DIR}/"
 echo "  RUN_MODE: ${RUN_MODE}"
+echo "  SAVE_DEBUG_DATA: ${SAVE_DEBUG_DATA}"
 echo "  Active sensors: ${RUN_MODE_LABEL}"
 [ -n "$BASELINE_RUN" ] && echo "  Baseline run: ${BASELINE_RUN}"
 [ "$USE_CAM" -eq 1 ] && echo "    - Camera: ${IMAGES_DIR}"
@@ -200,8 +202,10 @@ PYTHON_ARGS=(
     --imu "$IMU_PATH"
     --ground_truth "$GROUND_TRUTH"
     --output "$OUTPUT_DIR"
-    --save_debug_data
 )
+if [ "$SAVE_DEBUG_DATA" = "1" ]; then
+    PYTHON_ARGS+=(--save_debug_data)
+fi
 if [ "$USE_QUARRY" -eq 1 ]; then
     [ -f "$QUARRY_PATH" ] || fail_fast "RUN_MODE=${RUN_MODE} requires quarry file: $QUARRY_PATH"
     PYTHON_ARGS+=(--quarry "$QUARRY_PATH")
@@ -379,8 +383,14 @@ if [ -f "$CURRENT_SUMMARY" ] && [ -n "$BASELINE_SUMMARY" ]; then
 import pandas as pd
 import numpy as np
 
-cur = pd.read_csv("$CURRENT_SUMMARY").iloc[-1]
-base = pd.read_csv("$BASELINE_SUMMARY").iloc[-1]
+cur_df = pd.read_csv("$CURRENT_SUMMARY")
+base_df = pd.read_csv("$BASELINE_SUMMARY")
+if len(cur_df) == 0 or len(base_df) == 0:
+    print("Baseline/current summary has no data rows; skipping before/after diff.")
+    raise SystemExit(0)
+
+cur = cur_df.iloc[-1]
+base = base_df.iloc[-1]
 metrics = [
     "projection_count",
     "first_projection_time",
@@ -404,6 +414,87 @@ EOF
 else
     echo "No baseline summary found; skipping before/after diff."
 fi
+echo ""
+
+echo "=== Runtime Profiling (quick) ==="
+python3 - <<EOF
+import os
+import pandas as pd
+import numpy as np
+
+out_dir = "$OUTPUT_DIR"
+inf_csv = os.path.join(out_dir, "inference_log.csv")
+pose_csv = os.path.join(out_dir, "pose.csv")
+vps_attempts_csv = os.path.join(out_dir, "debug_vps_attempts.csv")
+vps_profile_csv = os.path.join(out_dir, "debug_vps_profile.csv")
+
+def _read_last_pose_time(path):
+    if not os.path.isfile(path):
+        return float("nan")
+    try:
+        p = pd.read_csv(path)
+        if len(p) == 0:
+            return float("nan")
+        return float(pd.to_numeric(p.iloc[-1, 0], errors="coerce"))
+    except Exception:
+        return float("nan")
+
+if os.path.isfile(inf_csv):
+    inf = pd.read_csv(inf_csv)
+    if len(inf) > 0:
+        dt = pd.to_numeric(inf.iloc[:, 1], errors="coerce").to_numpy(dtype=float)
+        dt = dt[np.isfinite(dt)]
+        proc_total = float(np.nansum(dt)) if dt.size else float("nan")
+        avg_dt = float(np.nanmean(dt)) if dt.size else float("nan")
+        max_dt = float(np.nanmax(dt)) if dt.size else float("nan")
+        sim_time = _read_last_pose_time(pose_csv)
+        rtf = proc_total / sim_time if np.isfinite(sim_time) and sim_time > 1e-9 else float("nan")
+        print(f"inference rows   : {len(inf)}")
+        print(f"proc_total       : {proc_total:.3f} s")
+        print(f"avg_dt           : {avg_dt:.6f} s (avg_fps={1.0/avg_dt:.2f})")
+        print(f"max_dt           : {max_dt:.6f} s")
+        print(f"sim_time         : {sim_time:.3f} s")
+        print(f"RTF (proc/sim)   : {rtf:.3f}x")
+else:
+    print("No inference_log.csv")
+
+if os.path.isfile(vps_attempts_csv):
+    a = pd.read_csv(vps_attempts_csv)
+    if len(a) > 0 and "processing_time_ms" in a.columns:
+        t = pd.to_numeric(a["processing_time_ms"], errors="coerce").to_numpy(dtype=float)
+        t = t[np.isfinite(t)]
+        if t.size:
+            print(f"VPS attempts     : {len(a)}")
+            print(f"VPS total        : {np.sum(t):.2f} ms")
+            print(f"VPS avg / p95    : {np.mean(t):.2f} / {np.percentile(t,95):.2f} ms")
+
+if os.path.isfile(vps_profile_csv):
+    vp = pd.read_csv(vps_profile_csv)
+    if len(vp) > 0:
+        ok = vp[vp["success"] == 1] if "success" in vp.columns else vp
+        src = ok if len(ok) > 0 else vp
+        cols = ["tile_ms", "preprocess_ms", "match_ms", "pose_ms", "total_ms"]
+        print("VPS stage means  :", ", ".join(
+            f"{c}={pd.to_numeric(src[c], errors='coerce').mean():.2f}ms"
+            for c in cols if c in src.columns
+        ))
+
+# CSV I/O footprint (proxy for logging overhead)
+csv_sizes = []
+for name in os.listdir(out_dir):
+    if name.endswith(".csv"):
+        path = os.path.join(out_dir, name)
+        try:
+            csv_sizes.append((name, os.path.getsize(path)))
+        except OSError:
+            pass
+csv_sizes.sort(key=lambda x: x[1], reverse=True)
+if csv_sizes:
+    top = csv_sizes[:8]
+    print("Top CSV size     :")
+    for n, s in top:
+        print(f"  {n:28s} {s/1024/1024:8.2f} MB")
+EOF
 echo ""
 
 echo "=== Sensor Health by Phase (accept-rate / NIS EWMA) ==="

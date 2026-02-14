@@ -9,6 +9,7 @@ Includes helpers for time synchronization and ZUPT (Zero Velocity Update).
 Author: VIO project
 """
 
+import os
 import numpy as np
 from typing import Tuple, List, Optional
 from scipy.spatial.transform import Rotation as R_scipy
@@ -27,6 +28,21 @@ from .data_loaders import IMURecord
 # Note: propagate_nominal_state() was removed in v3.5.1
 # It was based on a misunderstanding of OpenVINS architecture.
 # Use process_imu() instead - it correctly propagates both x and P every tick.
+
+_VERBOSE_EVERY_N = max(1, int(os.getenv("VIO_VERBOSE_EVERY_N", "25")))
+_VERBOSE_COUNTERS = {
+    "marginalize": 0,
+    "preint_snapshot": 0,
+    "clone_create": 0,
+}
+
+
+def _log_throttled(tag: str, message: str):
+    """Rate-limit noisy INFO logs inside the high-frequency IMU/VIO loop."""
+    c = int(_VERBOSE_COUNTERS.get(tag, 0)) + 1
+    _VERBOSE_COUNTERS[tag] = c
+    if c <= 3 or c % _VERBOSE_EVERY_N == 0:
+        print(message)
 
 
 def _wrap_pi(angle: float) -> float:
@@ -1695,8 +1711,11 @@ def augment_state_with_camera(kf: ExtendedKalmanFilter, cam_q_wxyz: np.ndarray,
                 new_observations.append(new_obs)
         cam_observations[:] = new_observations
         
-        print(f"[VIO] Marginalized oldest pose, removed {old_obs_count} observation sets, "
-              f"now tracking {len(cam_states)} poses")
+        _log_throttled(
+            "marginalize",
+            f"[VIO] Marginalized oldest pose, removed {old_obs_count} observation sets, "
+            f"now tracking {len(cam_states)} poses",
+        )
 
     # Augment with new pose
     add_n_nominal = pose_size_nominal
@@ -1799,7 +1818,7 @@ def apply_preintegration_at_camera(kf: ExtendedKalmanFilter,
     # Reset preintegration buffer for next camera frame
     ongoing_preint.reset(bg=bg, ba=ba)
     
-    print(f"[PREINT] Jacobians snapshotted and reset: Δt={dt_total:.3f}s")
+    _log_throttled("preint_snapshot", f"[PREINT] Jacobians snapshotted and reset: Δt={dt_total:.3f}s")
     
     return preint_jacobians
 
@@ -1891,7 +1910,7 @@ def clone_camera_for_msckf(kf: ExtendedKalmanFilter, t: float,
             'observations': obs_data
         })
         
-        print(f"[CLONE] Created clone {clone_idx} with {len(obs_data)} observations")
+        _log_throttled("clone_create", f"[CLONE] Created clone {clone_idx} with {len(obs_data)} observations")
         
         return clone_idx
         

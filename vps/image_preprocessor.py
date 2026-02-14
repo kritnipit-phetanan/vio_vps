@@ -160,9 +160,13 @@ class VPSImagePreprocessor:
         """
         if drone_gsd <= 0 or target_gsd <= 0:
             return img, 1.0
+        if img is None or getattr(img, "size", 0) == 0:
+            return img, 1.0
         
         # Scale factor: if drone GSD is smaller (higher res), scale down
         scale = drone_gsd / target_gsd
+        if not np.isfinite(scale) or scale <= 0:
+            return img, 1.0
         
         if abs(scale - 1.0) < 0.05:
             # Close enough, no scaling needed
@@ -180,11 +184,18 @@ class VPSImagePreprocessor:
             new_h = int(new_h * limit_scale)
             scale *= limit_scale
         
+        # Guard against degenerate output size before resize.
+        if new_w <= 0 or new_h <= 0:
+            return img, 1.0
+        
         if new_w < 64 or new_h < 64:
             # Too small, don't scale
             return img, 1.0
         
-        scaled = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        try:
+            scaled = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        except cv2.error:
+            return img, 1.0
         
         return scaled, scale
     
@@ -447,4 +458,3 @@ def test_preprocessor():
 
 if __name__ == "__main__":
     test_preprocessor()
-

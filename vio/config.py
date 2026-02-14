@@ -563,6 +563,7 @@ def load_config(config_path: str) -> VIOConfig:
                 'VIO_VEL': {'r_scale': 1.0, 'chi2_scale': 1.0},
                 'MSCKF': {'chi2_scale': 1.0, 'reproj_scale': 1.0},
                 'ZUPT': {'r_scale': 1.0, 'chi2_scale': 1.0},
+                'VPS': {'r_scale': 1.0, 'chi2_scale': 1.0},
                 'GRAVITY_RP': {'r_scale': 1.0, 'chi2_scale': 1.0},
                 'YAW_AID': {'r_scale': 1.0, 'chi2_scale': 1.0},
                 'BIAS_GUARD': {'r_scale': 1.0, 'chi2_scale': 1.0},
@@ -725,6 +726,11 @@ def load_config(config_path: str) -> VIOConfig:
         },
         'logging': {
             'enabled': True,
+            # Sensor-health CSV downsampling:
+            # - debug tier (with --save_debug_data): keep every row
+            # - light tier (without --save_debug_data): keep every Nth accepted row
+            'sensor_health_stride_debug': 1,
+            'sensor_health_stride_release': 10,
         },
     }
     result['ADAPTIVE'] = _merge_dict_defaults(adaptive_defaults, config.get('adaptive', {}))

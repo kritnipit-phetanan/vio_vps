@@ -21,7 +21,7 @@ WARNING = "WARNING"
 DEGRADED = "DEGRADED"
 RECOVERY = "RECOVERY"
 
-_KNOWN_SENSORS = ("MAG", "DEM", "VIO_VEL", "MSCKF", "ZUPT", "GRAVITY_RP", "YAW_AID", "BIAS_GUARD")
+_KNOWN_SENSORS = ("MAG", "DEM", "VIO_VEL", "MSCKF", "ZUPT", "VPS", "GRAVITY_RP", "YAW_AID", "BIAS_GUARD")
 
 
 def _clamp(value: float, lo: float, hi: float) -> float:
@@ -173,6 +173,7 @@ class AdaptiveController:
                 "VIO_VEL": {"r_scale": 1.0, "chi2_scale": 1.0},
                 "MSCKF": {"chi2_scale": 1.0, "reproj_scale": 1.0},
                 "ZUPT": {"r_scale": 1.0, "chi2_scale": 1.0},
+                "VPS": {"r_scale": 1.0, "chi2_scale": 1.0},
                 "GRAVITY_RP": {"r_scale": 1.0, "chi2_scale": 1.0},
                 "YAW_AID": {"r_scale": 1.0, "chi2_scale": 1.0},
                 "BIAS_GUARD": {"r_scale": 1.0, "chi2_scale": 1.0},

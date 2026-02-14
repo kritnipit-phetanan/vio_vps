@@ -139,6 +139,8 @@ def run_imu_driven_loop(runner):
     # Initialize timing
     runner.state.t0 = runner.imu[0].t
     runner.state.last_t = runner.state.t0
+    if hasattr(runner, "_run_bootstrap_convention_checks"):
+        runner._run_bootstrap_convention_checks()
     
     # Initialize preintegration cache for MSCKF Jacobians
     # Keep runtime-adjusted imu_params (e.g., imu_only conservative profile).
@@ -352,8 +354,9 @@ def run_imu_driven_loop(runner):
             fps = (1.0 / dt_proc) if dt_proc > 0 else 0.0
             f.write(f"{i},{dt_proc:.6f},{fps:.2f}\n")
         
-        # Log state debug (every sample, like vio_vps.py)
-        log_state_debug(runner.state_dbg_csv, t, runner.kf, dem_now, agl_now, msl_now, last_a_world)
+        # Heavy state debug is optional (enabled by --save_debug_data).
+        if runner.state_dbg_csv:
+            log_state_debug(runner.state_dbg_csv, t, runner.kf, dem_now, agl_now, msl_now, last_a_world)
         
         # Update last_a_world for next iteration
         # Get a_world from last IMU sample processing

@@ -272,6 +272,27 @@ def log_sensor_health(sensor_csv: Optional[str],
         pass
 
 
+def log_convention_event(convention_csv: Optional[str],
+                         t: float,
+                         sensor: str,
+                         check: str,
+                         value: float,
+                         threshold: float,
+                         status: str,
+                         note: str = ""):
+    """Log one frame/time convention monitor row."""
+    if convention_csv is None:
+        return
+    try:
+        with open(convention_csv, "a", newline="") as f:
+            f.write(
+                f"{float(t):.6f},{sensor},{check},{float(value):.6e},"
+                f"{float(threshold):.6e},{status},{note}\n"
+            )
+    except Exception:
+        pass
+
+
 def append_benchmark_health_summary(summary_csv: Optional[str],
                                     run_id: str,
                                     projection_count: int,
@@ -1094,7 +1115,7 @@ def log_msckf_window(msckf_window_csv: str, frame: int, t: float,
 # Output CSV Initialization
 # =============================================================================
 
-def init_output_csvs(output_dir: str) -> Dict[str, str]:
+def init_output_csvs(output_dir: str, save_debug_data: bool = False) -> Dict[str, Optional[str]]:
     """
     Initialize output CSV files.
     
@@ -1119,23 +1140,6 @@ def init_output_csvs(output_dir: str) -> Dict[str, str]:
     with open(paths['inf_csv'], "w", newline="") as f:
         f.write("Index,Inference Time (s),FPS\n")
     
-    # State debug
-    paths['state_dbg_csv'] = os.path.join(output_dir, "state_debug.csv")
-    with open(paths['state_dbg_csv'], "w", newline="") as f:
-        f.write("t,px,py,pz,vx,vy,vz,a_world_x,a_world_y,a_world_z,dem,agl,msl\n")
-    
-    # VO debug
-    paths['vo_dbg'] = os.path.join(output_dir, "vo_debug.csv")
-    with open(paths['vo_dbg'], "w", newline="") as f:
-        f.write("Frame,num_inliers,rot_angle_deg,alignment_deg,rotation_rate_deg_s,"
-                "use_only_vz,skip_vo,vo_dx,vo_dy,vo_dz,vel_vx,vel_vy,vel_vz\n")
-    
-    # MSCKF debug
-    paths['msckf_dbg'] = os.path.join(output_dir, "msckf_debug.csv")
-    with open(paths['msckf_dbg'], "w", newline="") as f:
-        f.write("frame,feature_id,num_observations,triangulation_success,"
-                "reprojection_error_px,innovation_norm,update_applied,chi2_test\n")
-    
     # Error log
     paths['error_csv'] = os.path.join(output_dir, "error_log.csv")
     with open(paths['error_csv'], "w", newline="") as f:
@@ -1143,11 +1147,6 @@ def init_output_csvs(output_dir: str) -> Dict[str, str]:
                 "vel_error_m_s,vel_error_E,vel_error_N,vel_error_U,"
                 "alt_error_m,yaw_vio_deg,yaw_gps_deg,yaw_error_deg,"
                 "gps_lat,gps_lon,gps_alt,vio_E,vio_N,vio_U\n")
-
-    # Time synchronization debug log
-    paths['time_sync_csv'] = os.path.join(output_dir, "time_sync_debug.csv")
-    with open(paths['time_sync_csv'], "w", newline="") as f:
-        f.write("t_filter,t_gt_mapped,dt_gt,gt_idx,gt_stamp_log,matched,error_time_mode\n")
     
     # Covariance health debug log
     paths['cov_health_csv'] = os.path.join(output_dir, "cov_health.csv")
@@ -1183,5 +1182,39 @@ def init_output_csvs(output_dir: str) -> Dict[str, str]:
             "run_id,projection_count,first_projection_time,pcond_max,pmax_max,"
             "cov_large_rate,pos_rmse,final_pos_err,final_alt_err\n"
         )
+
+    # Heavy per-frame/per-feature debug logs are opt-in via --save_debug_data.
+    paths['state_dbg_csv'] = None
+    paths['vo_dbg'] = None
+    paths['msckf_dbg'] = None
+    paths['time_sync_csv'] = None
+    paths['convention_csv'] = None
+    if save_debug_data:
+        # State debug
+        paths['state_dbg_csv'] = os.path.join(output_dir, "state_debug.csv")
+        with open(paths['state_dbg_csv'], "w", newline="") as f:
+            f.write("t,px,py,pz,vx,vy,vz,a_world_x,a_world_y,a_world_z,dem,agl,msl\n")
+
+        # VO debug
+        paths['vo_dbg'] = os.path.join(output_dir, "vo_debug.csv")
+        with open(paths['vo_dbg'], "w", newline="") as f:
+            f.write("Frame,num_inliers,rot_angle_deg,alignment_deg,rotation_rate_deg_s,"
+                    "use_only_vz,skip_vo,vo_dx,vo_dy,vo_dz,vel_vx,vel_vy,vel_vz\n")
+
+        # MSCKF debug
+        paths['msckf_dbg'] = os.path.join(output_dir, "msckf_debug.csv")
+        with open(paths['msckf_dbg'], "w", newline="") as f:
+            f.write("frame,feature_id,num_observations,triangulation_success,"
+                    "reprojection_error_px,innovation_norm,update_applied,chi2_test\n")
+
+        # Time synchronization debug log
+        paths['time_sync_csv'] = os.path.join(output_dir, "time_sync_debug.csv")
+        with open(paths['time_sync_csv'], "w", newline="") as f:
+            f.write("t_filter,t_gt_mapped,dt_gt,gt_idx,gt_stamp_log,matched,error_time_mode\n")
+
+        # Convention monitor debug log (frame/time base consistency checks)
+        paths['convention_csv'] = os.path.join(output_dir, "convention_debug.csv")
+        with open(paths['convention_csv'], "w", newline="") as f:
+            f.write("t,sensor,check,value,threshold,status,note\n")
     
     return paths
