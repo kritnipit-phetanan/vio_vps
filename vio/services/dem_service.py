@@ -75,7 +75,7 @@ class DEMService:
 
         time_since_correction = t - getattr(self.runner.kf, "last_absolute_correction_time", t)
         speed = float(np.linalg.norm(self.runner.kf.x[3:6, 0]))
-        dem_policy_scales, dem_apply_scales = self.runner._get_sensor_adaptive_scales("DEM")
+        dem_policy_scales, dem_apply_scales = self.runner.adaptive_service.get_sensor_adaptive_scales("DEM")
         dem_adaptive_info: Dict[str, Any] = {}
 
         # Get residual_csv path if debug data is enabled
@@ -101,7 +101,7 @@ class DEMService:
             r_scale_extra=float(dem_apply_scales.get("r_scale", 1.0)),
             adaptive_info=dem_adaptive_info,
         )
-        self.runner.record_adaptive_measurement(
+        self.runner.adaptive_service.record_adaptive_measurement(
             "DEM",
             adaptive_info=dem_adaptive_info,
             timestamp=t,

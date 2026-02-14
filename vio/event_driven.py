@@ -706,7 +706,7 @@ def handle_camera_event(runner, event: SensorEvent, filter_state: FilterState,
     # Get a dummy IMU record for rotation rate check
     last_imu = filter_state.imu_buffer.get_closest_before(t_cam)
     
-    used_vo, vo_data = runner.process_vio(last_imu, t_cam, filter_state.ongoing_preint)
+    used_vo, vo_data = runner.vio_service.process_vio(last_imu, t_cam, filter_state.ongoing_preint)
     
     return used_vo, vo_data
 
@@ -726,7 +726,7 @@ def handle_vps_event(runner, event: SensorEvent, filter_state: FilterState,
     
     # Apply VPS update (runner.process_vps already handles the actual update)
     # We need to call it at the exact timestamp
-    runner._process_single_vps(event.data, t_vps)
+    runner.vps_service.process_single_vps(event.data, t_vps)
 
 
 def handle_magnetometer_event(runner, event: SensorEvent, filter_state: FilterState,
@@ -743,24 +743,7 @@ def handle_magnetometer_event(runner, event: SensorEvent, filter_state: FilterSt
     )
     
     # Apply magnetometer update
-    runner._process_single_mag(event.data, t_mag)
-
-
-def handle_dem_event(runner, event: SensorEvent, filter_state: FilterState,
-                     imu_params: dict):
-    """
-    Handle DEM height event: propagate to time, then apply update.
-    """
-    t_dem = event.timestamp
-    
-    # Propagate to exact time
-    propagate_to_event(
-        runner.kf, filter_state, t_dem,
-        imu_params, runner.config.estimate_imu_bias
-    )
-    
-    # Apply DEM height update
-    runner.process_dem_height(t_dem)
+    runner.magnetometer_service.process_single_mag(event.data, t_mag)
 
 
 # =============================================================================
@@ -830,11 +813,11 @@ def run_event_driven_loop(runner):
     # =========================================================================
     # Step 1: Initialize (same as IMU-driven mode)
     # =========================================================================
-    runner.load_data()
-    runner.initialize_ekf()
-    runner.initialize_vio_frontend()
-    runner._initialize_rectifier()
-    runner._initialize_loop_closure()
+    runner.bootstrap_service.load_data()
+    runner.bootstrap_service.initialize_ekf()
+    runner.bootstrap_service.initialize_vio_frontend()
+    runner.bootstrap_service.initialize_rectifier()
+    runner.bootstrap_service.initialize_loop_closure()
     
     # Initialize magnetometer filter
     reset_mag_filter_state()
@@ -868,7 +851,7 @@ def run_event_driven_loop(runner):
         print("[TRN] Disabled")
     
     runner.initial_msl = runner.msl0
-    runner.setup_output_files()
+    runner.bootstrap_service.setup_output_files()
     
     # =========================================================================
     # Step 2: Create Filter State Tracker
@@ -1057,10 +1040,10 @@ def run_event_driven_loop(runner):
             # Log pose (using output state at real-time)
             dt = filter_state.output_time - runner.state.last_t
             used_vo = event.event_type == EventType.CAMERA
-            runner.log_pose(filter_state.output_time, dt, used_vo, None, msl_now, agl_now, lat_now, lon_now)
+            runner.output_reporting.log_pose(filter_state.output_time, dt, used_vo, None, msl_now, agl_now, lat_now, lon_now)
             
             # Log error
-            runner.log_error(filter_state.output_time)
+            runner.output_reporting.log_error(filter_state.output_time)
             
             # Restore fusion state
             runner.kf.x = x_backup
@@ -1088,7 +1071,6 @@ def run_event_driven_loop(runner):
     # =========================================================================
     toc_all = time.time()
     
-    runner.print_summary()
     print(f"\n[PURE EVENT-DRIVEN] Processed {event_count} sensor events")
     print(f"  Camera: {scheduler.processed_count.get(EventType.CAMERA, 0)}")
     print(f"  VPS: {scheduler.processed_count.get(EventType.VPS, 0)}")
@@ -1101,4 +1083,6 @@ def run_event_driven_loop(runner):
     print(f"  Final output time: {filter_state.output_time:.3f}s")
     print(f"  Final lag: {(filter_state.output_time - filter_state.filter_time)*1000:.1f}ms")
     
-    print(f"\n=== Finished in {toc_all - tic_all:.2f} seconds ===")
+    duration_sec = toc_all - tic_all
+    print(f"\n=== Finished in {duration_sec:.2f} seconds ===")
+    return duration_sec

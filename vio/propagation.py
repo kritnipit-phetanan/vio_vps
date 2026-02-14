@@ -702,22 +702,44 @@ def apply_zupt(kf: ExtendedKalmanFilter, v_mag: float,
     predicted_vel = kf.x[3:6, 0].reshape(3, 1)
     innovation = z_zupt - predicted_vel
     
-    # CRITICAL: Check P and compute S_zupt with overflow protection
+    # CRITICAL: compute S_zupt with velocity block only (stable and overflow-safe).
     if not np.all(np.isfinite(kf.P)):
         print(f"[ZUPT] CRITICAL: P matrix contains inf/nan before S_zupt computation")
         _set_adaptive_info(False, None, None, attempted=1, reason_code="hard_reject")
         return False, 0.0, consecutive_stationary_count
-    
-    try:
-        with np.errstate(invalid='ignore', divide='ignore', over='ignore'):
-            S_zupt = H_zupt @ kf.P @ H_zupt.T + R_zupt
-    except (FloatingPointError, RuntimeWarning) as e:
-        print(f"[ZUPT] WARNING: Matmul overflow in S matrix: {e}")
-        _set_adaptive_info(False, None, None, attempted=1, reason_code="hard_reject")
-        return False, 0.0, consecutive_stationary_count
-    
-    if not np.all(np.isfinite(S_zupt)):
-        print(f"[ZUPT] WARNING: S_zupt matrix contains inf/nan")
+
+    def _build_safe_s_zupt(r_mat: np.ndarray) -> Optional[np.ndarray]:
+        try:
+            p_vv = np.array(kf.P[3:6, 3:6], dtype=float, copy=True)
+            if p_vv.shape != (3, 3) or not np.all(np.isfinite(p_vv)):
+                return None
+
+            # Symmetrize + clip to keep numeric scale bounded.
+            p_vv = 0.5 * (p_vv + p_vv.T)
+            p_cap = float(max(1e3, getattr(kf, "covariance_max_value", 1e8)))
+            p_vv = np.clip(p_vv, -p_cap, p_cap)
+
+            # Ensure PSD for velocity block before adding R.
+            evals, evecs = np.linalg.eigh(p_vv)
+            min_var = max(1e-9, float(np.min(np.diag(r_mat))) * 1e-3)
+            evals = np.clip(evals, min_var, p_cap)
+            p_vv = evecs @ np.diag(evals) @ evecs.T
+
+            s = p_vv + r_mat
+            s = 0.5 * (s + s.T)
+            if not np.all(np.isfinite(s)):
+                return None
+
+            # Tiny diagonal loading to keep Cholesky/solve stable.
+            s_floor = max(1e-9, 1e-8 * float(np.max(np.diag(s))))
+            s[np.diag_indices(3)] += s_floor
+            return s
+        except Exception:
+            return None
+
+    S_zupt = _build_safe_s_zupt(R_zupt)
+    if S_zupt is None:
+        print(f"[ZUPT] WARNING: Failed to build stable S_zupt")
         _set_adaptive_info(False, None, None, attempted=1, reason_code="hard_reject")
         return False, 0.0, consecutive_stationary_count
     
@@ -779,7 +801,9 @@ def apply_zupt(kf: ExtendedKalmanFilter, v_mag: float,
             R_zupt = R_zupt * soft_factor
             r_scale_used *= soft_factor
             try:
-                S_zupt = H_zupt @ kf.P @ H_zupt.T + R_zupt
+                S_zupt = _build_safe_s_zupt(R_zupt)
+                if S_zupt is None:
+                    raise RuntimeError("S_zupt build failed")
                 S_zupt_inv = safe_matrix_inverse(S_zupt, damping=1e-9, method='cholesky')
                 mahal_squared = float((innovation.T @ S_zupt_inv @ innovation).item())
                 mahal_dist = np.sqrt(mahal_squared)

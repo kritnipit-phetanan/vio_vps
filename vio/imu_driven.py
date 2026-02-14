@@ -45,19 +45,19 @@ def run_imu_driven_loop(runner):
         runner: VIORunner instance with initialized config and state
     """
     # Load data
-    runner.load_data()
+    runner.bootstrap_service.load_data()
     
     # Initialize EKF
-    runner.initialize_ekf()
+    runner.bootstrap_service.initialize_ekf()
     
     # Initialize VIO frontend
-    runner.initialize_vio_frontend()
+    runner.bootstrap_service.initialize_vio_frontend()
     
     # Initialize fisheye rectifier (optional - for converting fisheye to pinhole)
-    runner._initialize_rectifier()
+    runner.bootstrap_service.initialize_rectifier()
     
     # Initialize loop closure detector (for yaw drift correction)
-    runner._initialize_loop_closure()
+    runner.bootstrap_service.initialize_loop_closure()
     
     # Initialize magnetometer filter state
     reset_mag_filter_state()
@@ -134,13 +134,12 @@ def run_imu_driven_loop(runner):
     runner.initial_msl = runner.msl0
     
     # Setup output files
-    runner.setup_output_files()
+    runner.bootstrap_service.setup_output_files()
     
     # Initialize timing
     runner.state.t0 = runner.imu[0].t
     runner.state.last_t = runner.state.t0
-    if hasattr(runner, "_run_bootstrap_convention_checks"):
-        runner._run_bootstrap_convention_checks()
+    runner.output_reporting.run_bootstrap_convention_checks()
     
     # Initialize preintegration cache for MSCKF Jacobians
     # Keep runtime-adjusted imu_params (e.g., imu_only conservative profile).
@@ -183,7 +182,7 @@ def run_imu_driven_loop(runner):
         altitude_change = runner.kf.x[2, 0] - runner.initial_msl if runner.kf is not None else 0.0
         
         # Flight phase with hysteresis/one-way protection.
-        phase_num = runner.estimate_flight_phase(
+        phase_num = runner.phase_service.estimate_flight_phase(
             velocity=velocity,
             velocity_sigma=velocity_sigma,
             vibration_level=vibration_level,
@@ -191,11 +190,11 @@ def run_imu_driven_loop(runner):
             dt=dt,
         )
         runner.state.current_phase = phase_num
-        runner.update_adaptive_policy(t=t, phase=phase_num)
-        imu_params_step, sigma_accel_step = runner.build_step_imu_params(
+        runner.adaptive_service.update_adaptive_policy(t=t, phase=phase_num)
+        imu_params_step, sigma_accel_step = runner.adaptive_service.build_step_imu_params(
             imu_params_base, sigma_accel_base
         )
-        _, zupt_apply_scales = runner._get_sensor_adaptive_scales("ZUPT")
+        _, zupt_apply_scales = runner.adaptive_service.get_sensor_adaptive_scales("ZUPT")
         
         # =====================================================================
         # IMU Propagation (v3.7.0: IMU-driven with sub-sample timestamp precision)
@@ -230,12 +229,12 @@ def run_imu_driven_loop(runner):
                 Phi_approx = np.eye(18, dtype=float)
                 Phi_approx[0:3, 3:6] = np.eye(3) * dt_before
                 runner.vps_clone_manager.propagate_cross_covariance(Phi_approx)
-            runner._update_imu_helpers(rec, dt_before, imu_params_step, zupt_scales=zupt_apply_scales)
+            runner.imu_update_service.update_imu_helpers(rec, dt_before, imu_params_step, zupt_scales=zupt_apply_scales)
             runner.state.last_t = next_cam_time
             
             # Process camera at exact timestamp
             # VIO updates (feature tracking, MSCKF, velocity) at t_cam
-            used_vo, vo_data = runner.process_vio(rec, next_cam_time, ongoing_preint)
+            used_vo, vo_data = runner.vio_service.process_vio(rec, next_cam_time, ongoing_preint)
             
             # Step 1b: Propagate remaining dt after camera
             if dt_after > 1e-6:  # Only if significant remaining time
@@ -253,7 +252,7 @@ def run_imu_driven_loop(runner):
                     Phi_approx = np.eye(18, dtype=float)
                     Phi_approx[0:3, 3:6] = np.eye(3) * dt_after
                     runner.vps_clone_manager.propagate_cross_covariance(Phi_approx)
-                runner._update_imu_helpers(rec, dt_after, imu_params_step, zupt_scales=zupt_apply_scales)
+                runner.imu_update_service.update_imu_helpers(rec, dt_after, imu_params_step, zupt_scales=zupt_apply_scales)
             runner.state.last_t = t_current
         else:
             # Normal propagation (no camera crossing)
@@ -281,13 +280,13 @@ def run_imu_driven_loop(runner):
                 runner.vps_clone_manager.propagate_cross_covariance(Phi_approx)
             
             # Step 3: Update mag filter variables and check ZUPT
-            runner._update_imu_helpers(rec, dt, imu_params_step, zupt_scales=zupt_apply_scales)
+            runner.imu_update_service.update_imu_helpers(rec, dt, imu_params_step, zupt_scales=zupt_apply_scales)
             
             # Update state time
             runner.state.last_t = t
             
             # VIO updates (feature tracking, MSCKF, velocity) if no camera crossed
-            used_vo, vo_data = runner.process_vio(rec, t, ongoing_preint)
+            used_vo, vo_data = runner.vio_service.process_vio(rec, t, ongoing_preint)
         
         # Increment counter for debug logging
         runner.state.imu_propagation_count += 1
@@ -305,7 +304,7 @@ def run_imu_driven_loop(runner):
         
         # Magnetometer updates
         if runner.config.use_magnetometer:
-            runner.process_magnetometer(t)
+            runner.magnetometer_service.process_magnetometer(t)
         
         # Capture current MSL/AGL BEFORE DEM update (matches vio_vps.py behavior)
         lat_now, lon_now = runner.proj_cache.xy_to_latlon(
@@ -319,7 +318,7 @@ def run_imu_driven_loop(runner):
         agl_now = msl_now - dem_now
         
         # DEM height updates (modifies kf.x[2,0], but we use pre-update values for logging)
-        runner.process_dem_height(t)
+        runner.dem_service.process_dem_height(t)
         
         # TRN (Terrain Referenced Navigation) updates - v3.3.0
         if runner.trn is not None:
@@ -341,11 +340,19 @@ def run_imu_driven_loop(runner):
                 )
         
         # Log error vs ground truth (every sample, like vio_vps.py)
-        runner.log_error(t)
+        runner.output_reporting.log_error(t)
         
         # Log pose (using pre-DEM-update msl_now/agl_now for consistency with vio_vps.py)
-        runner.log_pose(t, dt, used_vo, vo_data, msl_now=msl_now, agl_now=agl_now, 
-                        lat_now=lat_now, lon_now=lon_now)
+        runner.output_reporting.log_pose(
+            t,
+            dt,
+            used_vo,
+            vo_data,
+            msl_now=msl_now,
+            agl_now=agl_now,
+            lat_now=lat_now,
+            lon_now=lon_now,
+        )
         
         # Log inference timing (every sample, like vio_vps.py)
         toc_iter = time.time()
@@ -389,6 +396,6 @@ def run_imu_driven_loop(runner):
     
     toc_all = time.time()
     
-    # Print summary
-    runner.print_summary()
-    print(f"\n=== Finished in {toc_all - tic_all:.2f} seconds ===")
+    duration_sec = toc_all - tic_all
+    print(f"\n=== Finished in {duration_sec:.2f} seconds ===")
+    return duration_sec

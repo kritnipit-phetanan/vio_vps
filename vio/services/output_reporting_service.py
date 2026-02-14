@@ -129,7 +129,7 @@ class OutputReportingService:
             return
 
         try:
-            t_gt = self.runner._filter_time_to_gt_time(t)
+            t_gt = self.runner.bootstrap_service.filter_time_to_gt_time(t)
 
             # Find closest ground truth
             gt_diffs = np.abs(gt_df["stamp_log"].values - t_gt)

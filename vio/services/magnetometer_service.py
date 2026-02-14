@@ -42,7 +42,7 @@ class MagnetometerService:
             sync_threshold = float(self.runner.global_config.get("MAG_TIME_SYNC_THRESHOLD_SEC", 0.05))
             dt_sync = abs(float(t) - float(mag_rec.t))
             sync_status = "PASS" if dt_sync <= sync_threshold else "FAIL"
-            self.runner._log_convention_check(
+            self.runner.output_reporting.log_convention_check(
                 t=float(mag_rec.t),
                 sensor="MAG",
                 check="time_base_abs_dt",
@@ -63,7 +63,7 @@ class MagnetometerService:
                     "r_scale_used": 1.0,
                     "reason_code": "skip_time_mismatch",
                 }
-                self.runner.record_adaptive_measurement(
+                self.runner.adaptive_service.record_adaptive_measurement(
                     "MAG",
                     adaptive_info=mag_adaptive_info,
                     timestamp=float(mag_rec.t),
@@ -110,7 +110,7 @@ class MagnetometerService:
 
             # Scale measurement noise based on filter confidence
             sigma_mag_scaled = sigma_mag * r_scale
-            mag_policy_scales, mag_apply_scales = self.runner._get_sensor_adaptive_scales("MAG")
+            mag_policy_scales, mag_apply_scales = self.runner.adaptive_service.get_sensor_adaptive_scales("MAG")
             mag_adaptive_info: Dict[str, Any] = {}
 
             # Use filtered yaw instead of raw calibrated mag
@@ -143,7 +143,7 @@ class MagnetometerService:
                 r_scale_extra=float(mag_apply_scales.get("r_scale", 1.0)),
                 adaptive_info=mag_adaptive_info,
             )
-            self.runner.record_adaptive_measurement(
+            self.runner.adaptive_service.record_adaptive_measurement(
                 "MAG",
                 adaptive_info=mag_adaptive_info,
                 timestamp=mag_rec.t,

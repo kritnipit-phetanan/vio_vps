@@ -229,20 +229,37 @@ class VPSDelayedUpdateManager:
         innovation = (vps_xy - xy_clone).reshape(-1, 1)
         innovation_mag = float(np.linalg.norm(innovation))
         
-        # Innovation covariance
-        S = H @ clone.P_clone @ H.T + R_vps
-        
+        # Innovation covariance (overflow-safe: only XY block is needed)
         try:
-            S_inv = np.linalg.inv(S)
-        except np.linalg.LinAlgError:
+            r_vps_safe = np.array(R_vps, dtype=float, copy=True)
+            r_vps_safe = 0.5 * (r_vps_safe + r_vps_safe.T)
+            r_diag = np.clip(np.diag(r_vps_safe), 1e-6, 1e6)
+            r_vps_safe = np.diag(r_diag)
+
+            p_xy = np.array(clone.P_clone[0:2, 0:2], dtype=float, copy=True)
+            if p_xy.shape != (2, 2) or not np.all(np.isfinite(p_xy)):
+                raise ValueError("invalid clone covariance block")
+            p_xy = 0.5 * (p_xy + p_xy.T)
+            p_xy = np.clip(p_xy, -1e8, 1e8)
+            eigvals, eigvecs = np.linalg.eigh(p_xy)
+            eigvals = np.clip(eigvals, 1e-9, 1e8)
+            p_xy = eigvecs @ np.diag(eigvals) @ eigvecs.T
+
+            S = p_xy + r_vps_safe
+            S = 0.5 * (S + S.T)
+            S[np.diag_indices(2)] += 1e-9
+            if not np.all(np.isfinite(S)):
+                raise ValueError("non-finite S")
+
+            try:
+                S_inv = np.linalg.inv(S)
+            except np.linalg.LinAlgError:
+                S_inv = np.linalg.pinv(S, rcond=1e-9)
+            if not np.all(np.isfinite(S_inv)):
+                raise ValueError("non-finite S_inv")
+        except Exception:
             self.stats['updates_failed'] += 1
             return False, innovation_mag
-        
-        # Kalman gain for clone
-        K_clone = clone.P_clone @ H.T @ S_inv
-        
-        # Update clone state (for consistency check)
-        dx_clone = K_clone @ innovation
         
         # === KEY: Propagate correction to current state ===
         # dx_current = P_cross @ P_clone_inv @ dx_clone
@@ -250,8 +267,13 @@ class VPSDelayedUpdateManager:
         # More numerically stable form:
         # dx_current = P_cross @ H.T @ S_inv @ innovation
         
-        # Cross-covariance contribution
-        dx_current = clone.cross_cov @ H.T @ S_inv @ innovation
+        # Cross-covariance contribution (bounded to avoid numerical explosion)
+        cross_cov_safe = np.array(clone.cross_cov, dtype=float, copy=True)
+        cross_cov_safe = np.nan_to_num(cross_cov_safe, nan=0.0, posinf=1e8, neginf=-1e8)
+        cross_cov_safe = np.clip(cross_cov_safe, -1e8, 1e8)
+        dx_current = cross_cov_safe @ H.T @ S_inv @ innovation
+        dx_current = np.nan_to_num(dx_current, nan=0.0, posinf=1e4, neginf=-1e4)
+        dx_current = np.clip(dx_current, -1e4, 1e4)
         
         # Apply correction to current state
         # Position
@@ -269,12 +291,36 @@ class VPSDelayedUpdateManager:
         # Update covariance
         # P_current -= P_cross @ H.T @ S_inv @ H @ P_cross.T
         err_dim = min(clone.cross_cov.shape[0], kf.P.shape[0])
-        P_cross = clone.cross_cov[:err_dim, :]
-        dP = P_cross @ H.T @ S_inv @ H @ P_cross.T
+        P_cross = cross_cov_safe[:err_dim, :]
+        HSH = H.T @ S_inv @ H
+        with np.errstate(all='ignore'):
+            dP = P_cross @ HSH @ P_cross.T
+        if not np.all(np.isfinite(dP)):
+            dP = np.zeros((err_dim, err_dim), dtype=float)
+        dP = np.nan_to_num(dP, nan=0.0, posinf=1e8, neginf=-1e8)
+        dP = np.clip(dP, -1e8, 1e8)
         kf.P[:err_dim, :err_dim] -= dP
-        
-        # Ensure symmetry
+
+        # Ensure symmetry + finite + PSD floor on updated core block
         kf.P = 0.5 * (kf.P + kf.P.T)
+        kf.P = np.nan_to_num(kf.P, nan=0.0, posinf=1e8, neginf=-1e8)
+        core = kf.P[:err_dim, :err_dim]
+        core = np.clip(0.5 * (core + core.T), -1e8, 1e8)
+        try:
+            evals_core, evecs_core = np.linalg.eigh(core)
+            evals_core = np.clip(evals_core, 1e-9, 1e8)
+            with np.errstate(all='ignore'):
+                core_psd = evecs_core @ np.diag(evals_core) @ evecs_core.T
+            if not np.all(np.isfinite(core_psd)):
+                raise ValueError("non-finite core_psd")
+            kf.P[:err_dim, :err_dim] = core_psd
+        except Exception:
+            diag = np.diag(core) if core.ndim == 2 else np.array([], dtype=float)
+            diag = np.nan_to_num(diag, nan=1e-6, posinf=1e8, neginf=1e-6)
+            diag = np.clip(diag, 1e-9, 1e8)
+            if diag.size != err_dim:
+                diag = np.full((err_dim,), 1e-3, dtype=float)
+            kf.P[:err_dim, :err_dim] = np.diag(diag)
         
         # Remove used clone
         del self.clones[image_id]

@@ -182,7 +182,6 @@ if [ -f "$MBTILES_PATH" ]; then
 fi
 echo "  Entry point: run_vio.py (modular)"
 echo "  Algorithm settings: From YAML config"
-echo "  Performance: From YAML (fast_mode section)"
 echo ""
 
 # ============================================================================
