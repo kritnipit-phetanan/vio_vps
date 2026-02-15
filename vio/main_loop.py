@@ -156,6 +156,11 @@ class VIORunner:
         self._vps_last_attempt_t = -1e9
         self._vps_next_allowed_t = 0.0
         self._vps_skip_streak = 0
+        self._vps_soft_accept_count: int = 0
+        self._vps_soft_reject_count: int = 0
+        self._vps_last_accepted_offset_vec: Optional[np.ndarray] = None
+        self._vps_pending_large_offset_vec: Optional[np.ndarray] = None
+        self._vps_pending_large_offset_hits: int = 0
         
         # Timestamp base tracking (for GT/error alignment)
         self.imu_time_col: Optional[str] = None

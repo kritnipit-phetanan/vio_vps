@@ -97,6 +97,7 @@ class LoopClosureDetector:
             'loop_cooldown_skipped': 0,
             'loop_rejected_few_matches': 0,
             'loop_rejected_geometry': 0,
+            'loop_speed_skipped': 0,
             'yaw_corrections_applied': 0,
             'total_yaw_correction': 0.0,
         }
@@ -733,11 +734,22 @@ def apply_loop_closure_correction(kf, loop_info: Dict[str, Any], t: float,
         min_abs_deg = float(global_config.get("LOOP_MIN_ABS_YAW_CORR_DEG", 1.5))
         max_abs_deg = float(global_config.get("LOOP_MAX_ABS_YAW_CORR_DEG", 4.0))
         reject_abs_deg = float(global_config.get("LOOP_YAW_RESIDUAL_BOUND_DEG", 25.0))
+        speed_skip_m_s = float(global_config.get("LOOP_SPEED_SKIP_M_S", 35.0))
+        speed_sigma_inflate_m_s = float(global_config.get("LOOP_SPEED_SIGMA_INFLATE_M_S", 25.0))
+        speed_sigma_mult = float(global_config.get("LOOP_SPEED_SIGMA_MULT", 1.5))
+        speed_now = float(np.linalg.norm(np.asarray(kf.x[3:6, 0], dtype=float)))
 
         if abs(np.degrees(yaw_error)) < min_abs_deg:
             return False
         if abs(np.degrees(yaw_error)) > reject_abs_deg:
             print(f"[LOOP] REJECT: yaw_error={np.degrees(yaw_error):.1f}° > {reject_abs_deg:.1f}°")
+            return False
+        if np.isfinite(speed_now) and speed_now > speed_skip_m_s:
+            if loop_detector is not None and hasattr(loop_detector, "stats"):
+                loop_detector.stats["loop_speed_skipped"] = int(loop_detector.stats.get("loop_speed_skipped", 0)) + 1
+            print(
+                f"[LOOP] SKIP apply at t={t:.2f}s: speed={speed_now:.2f}m/s > {speed_skip_m_s:.2f}m/s"
+            )
             return False
 
         # Clamp correction magnitude (fail-soft by design)
@@ -760,6 +772,12 @@ def apply_loop_closure_correction(kf, loop_info: Dict[str, Any], t: float,
         sigma_loop = np.deg2rad(base_sigma_deg) / np.sqrt(max(num_inliers, 1) / 15.0)
         if fail_soft:
             sigma_loop = max(sigma_loop, np.deg2rad(fail_soft_sigma_deg))
+        if (
+            np.isfinite(speed_now)
+            and speed_now > speed_sigma_inflate_m_s
+            and speed_sigma_mult > 1.0
+        ):
+            sigma_loop *= float(speed_sigma_mult)
 
         # Dynamic phase/health inflation (conservative during dynamic phases)
         if phase <= 1:

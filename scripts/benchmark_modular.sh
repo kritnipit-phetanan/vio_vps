@@ -71,7 +71,7 @@ fi
 echo ""
 
 # Dataset paths
-CONFIG="configs/config_bell412_dataset3.yaml"
+CONFIG="${CONFIG:-configs/config_bell412_dataset3.yaml}"
 DATASET_BASE="/Users/france/Downloads/vio_dataset/bell412_dataset3"
 # v3.9.0: Use imu_with_ref.csv (has time_ref for unified clock)
 IMU_PATH="${DATASET_BASE}/extracted_data_new/imu_data/imu__data_stamped/imu_with_ref.csv"
@@ -84,6 +84,10 @@ TIMEREF_PPS_CSV="${DATASET_BASE}/extracted_data_new/imu_data/imu__time_ref_pps/t
 MAG_PATH="${DATASET_BASE}/extracted_data_new/imu_data/imu__mag/vector3.csv"
 DEM_PATH="${DATASET_BASE}/Copernicus_DSM_10_N45_00_W076_00_DEM.tif"
 GROUND_TRUTH="${DATASET_BASE}/bell412_dataset3_frl.pos"
+# VPS Configuration (optional)
+MBTILES_PATH="mission.mbtiles"
+HAS_VPS=0
+[ -f "$MBTILES_PATH" ] && HAS_VPS=1
 
 # Run mode
 #   auto: enable optional sensors only if files exist
@@ -99,15 +103,61 @@ OUTPUT_DIR="benchmark_modular_${TEST_ID}/preintegration"
 mkdir -p "$OUTPUT_DIR"
 
 # Baseline run for before/after diff.
-# Priority: explicit BASELINE_RUN > latest previous benchmark run.
+# Priority: explicit BASELINE_RUN > scripts/baseline_run.txt > latest previous benchmark run.
+BASELINE_FILE="$SCRIPT_DIR/baseline_run.txt"
 BASELINE_RUN="${BASELINE_RUN:-}"
-if [ -z "$BASELINE_RUN" ]; then
-    BASELINE_RUN="$(ls -dt benchmark_modular_*/preintegration 2>/dev/null | grep -v "^${OUTPUT_DIR}$" | head -n 1 || true)"
+if [ -z "$BASELINE_RUN" ] && [ -f "$BASELINE_FILE" ]; then
+    BASELINE_RUN="$(head -n 1 "$BASELINE_FILE" | tr -d '\r')"
 fi
+if [ -z "$BASELINE_RUN" ]; then
+    BASELINE_RUN="$(
+        python3 - <<EOF
+import csv
+import glob
+import os
 
-# VPS Configuration (optional)
-# Uncomment to enable VPS real-time processing
-MBTILES_PATH="mission.mbtiles"
+exclude = os.path.normpath("$OUTPUT_DIR")
+cands = sorted(
+    glob.glob("benchmark_modular_*/preintegration"),
+    key=lambda p: os.path.getmtime(p) if os.path.exists(p) else 0.0,
+    reverse=True,
+)
+
+def has_nonempty_summary(run_dir: str) -> bool:
+    p = os.path.join(run_dir, "benchmark_health_summary.csv")
+    if not os.path.isfile(p):
+        return False
+    try:
+        with open(p, newline="") as f:
+            rows = list(csv.reader(f))
+        return len(rows) >= 2
+    except Exception:
+        return False
+
+def has_error_log(run_dir: str) -> bool:
+    p = os.path.join(run_dir, "error_log.csv")
+    return os.path.isfile(p) and os.path.getsize(p) > 0
+
+for p in cands:
+    if os.path.normpath(p) == exclude:
+        continue
+    if has_nonempty_summary(p):
+        print(p)
+        raise SystemExit(0)
+
+for p in cands:
+    if os.path.normpath(p) == exclude:
+        continue
+    if has_error_log(p):
+        print(p)
+        raise SystemExit(0)
+EOF
+    )"
+fi
+if [ -n "$BASELINE_RUN" ] && [ ! -d "$BASELINE_RUN" ]; then
+    echo "⚠️  Baseline path not found, ignore: $BASELINE_RUN"
+    BASELINE_RUN=""
+fi
 
 fail_fast() {
     echo "❌ $1"
@@ -141,6 +191,7 @@ USE_DEM=0
 USE_TIMEREF=0
 USE_TIMEREF_PPS=0
 USE_QUARRY=0
+USE_VPS=0
 
 case "$RUN_MODE" in
     full)
@@ -149,22 +200,27 @@ case "$RUN_MODE" in
         [ "$HAS_MAG" -eq 1 ] || fail_fast "RUN_MODE=full requires magnetometer CSV"
         [ "$HAS_DEM" -eq 1 ] || fail_fast "RUN_MODE=full requires DEM file"
         USE_CAM=1; USE_MAG=1; USE_DEM=1; USE_TIMEREF=1; USE_QUARRY=1
+        [ "$HAS_VPS" -eq 1 ] && USE_VPS=1
         [ "$HAS_TIMEREF_PPS" -eq 1 ] && USE_TIMEREF_PPS=1
         ;;
     imu_cam)
         [ "$HAS_CAM" -eq 1 ] || fail_fast "RUN_MODE=imu_cam requires camera inputs"
         [ "$HAS_TIMEREF" -eq 1 ] || fail_fast "RUN_MODE=imu_cam requires timeref CSV"
         USE_CAM=1; USE_TIMEREF=1; USE_QUARRY=0
+        [ "$HAS_VPS" -eq 1 ] && USE_VPS=1
         [ "$HAS_TIMEREF_PPS" -eq 1 ] && USE_TIMEREF_PPS=1
         ;;
     imu_only)
-        USE_CAM=0; USE_MAG=0; USE_DEM=0; USE_TIMEREF=0; USE_TIMEREF_PPS=0; USE_QUARRY=0
+        USE_CAM=0; USE_MAG=0; USE_DEM=0; USE_TIMEREF=0; USE_TIMEREF_PPS=0; USE_QUARRY=0; USE_VPS=0
         ;;
     auto)
         USE_CAM="$HAS_CAM"
         USE_MAG="$HAS_MAG"
         USE_DEM="$HAS_DEM"
         USE_QUARRY="$HAS_DEM"
+        if [ "$HAS_VPS" -eq 1 ] && [ "$USE_CAM" -eq 1 ]; then
+            USE_VPS=1
+        fi
         if [ "$HAS_TIMEREF" -eq 1 ] && { [ "$USE_CAM" -eq 1 ] || [ "$USE_MAG" -eq 1 ]; }; then
             USE_TIMEREF=1
         fi
@@ -199,7 +255,7 @@ RUN_MODE_LABEL="IMU+GT"
 [ "$USE_MAG" -eq 1 ] && RUN_MODE_LABEL="${RUN_MODE_LABEL}+MAG"
 [ "$USE_DEM" -eq 1 ] && RUN_MODE_LABEL="${RUN_MODE_LABEL}+DEM"
 [ "$USE_QUARRY" -eq 1 ] && RUN_MODE_LABEL="${RUN_MODE_LABEL}+MSL"
-[ -f "$MBTILES_PATH" ] && RUN_MODE_LABEL="${RUN_MODE_LABEL}+VPS"
+[ "$USE_VPS" -eq 1 ] && RUN_MODE_LABEL="${RUN_MODE_LABEL}+VPS"
 
 echo "Test Configuration:"
 echo "  Test ID: ${TEST_ID}"
@@ -215,7 +271,7 @@ echo "  Active sensors: ${RUN_MODE_LABEL}"
 [ "$USE_TIMEREF" -eq 1 ] && echo "    - TimeRef: ${TIMEREF_CSV}"
 [ "$USE_TIMEREF_PPS" -eq 1 ] && echo "    - TimeRef PPS: ${TIMEREF_PPS_CSV}"
 [ "$USE_QUARRY" -eq 1 ] && echo "    - Quarry: ${QUARRY_PATH}"
-if [ -f "$MBTILES_PATH" ]; then
+if [ "$USE_VPS" -eq 1 ]; then
     echo "    - VPS Tiles: ${MBTILES_PATH}"
 fi
 echo "  Entry point: run_vio.py (modular)"
@@ -267,10 +323,12 @@ if [ "$USE_TIMEREF_PPS" -eq 1 ]; then
     PYTHON_ARGS+=(--timeref_pps_csv "$TIMEREF_PPS_CSV")
 fi
 
-# Add MBTiles path if VPS is enabled
-if [ -f "$MBTILES_PATH" ]; then
+# Add MBTiles path if VPS is enabled for selected mode
+if [ "$USE_VPS" -eq 1 ]; then
     PYTHON_ARGS+=(--vps_tiles "$MBTILES_PATH")
     echo "✅ VPS enabled with MBTiles: $MBTILES_PATH"
+elif [ "$HAS_VPS" -eq 1 ]; then
+    echo "ℹ️  VPS disabled for RUN_MODE=${RUN_MODE} (camera/VPS policy)"
 fi
 
 if ! "${PYTHON_ARGS[@]}" 2>&1 | tee "$OUTPUT_DIR/run.log"; then
@@ -285,642 +343,27 @@ echo "✅ Test completed in ${RUNTIME}s"
 echo ""
 
 # ============================================================================
-# Quick Analysis
+# Quick Analysis (delegated to Python scripts)
 # ============================================================================
 echo "============================================================================"
 echo "RESULTS (v3.2.0 - VIOConfig Dataclass Model)"
 echo "============================================================================"
 echo ""
 
-# Function to extract error statistics
-analyze_errors() {
-    local csv_file="$1"
-    
-    if [ ! -f "$csv_file" ]; then
-        echo "❌ error_log.csv not found"
-        return
-    fi
-    
-    # Use Python to compute RMSE
-    python3 - <<EOF
-import pandas as pd
-import numpy as np
-
-df = pd.read_csv("$csv_file")
-if len(df) > 50:
-    df = df.iloc[50:]  # Skip initial convergence
-
-pos_err = np.sqrt((df['pos_error_m']**2).mean())
-vel_err = np.sqrt((df['vel_error_m_s']**2).mean())
-alt_err = df['alt_error_m'].abs().mean()
-final_pos_err = df['pos_error_m'].iloc[-1]
-
-print(f"Position RMSE: {pos_err:.3f} m")
-print(f"Altitude Mean Error: {alt_err:.3f} m")
-print(f"Velocity RMSE: {vel_err:.3f} m/s")
-print(f"Final Position Error: {final_pos_err:.3f} m")
-print()
-
-# Axis breakdown
-print(f"E mean error: {df['pos_error_E'].mean():.3f} m")
-print(f"N mean error: {df['pos_error_N'].mean():.3f} m")
-print(f"U mean error: {df['pos_error_U'].mean():.3f} m")
-EOF
-}
-
-echo "=== Accuracy Analysis ==="
-analyze_errors "$OUTPUT_DIR/error_log.csv"
-echo ""
-
-echo "=== Accuracy-First Summary ==="
-python3 - <<EOF
-import os
-import re
-import numpy as np
-import pandas as pd
-
-out_dir = "$OUTPUT_DIR"
-run_id = os.path.basename(os.path.dirname(os.path.normpath(out_dir))) if os.path.basename(os.path.normpath(out_dir)) == "preintegration" else os.path.basename(os.path.normpath(out_dir))
-summary_csv = os.path.join(out_dir, "accuracy_first_summary.csv")
-
-def summarize_run(run_dir: str):
-    res = {
-        "run_id": run_id,
-        "err3d_mean": np.nan,
-        "err3d_median": np.nan,
-        "err3d_final": np.nan,
-        "heading_final_abs_deg": np.nan,
-        "vps_used": np.nan,
-        "msckf_fail_depth_sign": np.nan,
-        "msckf_fail_reproj_error": np.nan,
-        "msckf_fail_nonlinear": np.nan,
-    }
-
-    err_csv = os.path.join(run_dir, "error_log.csv")
-    if os.path.isfile(err_csv):
-        try:
-            err_df = pd.read_csv(err_csv)
-            if len(err_df) > 0:
-                pos = pd.to_numeric(err_df.get("pos_error_m", np.nan), errors="coerce").to_numpy(dtype=float)
-                yaw = pd.to_numeric(err_df.get("yaw_error_deg", np.nan), errors="coerce").to_numpy(dtype=float)
-                pos = pos[np.isfinite(pos)]
-                yaw = yaw[np.isfinite(yaw)]
-                if pos.size > 0:
-                    res["err3d_mean"] = float(np.nanmean(pos))
-                    res["err3d_median"] = float(np.nanmedian(pos))
-                    res["err3d_final"] = float(pos[-1])
-                if yaw.size > 0:
-                    res["heading_final_abs_deg"] = float(abs(yaw[-1]))
-        except Exception:
-            pass
-
-    run_log = os.path.join(run_dir, "run.log")
-    if os.path.isfile(run_log):
-        try:
-            with open(run_log, "r", errors="ignore") as f:
-                lines = f.readlines()
-            for line in lines:
-                m = re.search(r"VPS used:\\s*(\\d+)", line)
-                if m:
-                    res["vps_used"] = float(m.group(1))
-                m = re.search(r"fail_depth_sign:\\s*(\\d+)", line)
-                if m:
-                    res["msckf_fail_depth_sign"] = float(m.group(1))
-                m = re.search(r"fail_reproj_error:\\s*(\\d+)", line)
-                if m:
-                    res["msckf_fail_reproj_error"] = float(m.group(1))
-                m = re.search(r"fail_nonlinear:\\s*(\\d+)", line)
-                if m:
-                    res["msckf_fail_nonlinear"] = float(m.group(1))
-        except Exception:
-            pass
-    return res
-
-cur = summarize_run(out_dir)
-cur["run_id"] = run_id
-pd.DataFrame([cur]).to_csv(summary_csv, index=False)
-
-print(f"mean 3D error      : {cur['err3d_mean']:.3f} m")
-print(f"median 3D error    : {cur['err3d_median']:.3f} m")
-print(f"final 3D error     : {cur['err3d_final']:.3f} m")
-print(f"final |heading err|: {cur['heading_final_abs_deg']:.3f} deg")
-print(f"VPS used           : {int(cur['vps_used']) if np.isfinite(cur['vps_used']) else 'nan'}")
-print(
-    "MSCKF fails        : "
-    f"depth_sign={int(cur['msckf_fail_depth_sign']) if np.isfinite(cur['msckf_fail_depth_sign']) else 'nan'}, "
-    f"reproj={int(cur['msckf_fail_reproj_error']) if np.isfinite(cur['msckf_fail_reproj_error']) else 'nan'}, "
-    f"nonlinear={int(cur['msckf_fail_nonlinear']) if np.isfinite(cur['msckf_fail_nonlinear']) else 'nan'}"
-)
-print(f"saved: {summary_csv}")
-
-base_dir = "$BASELINE_RUN"
-if base_dir and os.path.isdir(base_dir):
-    base = summarize_run(base_dir)
-    print("")
-    print(f"Baseline accuracy delta vs: {base_dir}")
-    keys = [
-        "err3d_mean",
-        "err3d_median",
-        "err3d_final",
-        "heading_final_abs_deg",
-        "vps_used",
-        "msckf_fail_depth_sign",
-        "msckf_fail_reproj_error",
-        "msckf_fail_nonlinear",
-    ]
-    for k in keys:
-        c = float(cur[k]) if np.isfinite(cur[k]) else np.nan
-        b = float(base[k]) if np.isfinite(base[k]) else np.nan
-        if np.isfinite(b) and abs(b) > 1e-12 and np.isfinite(c):
-            pct = 100.0 * (c - b) / abs(b)
-            print(f"{k:24s} base={b: .6e} cur={c: .6e} delta={pct:+7.2f}%")
-        else:
-            print(f"{k:24s} base={b: .6e} cur={c: .6e} delta=   n/a")
-EOF
-echo ""
-
-echo "=== Spectacular-Style Metrics ==="
-python3 - <<EOF
-import os
-import numpy as np
-import pandas as pd
-
-out_dir = "$OUTPUT_DIR"
-run_id = os.path.basename(os.path.dirname(os.path.normpath(out_dir))) if os.path.basename(os.path.normpath(out_dir)) == "preintegration" else os.path.basename(os.path.normpath(out_dir))
-out_csv = os.path.join(out_dir, "spectacular_style_metrics.csv")
-
-
-def _to_num(series):
-    return pd.to_numeric(series, errors="coerce").to_numpy(dtype=float)
-
-
-def _compute_metrics(run_dir: str, run_id_override: str = ""):
-    res = {
-        "run_id": run_id_override or os.path.basename(os.path.dirname(os.path.normpath(run_dir))),
-        "samples": np.nan,
-        "raw_h_cep50_m": np.nan,
-        "raw_h_cep95_m": np.nan,
-        "raw_h_rmse_m": np.nan,
-        "raw_3d_rmse_m": np.nan,
-        "aligned4dof_h_cep50_m": np.nan,
-        "aligned4dof_h_cep95_m": np.nan,
-        "aligned4dof_h_rmse_m": np.nan,
-        "aligned4dof_3d_rmse_m": np.nan,
-        "aligned4dof_final_3d_m": np.nan,
-        "yaw_align_deg": np.nan,
-        "heading_mae_deg": np.nan,
-        "heading_final_abs_deg": np.nan,
-    }
-    err_csv = os.path.join(run_dir, "error_log.csv")
-    if not os.path.isfile(err_csv):
-        return res
-
-    try:
-        df = pd.read_csv(err_csv)
-    except Exception:
-        return res
-
-    if len(df) == 0:
-        return res
-
-    res["samples"] = float(len(df))
-
-    required = ["pos_error_E", "pos_error_N", "pos_error_U", "yaw_error_deg"]
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        return res
-
-    err_e = _to_num(df["pos_error_E"])
-    err_n = _to_num(df["pos_error_N"])
-    err_u = _to_num(df["pos_error_U"])
-    yaw_err = np.abs(_to_num(df["yaw_error_deg"]))
-
-    mask_raw = np.isfinite(err_e) & np.isfinite(err_n) & np.isfinite(err_u)
-    if mask_raw.sum() < 5:
-        return res
-
-    he = np.sqrt(err_e[mask_raw] ** 2 + err_n[mask_raw] ** 2)
-    e3 = np.sqrt(err_e[mask_raw] ** 2 + err_n[mask_raw] ** 2 + err_u[mask_raw] ** 2)
-    res["raw_h_cep50_m"] = float(np.percentile(he, 50))
-    res["raw_h_cep95_m"] = float(np.percentile(he, 95))
-    res["raw_h_rmse_m"] = float(np.sqrt(np.mean(he ** 2)))
-    res["raw_3d_rmse_m"] = float(np.sqrt(np.mean(e3 ** 2)))
-
-    yaw_ok = yaw_err[np.isfinite(yaw_err)]
-    if yaw_ok.size > 0:
-        res["heading_mae_deg"] = float(np.mean(yaw_ok))
-        res["heading_final_abs_deg"] = float(yaw_ok[-1])
-
-    # 4-DoF alignment (yaw + xyz translation) on overlap samples from error_log.
-    # Reconstruct GT ENU from (vio - error) when vio_E/N/U are available.
-    if all(c in df.columns for c in ["vio_E", "vio_N", "vio_U"]):
-        v_e = _to_num(df["vio_E"])
-        v_n = _to_num(df["vio_N"])
-        v_u = _to_num(df["vio_U"])
-        g_e = v_e - err_e
-        g_n = v_n - err_n
-        g_u = v_u - err_u
-
-        mask = (
-            np.isfinite(v_e) & np.isfinite(v_n) & np.isfinite(v_u) &
-            np.isfinite(g_e) & np.isfinite(g_n) & np.isfinite(g_u)
-        )
-        if mask.sum() >= 5:
-            v_xy = np.column_stack([v_e[mask], v_n[mask]])
-            g_xy = np.column_stack([g_e[mask], g_n[mask]])
-            v_z = v_u[mask]
-            g_z = g_u[mask]
-
-            v_xy_mu = np.mean(v_xy, axis=0)
-            g_xy_mu = np.mean(g_xy, axis=0)
-            v_xy_c = v_xy - v_xy_mu
-            g_xy_c = g_xy - g_xy_mu
-
-            c_val = float(np.sum(v_xy_c[:, 0] * g_xy_c[:, 0] + v_xy_c[:, 1] * g_xy_c[:, 1]))
-            s_val = float(np.sum(v_xy_c[:, 0] * g_xy_c[:, 1] - v_xy_c[:, 1] * g_xy_c[:, 0]))
-            yaw = float(np.arctan2(s_val, c_val))
-            cy, sy = np.cos(yaw), np.sin(yaw)
-            r2 = np.array([[cy, -sy], [sy, cy]], dtype=float)
-
-            v_xy_aligned = (r2 @ v_xy.T).T
-            t_xy = g_xy_mu - np.mean(v_xy_aligned, axis=0)
-            v_xy_aligned = v_xy_aligned + t_xy
-
-            t_z = float(np.mean(g_z - v_z))
-            v_z_aligned = v_z + t_z
-
-            err_xy = v_xy_aligned - g_xy
-            err_z = v_z_aligned - g_z
-            err_h = np.sqrt(np.sum(err_xy ** 2, axis=1))
-            err_3d = np.sqrt(np.sum(err_xy ** 2, axis=1) + err_z ** 2)
-
-            res["aligned4dof_h_cep50_m"] = float(np.percentile(err_h, 50))
-            res["aligned4dof_h_cep95_m"] = float(np.percentile(err_h, 95))
-            res["aligned4dof_h_rmse_m"] = float(np.sqrt(np.mean(err_h ** 2)))
-            res["aligned4dof_3d_rmse_m"] = float(np.sqrt(np.mean(err_3d ** 2)))
-            res["aligned4dof_final_3d_m"] = float(err_3d[-1])
-            res["yaw_align_deg"] = float(np.degrees(yaw))
-
-    return res
-
-
-cur = _compute_metrics(out_dir, run_id_override=run_id)
-pd.DataFrame([cur]).to_csv(out_csv, index=False)
-
-print("Horizontal CEP (raw ENU error):")
-print(f"  CEP50          : {cur['raw_h_cep50_m']:.3f} m")
-print(f"  CEP95          : {cur['raw_h_cep95_m']:.3f} m")
-print(f"  RMSE (horizontal): {cur['raw_h_rmse_m']:.3f} m")
-print("")
-print("4-DoF aligned ATE (yaw + translation):")
-print(f"  ATE RMSE 3D    : {cur['aligned4dof_3d_rmse_m']:.3f} m")
-print(f"  ATE final 3D   : {cur['aligned4dof_final_3d_m']:.3f} m")
-print(f"  CEP50/95 (2D)  : {cur['aligned4dof_h_cep50_m']:.3f} / {cur['aligned4dof_h_cep95_m']:.3f} m")
-print(f"  best yaw align : {cur['yaw_align_deg']:.3f} deg")
-print("")
-print("Heading error:")
-print(f"  MAE            : {cur['heading_mae_deg']:.3f} deg")
-print(f"  final |err|    : {cur['heading_final_abs_deg']:.3f} deg")
-print(f"saved: {out_csv}")
-
-base_dir = "$BASELINE_RUN"
-if base_dir and os.path.isdir(base_dir):
-    base = _compute_metrics(base_dir)
-    print("")
-    print(f"Baseline spectacular-style delta vs: {base_dir}")
-    keys = [
-        "raw_h_cep50_m",
-        "raw_h_cep95_m",
-        "raw_h_rmse_m",
-        "aligned4dof_3d_rmse_m",
-        "aligned4dof_h_cep50_m",
-        "aligned4dof_h_cep95_m",
-        "heading_mae_deg",
-        "heading_final_abs_deg",
-    ]
-    for k in keys:
-        c = float(cur[k]) if np.isfinite(cur[k]) else np.nan
-        b = float(base[k]) if np.isfinite(base[k]) else np.nan
-        if np.isfinite(b) and abs(b) > 1e-12 and np.isfinite(c):
-            pct = 100.0 * (c - b) / abs(b)
-            print(f"{k:24s} base={b: .6e} cur={c: .6e} delta={pct:+7.2f}%")
-        else:
-            print(f"{k:24s} base={b: .6e} cur={c: .6e} delta=   n/a")
-EOF
-echo ""
-
-CURRENT_SUMMARY="$OUTPUT_DIR/benchmark_health_summary.csv"
-BASELINE_SUMMARY=""
-if [ -n "$BASELINE_RUN" ] && [ -f "$BASELINE_RUN/benchmark_health_summary.csv" ]; then
-    BASELINE_SUMMARY="$BASELINE_RUN/benchmark_health_summary.csv"
-elif [ -n "$BASELINE_RUN" ]; then
-    BASELINE_SUMMARY="$OUTPUT_DIR/_baseline_health_summary_fallback.csv"
-    python3 - <<EOF
-import os
-import re
-import numpy as np
-import pandas as pd
-
-base_dir = "$BASELINE_RUN"
-out_csv = "$BASELINE_SUMMARY"
-
-projection_count = np.nan
-first_projection_time = np.nan
-pcond_max = np.nan
-pmax_max = np.nan
-cov_large_rate = np.nan
-pos_rmse = np.nan
-final_pos_err = np.nan
-final_alt_err = np.nan
-frames_inlier_nonzero_ratio = np.nan
-vio_vel_accept_ratio_vs_cam = np.nan
-mag_cholfail_rate = np.nan
-loop_applied_rate = np.nan
-
-run_log = os.path.join(base_dir, "run.log")
-if os.path.isfile(run_log):
-    with open(run_log, "r", errors="ignore") as f:
-        lines = f.readlines()
-    projection_count = float(sum(1 for line in lines if ("Eigenvalue projection" in line or "[EKF-COND]" in line)))
-    for line in lines:
-        m = re.search(r"\\[EKF-COND\\]\\s+t=([0-9.+-eE]+)", line)
-        if m:
-            first_projection_time = float(m.group(1))
-            break
-
-cov_csv = os.path.join(base_dir, "cov_health.csv")
-if os.path.isfile(cov_csv):
-    cov_df = pd.read_csv(cov_csv)
-    if len(cov_df) > 0:
-        pcond_max = float(pd.to_numeric(cov_df["p_cond"], errors="coerce").max())
-        pmax_max = float(pd.to_numeric(cov_df["p_max"], errors="coerce").max())
-        cov_large_rate = float(pd.to_numeric(cov_df["large_flag"], errors="coerce").mean())
-
-err_csv = os.path.join(base_dir, "error_log.csv")
-if os.path.isfile(err_csv):
-    err_df = pd.read_csv(err_csv)
-    if len(err_df) > 0:
-        pos = pd.to_numeric(err_df["pos_error_m"], errors="coerce").to_numpy(dtype=float)
-        alt = pd.to_numeric(err_df["alt_error_m"], errors="coerce").to_numpy(dtype=float)
-        pos_rmse = float(np.sqrt(np.nanmean(pos ** 2)))
-        final_pos_err = float(pos[-1])
-        final_alt_err = float(alt[-1])
-
-run_id = os.path.basename(os.path.dirname(os.path.normpath(base_dir))) if os.path.basename(os.path.normpath(base_dir)) == "preintegration" else os.path.basename(os.path.normpath(base_dir))
-with open(out_csv, "w", newline="") as f:
-    f.write("run_id,projection_count,first_projection_time,pcond_max,pmax_max,cov_large_rate,pos_rmse,final_pos_err,final_alt_err,frames_inlier_nonzero_ratio,vio_vel_accept_ratio_vs_cam,mag_cholfail_rate,loop_applied_rate\\n")
-    f.write(f"{run_id},{projection_count},{first_projection_time},{pcond_max},{pmax_max},{cov_large_rate},{pos_rmse},{final_pos_err},{final_alt_err},{frames_inlier_nonzero_ratio},{vio_vel_accept_ratio_vs_cam},{mag_cholfail_rate},{loop_applied_rate}\\n")
-EOF
-    if [ ! -f "$BASELINE_SUMMARY" ]; then
-        BASELINE_SUMMARY=""
-    fi
+ANALYZE_ARGS=(python3 scripts/analyze_benchmark.py --output_dir "$OUTPUT_DIR")
+if [ -n "$BASELINE_RUN" ]; then
+    ANALYZE_ARGS+=(--baseline_run "$BASELINE_RUN")
 fi
+"${ANALYZE_ARGS[@]}"
 
-echo "=== Conditioning Health Summary ==="
-if [ -f "$CURRENT_SUMMARY" ]; then
-    python3 - <<EOF
-import pandas as pd
-import numpy as np
-
-cur = pd.read_csv("$CURRENT_SUMMARY")
-if len(cur) == 0:
-    print("❌ benchmark_health_summary.csv is empty")
-else:
-    row = cur.iloc[-1]
-    print(f"projection_count   : {int(row['projection_count'])}")
-    print(f"first_projection_t : {row['first_projection_time']:.3f} s")
-    print(f"pcond_max          : {row['pcond_max']:.3e}")
-    print(f"pmax_max           : {row['pmax_max']:.3e}")
-    print(f"cov_large_rate     : {row['cov_large_rate']:.4f}")
-    print(f"pos_rmse           : {row['pos_rmse']:.3f} m")
-    print(f"final_pos_err      : {row['final_pos_err']:.3f} m")
-    print(f"final_alt_err      : {row['final_alt_err']:.3f} m")
-    if 'frames_inlier_nonzero_ratio' in row:
-        print(f"inlier_nonzero_rt  : {row['frames_inlier_nonzero_ratio']:.3f}")
-    if 'vio_vel_accept_ratio_vs_cam' in row:
-        print(f"vio_vel_accept_rt  : {row['vio_vel_accept_ratio_vs_cam']:.3f}")
-    if 'mag_cholfail_rate' in row:
-        print(f"mag_cholfail_rate  : {row['mag_cholfail_rate']:.3f}")
-    if 'loop_applied_rate' in row:
-        print(f"loop_applied_rate  : {row['loop_applied_rate']:.3f}")
-EOF
-else
-    echo "❌ Missing $CURRENT_SUMMARY"
+echo ""
+COMPARE_ARGS=(python3 scripts/compare_benchmark.py --output_dir "$OUTPUT_DIR")
+if [ -n "$BASELINE_RUN" ]; then
+    COMPARE_ARGS+=(--baseline_run "$BASELINE_RUN")
 fi
+"${COMPARE_ARGS[@]}"
+
 echo ""
-
-echo "=== Before/After vs Baseline ==="
-if [ -f "$CURRENT_SUMMARY" ] && [ -n "$BASELINE_SUMMARY" ]; then
-    python3 - <<EOF
-import pandas as pd
-import numpy as np
-
-cur_df = pd.read_csv("$CURRENT_SUMMARY")
-base_df = pd.read_csv("$BASELINE_SUMMARY")
-if len(cur_df) == 0 or len(base_df) == 0:
-    print("Baseline/current summary has no data rows; skipping before/after diff.")
-    raise SystemExit(0)
-
-metrics = [
-    "projection_count",
-    "first_projection_time",
-    "pcond_max",
-    "pmax_max",
-    "cov_large_rate",
-    "pos_rmse",
-    "final_pos_err",
-    "final_alt_err",
-    "frames_inlier_nonzero_ratio",
-    "vio_vel_accept_ratio_vs_cam",
-    "mag_cholfail_rate",
-    "loop_applied_rate",
-]
-for m in metrics:
-    if m not in cur_df.columns:
-        cur_df[m] = np.nan
-    if m not in base_df.columns:
-        base_df[m] = np.nan
-
-cur = cur_df.iloc[-1]
-base = base_df.iloc[-1]
-
-print(f"Baseline: $BASELINE_RUN")
-for m in metrics:
-    c = float(pd.to_numeric(cur.get(m, np.nan), errors="coerce"))
-    b = float(pd.to_numeric(base.get(m, np.nan), errors="coerce"))
-    if np.isfinite(b) and abs(b) > 1e-12:
-        pct = 100.0 * (c - b) / abs(b)
-        print(f"{m:20s}  base={b: .6e}  cur={c: .6e}  delta={pct:+7.2f}%")
-    else:
-        print(f"{m:20s}  base={b: .6e}  cur={c: .6e}  delta=   n/a")
-EOF
-else
-    echo "No baseline summary found; skipping before/after diff."
-fi
-echo ""
-
-echo "=== Runtime Profiling (quick) ==="
-python3 - <<EOF
-import os
-import pandas as pd
-import numpy as np
-
-out_dir = "$OUTPUT_DIR"
-inf_csv = os.path.join(out_dir, "inference_log.csv")
-pose_csv = os.path.join(out_dir, "pose.csv")
-vps_attempts_csv = os.path.join(out_dir, "debug_vps_attempts.csv")
-vps_profile_csv = os.path.join(out_dir, "debug_vps_profile.csv")
-
-def _read_last_pose_time(path):
-    if not os.path.isfile(path):
-        return float("nan")
-    try:
-        p = pd.read_csv(path)
-        if len(p) == 0:
-            return float("nan")
-        return float(pd.to_numeric(p.iloc[-1, 0], errors="coerce"))
-    except Exception:
-        return float("nan")
-
-if os.path.isfile(inf_csv):
-    inf = pd.read_csv(inf_csv)
-    if len(inf) > 0:
-        dt = pd.to_numeric(inf.iloc[:, 1], errors="coerce").to_numpy(dtype=float)
-        dt = dt[np.isfinite(dt)]
-        proc_total = float(np.nansum(dt)) if dt.size else float("nan")
-        avg_dt = float(np.nanmean(dt)) if dt.size else float("nan")
-        max_dt = float(np.nanmax(dt)) if dt.size else float("nan")
-        sim_time = _read_last_pose_time(pose_csv)
-        rtf = proc_total / sim_time if np.isfinite(sim_time) and sim_time > 1e-9 else float("nan")
-        print(f"inference rows   : {len(inf)}")
-        print(f"proc_total       : {proc_total:.3f} s")
-        print(f"avg_dt           : {avg_dt:.6f} s (avg_fps={1.0/avg_dt:.2f})")
-        print(f"max_dt           : {max_dt:.6f} s")
-        print(f"sim_time         : {sim_time:.3f} s")
-        print(f"RTF (proc/sim)   : {rtf:.3f}x")
-else:
-    print("No inference_log.csv")
-
-if os.path.isfile(vps_attempts_csv):
-    a = pd.read_csv(vps_attempts_csv)
-    if len(a) > 0 and "processing_time_ms" in a.columns:
-        t = pd.to_numeric(a["processing_time_ms"], errors="coerce").to_numpy(dtype=float)
-        t = t[np.isfinite(t)]
-        if t.size:
-            print(f"VPS attempts     : {len(a)}")
-            print(f"VPS total        : {np.sum(t):.2f} ms")
-            print(f"VPS avg / p95    : {np.mean(t):.2f} / {np.percentile(t,95):.2f} ms")
-
-if os.path.isfile(vps_profile_csv):
-    vp = pd.read_csv(vps_profile_csv)
-    if len(vp) > 0:
-        ok = vp[vp["success"] == 1] if "success" in vp.columns else vp
-        src = ok if len(ok) > 0 else vp
-        cols = ["tile_ms", "preprocess_ms", "match_ms", "pose_ms", "total_ms"]
-        print("VPS stage means  :", ", ".join(
-            f"{c}={pd.to_numeric(src[c], errors='coerce').mean():.2f}ms"
-            for c in cols if c in src.columns
-        ))
-
-# CSV I/O footprint (proxy for logging overhead)
-csv_sizes = []
-for name in os.listdir(out_dir):
-    if name.endswith(".csv"):
-        path = os.path.join(out_dir, name)
-        try:
-            csv_sizes.append((name, os.path.getsize(path)))
-        except OSError:
-            pass
-csv_sizes.sort(key=lambda x: x[1], reverse=True)
-if csv_sizes:
-    top = csv_sizes[:8]
-    print("Top CSV size     :")
-    for n, s in top:
-        print(f"  {n:28s} {s/1024/1024:8.2f} MB")
-EOF
-echo ""
-
-echo "=== Sensor Health by Phase (accept-rate / NIS EWMA) ==="
-if [ -f "$OUTPUT_DIR/sensor_health.csv" ] && [ -f "$OUTPUT_DIR/adaptive_debug.csv" ]; then
-    python3 - <<EOF
-import pandas as pd
-import numpy as np
-
-sensor_df = pd.read_csv("$OUTPUT_DIR/sensor_health.csv")
-adaptive_df = pd.read_csv("$OUTPUT_DIR/adaptive_debug.csv")[["t", "phase"]]
-
-if len(sensor_df) == 0 or len(adaptive_df) == 0:
-    print("No sensor/adaptive rows for phase summary")
-else:
-    sensor_df = sensor_df.sort_values("t")
-    adaptive_df = adaptive_df.sort_values("t")
-    merged = pd.merge_asof(sensor_df, adaptive_df, on="t", direction="backward")
-    merged["phase"] = merged["phase"].fillna(-1).astype(int)
-    summary = (
-        merged.groupby(["sensor", "phase"], dropna=False)
-        .agg(
-            samples=("accepted", "count"),
-            # With light debug mode accepted rows are downsampled, so keep both:
-            # 1) logged_accept_ratio: raw ratio inside logged rows (can be biased low)
-            # 2) accept_rate_mean/last: controller-side accept rate reported at runtime
-            logged_accept_ratio=("accepted", "mean"),
-            accept_rate_mean=("accept_rate", "mean"),
-            accept_rate_last=("accept_rate", "last"),
-            nis_ewma_mean=("nis_ewma", "mean"),
-            nis_ewma_last=("nis_ewma", "last"),
-        )
-        .reset_index()
-        .sort_values(["sensor", "phase"])
-    )
-    out_csv = "$OUTPUT_DIR/sensor_phase_summary.csv"
-    summary.to_csv(out_csv, index=False)
-    print(summary.to_string(index=False))
-    print(f"saved: {out_csv}")
-
-    baseline_sensor = "$BASELINE_RUN/sensor_health.csv"
-    baseline_adaptive = "$BASELINE_RUN/adaptive_debug.csv"
-    if "$BASELINE_RUN" and pd.notna("$BASELINE_RUN") and \
-       baseline_sensor and baseline_adaptive and \
-       __import__("os").path.isfile(baseline_sensor) and __import__("os").path.isfile(baseline_adaptive):
-        b_s = pd.read_csv(baseline_sensor)
-        b_a = pd.read_csv(baseline_adaptive)[["t", "phase"]]
-        if len(b_s) > 0 and len(b_a) > 0:
-            b_s = b_s.sort_values("t")
-            b_a = b_a.sort_values("t")
-            b_m = pd.merge_asof(b_s, b_a, on="t", direction="backward")
-            b_m["phase"] = b_m["phase"].fillna(-1).astype(int)
-            b_sum = (
-                b_m.groupby(["sensor", "phase"], dropna=False)
-                .agg(
-                    logged_accept_ratio_base=("accepted", "mean"),
-                    accept_rate_mean_base=("accept_rate", "mean"),
-                    accept_rate_last_base=("accept_rate", "last"),
-                    nis_ewma_mean_base=("nis_ewma", "mean"),
-                )
-                .reset_index()
-            )
-            joined = summary.merge(b_sum, on=["sensor", "phase"], how="left")
-            joined["accept_rate_mean_delta"] = joined["accept_rate_mean"] - joined["accept_rate_mean_base"]
-            joined["accept_rate_last_delta"] = joined["accept_rate_last"] - joined["accept_rate_last_base"]
-            joined["nis_ewma_delta"] = joined["nis_ewma_mean"] - joined["nis_ewma_mean_base"]
-            print("\\nBaseline delta (sensor+phase):")
-            print(
-                joined[
-                    [
-                        "sensor",
-                        "phase",
-                        "accept_rate_mean_delta",
-                        "accept_rate_last_delta",
-                        "nis_ewma_delta",
-                    ]
-                ].to_string(index=False)
-            )
-EOF
-else
-    echo "Missing sensor_health.csv or adaptive_debug.csv"
-fi
-echo ""
-
 echo "=== Runtime ==="
 echo "Time: ${RUNTIME}s"
 echo ""
@@ -934,7 +377,7 @@ echo "  - error_log.csv    : Error statistics"
 echo "  - cov_health.csv   : Covariance health timeline"
 echo "  - conditioning_events.csv : Conditioning fallback events"
 echo "  - benchmark_health_summary.csv : Run health one-line summary"
-echo "  - accuracy_first_summary.csv : Accuracy-first metrics + baseline deltas"
+echo "  - accuracy_first_summary.csv : Accuracy-first metrics"
 echo "  - spectacular_style_metrics.csv : CEP + 4DoF-aligned ATE style metrics"
 echo "  - sensor_phase_summary.csv : accept-rate/NIS summary by sensor+phase"
 echo "  - run.log          : Full debug output"

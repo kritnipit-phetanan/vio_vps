@@ -976,6 +976,42 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
     use_vz_only = vio_config.get('use_vz_only', use_vz_only_default)
     xy_only_nadir = bool(global_config.get('VIO_NADIR_XY_ONLY_VELOCITY', False))
     use_xy_only = bool(camera_view == "nadir" and xy_only_nadir and not bool(use_vz_only))
+    speed_state_m_s = float(np.linalg.norm(np.asarray(kf.x[3:6, 0], dtype=float)))
+
+    def _parse_float_list(value, default_list):
+        if not isinstance(value, (list, tuple)):
+            value = default_list
+        out = []
+        for v in value:
+            try:
+                fv = float(v)
+            except Exception:
+                continue
+            if np.isfinite(fv):
+                out.append(fv)
+        if len(out) == 0:
+            out = [float(v) for v in default_list]
+        return out
+
+    speed_bp = _parse_float_list(
+        global_config.get("VIO_VEL_SPEED_R_INFLATE_BREAKPOINTS_M_S", [25.0, 40.0, 55.0]),
+        [25.0, 40.0, 55.0],
+    )
+    speed_vals = _parse_float_list(
+        global_config.get("VIO_VEL_SPEED_R_INFLATE_VALUES", [1.5, 2.5, 4.0]),
+        [1.5, 2.5, 4.0],
+    )
+    n_pairs = min(len(speed_bp), len(speed_vals))
+    speed_pairs = sorted(
+        [(float(speed_bp[i]), max(1.0, float(speed_vals[i]))) for i in range(n_pairs)],
+        key=lambda x: x[0],
+    )
+    speed_r_inflate = 1.0
+    for bp, val in speed_pairs:
+        if np.isfinite(speed_state_m_s) and speed_state_m_s > bp:
+            speed_r_inflate = float(max(speed_r_inflate, val))
+    min_flow_high_speed = float(global_config.get("VIO_VEL_MIN_FLOW_PX_HIGH_SPEED", 0.8))
+    high_speed_flow_bp = float(speed_pairs[0][0]) if len(speed_pairs) > 0 else 25.0
     
     # ESKF velocity update
     num_clones = (kf.x.shape[0] - 19) // 7  # v3.9.7: 19D nominal
@@ -996,9 +1032,10 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
         vel_meas = np.array([[vel_world[0]], [vel_world[1]]], dtype=float)
         scale_xy = view_cfg.get('sigma_scale_xy', 1.0)
         # Slightly conservative XY-only R to preserve fail-soft behavior.
+        r_speed = float(max(1.0, speed_r_inflate))
         r_mat = np.diag([
-            (sigma_vo * scale_xy * flow_quality_scale * 1.4 * extra_scale) ** 2,
-            (sigma_vo * scale_xy * flow_quality_scale * 1.4 * extra_scale) ** 2,
+            (sigma_vo * scale_xy * flow_quality_scale * 1.4 * extra_scale * r_speed) ** 2,
+            (sigma_vo * scale_xy * flow_quality_scale * 1.4 * extra_scale * r_speed) ** 2,
         ])
         dof = 2
     else:
@@ -1038,6 +1075,21 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
             _log_vio_vel_update("[VIO] Velocity REJECTED: P matrix contains inf/nan")
             _set_adaptive_info(False, dof, None, None, extra_scale, reason_code="hard_reject")
             return False
+        if (
+            use_xy_only
+            and np.isfinite(speed_state_m_s)
+            and speed_state_m_s > high_speed_flow_bp
+            and float(avg_flow_px) < min_flow_high_speed
+        ):
+            _log_vio_vel_update(
+                f"[VIO] Velocity REJECTED: low flow at high speed (flow={avg_flow_px:.2f}px, "
+                f"speed={speed_state_m_s:.2f}m/s, min_flow={min_flow_high_speed:.2f}px)"
+            )
+            _set_adaptive_info(
+                False, dof, None, None, extra_scale * max(1.0, speed_r_inflate),
+                reason_code="soft_reject_low_flow"
+            )
+            return False
         
         # Clamp large P values to prevent overflow in matmul
         P_max = np.max(np.abs(kf.P))
@@ -1068,6 +1120,39 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
         # Compute innovation for gating with overflow protection
         predicted_vel = hx_fun(kf.x)
         innovation = vel_meas - predicted_vel
+        if use_xy_only:
+            max_delta_v_xy = float(global_config.get("VIO_VEL_MAX_DELTA_V_XY_PER_UPDATE_M_S", 2.0))
+            delta_v_xy = float(np.linalg.norm(np.asarray(innovation[:2]).reshape(-1)))
+            if np.isfinite(max_delta_v_xy) and max_delta_v_xy > 0.0 and delta_v_xy > max_delta_v_xy:
+                _log_vio_vel_update(
+                    f"[VIO] Velocity REJECTED: delta-v cap (|Δv_xy|={delta_v_xy:.2f}m/s > "
+                    f"{max_delta_v_xy:.2f}m/s)"
+                )
+                _set_adaptive_info(
+                    False,
+                    dof,
+                    None,
+                    None,
+                    extra_scale * max(1.0, speed_r_inflate),
+                    reason_code="soft_reject_delta_v_cap",
+                )
+                if save_debug and residual_csv:
+                    try:
+                        s_cap = h_vel @ kf.P @ h_vel.T + r_mat
+                        log_measurement_update(
+                            residual_csv, t, vio_frame, 'VIO_VEL',
+                            innovation=innovation.flatten(),
+                            mahalanobis_dist=np.nan,
+                            chi2_threshold=np.nan,
+                            accepted=False,
+                            s_matrix=s_cap,
+                            p_prior=getattr(kf, 'P_prior', kf.P),
+                            state_error=state_error,
+                            state_cov=state_cov,
+                        )
+                    except Exception:
+                        pass
+                return False
         
         # Suppress numpy warnings - we handle explicitly with tripwires
         with np.errstate(all='ignore'):
@@ -1136,6 +1221,8 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
         s_used = s_mat
         r_used = r_mat
         r_scale_used = extra_scale
+        if use_xy_only:
+            r_scale_used *= max(1.0, speed_r_inflate)
         chi2_used = chi2_value
         mahal_used = mahal_dist
 

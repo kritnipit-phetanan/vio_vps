@@ -614,6 +614,8 @@ class OutputReportingService:
         pos_rmse = float("nan")
         final_pos_err = float("nan")
         final_alt_err = float("nan")
+        speed_max_m_s = float("nan")
+        speed_p99_m_s = float("nan")
         if self.runner.error_csv and os.path.isfile(self.runner.error_csv):
             try:
                 err_df = pd.read_csv(self.runner.error_csv)
@@ -623,6 +625,20 @@ class OutputReportingService:
                     pos_rmse = float(np.sqrt(np.nanmean(pos_vals ** 2)))
                     final_pos_err = float(pos_vals[-1])
                     final_alt_err = float(alt_vals[-1])
+            except Exception:
+                pass
+        if self.runner.pose_csv and os.path.isfile(self.runner.pose_csv):
+            try:
+                pose_df = pd.read_csv(self.runner.pose_csv)
+                if len(pose_df) > 0 and all(c in pose_df.columns for c in ("vx", "vy", "vz")):
+                    vx = pd.to_numeric(pose_df["vx"], errors="coerce").to_numpy(dtype=float)
+                    vy = pd.to_numeric(pose_df["vy"], errors="coerce").to_numpy(dtype=float)
+                    vz = pd.to_numeric(pose_df["vz"], errors="coerce").to_numpy(dtype=float)
+                    speed = np.sqrt(vx * vx + vy * vy + vz * vz)
+                    speed = speed[np.isfinite(speed)]
+                    if speed.size > 0:
+                        speed_max_m_s = float(np.max(speed))
+                        speed_p99_m_s = float(np.percentile(speed, 99.0))
             except Exception:
                 pass
 
@@ -654,15 +670,28 @@ class OutputReportingService:
                 pass
 
         loop_applied_rate = float("nan")
+        loop_corr_count = float("nan")
+        loop_abs_yaw_corr_sum_deg = float("nan")
         if getattr(self.runner, "loop_detector", None) is not None and hasattr(self.runner.loop_detector, "stats"):
             try:
                 l_stats = self.runner.loop_detector.stats
                 checks = int(l_stats.get("loop_checks", 0))
                 applied = int(l_stats.get("yaw_corrections_applied", 0))
+                loop_corr_count = float(applied)
+                loop_abs_yaw_corr_sum_deg = float(
+                    np.degrees(float(l_stats.get("total_yaw_correction", 0.0)))
+                )
                 if checks > 0:
                     loop_applied_rate = float(applied / float(checks))
             except Exception:
                 pass
+
+        vps_soft_accept_count = float(int(getattr(self.runner, "_vps_soft_accept_count", 0)))
+        vps_soft_reject_count = float(int(getattr(self.runner, "_vps_soft_reject_count", 0)))
+        mag_accept_rate = float("nan")
+        mag_total = int(getattr(self.runner.state, "mag_updates", 0)) + int(getattr(self.runner.state, "mag_rejects", 0))
+        if mag_total > 0:
+            mag_accept_rate = float(int(getattr(self.runner.state, "mag_updates", 0)) / float(mag_total))
 
         output_dir_norm = os.path.normpath(self.runner.config.output_dir)
         if os.path.basename(output_dir_norm) == "preintegration":
@@ -687,6 +716,13 @@ class OutputReportingService:
             vio_vel_accept_ratio_vs_cam=vio_vel_accept_ratio_vs_cam,
             mag_cholfail_rate=mag_cholfail_rate,
             loop_applied_rate=loop_applied_rate,
+            speed_max_m_s=speed_max_m_s,
+            speed_p99_m_s=speed_p99_m_s,
+            loop_corr_count=loop_corr_count,
+            loop_abs_yaw_corr_sum_deg=loop_abs_yaw_corr_sum_deg,
+            vps_soft_accept_count=vps_soft_accept_count,
+            vps_soft_reject_count=vps_soft_reject_count,
+            mag_accept_rate=mag_accept_rate,
         )
         print(
             f"[SUMMARY] projection_count={projection_count}, "
@@ -695,7 +731,8 @@ class OutputReportingService:
             f"inlier_nonzero={frames_inlier_nonzero_ratio:.3f}, "
             f"vio_vel_ratio={vio_vel_accept_ratio_vs_cam:.3f}, "
             f"mag_cholfail_rate={mag_cholfail_rate:.3f}, "
-            f"loop_applied_rate={loop_applied_rate:.3f}"
+            f"loop_applied_rate={loop_applied_rate:.3f}, "
+            f"speed_p99={speed_p99_m_s:.2f}m/s"
         )
 
     def print_summary(self):

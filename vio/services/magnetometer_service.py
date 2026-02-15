@@ -278,20 +278,19 @@ class MagnetometerService:
         return p_max, p_cond
 
     def _check_conditioning_guard(self, health_key: str, p_max: float, p_cond: float) -> tuple[bool, str]:
-        """Skip MAG updates when covariance is already numerically stressed."""
+        """
+        Skip MAG updates only on hard conditioning violations.
+
+        WARNING/DEGRADED moderate stress is handled by R inflation (fail-soft),
+        not hard skip, to keep heading aid continuity.
+        """
         cfg = self.runner.global_config
         if not bool(cfg.get("MAG_CONDITIONING_GUARD_ENABLE", True)):
             return False, ""
-        if health_key == "WARNING":
-            pcond_th = float(cfg.get("MAG_CONDITIONING_GUARD_WARN_PCOND", 5e11))
-            pmax_th = float(cfg.get("MAG_CONDITIONING_GUARD_WARN_PMAX", 5e6))
-            if p_cond > pcond_th or p_max > pmax_th:
-                return True, "skip_conditioning_warning"
-        elif health_key == "DEGRADED":
-            pcond_th = float(cfg.get("MAG_CONDITIONING_GUARD_DEGRADED_PCOND", 1e11))
-            pmax_th = float(cfg.get("MAG_CONDITIONING_GUARD_DEGRADED_PMAX", 2e6))
-            if p_cond > pcond_th or p_max > pmax_th:
-                return True, "skip_conditioning_degraded"
+        pcond_hard = float(cfg.get("MAG_CONDITIONING_GUARD_HARD_PCOND", 1e12))
+        pmax_hard = float(cfg.get("MAG_CONDITIONING_GUARD_HARD_PMAX", 1e7))
+        if p_cond > pcond_hard or p_max > pmax_hard:
+            return True, "skip_conditioning_hard"
         return False, ""
 
     def _should_use_estimated_bias(self, health_key: str, p_cond: float) -> bool:
@@ -416,13 +415,13 @@ class MagnetometerService:
             )
             sigma_mag_scaled *= float(mag_quality.get("r_scale", 1.0))
             if health_key == "WARNING":
-                warn_soft = 0.5 * float(self.runner.global_config.get("MAG_CONDITIONING_GUARD_WARN_PCOND", 5e11))
+                warn_soft = float(self.runner.global_config.get("MAG_CONDITIONING_GUARD_WARN_PCOND", 8e11))
                 if p_cond > warn_soft:
-                    sigma_mag_scaled *= float(self.runner.global_config.get("MAG_WARNING_EXTRA_R_MULT", 1.6))
+                    sigma_mag_scaled *= float(self.runner.global_config.get("MAG_WARNING_EXTRA_R_MULT", 2.0))
             elif health_key == "DEGRADED":
-                deg_soft = 0.5 * float(self.runner.global_config.get("MAG_CONDITIONING_GUARD_DEGRADED_PCOND", 1e11))
+                deg_soft = float(self.runner.global_config.get("MAG_CONDITIONING_GUARD_DEGRADED_PCOND", 1e11))
                 if p_cond > deg_soft:
-                    sigma_mag_scaled *= float(self.runner.global_config.get("MAG_DEGRADED_EXTRA_R_MULT", 2.2))
+                    sigma_mag_scaled *= float(self.runner.global_config.get("MAG_DEGRADED_EXTRA_R_MULT", 2.8))
             skip_mag, sigma_mag_scaled, consistency_reason = self._apply_visual_heading_consistency(
                 yaw_mag_filtered=yaw_mag_filtered,
                 sigma_mag_scaled=sigma_mag_scaled,
@@ -594,13 +593,13 @@ class MagnetometerService:
         health_key = str(health_state).upper()
         p_max, p_cond = self._get_cov_health()
         if health_key == "WARNING":
-            warn_soft = 0.5 * float(self.runner.global_config.get("MAG_CONDITIONING_GUARD_WARN_PCOND", 5e11))
+            warn_soft = float(self.runner.global_config.get("MAG_CONDITIONING_GUARD_WARN_PCOND", 8e11))
             if p_cond > warn_soft:
-                sigma_mag_scaled *= float(self.runner.global_config.get("MAG_WARNING_EXTRA_R_MULT", 1.6))
+                sigma_mag_scaled *= float(self.runner.global_config.get("MAG_WARNING_EXTRA_R_MULT", 2.0))
         elif health_key == "DEGRADED":
-            deg_soft = 0.5 * float(self.runner.global_config.get("MAG_CONDITIONING_GUARD_DEGRADED_PCOND", 1e11))
+            deg_soft = float(self.runner.global_config.get("MAG_CONDITIONING_GUARD_DEGRADED_PCOND", 1e11))
             if p_cond > deg_soft:
-                sigma_mag_scaled *= float(self.runner.global_config.get("MAG_DEGRADED_EXTRA_R_MULT", 2.2))
+                sigma_mag_scaled *= float(self.runner.global_config.get("MAG_DEGRADED_EXTRA_R_MULT", 2.8))
         mag_quality = self._evaluate_accuracy_policy(
             yaw_mag_filtered=yaw_mag_filtered,
             mag_norm=float(np.linalg.norm(mag_cal)),

@@ -162,6 +162,69 @@ class VIOService:
         runner._vps_skip_streak = 0
         return True, "run"
 
+    def _evaluate_vps_failsoft_temporal_gate(self, vps_offset: np.ndarray, vps_offset_m: float) -> Tuple[bool, str]:
+        """
+        Evaluate fail-soft temporal consistency for VPS update apply path.
+
+        Rules:
+        - Reject if offset direction changes too sharply vs last accepted VPS.
+        - For large offsets, require N consecutive consistent observations.
+        """
+        runner = self.runner
+        if vps_offset is None or np.size(vps_offset) < 2:
+            return True, ""
+        cur = np.array(vps_offset[:2], dtype=float)
+        cur_norm = float(np.linalg.norm(cur))
+        if not np.isfinite(cur_norm) or cur_norm <= 1e-6:
+            return True, ""
+
+        max_dir_change_deg = float(
+            runner.global_config.get("VPS_APPLY_FAILSOFT_MAX_DIR_CHANGE_DEG", 60.0)
+        )
+        last_vec = getattr(runner, "_vps_last_accepted_offset_vec", None)
+        if isinstance(last_vec, np.ndarray) and last_vec.size >= 2:
+            last = np.array(last_vec[:2], dtype=float)
+            last_norm = float(np.linalg.norm(last))
+            if np.isfinite(last_norm) and last_norm > 1e-6:
+                cosang = float(np.clip(np.dot(cur, last) / (cur_norm * last_norm), -1.0, 1.0))
+                dir_delta_deg = float(np.degrees(np.arccos(cosang)))
+                if dir_delta_deg > max_dir_change_deg:
+                    return False, f"SOFT_REJECT_DIR_CHANGE: dir={dir_delta_deg:.1f}deg>{max_dir_change_deg:.1f}deg"
+
+        large_offset_m = float(
+            runner.global_config.get("VPS_APPLY_FAILSOFT_LARGE_OFFSET_CONFIRM_M", 80.0)
+        )
+        required_hits = max(
+            1,
+            int(runner.global_config.get("VPS_APPLY_FAILSOFT_LARGE_OFFSET_CONFIRM_HITS", 2)),
+        )
+        if np.isfinite(vps_offset_m) and vps_offset_m > large_offset_m and required_hits > 1:
+            pending_vec = getattr(runner, "_vps_pending_large_offset_vec", None)
+            pending_hits = int(getattr(runner, "_vps_pending_large_offset_hits", 0))
+            consistent = False
+            if isinstance(pending_vec, np.ndarray) and pending_vec.size >= 2:
+                prev = np.array(pending_vec[:2], dtype=float)
+                prev_norm = float(np.linalg.norm(prev))
+                if np.isfinite(prev_norm) and prev_norm > 1e-6:
+                    cos_prev = float(np.clip(np.dot(cur, prev) / (cur_norm * prev_norm), -1.0, 1.0))
+                    prev_delta_deg = float(np.degrees(np.arccos(cos_prev)))
+                    consistent = prev_delta_deg <= max_dir_change_deg
+            pending_hits = pending_hits + 1 if consistent else 1
+            runner._vps_pending_large_offset_vec = cur.copy()
+            runner._vps_pending_large_offset_hits = int(pending_hits)
+            if pending_hits < required_hits:
+                return False, (
+                    f"SOFT_REJECT_LARGE_OFFSET_PENDING: hits={pending_hits}/{required_hits}, "
+                    f"offset={vps_offset_m:.1f}m"
+                )
+            runner._vps_pending_large_offset_vec = None
+            runner._vps_pending_large_offset_hits = 0
+        elif np.isfinite(vps_offset_m) and vps_offset_m <= large_offset_m:
+            runner._vps_pending_large_offset_vec = None
+            runner._vps_pending_large_offset_hits = 0
+
+        return True, ""
+
     def process_vio(self, rec, t: float, ongoing_preint=None) -> Tuple[bool, Optional[Dict[str, float]]]:
         """
         Process VIO (Visual-Inertial Odometry) + VPS updates.
@@ -711,6 +774,16 @@ class VIOService:
                     )
                     quality_mode = "strict" if strict_quality_ok else ("failsoft" if failsoft_quality_ok else "reject")
                     r_scale_apply = float(vps_apply_scales.get("r_scale", 1.0))
+                    temporal_reject_note = ""
+
+                    if quality_mode == "failsoft":
+                        temporal_ok, temporal_note = self._evaluate_vps_failsoft_temporal_gate(
+                            vps_offset=vps_offset,
+                            vps_offset_m=vps_offset_m,
+                        )
+                        if not temporal_ok:
+                            quality_mode = "reject"
+                            temporal_reject_note = str(temporal_note)
 
                     if quality_mode == "reject":
                         if hasattr(runner, "vps_clone_manager"):
@@ -723,6 +796,8 @@ class VIOService:
                             f"speed={speed_now:.2f}/{max_speed_apply:.2f}, "
                             f"offset={vps_offset_m:.1f}/{fs_max_offset_m:.1f}"
                         )
+                        if temporal_reject_note:
+                            vps_status = f"{temporal_reject_note} | {vps_status}"
                     else:
                         if quality_mode == "failsoft":
                             r_scale_apply *= float(runner.global_config.get("VPS_APPLY_FAILSOFT_R_MULT", 1.5))
@@ -753,6 +828,8 @@ class VIOService:
                             reason_code = "skip_missing_clone"
                         elif "skipped_quality" in status_lower:
                             reason_code = "skip_low_quality"
+                            if "soft_reject" in status_lower:
+                                reason_code = "soft_reject"
                         elif quality_mode == "failsoft" and "gated" in status_lower:
                             reason_code = "soft_reject"
                         elif "gated" in status_lower:
@@ -778,9 +855,17 @@ class VIOService:
                         timestamp=float(t_cam),
                         policy_scales=vps_policy_scales,
                     )
+                    if reason_code.startswith("soft_accept"):
+                        runner._vps_soft_accept_count = int(getattr(runner, "_vps_soft_accept_count", 0)) + 1
+                    elif reason_code.startswith("soft_reject"):
+                        runner._vps_soft_reject_count = int(getattr(runner, "_vps_soft_reject_count", 0)) + 1
                     if vps_applied:
                         runner.last_vps_update_time = t_cam
                         runner.state.vps_idx += 1
+                        runner._vps_pending_large_offset_vec = None
+                        runner._vps_pending_large_offset_hits = 0
+                        if vps_offset.size >= 2:
+                            runner._vps_last_accepted_offset_vec = np.array(vps_offset[:2], dtype=float)
 
             # Save keyframe image with visualization overlay
             if runner.config.save_keyframe_images and hasattr(runner, "keyframe_dir"):

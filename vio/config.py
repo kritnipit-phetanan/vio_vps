@@ -368,16 +368,22 @@ def load_config(config_path: str) -> VIOConfig:
         warning_weak_yaw.get('conditioning_guard_enable', True)
     )
     result['MAG_CONDITIONING_GUARD_WARN_PCOND'] = float(
-        warning_weak_yaw.get('conditioning_guard_warn_pcond', 5e11)
+        warning_weak_yaw.get('conditioning_guard_warn_pcond', 8e11)
     )
     result['MAG_CONDITIONING_GUARD_DEGRADED_PCOND'] = float(
         warning_weak_yaw.get('conditioning_guard_degraded_pcond', 1e11)
     )
     result['MAG_CONDITIONING_GUARD_WARN_PMAX'] = float(
-        warning_weak_yaw.get('conditioning_guard_warn_pmax', 5e6)
+        warning_weak_yaw.get('conditioning_guard_warn_pmax', 8e6)
     )
     result['MAG_CONDITIONING_GUARD_DEGRADED_PMAX'] = float(
         warning_weak_yaw.get('conditioning_guard_degraded_pmax', 2e6)
+    )
+    result['MAG_CONDITIONING_GUARD_HARD_PCOND'] = float(
+        warning_weak_yaw.get('conditioning_guard_hard_pcond', 1e12)
+    )
+    result['MAG_CONDITIONING_GUARD_HARD_PMAX'] = float(
+        warning_weak_yaw.get('conditioning_guard_hard_pmax', 1e7)
     )
     result['MAG_BIAS_FREEZE_WARN_PCOND'] = float(
         warning_weak_yaw.get('bias_freeze_warn_pcond', 1e10)
@@ -386,10 +392,10 @@ def load_config(config_path: str) -> VIOConfig:
         warning_weak_yaw.get('bias_freeze_degraded_pcond', 5e9)
     )
     result['MAG_WARNING_EXTRA_R_MULT'] = float(
-        warning_weak_yaw.get('warning_extra_r_mult', 1.6)
+        warning_weak_yaw.get('warning_extra_r_mult', 2.0)
     )
     result['MAG_DEGRADED_EXTRA_R_MULT'] = float(
-        warning_weak_yaw.get('degraded_extra_r_mult', 2.2)
+        warning_weak_yaw.get('degraded_extra_r_mult', 2.8)
     )
     result['VISION_HEADING_MIN_INLIERS'] = int(
         mag.get('vision_heading_min_inliers', 25)
@@ -481,6 +487,18 @@ def load_config(config_path: str) -> VIOConfig:
     result['VIO_NADIR_XY_ONLY_VELOCITY'] = bool(vio.get('nadir_xy_only_velocity', False))
     vio_vel_cfg = config.get('vio_vel', {})
     result['VIO_VEL_XY_ONLY_CHI2_SCALE'] = float(vio_vel_cfg.get('xy_only_chi2_scale', 1.10))
+    result['VIO_VEL_SPEED_R_INFLATE_BREAKPOINTS_M_S'] = list(
+        vio_vel_cfg.get('speed_r_inflate_breakpoints_m_s', [25.0, 40.0, 55.0])
+    )
+    result['VIO_VEL_SPEED_R_INFLATE_VALUES'] = list(
+        vio_vel_cfg.get('speed_r_inflate_values', [1.5, 2.5, 4.0])
+    )
+    result['VIO_VEL_MAX_DELTA_V_XY_PER_UPDATE_M_S'] = float(
+        vio_vel_cfg.get('max_delta_v_xy_per_update_m_s', 2.0)
+    )
+    result['VIO_VEL_MIN_FLOW_PX_HIGH_SPEED'] = float(
+        vio_vel_cfg.get('min_flow_px_high_speed', 0.8)
+    )
     
     # v2.9.10.5: Store raw vio config dict for access to all parameters
     # This includes new parameters like initial_agl_override
@@ -591,6 +609,9 @@ def load_config(config_path: str) -> VIOConfig:
         result['LOOP_DYNAMIC_PHASE_SIGMA_MULT'] = float(fs.get('dynamic_phase_sigma_mult', 1.15))
         result['LOOP_WARNING_SIGMA_MULT'] = float(fs.get('warning_sigma_mult', 1.20))
         result['LOOP_DEGRADED_SIGMA_MULT'] = float(fs.get('degraded_sigma_mult', 1.40))
+        result['LOOP_SPEED_SKIP_M_S'] = float(fs.get('speed_skip_m_s', 35.0))
+        result['LOOP_SPEED_SIGMA_INFLATE_M_S'] = float(fs.get('speed_sigma_inflate_m_s', 25.0))
+        result['LOOP_SPEED_SIGMA_MULT'] = float(fs.get('speed_sigma_mult', 1.5))
     else:
         result['USE_LOOP_CLOSURE'] = True
         result['LOOP_POSITION_THRESHOLD'] = 30.0
@@ -619,6 +640,9 @@ def load_config(config_path: str) -> VIOConfig:
         result['LOOP_DYNAMIC_PHASE_SIGMA_MULT'] = 1.15
         result['LOOP_WARNING_SIGMA_MULT'] = 1.20
         result['LOOP_DEGRADED_SIGMA_MULT'] = 1.40
+        result['LOOP_SPEED_SKIP_M_S'] = 35.0
+        result['LOOP_SPEED_SIGMA_INFLATE_M_S'] = 25.0
+        result['LOOP_SPEED_SIGMA_MULT'] = 1.5
 
     # =========================================================================
     # Kinematic consistency guard
@@ -634,6 +658,10 @@ def load_config(config_path: str) -> VIOConfig:
     result['KIN_GUARD_MAX_STATE_SPEED_M_S'] = float(kin_cfg.get('max_state_speed_m_s', 120.0))
     result['KIN_GUARD_MAX_BLEND_SPEED_M_S'] = float(kin_cfg.get('max_blend_speed_m_s', 60.0))
     result['KIN_GUARD_MAX_KIN_SPEED_M_S'] = float(kin_cfg.get('max_kin_speed_m_s', 80.0))
+    result['KIN_GUARD_HARD_HOLD_SEC'] = float(kin_cfg.get('hard_hold_sec', 0.30))
+    result['KIN_GUARD_RELEASE_HYSTERESIS_RATIO'] = float(
+        kin_cfg.get('release_hysteresis_ratio', 0.75)
+    )
     
     # =========================================================================
     # NEW: Vibration Detection (v2.8.0)
@@ -708,6 +736,15 @@ def load_config(config_path: str) -> VIOConfig:
     )
     result['VPS_APPLY_FAILSOFT_MAX_OFFSET_M'] = float(
         vps_cfg.get('apply_failsoft_max_offset_m', 180.0)
+    )
+    result['VPS_APPLY_FAILSOFT_MAX_DIR_CHANGE_DEG'] = float(
+        vps_cfg.get('apply_failsoft_max_dir_change_deg', 60.0)
+    )
+    result['VPS_APPLY_FAILSOFT_LARGE_OFFSET_CONFIRM_M'] = float(
+        vps_cfg.get('apply_failsoft_large_offset_confirm_m', 80.0)
+    )
+    result['VPS_APPLY_FAILSOFT_LARGE_OFFSET_CONFIRM_HITS'] = int(
+        vps_cfg.get('apply_failsoft_large_offset_confirm_hits', 2)
     )
     result['VPS_APPLY_FAILSOFT_ALLOW_WARNING'] = bool(
         vps_cfg.get('apply_failsoft_allow_warning', True)

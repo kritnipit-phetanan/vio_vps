@@ -333,7 +333,14 @@ def append_benchmark_health_summary(summary_csv: Optional[str],
                                     frames_inlier_nonzero_ratio: float = float("nan"),
                                     vio_vel_accept_ratio_vs_cam: float = float("nan"),
                                     mag_cholfail_rate: float = float("nan"),
-                                    loop_applied_rate: float = float("nan")):
+                                    loop_applied_rate: float = float("nan"),
+                                    speed_max_m_s: float = float("nan"),
+                                    speed_p99_m_s: float = float("nan"),
+                                    loop_corr_count: float = float("nan"),
+                                    loop_abs_yaw_corr_sum_deg: float = float("nan"),
+                                    vps_soft_accept_count: float = float("nan"),
+                                    vps_soft_reject_count: float = float("nan"),
+                                    mag_accept_rate: float = float("nan")):
     """Append one benchmark-health summary row."""
     if summary_csv is None:
         return
@@ -344,7 +351,10 @@ def append_benchmark_health_summary(summary_csv: Optional[str],
                 f"{pcond_max:.6e},{pmax_max:.6e},{cov_large_rate:.6f},"
                 f"{pos_rmse:.6f},{final_pos_err:.6f},{final_alt_err:.6f},"
                 f"{frames_inlier_nonzero_ratio:.6f},{vio_vel_accept_ratio_vs_cam:.6f},"
-                f"{mag_cholfail_rate:.6f},{loop_applied_rate:.6f}\n"
+                f"{mag_cholfail_rate:.6f},{loop_applied_rate:.6f},"
+                f"{speed_max_m_s:.6f},{speed_p99_m_s:.6f},{loop_corr_count:.6f},"
+                f"{loop_abs_yaw_corr_sum_deg:.6f},{vps_soft_accept_count:.6f},"
+                f"{vps_soft_reject_count:.6f},{mag_accept_rate:.6f}\n"
             )
     except Exception:
         pass
@@ -1308,7 +1318,9 @@ def init_output_csvs(output_dir: str, save_debug_data: bool = False) -> Dict[str
             "run_id,projection_count,first_projection_time,pcond_max,pmax_max,"
             "cov_large_rate,pos_rmse,final_pos_err,final_alt_err,"
             "frames_inlier_nonzero_ratio,vio_vel_accept_ratio_vs_cam,"
-            "mag_cholfail_rate,loop_applied_rate\n"
+            "mag_cholfail_rate,loop_applied_rate,"
+            "speed_max_m_s,speed_p99_m_s,loop_corr_count,loop_abs_yaw_corr_sum_deg,"
+            "vps_soft_accept_count,vps_soft_reject_count,mag_accept_rate\n"
         )
 
     # Heavy per-frame/per-feature debug logs are opt-in via --save_debug_data.

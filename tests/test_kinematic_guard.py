@@ -22,6 +22,8 @@ class _DummyRunner:
             "KIN_GUARD_VEL_MISMATCH_HARD": 15.0,
             "KIN_GUARD_MAX_INFLATE": 1.5,
             "KIN_GUARD_HARD_BLEND_ALPHA": 0.20,
+            "KIN_GUARD_HARD_HOLD_SEC": 0.0,
+            "KIN_GUARD_RELEASE_HYSTERESIS_RATIO": 0.75,
         }
         self.output_reporting = _DummyReporting()
         self._kin_guard_samples = 0

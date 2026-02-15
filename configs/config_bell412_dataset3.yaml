@@ -279,14 +279,16 @@ magnetometer:
     degraded_max_dyaw_deg: 1.0
     skip_vision_hard_mismatch: true
     conditioning_guard_enable: true
-    conditioning_guard_warn_pcond: 5.0e11
+    conditioning_guard_warn_pcond: 8.0e11
     conditioning_guard_degraded_pcond: 1.0e11
-    conditioning_guard_warn_pmax: 5.0e6
+    conditioning_guard_warn_pmax: 8.0e6
     conditioning_guard_degraded_pmax: 2.0e6
+    conditioning_guard_hard_pcond: 1.0e12
+    conditioning_guard_hard_pmax: 1.0e7
     bias_freeze_warn_pcond: 1.0e10
     bias_freeze_degraded_pcond: 5.0e9
-    warning_extra_r_mult: 1.6
-    degraded_extra_r_mult: 2.2
+    warning_extra_r_mult: 2.0
+    degraded_extra_r_mult: 2.8
 
 # EKF Process Noise
 # v2.9.9.10: AGGRESSIVE 3× increase (v2.9.9.9's 2× still showed 13.1σ overconfidence)
@@ -425,6 +427,10 @@ default_camera_view: "nadir"
 
 vio_vel:
   xy_only_chi2_scale: 1.10
+  speed_r_inflate_breakpoints_m_s: [25.0, 40.0, 55.0]
+  speed_r_inflate_values: [1.5, 2.5, 4.0]
+  max_delta_v_xy_per_update_m_s: 2.0
+  min_flow_px_high_speed: 0.8
 
 # Use fisheye undistortion backend
 use_fisheye: true
@@ -498,7 +504,7 @@ loop_closure:
     double_confirm_enable: true
     double_confirm_window_sec: 2.0
     double_confirm_yaw_deg: 8.0
-    cooldown_sec: 2.0
+    cooldown_sec: 4.0
     phase_dynamic_inlier_mult: 1.15
     warning_inlier_mult: 1.10
     degraded_inlier_mult: 1.20
@@ -506,11 +512,14 @@ loop_closure:
     enable: true
     fail_soft_sigma_yaw_deg: 18.0
     base_sigma_yaw_deg: 5.0
-    max_abs_yaw_corr_deg: 4.0
+    max_abs_yaw_corr_deg: 2.5
     min_abs_yaw_corr_deg: 1.5
     dynamic_phase_sigma_mult: 1.15
     warning_sigma_mult: 1.20
     degraded_sigma_mult: 1.40
+    speed_skip_m_s: 35.0
+    speed_sigma_inflate_m_s: 25.0
+    speed_sigma_mult: 1.5
 
 # ============================================================================
 # NEW: Vibration Detection (v2.8.0)
@@ -525,14 +534,16 @@ vibration:
 kinematic_guard:
   enabled: true
   window_sec: 0.5
-  vel_mismatch_warn: 10.0
-  vel_mismatch_hard: 25.0
+  vel_mismatch_warn: 6.0
+  vel_mismatch_hard: 12.0
   max_inflate: 1.08
-  hard_blend_alpha: 0.0
+  hard_blend_alpha: 0.12
   min_action_dt_sec: 0.25
-  max_state_speed_m_s: 120.0
-  max_blend_speed_m_s: 60.0
-  max_kin_speed_m_s: 80.0
+  max_state_speed_m_s: 70.0
+  max_blend_speed_m_s: 70.0
+  max_kin_speed_m_s: 65.0
+  hard_hold_sec: 0.30
+  release_hysteresis_ratio: 0.75
 
 # ============================================================================
 # Adaptive + State-aware Policy (IMU-driven)
@@ -860,8 +871,11 @@ vps:
   apply_failsoft_min_confidence: 0.12
   apply_failsoft_max_reproj_error: 1.2
   apply_failsoft_max_speed_m_s: 95.0
-  apply_failsoft_max_offset_m: 220.0
-  apply_failsoft_r_mult: 1.6
+  apply_failsoft_max_offset_m: 140.0
+  apply_failsoft_max_dir_change_deg: 60.0
+  apply_failsoft_large_offset_confirm_m: 80.0
+  apply_failsoft_large_offset_confirm_hits: 2
+  apply_failsoft_r_mult: 2.5
   apply_failsoft_allow_warning: true
   apply_failsoft_allow_degraded: false
   
