@@ -626,6 +626,44 @@ class OutputReportingService:
             except Exception:
                 pass
 
+        frames_inlier_nonzero_ratio = float("nan")
+        cam_frames = int(getattr(self.runner, "_cam_frames_processed", 0))
+        if cam_frames > 0:
+            frames_inlier_nonzero_ratio = float(
+                int(getattr(self.runner, "_cam_frames_inlier_nonzero", 0)) / float(cam_frames)
+            )
+
+        vio_vel_accept_ratio_vs_cam = float("nan")
+        vio_vel_accept = int(getattr(self.runner, "_vio_vel_accept_count", 0))
+        if cam_frames > 0:
+            vio_vel_accept_ratio_vs_cam = float(vio_vel_accept / float(cam_frames))
+
+        mag_cholfail_rate = float("nan")
+        mag_attempts = int(getattr(self.runner.state, "mag_updates", 0)) + int(getattr(self.runner.state, "mag_rejects", 0))
+        if self.runner.conditioning_events_csv and os.path.isfile(self.runner.conditioning_events_csv):
+            try:
+                cond_df = pd.read_csv(self.runner.conditioning_events_csv)
+                if len(cond_df) > 0:
+                    event_col = cond_df["event"].astype(str) if "event" in cond_df.columns else pd.Series(dtype=str)
+                    stage_col = cond_df["stage"].astype(str) if "stage" in cond_df.columns else pd.Series(dtype=str)
+                    mask = event_col.str.upper().eq("CHOLESKY_FAIL") & stage_col.str.upper().str.contains("MAG", na=False)
+                    chol_fails = int(mask.sum())
+                    if mag_attempts > 0:
+                        mag_cholfail_rate = float(chol_fails / float(mag_attempts))
+            except Exception:
+                pass
+
+        loop_applied_rate = float("nan")
+        if getattr(self.runner, "loop_detector", None) is not None and hasattr(self.runner.loop_detector, "stats"):
+            try:
+                l_stats = self.runner.loop_detector.stats
+                checks = int(l_stats.get("loop_checks", 0))
+                applied = int(l_stats.get("yaw_corrections_applied", 0))
+                if checks > 0:
+                    loop_applied_rate = float(applied / float(checks))
+            except Exception:
+                pass
+
         output_dir_norm = os.path.normpath(self.runner.config.output_dir)
         if os.path.basename(output_dir_norm) == "preintegration":
             run_id = os.path.basename(os.path.dirname(output_dir_norm))
@@ -645,11 +683,19 @@ class OutputReportingService:
             pos_rmse=pos_rmse,
             final_pos_err=final_pos_err,
             final_alt_err=final_alt_err,
+            frames_inlier_nonzero_ratio=frames_inlier_nonzero_ratio,
+            vio_vel_accept_ratio_vs_cam=vio_vel_accept_ratio_vs_cam,
+            mag_cholfail_rate=mag_cholfail_rate,
+            loop_applied_rate=loop_applied_rate,
         )
         print(
             f"[SUMMARY] projection_count={projection_count}, "
             f"first_projection_time={first_projection_time:.3f}, "
-            f"pcond_max={pcond_max:.2e}, cov_large_rate={cov_large_rate:.3f}"
+            f"pcond_max={pcond_max:.2e}, cov_large_rate={cov_large_rate:.3f}, "
+            f"inlier_nonzero={frames_inlier_nonzero_ratio:.3f}, "
+            f"vio_vel_ratio={vio_vel_accept_ratio_vs_cam:.3f}, "
+            f"mag_cholfail_rate={mag_cholfail_rate:.3f}, "
+            f"loop_applied_rate={loop_applied_rate:.3f}"
         )
 
     def print_summary(self):

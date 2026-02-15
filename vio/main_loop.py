@@ -48,6 +48,7 @@ from .services.dem_service import DEMService
 from .services.vps_service import VPSService
 from .services.vio_service import VIOService
 from .services.imu_update_service import IMUUpdateService
+from .services.kinematic_guard_service import KinematicGuardService
 
 
 class VIORunner:
@@ -183,6 +184,14 @@ class VIORunner:
         self._vision_yaw_last_t: Optional[float] = None
         self._vision_heading_quality: float = 0.0
         self._convention_warn_counts: Dict[str, int] = {}
+        self._cam_frames_processed: int = 0
+        self._cam_frames_inlier_nonzero: int = 0
+        self._vio_vel_attempt_count: int = 0
+        self._vio_vel_accept_count: int = 0
+        self._kin_guard_samples: int = 0
+        self._kin_guard_trigger_count: int = 0
+        self._kin_guard_hard_count: int = 0
+        self._kin_guard_last_mismatch: float = float("nan")
         self.phase_service = PhaseService(self)
         self.adaptive_service = AdaptiveService(self)
         self.output_reporting = OutputReportingService(self)
@@ -192,6 +201,7 @@ class VIORunner:
         self.vps_service = VPSService(self)
         self.vio_service = VIOService(self)
         self.imu_update_service = IMUUpdateService(self)
+        self.kinematic_guard_service = KinematicGuardService(self)
     
     def run(self):
         """

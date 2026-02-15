@@ -75,7 +75,9 @@ def apply_magnetometer_update(kf,
                               mag_declination: float,
                               use_raw_heading: bool,
                               sigma_mag_yaw: float,
+                              global_config: Optional[dict] = None,
                               current_phase: int = 2,
+                              health_state: str = "HEALTHY",
                               gyro_z: float = 0.0,
                               in_convergence: bool = False,
                               has_ppk_yaw: bool = False,
@@ -141,6 +143,7 @@ def apply_magnetometer_update(kf,
             "r_scale_used": float(r_scale_used),
         })
     from .magnetometer import compute_yaw_from_mag
+    global_config = global_config or {}
     
     # Track filter rejection reasons (v2.9.2)
     if filter_info is not None:
@@ -263,6 +266,11 @@ def apply_magnetometer_update(kf,
     
     # Apply oscillation R-scaling to measurement noise (v2.9.5)
     sigma_mag_yaw_scaled = sigma_mag_yaw * oscillation_r_scale * extra_scale
+    health_key = str(health_state).upper()
+    if health_key == "WARNING":
+        sigma_mag_yaw_scaled *= float(global_config.get("MAG_WARNING_R_MULT", 4.0))
+    elif health_key == "DEGRADED":
+        sigma_mag_yaw_scaled *= float(global_config.get("MAG_DEGRADED_R_MULT", 8.0))
     
     # Build measurement model
     _MAG_STATE['total_accepted'] += 1
@@ -336,7 +344,7 @@ def apply_magnetometer_update(kf,
         return np.array([[yaw_x]])
     
     # Measurement covariance (use scaled sigma from oscillation detection)
-    r_yaw = np.array([[sigma_mag_yaw_scaled**2]])
+    r_yaw = np.array([[sigma_mag_yaw_scaled**2]], dtype=float)
     
     # Phase-based Kalman gain tuning (v3.4.0)
     # SPINUP (0): FULL CORRECTION (K=1.0) to completely prevent drift
@@ -345,17 +353,41 @@ def apply_magnetometer_update(kf,
     # Solution: K=1.0 (100% correction) in SPINUP - trust magnetometer completely
     if current_phase == 0:  # SPINUP phase - FULL CORRECTION
         K_MIN = 0.999  # Use 0.999 instead of 1.0 to avoid div by zero!
-        MAX_YAW_CORRECTION = np.radians(180.0)  # NO CLAMP in SPINUP!
+        MAX_YAW_CORRECTION = np.radians(120.0)  # Keep broad, but avoid hard snaps
     elif current_phase == 1:  # EARLY phase - moderate correction
         K_MIN = 0.70  # Higher trust in mag during convergence
-        MAX_YAW_CORRECTION = np.radians(90.0)  # Allow larger corrections
+        MAX_YAW_CORRECTION = np.radians(55.0)
     else:  # NORMAL phase - gentler correction
         K_MIN = 0.40  # Standard tracking
-        MAX_YAW_CORRECTION = np.radians(60.0)  # Conservative limit
+        MAX_YAW_CORRECTION = np.radians(35.0)
+
+    health_corr_mult = {
+        "HEALTHY": 1.00,
+        "WARNING": 0.80,
+        "DEGRADED": 0.65,
+        "RECOVERY": 0.90,
+    }.get(health_key, 1.00)
+    MAX_YAW_CORRECTION *= float(health_corr_mult)
+    if health_key == "WARNING":
+        MAX_YAW_CORRECTION = min(
+            MAX_YAW_CORRECTION,
+            np.radians(float(global_config.get("MAG_WARNING_MAX_DYAW_DEG", 1.5)))
+        )
+    elif health_key == "DEGRADED":
+        MAX_YAW_CORRECTION = min(
+            MAX_YAW_CORRECTION,
+            np.radians(float(global_config.get("MAG_DEGRADED_MAX_DYAW_DEG", 1.0)))
+        )
     
     # Compute current Kalman gain
-    P_yaw = kf.P[theta_cov_idx, theta_cov_idx]
-    S_yaw = P_yaw + sigma_mag_yaw_scaled**2  # BUG FIX: Use scaled sigma!
+    P_yaw = float(kf.P[theta_cov_idx, theta_cov_idx])
+    if not np.isfinite(P_yaw) or P_yaw <= 0.0:
+        _set_adaptive_info(False, None, None, None, extra_scale)
+        return False, "Invalid P_yaw"
+    S_yaw = float(P_yaw + sigma_mag_yaw_scaled**2)  # BUG FIX: Use scaled sigma!
+    if not np.isfinite(S_yaw) or S_yaw <= 1e-12:
+        _set_adaptive_info(False, None, None, None, extra_scale)
+        return False, "Invalid S_yaw"
     K_yaw = P_yaw / S_yaw
     
     # Enforce minimum K
@@ -380,7 +412,11 @@ def apply_magnetometer_update(kf,
     if abs(expected_correction) > MAX_YAW_CORRECTION:
         K_target = MAX_YAW_CORRECTION / abs(yaw_innov)
         R_inflated = P_yaw * (1.0 / K_target - 1.0)
-        r_yaw = np.array([[max(R_inflated, sigma_mag_yaw**2)]])
+        r_yaw = np.array([[max(R_inflated, sigma_mag_yaw_scaled**2)]], dtype=float)
+
+    if not np.all(np.isfinite(r_yaw)) or float(r_yaw[0, 0]) <= 0.0:
+        _set_adaptive_info(False, None, None, None, extra_scale)
+        return False, "Invalid MAG covariance"
     
     # Decouple yaw from roll/pitch and velocity
     kf.P[8, 6] = 0.0; kf.P[6, 8] = 0.0
@@ -668,6 +704,8 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
                                soft_fail_r_cap: float = 8.0,
                                soft_fail_hard_reject_factor: float = 3.0,
                                soft_fail_power: float = 1.0,
+                               phase: int = 2,
+                               health_state: str = "HEALTHY",
                                adaptive_info: Optional[Dict[str, Any]] = None) -> bool:
     """
     Apply VIO velocity update with scale recovery and chi-square gating.
@@ -929,11 +967,15 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
         # Avoid injecting synthetic vertical velocity from nadir XY flow.
         vel_world[2] = float(kf.x[5, 0])
     
-    # Determine if using VZ only (for nadir cameras)
-    # Allow config override for OF-velocity drift reduction
+    # Determine velocity measurement mode for VIO velocity update.
+    # - vz_only: legacy 1D vertical update
+    # - xy_only_nadir: nadir-only horizontal update (2DOF) to avoid Z coupling
+    # - full_3d: standard 3DOF update
     use_vz_only_default = view_cfg.get('use_vz_only', True)
     vio_config = global_config.get('vio', {})
     use_vz_only = vio_config.get('use_vz_only', use_vz_only_default)
+    xy_only_nadir = bool(global_config.get('VIO_NADIR_XY_ONLY_VELOCITY', False))
+    use_xy_only = bool(camera_view == "nadir" and xy_only_nadir and not bool(use_vz_only))
     
     # ESKF velocity update
     num_clones = (kf.x.shape[0] - 19) // 7  # v3.9.7: 19D nominal
@@ -947,6 +989,18 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
         # Apply flow quality scaling to uncertainty
         r_mat = np.array([[(sigma_vo * view_cfg.get('sigma_scale_z', 2.0) * flow_quality_scale * extra_scale)**2]])
         dof = 1
+    elif use_xy_only:
+        h_vel = np.zeros((2, err_dim), dtype=float)
+        h_vel[0, 3] = 1.0
+        h_vel[1, 4] = 1.0
+        vel_meas = np.array([[vel_world[0]], [vel_world[1]]], dtype=float)
+        scale_xy = view_cfg.get('sigma_scale_xy', 1.0)
+        # Slightly conservative XY-only R to preserve fail-soft behavior.
+        r_mat = np.diag([
+            (sigma_vo * scale_xy * flow_quality_scale * 1.4 * extra_scale) ** 2,
+            (sigma_vo * scale_xy * flow_quality_scale * 1.4 * extra_scale) ** 2,
+        ])
+        dof = 2
     else:
         h_vel = np.zeros((3, err_dim), dtype=float)
         h_vel[0, 3] = 1.0
@@ -969,6 +1023,8 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
     def hx_fun(x, h=h_vel):
         if use_vz_only:
             return x[5:6].reshape(1, 1)
+        elif use_xy_only:
+            return x[3:5].reshape(2, 1)
         else:
             return x[3:6].reshape(3, 1)
     
@@ -1037,7 +1093,7 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
             try:
                 s_inv = safe_matrix_inverse(s_matrix, damping=1e-9, method='cholesky')
                 m2 = innovation.T @ s_inv @ innovation
-                chi2_val = float(m2)
+                chi2_val = float(np.squeeze(m2))
                 return chi2_val, float(np.sqrt(max(0.0, chi2_val)))
             except Exception:
                 return float("inf"), float("nan")
@@ -1047,9 +1103,34 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
         # Chi-square thresholds
         # v2.9.9.7: RELAXED from 95% to 99.5% to accept more valid updates
         # Analysis: Filter overconfident (11.8σ vel error) → rejects valid VIO_VEL → divergence
-        chi2_threshold = 6.63 if use_vz_only else 11.34  # 1-DOF: 99%, 3-DOF: 99.5% (was 3.84/7.81)
+        if use_vz_only:
+            chi2_threshold = 6.63  # 1-DOF (99%)
+        elif use_xy_only:
+            chi2_threshold = 9.21 * float(global_config.get("VIO_VEL_XY_ONLY_CHI2_SCALE", 1.10))  # 2-DOF
+        else:
+            chi2_threshold = 11.34  # 3-DOF (99.5%)
         chi2_threshold *= max(1e-3, float(chi2_scale))
-        hard_threshold = chi2_threshold * max(1.0, float(soft_fail_hard_reject_factor))
+        phase_key = str(max(0, min(2, int(phase))))
+        health_key = str(health_state).upper()
+        phase_hard_map = {
+            "0": float(global_config.get("VIO_VEL_PHASE_HARD_FACTOR_0", 1.35)),
+            "1": float(global_config.get("VIO_VEL_PHASE_HARD_FACTOR_1", 1.18)),
+            "2": float(global_config.get("VIO_VEL_PHASE_HARD_FACTOR_2", 1.00)),
+        }
+        health_hard_map = {
+            "HEALTHY": float(global_config.get("VIO_VEL_HEALTH_HARD_FACTOR_HEALTHY", 1.00)),
+            "WARNING": float(global_config.get("VIO_VEL_HEALTH_HARD_FACTOR_WARNING", 1.20)),
+            "DEGRADED": float(global_config.get("VIO_VEL_HEALTH_HARD_FACTOR_DEGRADED", 1.45)),
+            "RECOVERY": float(global_config.get("VIO_VEL_HEALTH_HARD_FACTOR_RECOVERY", 1.10)),
+        }
+        phase_hard_mult = float(phase_hard_map.get(phase_key, 1.0))
+        health_hard_mult = float(health_hard_map.get(health_key, 1.0))
+        hard_threshold = (
+            chi2_threshold
+            * max(1.0, float(soft_fail_hard_reject_factor))
+            * max(1.0, phase_hard_mult)
+            * max(1.0, health_hard_mult)
+        )
         accepted = False
         reason_code = "hard_reject"
         s_used = s_mat
@@ -1067,14 +1148,31 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
             vo_mode = "VO" if (t_unit is not None and np.linalg.norm(t_unit) > 1e-6) else "OF-fallback"
             _log_vio_vel_update(
                 f"[VIO] Velocity update: speed={speed_final:.2f}m/s, vz_only={use_vz_only}, "
+                f"xy_only={use_xy_only}, "
                 f"flow={avg_flow_px:.1f}px, R_scale={flow_quality_scale:.1f}x, mode={vo_mode}, chi2={chi2_value:.2f}"
             )
             accepted = True
             reason_code = "normal_accept"
         elif bool(soft_fail_enable):
             soft_ratio = max(1.0, float(chi2_value) / max(chi2_threshold, 1e-9))
+            phase_cap_map = {
+                "0": float(global_config.get("VIO_VEL_PHASE_SOFT_CAP_FACTOR_0", 1.20)),
+                "1": float(global_config.get("VIO_VEL_PHASE_SOFT_CAP_FACTOR_1", 1.10)),
+                "2": float(global_config.get("VIO_VEL_PHASE_SOFT_CAP_FACTOR_2", 1.00)),
+            }
+            health_cap_map = {
+                "HEALTHY": float(global_config.get("VIO_VEL_HEALTH_SOFT_CAP_FACTOR_HEALTHY", 1.00)),
+                "WARNING": float(global_config.get("VIO_VEL_HEALTH_SOFT_CAP_FACTOR_WARNING", 1.20)),
+                "DEGRADED": float(global_config.get("VIO_VEL_HEALTH_SOFT_CAP_FACTOR_DEGRADED", 1.40)),
+                "RECOVERY": float(global_config.get("VIO_VEL_HEALTH_SOFT_CAP_FACTOR_RECOVERY", 1.10)),
+            }
+            soft_r_cap_eff = (
+                float(soft_fail_r_cap)
+                * float(phase_cap_map.get(phase_key, 1.0))
+                * float(health_cap_map.get(health_key, 1.0))
+            )
             soft_factor = soft_ratio ** max(0.1, float(soft_fail_power))
-            soft_factor = min(max(1.0, float(soft_fail_r_cap)), soft_factor)
+            soft_factor = min(max(1.0, float(soft_r_cap_eff)), soft_factor)
             r_used = r_mat * soft_factor
             with np.errstate(all='ignore'):
                 s_soft = h_vel @ kf.P @ h_vel.T + r_used
@@ -1084,6 +1182,14 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
                 mahal_used = mahal_soft
                 s_used = s_soft
                 r_scale_used = extra_scale * soft_factor
+                tail_factor = float(global_config.get("VIO_VEL_SOFT_FAIL_TAIL_FACTOR", 1.30))
+                tail_gate = hard_threshold * max(1.0, tail_factor)
+                flow_tail_guard = float(global_config.get("VIO_VEL_SOFT_FAIL_TAIL_FLOW_GUARD_PX", 0.8))
+                allow_tail_soft = (
+                    np.isfinite(chi2_soft)
+                    and chi2_soft <= tail_gate
+                    and float(avg_flow_px) >= flow_tail_guard
+                )
                 if np.isfinite(chi2_soft) and (chi2_soft <= hard_threshold):
                     kf.update(
                         z=vel_meas, HJacobian=h_fun, Hx=hx_fun, R=r_used,
@@ -1096,6 +1202,19 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
                     )
                     accepted = True
                     reason_code = "soft_accept"
+                elif allow_tail_soft:
+                    # Fail-soft tail: keep weakly consistent measurements alive with
+                    # heavily inflated R to avoid long hard-reject bursts.
+                    kf.update(
+                        z=vel_meas, HJacobian=h_fun, Hx=hx_fun, R=r_used,
+                        update_type="VIO_VEL", timestamp=t
+                    )
+                    _log_vio_vel_update(
+                        f"[VIO] Velocity soft-tail accept: chi2={chi2_value:.2f}->{chi2_soft:.2f}, "
+                        f"hard={hard_threshold:.2f}, tail={tail_gate:.2f}, infl={soft_factor:.2f}x"
+                    )
+                    accepted = True
+                    reason_code = "soft_accept_tail"
                 else:
                     _log_vio_vel_update(
                         f"[VIO] Velocity REJECTED: chi2={chi2_soft:.2f} > hard={hard_threshold:.2f} "

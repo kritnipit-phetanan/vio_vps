@@ -198,9 +198,37 @@ class MagnetometerService:
         yaw_diff = self._wrap_angle(float(yaw_mag_filtered) - float(vis_yaw))
         yaw_diff_deg = abs(float(np.degrees(yaw_diff)))
 
+        phase = int(getattr(runner.state, "current_phase", 2))
+        phase_key = str(max(0, min(2, phase)))
         soft_deg = float(cfg.get("MAG_VISION_HEADING_SOFT_DEG", 30.0))
         hard_deg = max(soft_deg + 1.0, float(cfg.get("MAG_VISION_HEADING_HARD_DEG", 85.0)))
+        soft_deg = float(cfg.get("MAG_VISION_HEADING_PHASE_SOFT_DEG", {}).get(phase_key, soft_deg))
+        hard_deg = float(cfg.get("MAG_VISION_HEADING_PHASE_HARD_DEG", {}).get(phase_key, hard_deg))
+
+        health_state = "HEALTHY"
+        decision = getattr(runner, "current_adaptive_decision", None)
+        if decision is not None and hasattr(decision, "health_state"):
+            health_state = str(getattr(decision, "health_state", "HEALTHY")).upper()
+        th_mult = float(
+            cfg.get("MAG_VISION_HEADING_HEALTH_THRESHOLD_MULT", {}).get(health_state, 1.0)
+        )
+        soft_deg = max(5.0, float(soft_deg) * max(0.3, th_mult))
+        hard_deg = max(soft_deg + 1.0, float(hard_deg) * max(0.3, th_mult))
+
         max_r = max(1.0, float(cfg.get("MAG_VISION_HEADING_R_INFLATE_MAX", 6.0)))
+        max_r *= float(cfg.get("MAG_VISION_HEADING_HEALTH_R_MULT", {}).get(health_state, 1.0))
+
+        # At high speed, trust transient MAG heading less; tighten mismatch thresholds
+        # and increase fail-soft inflation ceiling.
+        speed_m_s = float(np.linalg.norm(np.asarray(runner.kf.x[3:6, 0], dtype=float)))
+        high_speed_m_s = float(cfg.get("MAG_VISION_HEADING_HIGH_SPEED_M_S", 45.0))
+        if speed_m_s >= high_speed_m_s:
+            hs_th_mult = float(cfg.get("MAG_VISION_HEADING_HIGH_SPEED_THRESH_MULT", 0.85))
+            hs_r_mult = float(cfg.get("MAG_VISION_HEADING_HIGH_SPEED_R_MULT", 1.20))
+            soft_deg = max(5.0, soft_deg * max(0.3, hs_th_mult))
+            hard_deg = max(soft_deg + 1.0, hard_deg * max(0.3, hs_th_mult))
+            max_r *= max(1.0, hs_r_mult)
+
         strong_quality = float(cfg.get("MAG_VISION_HEADING_STRONG_QUALITY", 0.60))
         strong_quality = max(min_quality, min(1.0, strong_quality))
 
@@ -211,12 +239,17 @@ class MagnetometerService:
             value=float(yaw_diff_deg),
             threshold=float(hard_deg),
             status="PASS" if yaw_diff_deg <= hard_deg else "WARN",
-            note=f"vision_quality={vis_q:.3f}",
+            note=f"vision_quality={vis_q:.3f};phase={phase};health={health_state};speed={speed_m_s:.1f}",
         )
 
         if yaw_diff_deg >= hard_deg:
             # Fail-soft: only hard reject when vision heading confidence is truly strong.
             # Otherwise keep MAG update alive with aggressive R inflation.
+            if (
+                bool(cfg.get("MAG_WARNING_SKIP_VISION_HARD_MISMATCH", True))
+                and health_state in ("WARNING", "DEGRADED")
+            ):
+                return True, float(sigma_mag_scaled), "skip_vision_heading_mismatch"
             if vis_q >= strong_quality:
                 return True, float(sigma_mag_scaled), "skip_vision_heading_mismatch"
             sigma_scaled = float(sigma_mag_scaled) * float(max_r)
@@ -228,6 +261,49 @@ class MagnetometerService:
         r_inflate = 1.0 + frac * (max_r - 1.0)
         sigma_scaled = float(sigma_mag_scaled) * float(r_inflate)
         return False, sigma_scaled, "vision_heading_soft_inflate"
+
+    def _get_cov_health(self) -> tuple[float, float]:
+        """Return lightweight covariance health metrics for MAG safety gating."""
+        p_core = np.array(self.runner.kf.P[:18, :18], dtype=float, copy=True)
+        if p_core.size == 0:
+            return float("nan"), float("inf")
+        p_core = 0.5 * (p_core + p_core.T)
+        p_max = float(np.nanmax(np.abs(p_core)))
+        try:
+            p_cond = float(np.linalg.cond(p_core))
+        except Exception:
+            p_cond = float("inf")
+        if not np.isfinite(p_cond):
+            p_cond = float("inf")
+        return p_max, p_cond
+
+    def _check_conditioning_guard(self, health_key: str, p_max: float, p_cond: float) -> tuple[bool, str]:
+        """Skip MAG updates when covariance is already numerically stressed."""
+        cfg = self.runner.global_config
+        if not bool(cfg.get("MAG_CONDITIONING_GUARD_ENABLE", True)):
+            return False, ""
+        if health_key == "WARNING":
+            pcond_th = float(cfg.get("MAG_CONDITIONING_GUARD_WARN_PCOND", 5e11))
+            pmax_th = float(cfg.get("MAG_CONDITIONING_GUARD_WARN_PMAX", 5e6))
+            if p_cond > pcond_th or p_max > pmax_th:
+                return True, "skip_conditioning_warning"
+        elif health_key == "DEGRADED":
+            pcond_th = float(cfg.get("MAG_CONDITIONING_GUARD_DEGRADED_PCOND", 1e11))
+            pmax_th = float(cfg.get("MAG_CONDITIONING_GUARD_DEGRADED_PMAX", 2e6))
+            if p_cond > pcond_th or p_max > pmax_th:
+                return True, "skip_conditioning_degraded"
+        return False, ""
+
+    def _should_use_estimated_bias(self, health_key: str, p_cond: float) -> bool:
+        """Freeze online mag-bias updates when observability/conditioning is poor."""
+        if not bool(self.runner.config.use_mag_estimated_bias):
+            return False
+        cfg = self.runner.global_config
+        if health_key == "WARNING":
+            return bool(p_cond < float(cfg.get("MAG_BIAS_FREEZE_WARN_PCOND", 1e10)))
+        if health_key == "DEGRADED":
+            return bool(p_cond < float(cfg.get("MAG_BIAS_FREEZE_DEGRADED_PCOND", 5e9)))
+        return True
 
     def process_magnetometer(self, t: float):
         """
@@ -326,17 +402,36 @@ class MagnetometerService:
             sigma_mag_scaled = sigma_mag * r_scale
             mag_policy_scales, mag_apply_scales = self.runner.adaptive_service.get_sensor_adaptive_scales("MAG")
             mag_adaptive_info: Dict[str, Any] = {}
+            health_state = "HEALTHY"
+            if getattr(self.runner, "current_adaptive_decision", None) is not None:
+                health_state = str(
+                    getattr(self.runner.current_adaptive_decision, "health_state", "HEALTHY")
+                )
+            health_key = str(health_state).upper()
+            p_max, p_cond = self._get_cov_health()
             mag_quality = self._evaluate_accuracy_policy(
                 yaw_mag_filtered=yaw_mag_filtered,
                 mag_norm=mag_norm,
                 timestamp=float(mag_rec.t),
             )
             sigma_mag_scaled *= float(mag_quality.get("r_scale", 1.0))
+            if health_key == "WARNING":
+                warn_soft = 0.5 * float(self.runner.global_config.get("MAG_CONDITIONING_GUARD_WARN_PCOND", 5e11))
+                if p_cond > warn_soft:
+                    sigma_mag_scaled *= float(self.runner.global_config.get("MAG_WARNING_EXTRA_R_MULT", 1.6))
+            elif health_key == "DEGRADED":
+                deg_soft = 0.5 * float(self.runner.global_config.get("MAG_CONDITIONING_GUARD_DEGRADED_PCOND", 1e11))
+                if p_cond > deg_soft:
+                    sigma_mag_scaled *= float(self.runner.global_config.get("MAG_DEGRADED_EXTRA_R_MULT", 2.2))
             skip_mag, sigma_mag_scaled, consistency_reason = self._apply_visual_heading_consistency(
                 yaw_mag_filtered=yaw_mag_filtered,
                 sigma_mag_scaled=sigma_mag_scaled,
                 timestamp=float(mag_rec.t),
             )
+            cond_skip, cond_reason = self._check_conditioning_guard(health_key=health_key, p_max=p_max, p_cond=p_cond)
+            if cond_skip:
+                skip_mag = True
+                consistency_reason = cond_reason if consistency_reason == "" else f"{consistency_reason}|{cond_reason}"
             decision = str(mag_quality.get("decision", "good"))
             if decision == "bad_skip":
                 skip_mag = True
@@ -388,13 +483,16 @@ class MagnetometerService:
 
             # Apply magnetometer update using FILTERED yaw
             # CRITICAL: Pass filtered yaw directly instead of raw mag
+            use_estimated_bias = self._should_use_estimated_bias(health_key=health_key, p_cond=p_cond)
             applied, reason = apply_magnetometer_update(
                 self.runner.kf,
                 mag_calibrated=mag_cal,  # Still needed for compute_yaw_from_mag inside
                 mag_declination=declination,
                 use_raw_heading=use_raw,
                 sigma_mag_yaw=sigma_mag_scaled,  # Use scaled sigma
+                global_config=self.runner.global_config,
                 current_phase=self.runner.state.current_phase,  # v3.4.0: state-based phase
+                health_state=health_state,
                 in_convergence=in_convergence,
                 has_ppk_yaw=has_ppk,
                 timestamp=mag_rec.t,
@@ -402,12 +500,14 @@ class MagnetometerService:
                 frame=self.runner.state.vio_frame,
                 yaw_override=yaw_mag_filtered,  # NEW: pass filtered yaw directly
                 filter_info=filter_info,  # v2.9.2: track filter rejection reasons
-                use_estimated_bias=self.runner.config.use_mag_estimated_bias,  # v3.9.8: freeze states if disabled
+                use_estimated_bias=use_estimated_bias,
                 r_scale_extra=float(mag_apply_scales.get("r_scale", 1.0)),
                 adaptive_info=mag_adaptive_info,
             )
             if consistency_reason:
                 mag_adaptive_info["reason_code"] = consistency_reason
+            elif not applied and "reason_code" not in mag_adaptive_info:
+                mag_adaptive_info["reason_code"] = "hard_reject"
             self.runner.adaptive_service.record_adaptive_measurement(
                 "MAG",
                 adaptive_info=mag_adaptive_info,
@@ -486,6 +586,21 @@ class MagnetometerService:
 
         # Scale measurement noise based on filter confidence
         sigma_mag_scaled = sigma_mag * r_scale
+        health_state = "HEALTHY"
+        if getattr(self.runner, "current_adaptive_decision", None) is not None:
+            health_state = str(
+                getattr(self.runner.current_adaptive_decision, "health_state", "HEALTHY")
+            )
+        health_key = str(health_state).upper()
+        p_max, p_cond = self._get_cov_health()
+        if health_key == "WARNING":
+            warn_soft = 0.5 * float(self.runner.global_config.get("MAG_CONDITIONING_GUARD_WARN_PCOND", 5e11))
+            if p_cond > warn_soft:
+                sigma_mag_scaled *= float(self.runner.global_config.get("MAG_WARNING_EXTRA_R_MULT", 1.6))
+        elif health_key == "DEGRADED":
+            deg_soft = 0.5 * float(self.runner.global_config.get("MAG_CONDITIONING_GUARD_DEGRADED_PCOND", 1e11))
+            if p_cond > deg_soft:
+                sigma_mag_scaled *= float(self.runner.global_config.get("MAG_DEGRADED_EXTRA_R_MULT", 2.2))
         mag_quality = self._evaluate_accuracy_policy(
             yaw_mag_filtered=yaw_mag_filtered,
             mag_norm=float(np.linalg.norm(mag_cal)),
@@ -498,6 +613,9 @@ class MagnetometerService:
             timestamp=float(mag_rec.t),
         )
         if str(mag_quality.get("decision", "")) == "bad_skip":
+            skip_mag = True
+        cond_skip, _ = self._check_conditioning_guard(health_key=health_key, p_max=p_max, p_cond=p_cond)
+        if cond_skip:
             skip_mag = True
         log_mag_quality(
             getattr(self.runner, "mag_quality_csv", None),
@@ -527,13 +645,16 @@ class MagnetometerService:
         )
 
         # Apply magnetometer update using FILTERED yaw
+        use_estimated_bias = self._should_use_estimated_bias(health_key=health_key, p_cond=p_cond)
         applied, reason = apply_magnetometer_update(
             self.runner.kf,
             mag_calibrated=mag_cal,
             mag_declination=declination,
             use_raw_heading=use_raw,
             sigma_mag_yaw=sigma_mag_scaled,
+            global_config=self.runner.global_config,
             current_phase=self.runner.state.current_phase,
+            health_state=health_state,
             in_convergence=in_convergence,
             has_ppk_yaw=has_ppk,
             timestamp=mag_rec.t,
@@ -541,7 +662,7 @@ class MagnetometerService:
             frame=self.runner.state.vio_frame,
             yaw_override=yaw_mag_filtered,
             filter_info=filter_info,
-            use_estimated_bias=self.runner.config.use_mag_estimated_bias,  # v3.9.8: freeze states if disabled
+            use_estimated_bias=use_estimated_bias,
         )
 
         if applied:

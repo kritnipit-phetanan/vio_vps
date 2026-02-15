@@ -608,6 +608,36 @@ class AdaptiveController:
                 r_cap *= float(
                     vio_soft_cfg.get("health_r_cap_factor", {}).get(self.health_state, 1.0)
                 )
+                # State-aware fail-soft boost:
+                # If VIO_VEL enters reject burst / high-NIS mode, relax gate and
+                # increase soft-fail envelope instead of hard-reject bursts.
+                burst_accept_rate_low = float(vio_soft_cfg.get("burst_accept_rate_low", 0.35))
+                burst_nis_high = float(vio_soft_cfg.get("burst_nis_high", 5.0))
+                if accept_rate <= burst_accept_rate_low and nis >= burst_nis_high:
+                    sensor_scales["chi2_scale"] = sensor_scales.get("chi2_scale", 1.0) * float(
+                        vio_soft_cfg.get("burst_chi2_relax", 1.35)
+                    )
+                    sensor_scales["threshold_scale"] = sensor_scales.get("threshold_scale", 1.0) * float(
+                        vio_soft_cfg.get("burst_threshold_relax", 1.35)
+                    )
+                    sensor_scales["r_scale"] = sensor_scales.get("r_scale", 1.0) * float(
+                        vio_soft_cfg.get("burst_r_boost", 1.25)
+                    )
+
+                if nis >= hi:
+                    sensor_scales["chi2_scale"] = sensor_scales.get("chi2_scale", 1.0) * float(
+                        vio_soft_cfg.get("high_nis_relax_chi2_mult", 1.15)
+                    )
+                    sensor_scales["threshold_scale"] = sensor_scales.get("threshold_scale", 1.0) * float(
+                        vio_soft_cfg.get("high_nis_relax_threshold_mult", 1.15)
+                    )
+
+                health_relax = float(
+                    vio_soft_cfg.get("health_chi2_relax", {}).get(self.health_state, 1.0)
+                )
+                sensor_scales["chi2_scale"] = sensor_scales.get("chi2_scale", 1.0) * health_relax
+                sensor_scales["threshold_scale"] = sensor_scales.get("threshold_scale", 1.0) * health_relax
+
                 sensor_scales["fail_soft_enable"] = 1.0 if bool(vio_soft_cfg.get("enabled", True)) else 0.0
                 sensor_scales["hard_reject_factor"] = max(1.0, hard_factor)
                 sensor_scales["soft_r_cap"] = max(1.0, r_cap)

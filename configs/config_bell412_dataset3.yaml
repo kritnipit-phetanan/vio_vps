@@ -227,6 +227,21 @@ magnetometer:
   vision_heading_hard_deg: 85.0
   vision_heading_r_inflate_max: 4.0
   vision_heading_strong_quality: 0.65
+  vision_heading_phase_soft_deg: {"0": 36.0, "1": 28.0, "2": 24.0}
+  vision_heading_phase_hard_deg: {"0": 95.0, "1": 78.0, "2": 62.0}
+  vision_heading_health_threshold_mult:
+    HEALTHY: 1.0
+    WARNING: 0.90
+    DEGRADED: 0.80
+    RECOVERY: 0.95
+  vision_heading_health_r_mult:
+    HEALTHY: 1.0
+    WARNING: 1.2
+    DEGRADED: 1.4
+    RECOVERY: 1.1
+  vision_heading_high_speed_m_s: 45.0
+  vision_heading_high_speed_thresh_mult: 0.85
+  vision_heading_high_speed_r_mult: 1.20
   vision_heading_min_inliers: 25
   vision_heading_min_parallax_px: 1.0
   vision_heading_max_delta_deg: 20.0
@@ -256,6 +271,23 @@ magnetometer:
   sigma_mag_bias: 0.0001         # Process noise for mag bias (random walk) [normalized/sqrt(s)]
   use_estimated_bias: true      # Use EKF-estimated bias instead of config hard_iron
 
+  # State-aware weak-yaw path (for WARNING/DEGRADED health)
+  warning_weak_yaw:
+    warning_r_mult: 4.0
+    degraded_r_mult: 8.0
+    warning_max_dyaw_deg: 1.5
+    degraded_max_dyaw_deg: 1.0
+    skip_vision_hard_mismatch: true
+    conditioning_guard_enable: true
+    conditioning_guard_warn_pcond: 5.0e11
+    conditioning_guard_degraded_pcond: 1.0e11
+    conditioning_guard_warn_pmax: 5.0e6
+    conditioning_guard_degraded_pmax: 2.0e6
+    bias_freeze_warn_pcond: 1.0e10
+    bias_freeze_degraded_pcond: 5.0e9
+    warning_extra_r_mult: 1.6
+    degraded_extra_r_mult: 2.2
+
 # EKF Process Noise
 # v2.9.9.10: AGGRESSIVE 3× increase (v2.9.9.9's 2× still showed 13.1σ overconfidence)
 # DIAGNOSIS: v2.9.9.9 velocity σ = 0.5 m/s, but actual error = 6.5 m/s
@@ -276,6 +308,7 @@ vio:
   # Enable optical flow velocity updates (v2.9.8.2: gyro-compensated)
   # Helps reduce XY drift in outdoor long-range flights without VPS
   use_vio_velocity: true     # Enable optical flow → velocity → EKF updates
+  nadir_xy_only_velocity: true  # Nadir velocity update as XY-only (2DOF)
   
   # v2.9.10.5: Fixed AGL for VIO velocity scale (GPS-denied compliant)
   # Problem: DEM elevation (110.5m) vs GPS MSL (116.7m) have ~6m offset
@@ -331,6 +364,31 @@ vio:
       "0": 1.15
       "1": 1.05
       "2": 0.95
+    phase_reproj_gate_scale:
+      "0": 1.20
+      "1": 1.08
+      "2": 1.00
+    health_reproj_gate_scale:
+      HEALTHY: 1.00
+      WARNING: 1.10
+      DEGRADED: 1.20
+      RECOVERY: 1.05
+    phase_avg_reproj_gate_scale:
+      "0": 1.15
+      "1": 1.05
+      "2": 1.00
+    health_avg_reproj_gate_scale:
+      HEALTHY: 1.00
+      WARNING: 1.08
+      DEGRADED: 1.15
+      RECOVERY: 1.04
+    reproj_state_aware:
+      quality_high_th: 0.75
+      quality_low_th: 0.45
+      mid_gate_mult: 1.15
+      low_quality_reject: true
+      warning_scale: 1.20
+      degraded_scale: 1.35
   
   # Camera view configurations
   # CRITICAL FIX: use_vz_only=true for nadir camera
@@ -364,6 +422,9 @@ vio:
 
 # Default camera view (nadir/front/side)
 default_camera_view: "nadir"
+
+vio_vel:
+  xy_only_chi2_scale: 1.10
 
 # Use fisheye undistortion backend
 use_fisheye: true
@@ -421,12 +482,35 @@ rectification:
 # Corrects accumulated yaw drift using visual feature matching.
 # DISABLED for long-range outdoor flights without loops (CPU-intensive, low benefit)
 loop_closure:
-  use_loop_closure: false     # DISABLED: No loops in long-range flight, saves 0.3-0.5s/keyframe
+  use_loop_closure: true
   position_threshold: 30.0    # Distance threshold to consider loop candidate [m]
   min_keyframe_dist: 15.0     # Minimum distance between keyframes [m]
   min_keyframe_yaw: 20.0      # Minimum yaw change between keyframes [deg]
   min_frame_gap: 50           # Minimum frame gap for loop detection
-  min_inliers: 15             # Minimum feature match inliers
+  min_match_ratio: 0.12
+  min_inliers: 15
+  quality_gate:
+    min_inliers_hard: 35
+    min_inliers_failsoft: 20
+    min_spatial_spread: 0.18
+    max_reproj_px: 2.5
+    yaw_residual_bound_deg: 25.0
+    double_confirm_enable: true
+    double_confirm_window_sec: 2.0
+    double_confirm_yaw_deg: 8.0
+    cooldown_sec: 2.0
+    phase_dynamic_inlier_mult: 1.15
+    warning_inlier_mult: 1.10
+    degraded_inlier_mult: 1.20
+  fail_soft:
+    enable: true
+    fail_soft_sigma_yaw_deg: 18.0
+    base_sigma_yaw_deg: 5.0
+    max_abs_yaw_corr_deg: 4.0
+    min_abs_yaw_corr_deg: 1.5
+    dynamic_phase_sigma_mult: 1.15
+    warning_sigma_mult: 1.20
+    degraded_sigma_mult: 1.40
 
 # ============================================================================
 # NEW: Vibration Detection (v2.8.0)
@@ -437,6 +521,18 @@ vibration:
   use_vibration_detector: true
   window_size: 50             # Number of samples for vibration detection
   threshold_multiplier: 5.0   # Multiplier of acc_n for vibration threshold
+
+kinematic_guard:
+  enabled: true
+  window_sec: 0.5
+  vel_mismatch_warn: 10.0
+  vel_mismatch_hard: 25.0
+  max_inflate: 1.08
+  hard_blend_alpha: 0.0
+  min_action_dt_sec: 0.25
+  max_state_speed_m_s: 120.0
+  max_blend_speed_m_s: 60.0
+  max_kin_speed_m_s: 80.0
 
 # ============================================================================
 # Adaptive + State-aware Policy (IMU-driven)
@@ -567,6 +663,18 @@ adaptive:
       hard_reject_factor: 3.0
       max_r_scale: 12.0
       inflate_power: 1.0
+      burst_accept_rate_low: 0.35
+      burst_nis_high: 5.0
+      burst_chi2_relax: 1.35
+      burst_threshold_relax: 1.35
+      burst_r_boost: 1.25
+      high_nis_relax_chi2_mult: 1.15
+      high_nis_relax_threshold_mult: 1.15
+      health_chi2_relax:
+        HEALTHY: 1.00
+        WARNING: 1.10
+        DEGRADED: 1.25
+        RECOVERY: 1.05
       health_hard_factor:
         HEALTHY: 1.0
         WARNING: 1.15
@@ -737,6 +845,25 @@ vps:
   min_confidence_failsoft: 0.12    # Fail-soft minimum confidence
   max_offset_px_failsoft: 900.0    # Reject fail-soft matches with extreme pixel offset
   failsoft_r_inflate: 4.0          # Inflate R for fail-soft accepted matches
+  apply_min_inliers: 8             # Runtime gate before delayed EKF update
+  apply_min_confidence: 0.18       # Runtime gate before delayed EKF update
+  apply_max_reproj_error: 1.20     # Runtime gate before delayed EKF update [px]
+  apply_max_speed_m_s: 80.0        # Skip VPS correction when state speed is implausibly high
+  apply_warning_inlier_bonus: 2
+  apply_degraded_inlier_bonus: 4
+  apply_warning_conf_mult: 1.15
+  apply_degraded_conf_mult: 1.30
+  apply_warning_reproj_mult: 0.90
+  apply_degraded_reproj_mult: 0.80
+  apply_failsoft_enable: true
+  apply_failsoft_min_inliers: 5
+  apply_failsoft_min_confidence: 0.12
+  apply_failsoft_max_reproj_error: 1.2
+  apply_failsoft_max_speed_m_s: 95.0
+  apply_failsoft_max_offset_m: 220.0
+  apply_failsoft_r_mult: 1.6
+  apply_failsoft_allow_warning: true
+  apply_failsoft_allow_degraded: false
   
   # Altitude limits (AGL)
   min_altitude: 30.0               # Minimum altitude for VPS [m]

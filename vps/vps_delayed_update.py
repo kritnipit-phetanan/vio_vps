@@ -63,7 +63,9 @@ class VPSDelayedUpdateManager:
     def __init__(self, 
                  max_clones: int = 3,
                  max_delay_sec: float = 0.5,
-                 error_state_dim: int = 18):
+                 error_state_dim: int = 18,
+                 max_position_correction_m: float = 80.0,
+                 max_velocity_correction_m_s: float = 25.0):
         """
         Initialize delayed update manager.
         
@@ -75,6 +77,8 @@ class VPSDelayedUpdateManager:
         self.max_clones = max_clones
         self.max_delay_sec = max_delay_sec
         self.error_state_dim = error_state_dim
+        self.max_position_correction_m = float(max_position_correction_m)
+        self.max_velocity_correction_m_s = float(max_velocity_correction_m_s)
         
         self.clones: Dict[str, VPSStateClone] = {}
         
@@ -84,6 +88,7 @@ class VPSDelayedUpdateManager:
             'clones_expired': 0,
             'updates_applied': 0,
             'updates_failed': 0,
+            'updates_clamped': 0,
         }
     
     def clone_state(self, 
@@ -274,6 +279,22 @@ class VPSDelayedUpdateManager:
         dx_current = cross_cov_safe @ H.T @ S_inv @ innovation
         dx_current = np.nan_to_num(dx_current, nan=0.0, posinf=1e4, neginf=-1e4)
         dx_current = np.clip(dx_current, -1e4, 1e4)
+
+        # Guard against large delayed-correction jumps that can destabilize state.
+        pos_corr_norm = float(np.linalg.norm(dx_current[0:2, 0])) if dx_current.shape[0] >= 2 else 0.0
+        vel_corr_norm = float(np.linalg.norm(dx_current[3:5, 0])) if dx_current.shape[0] >= 5 else 0.0
+        corr_scale = 1.0
+        if np.isfinite(pos_corr_norm) and self.max_position_correction_m > 1e-6:
+            corr_scale = min(corr_scale, self.max_position_correction_m / max(pos_corr_norm, 1e-9))
+        if np.isfinite(vel_corr_norm) and self.max_velocity_correction_m_s > 1e-6:
+            corr_scale = min(corr_scale, self.max_velocity_correction_m_s / max(vel_corr_norm, 1e-9))
+        if corr_scale < 0.05:
+            self.stats['updates_failed'] += 1
+            del self.clones[image_id]
+            return False, innovation_mag
+        if corr_scale < 1.0:
+            dx_current *= float(corr_scale)
+            self.stats['updates_clamped'] += 1
         
         # Apply correction to current state
         # Position

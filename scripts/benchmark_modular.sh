@@ -91,8 +91,8 @@ GROUND_TRUTH="${DATASET_BASE}/bell412_dataset3_frl.pos"
 #   imu_cam: require IMU+GT+CAM
 #   imu_only: IMU+GT only
 RUN_MODE="${RUN_MODE:-auto}"
-SAVE_DEBUG_DATA="${SAVE_DEBUG_DATA:-0}"  # 1 => pass --save_debug_data (heavy CSV logs)
-SAVE_KEYFRAME_IMAGES="${SAVE_KEYFRAME_IMAGES:-0}"  # 1 => pass --save_keyframe_images (keyframe JPGs)
+SAVE_DEBUG_DATA="${SAVE_DEBUG_DATA:-1}"  # 1 => pass --save_debug_data (heavy CSV logs)
+SAVE_KEYFRAME_IMAGES="${SAVE_KEYFRAME_IMAGES:-1}"  # 1 => pass --save_keyframe_images (keyframe JPGs)
 
 # Output directory
 OUTPUT_DIR="benchmark_modular_${TEST_ID}/preintegration"
@@ -439,6 +439,176 @@ if base_dir and os.path.isdir(base_dir):
 EOF
 echo ""
 
+echo "=== Spectacular-Style Metrics ==="
+python3 - <<EOF
+import os
+import numpy as np
+import pandas as pd
+
+out_dir = "$OUTPUT_DIR"
+run_id = os.path.basename(os.path.dirname(os.path.normpath(out_dir))) if os.path.basename(os.path.normpath(out_dir)) == "preintegration" else os.path.basename(os.path.normpath(out_dir))
+out_csv = os.path.join(out_dir, "spectacular_style_metrics.csv")
+
+
+def _to_num(series):
+    return pd.to_numeric(series, errors="coerce").to_numpy(dtype=float)
+
+
+def _compute_metrics(run_dir: str, run_id_override: str = ""):
+    res = {
+        "run_id": run_id_override or os.path.basename(os.path.dirname(os.path.normpath(run_dir))),
+        "samples": np.nan,
+        "raw_h_cep50_m": np.nan,
+        "raw_h_cep95_m": np.nan,
+        "raw_h_rmse_m": np.nan,
+        "raw_3d_rmse_m": np.nan,
+        "aligned4dof_h_cep50_m": np.nan,
+        "aligned4dof_h_cep95_m": np.nan,
+        "aligned4dof_h_rmse_m": np.nan,
+        "aligned4dof_3d_rmse_m": np.nan,
+        "aligned4dof_final_3d_m": np.nan,
+        "yaw_align_deg": np.nan,
+        "heading_mae_deg": np.nan,
+        "heading_final_abs_deg": np.nan,
+    }
+    err_csv = os.path.join(run_dir, "error_log.csv")
+    if not os.path.isfile(err_csv):
+        return res
+
+    try:
+        df = pd.read_csv(err_csv)
+    except Exception:
+        return res
+
+    if len(df) == 0:
+        return res
+
+    res["samples"] = float(len(df))
+
+    required = ["pos_error_E", "pos_error_N", "pos_error_U", "yaw_error_deg"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        return res
+
+    err_e = _to_num(df["pos_error_E"])
+    err_n = _to_num(df["pos_error_N"])
+    err_u = _to_num(df["pos_error_U"])
+    yaw_err = np.abs(_to_num(df["yaw_error_deg"]))
+
+    mask_raw = np.isfinite(err_e) & np.isfinite(err_n) & np.isfinite(err_u)
+    if mask_raw.sum() < 5:
+        return res
+
+    he = np.sqrt(err_e[mask_raw] ** 2 + err_n[mask_raw] ** 2)
+    e3 = np.sqrt(err_e[mask_raw] ** 2 + err_n[mask_raw] ** 2 + err_u[mask_raw] ** 2)
+    res["raw_h_cep50_m"] = float(np.percentile(he, 50))
+    res["raw_h_cep95_m"] = float(np.percentile(he, 95))
+    res["raw_h_rmse_m"] = float(np.sqrt(np.mean(he ** 2)))
+    res["raw_3d_rmse_m"] = float(np.sqrt(np.mean(e3 ** 2)))
+
+    yaw_ok = yaw_err[np.isfinite(yaw_err)]
+    if yaw_ok.size > 0:
+        res["heading_mae_deg"] = float(np.mean(yaw_ok))
+        res["heading_final_abs_deg"] = float(yaw_ok[-1])
+
+    # 4-DoF alignment (yaw + xyz translation) on overlap samples from error_log.
+    # Reconstruct GT ENU from (vio - error) when vio_E/N/U are available.
+    if all(c in df.columns for c in ["vio_E", "vio_N", "vio_U"]):
+        v_e = _to_num(df["vio_E"])
+        v_n = _to_num(df["vio_N"])
+        v_u = _to_num(df["vio_U"])
+        g_e = v_e - err_e
+        g_n = v_n - err_n
+        g_u = v_u - err_u
+
+        mask = (
+            np.isfinite(v_e) & np.isfinite(v_n) & np.isfinite(v_u) &
+            np.isfinite(g_e) & np.isfinite(g_n) & np.isfinite(g_u)
+        )
+        if mask.sum() >= 5:
+            v_xy = np.column_stack([v_e[mask], v_n[mask]])
+            g_xy = np.column_stack([g_e[mask], g_n[mask]])
+            v_z = v_u[mask]
+            g_z = g_u[mask]
+
+            v_xy_mu = np.mean(v_xy, axis=0)
+            g_xy_mu = np.mean(g_xy, axis=0)
+            v_xy_c = v_xy - v_xy_mu
+            g_xy_c = g_xy - g_xy_mu
+
+            c_val = float(np.sum(v_xy_c[:, 0] * g_xy_c[:, 0] + v_xy_c[:, 1] * g_xy_c[:, 1]))
+            s_val = float(np.sum(v_xy_c[:, 0] * g_xy_c[:, 1] - v_xy_c[:, 1] * g_xy_c[:, 0]))
+            yaw = float(np.arctan2(s_val, c_val))
+            cy, sy = np.cos(yaw), np.sin(yaw)
+            r2 = np.array([[cy, -sy], [sy, cy]], dtype=float)
+
+            v_xy_aligned = (r2 @ v_xy.T).T
+            t_xy = g_xy_mu - np.mean(v_xy_aligned, axis=0)
+            v_xy_aligned = v_xy_aligned + t_xy
+
+            t_z = float(np.mean(g_z - v_z))
+            v_z_aligned = v_z + t_z
+
+            err_xy = v_xy_aligned - g_xy
+            err_z = v_z_aligned - g_z
+            err_h = np.sqrt(np.sum(err_xy ** 2, axis=1))
+            err_3d = np.sqrt(np.sum(err_xy ** 2, axis=1) + err_z ** 2)
+
+            res["aligned4dof_h_cep50_m"] = float(np.percentile(err_h, 50))
+            res["aligned4dof_h_cep95_m"] = float(np.percentile(err_h, 95))
+            res["aligned4dof_h_rmse_m"] = float(np.sqrt(np.mean(err_h ** 2)))
+            res["aligned4dof_3d_rmse_m"] = float(np.sqrt(np.mean(err_3d ** 2)))
+            res["aligned4dof_final_3d_m"] = float(err_3d[-1])
+            res["yaw_align_deg"] = float(np.degrees(yaw))
+
+    return res
+
+
+cur = _compute_metrics(out_dir, run_id_override=run_id)
+pd.DataFrame([cur]).to_csv(out_csv, index=False)
+
+print("Horizontal CEP (raw ENU error):")
+print(f"  CEP50          : {cur['raw_h_cep50_m']:.3f} m")
+print(f"  CEP95          : {cur['raw_h_cep95_m']:.3f} m")
+print(f"  RMSE (horizontal): {cur['raw_h_rmse_m']:.3f} m")
+print("")
+print("4-DoF aligned ATE (yaw + translation):")
+print(f"  ATE RMSE 3D    : {cur['aligned4dof_3d_rmse_m']:.3f} m")
+print(f"  ATE final 3D   : {cur['aligned4dof_final_3d_m']:.3f} m")
+print(f"  CEP50/95 (2D)  : {cur['aligned4dof_h_cep50_m']:.3f} / {cur['aligned4dof_h_cep95_m']:.3f} m")
+print(f"  best yaw align : {cur['yaw_align_deg']:.3f} deg")
+print("")
+print("Heading error:")
+print(f"  MAE            : {cur['heading_mae_deg']:.3f} deg")
+print(f"  final |err|    : {cur['heading_final_abs_deg']:.3f} deg")
+print(f"saved: {out_csv}")
+
+base_dir = "$BASELINE_RUN"
+if base_dir and os.path.isdir(base_dir):
+    base = _compute_metrics(base_dir)
+    print("")
+    print(f"Baseline spectacular-style delta vs: {base_dir}")
+    keys = [
+        "raw_h_cep50_m",
+        "raw_h_cep95_m",
+        "raw_h_rmse_m",
+        "aligned4dof_3d_rmse_m",
+        "aligned4dof_h_cep50_m",
+        "aligned4dof_h_cep95_m",
+        "heading_mae_deg",
+        "heading_final_abs_deg",
+    ]
+    for k in keys:
+        c = float(cur[k]) if np.isfinite(cur[k]) else np.nan
+        b = float(base[k]) if np.isfinite(base[k]) else np.nan
+        if np.isfinite(b) and abs(b) > 1e-12 and np.isfinite(c):
+            pct = 100.0 * (c - b) / abs(b)
+            print(f"{k:24s} base={b: .6e} cur={c: .6e} delta={pct:+7.2f}%")
+        else:
+            print(f"{k:24s} base={b: .6e} cur={c: .6e} delta=   n/a")
+EOF
+echo ""
+
 CURRENT_SUMMARY="$OUTPUT_DIR/benchmark_health_summary.csv"
 BASELINE_SUMMARY=""
 if [ -n "$BASELINE_RUN" ] && [ -f "$BASELINE_RUN/benchmark_health_summary.csv" ]; then
@@ -462,6 +632,10 @@ cov_large_rate = np.nan
 pos_rmse = np.nan
 final_pos_err = np.nan
 final_alt_err = np.nan
+frames_inlier_nonzero_ratio = np.nan
+vio_vel_accept_ratio_vs_cam = np.nan
+mag_cholfail_rate = np.nan
+loop_applied_rate = np.nan
 
 run_log = os.path.join(base_dir, "run.log")
 if os.path.isfile(run_log):
@@ -494,8 +668,8 @@ if os.path.isfile(err_csv):
 
 run_id = os.path.basename(os.path.dirname(os.path.normpath(base_dir))) if os.path.basename(os.path.normpath(base_dir)) == "preintegration" else os.path.basename(os.path.normpath(base_dir))
 with open(out_csv, "w", newline="") as f:
-    f.write("run_id,projection_count,first_projection_time,pcond_max,pmax_max,cov_large_rate,pos_rmse,final_pos_err,final_alt_err\\n")
-    f.write(f"{run_id},{projection_count},{first_projection_time},{pcond_max},{pmax_max},{cov_large_rate},{pos_rmse},{final_pos_err},{final_alt_err}\\n")
+    f.write("run_id,projection_count,first_projection_time,pcond_max,pmax_max,cov_large_rate,pos_rmse,final_pos_err,final_alt_err,frames_inlier_nonzero_ratio,vio_vel_accept_ratio_vs_cam,mag_cholfail_rate,loop_applied_rate\\n")
+    f.write(f"{run_id},{projection_count},{first_projection_time},{pcond_max},{pmax_max},{cov_large_rate},{pos_rmse},{final_pos_err},{final_alt_err},{frames_inlier_nonzero_ratio},{vio_vel_accept_ratio_vs_cam},{mag_cholfail_rate},{loop_applied_rate}\\n")
 EOF
     if [ ! -f "$BASELINE_SUMMARY" ]; then
         BASELINE_SUMMARY=""
@@ -521,6 +695,14 @@ else:
     print(f"pos_rmse           : {row['pos_rmse']:.3f} m")
     print(f"final_pos_err      : {row['final_pos_err']:.3f} m")
     print(f"final_alt_err      : {row['final_alt_err']:.3f} m")
+    if 'frames_inlier_nonzero_ratio' in row:
+        print(f"inlier_nonzero_rt  : {row['frames_inlier_nonzero_ratio']:.3f}")
+    if 'vio_vel_accept_ratio_vs_cam' in row:
+        print(f"vio_vel_accept_rt  : {row['vio_vel_accept_ratio_vs_cam']:.3f}")
+    if 'mag_cholfail_rate' in row:
+        print(f"mag_cholfail_rate  : {row['mag_cholfail_rate']:.3f}")
+    if 'loop_applied_rate' in row:
+        print(f"loop_applied_rate  : {row['loop_applied_rate']:.3f}")
 EOF
 else
     echo "❌ Missing $CURRENT_SUMMARY"
@@ -539,8 +721,6 @@ if len(cur_df) == 0 or len(base_df) == 0:
     print("Baseline/current summary has no data rows; skipping before/after diff.")
     raise SystemExit(0)
 
-cur = cur_df.iloc[-1]
-base = base_df.iloc[-1]
 metrics = [
     "projection_count",
     "first_projection_time",
@@ -550,21 +730,24 @@ metrics = [
     "pos_rmse",
     "final_pos_err",
     "final_alt_err",
+    "frames_inlier_nonzero_ratio",
+    "vio_vel_accept_ratio_vs_cam",
+    "mag_cholfail_rate",
+    "loop_applied_rate",
 ]
-missing_cur = [m for m in metrics if m not in cur_df.columns]
-missing_base = [m for m in metrics if m not in base_df.columns]
-if missing_cur or missing_base:
-    print("Summary schema mismatch; skipping before/after diff.")
-    if missing_cur:
-        print(f"  missing in current: {missing_cur}")
-    if missing_base:
-        print(f"  missing in baseline: {missing_base}")
-    raise SystemExit(0)
+for m in metrics:
+    if m not in cur_df.columns:
+        cur_df[m] = np.nan
+    if m not in base_df.columns:
+        base_df[m] = np.nan
+
+cur = cur_df.iloc[-1]
+base = base_df.iloc[-1]
 
 print(f"Baseline: $BASELINE_RUN")
 for m in metrics:
-    c = float(pd.to_numeric(cur[m], errors="coerce"))
-    b = float(pd.to_numeric(base[m], errors="coerce"))
+    c = float(pd.to_numeric(cur.get(m, np.nan), errors="coerce"))
+    b = float(pd.to_numeric(base.get(m, np.nan), errors="coerce"))
     if np.isfinite(b) and abs(b) > 1e-12:
         pct = 100.0 * (c - b) / abs(b)
         print(f"{m:20s}  base={b: .6e}  cur={c: .6e}  delta={pct:+7.2f}%")
@@ -752,6 +935,7 @@ echo "  - cov_health.csv   : Covariance health timeline"
 echo "  - conditioning_events.csv : Conditioning fallback events"
 echo "  - benchmark_health_summary.csv : Run health one-line summary"
 echo "  - accuracy_first_summary.csv : Accuracy-first metrics + baseline deltas"
+echo "  - spectacular_style_metrics.csv : CEP + 4DoF-aligned ATE style metrics"
 echo "  - sensor_phase_summary.csv : accept-rate/NIS summary by sensor+phase"
 echo "  - run.log          : Full debug output"
 echo ""

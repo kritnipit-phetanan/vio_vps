@@ -438,8 +438,35 @@ class BootstrapService:
 
         try:
             position_threshold = runner.global_config.get("LOOP_POSITION_THRESHOLD", 30.0)
-            runner.loop_detector = init_loop_closure(position_threshold=position_threshold)
-            print(f"[LOOP] Loop closure detector initialized (threshold={position_threshold}m)")
+            runner.loop_detector = init_loop_closure(
+                position_threshold=float(position_threshold),
+                min_keyframe_dist=float(runner.global_config.get("LOOP_MIN_KEYFRAME_DIST", 15.0)),
+                min_keyframe_yaw=float(runner.global_config.get("LOOP_MIN_KEYFRAME_YAW", 20.0)),
+                min_frame_gap=int(runner.global_config.get("LOOP_MIN_FRAME_GAP", 50)),
+                min_match_ratio=float(runner.global_config.get("LOOP_MIN_MATCH_RATIO", 0.12)),
+                min_inliers=int(runner.global_config.get("LOOP_MIN_INLIERS", 15)),
+                quality_gate={
+                    "min_inliers_hard": int(runner.global_config.get("LOOP_MIN_INLIERS_HARD", 35)),
+                    "min_inliers_failsoft": int(runner.global_config.get("LOOP_MIN_INLIERS_FAILSOFT", 20)),
+                    "min_spatial_spread": float(runner.global_config.get("LOOP_MIN_SPATIAL_SPREAD", 0.18)),
+                    "max_reproj_px": float(runner.global_config.get("LOOP_MAX_REPROJ_PX", 2.5)),
+                    "yaw_residual_bound_deg": float(runner.global_config.get("LOOP_YAW_RESIDUAL_BOUND_DEG", 25.0)),
+                    "double_confirm_enable": bool(runner.global_config.get("LOOP_DOUBLE_CONFIRM_ENABLE", True)),
+                    "double_confirm_window_sec": float(runner.global_config.get("LOOP_DOUBLE_CONFIRM_WINDOW_SEC", 2.0)),
+                    "double_confirm_yaw_deg": float(runner.global_config.get("LOOP_DOUBLE_CONFIRM_YAW_DEG", 8.0)),
+                    "cooldown_sec": float(runner.global_config.get("LOOP_COOLDOWN_SEC", 2.0)),
+                    "phase_dynamic_inlier_mult": float(runner.global_config.get("LOOP_PHASE_DYNAMIC_INLIER_MULT", 1.15)),
+                    "warning_inlier_mult": float(runner.global_config.get("LOOP_WARNING_INLIER_MULT", 1.10)),
+                    "degraded_inlier_mult": float(runner.global_config.get("LOOP_DEGRADED_INLIER_MULT", 1.20)),
+                },
+                fail_soft={
+                    "enable": bool(runner.global_config.get("LOOP_FAIL_SOFT_ENABLE", True)),
+                },
+            )
+            print(
+                f"[LOOP] Loop closure detector initialized "
+                f"(threshold={position_threshold}m, enabled={bool(runner.global_config.get('USE_LOOP_CLOSURE', True))})"
+            )
         except Exception as e:
             print(f"[LOOP] WARNING: Failed to initialize loop closure: {e}")
             runner.loop_detector = None

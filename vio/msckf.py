@@ -39,7 +39,10 @@ def _log_msckf_update(message: str):
 
 def get_adaptive_reprojection_threshold(kf: Any,
                                        base_threshold: float = 12.0,
-                                       reproj_scale: float = 1.0) -> float:
+                                       reproj_scale: float = 1.0,
+                                       phase: int = 2,
+                                       health_state: str = "HEALTHY",
+                                       global_config: Optional[dict] = None) -> float:
     """Adaptive MSCKF reprojection threshold based on filter convergence.
     
     v2.9.10.0 Priority 2: Start permissive during initialization (20px),
@@ -72,12 +75,89 @@ def get_adaptive_reprojection_threshold(kf: Any,
             threshold = 10.0
         
         scaled_threshold = threshold * max(1e-3, float(reproj_scale))
+
+        phase_key = str(max(0, min(2, int(phase))))
+        health_key = str(health_state).upper()
+        phase_gate = {"0": 1.20, "1": 1.08, "2": 1.00}
+        health_gate = {"HEALTHY": 1.00, "WARNING": 1.10, "DEGRADED": 1.20, "RECOVERY": 1.05}
+        if isinstance(global_config, dict):
+            try:
+                phase_gate = dict(global_config.get("MSCKF_PHASE_REPROJ_GATE_SCALE", phase_gate))
+            except Exception:
+                pass
+            try:
+                health_gate = dict(global_config.get("MSCKF_HEALTH_REPROJ_GATE_SCALE", health_gate))
+            except Exception:
+                pass
+        scaled_threshold *= float(phase_gate.get(phase_key, 1.0))
+        scaled_threshold *= float(health_gate.get(health_key, 1.0))
         return float(np.clip(scaled_threshold, 2.0, 100.0))
         
     except Exception:
         # Fallback to permissive threshold if covariance unavailable
         scaled_threshold = 15.0 * max(1e-3, float(reproj_scale))
         return float(np.clip(scaled_threshold, 2.0, 100.0))
+
+
+def _state_aware_reproj_policy(feature_quality: float,
+                               phase: int,
+                               health_state: str,
+                               global_config: Optional[dict]) -> Dict[str, float]:
+    """
+    Build state-aware reprojection gate policy from phase/health/feature quality.
+
+    Returns:
+        dict with keys:
+          - gate_mult: multiplicative factor on reprojection threshold
+          - avg_gate_mult: multiplicative factor on average reproj gate
+          - low_quality_reject: whether to hard reject low quality features
+          - quality_band: high|mid|low
+    """
+    cfg = global_config if isinstance(global_config, dict) else {}
+    q_high = float(cfg.get("MSCKF_REPROJ_QUALITY_HIGH_TH", 0.75))
+    q_low = float(cfg.get("MSCKF_REPROJ_QUALITY_LOW_TH", 0.45))
+    q_mid_mult = float(cfg.get("MSCKF_REPROJ_QUALITY_MID_GATE_MULT", 1.15))
+    low_quality_reject = bool(cfg.get("MSCKF_REPROJ_QUALITY_LOW_REJECT", True))
+    warning_mult = float(cfg.get("MSCKF_REPROJ_WARNING_SCALE", 1.20))
+    degraded_mult = float(cfg.get("MSCKF_REPROJ_DEGRADED_SCALE", 1.35))
+
+    band = "mid"
+    if np.isfinite(feature_quality):
+        if feature_quality >= q_high:
+            band = "high"
+        elif feature_quality < q_low:
+            band = "low"
+
+    gate_mult = 1.0
+    avg_gate_mult = 1.0
+    if band == "mid":
+        gate_mult *= q_mid_mult
+        avg_gate_mult *= q_mid_mult
+    elif band == "low":
+        # For low quality we can still fail-soft unless explicit low-reject is enabled.
+        gate_mult *= max(q_mid_mult, 1.25)
+        avg_gate_mult *= max(q_mid_mult, 1.20)
+
+    health_key = str(health_state).upper()
+    if health_key == "WARNING":
+        gate_mult *= warning_mult
+        avg_gate_mult *= max(1.0, 0.5 * (1.0 + warning_mult))
+    elif health_key == "DEGRADED":
+        gate_mult *= degraded_mult
+        avg_gate_mult *= max(1.0, 0.5 * (1.0 + degraded_mult))
+
+    # Dynamic phases are noisier; avoid reject bursts.
+    phase_int = int(phase)
+    if phase_int <= 1:
+        gate_mult *= 1.08
+        avg_gate_mult *= 1.05
+
+    return {
+        "gate_mult": float(np.clip(gate_mult, 0.7, 3.0)),
+        "avg_gate_mult": float(np.clip(avg_gate_mult, 0.7, 3.0)),
+        "low_quality_reject": bool(low_quality_reject),
+        "quality_band": band,
+    }
 from .ekf import ExtendedKalmanFilter, ensure_covariance_valid
 from .camera import normalized_to_unit_ray
 
@@ -100,6 +180,9 @@ MSCKF_STATS = {
     'fail_depth_sign': 0,
     'fail_depth_large': 0,
     'fail_reproj_error': 0,
+    'fail_reproj_pixel': 0,
+    'fail_reproj_normalized': 0,
+    'fail_geometry_borderline': 0,
     'fail_nonlinear': 0,
     'fail_chi2': 0,
     'fail_solver': 0,
@@ -558,7 +641,9 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
                         dem_reader = None,
                         origin_lat: float = 0.0, origin_lon: float = 0.0,
                         global_config: dict = None,
-                        reproj_scale: float = 1.0) -> Optional[dict]:
+                        reproj_scale: float = 1.0,
+                        phase: int = 2,
+                        health_state: str = "HEALTHY") -> Optional[dict]:
     """
     Triangulate a feature using multi-view observations.
     
@@ -740,15 +825,39 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
     except Exception:
         pass  # Fall back to normalized coordinate method
     
+    # Compute feature quality for state-aware reprojection policy.
+    quality_vals = []
+    for obs in obs_list:
+        qv = float(obs.get('quality', np.nan))
+        if np.isfinite(qv):
+            quality_vals.append(qv)
+    feature_quality = float(np.nanmean(quality_vals)) if len(quality_vals) > 0 else np.nan
+    reproj_policy = _state_aware_reproj_policy(
+        feature_quality=feature_quality,
+        phase=int(phase),
+        health_state=str(health_state),
+        global_config=global_config,
+    )
+
     # Compute reprojection error (ENHANCED with pixel-level validation)
     # v2.9.10.0: Adaptive threshold based on filter convergence (Priority 2)
     # Start permissive (20px) during initialization, tighten to 10px when converged
-    MAX_REPROJ_ERROR_PX = get_adaptive_reprojection_threshold(kf, reproj_scale=reproj_scale)
+    MAX_REPROJ_ERROR_PX = get_adaptive_reprojection_threshold(
+        kf,
+        reproj_scale=reproj_scale,
+        phase=int(phase),
+        health_state=str(health_state),
+        global_config=global_config,
+    )
+    MAX_REPROJ_ERROR_PX *= float(reproj_policy.get("gate_mult", 1.0))
     total_error = 0.0
     max_pixel_error = 0.0
     valid_obs: List[dict] = []
     depth_rejects = 0
     reproj_rejects = 0
+    pixel_rejects = 0
+    norm_rejects = 0
+    borderline_rejects = 0
 
     norm_scale_px = 120.0
     try:
@@ -782,6 +891,26 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
     ray_soft_factor = float(np.clip(ray_soft_factor, 1.0, 6.0))
     pixel_soft_factor = float(np.clip(pixel_soft_factor, 1.0, 6.0))
     avg_gate_factor = float(np.clip(avg_gate_factor, 1.0, 6.0))
+    phase_key = str(max(0, min(2, int(phase))))
+    health_key = str(health_state).upper()
+    phase_avg_gate = {"0": 1.15, "1": 1.05, "2": 1.00}
+    health_avg_gate = {"HEALTHY": 1.00, "WARNING": 1.08, "DEGRADED": 1.15, "RECOVERY": 1.04}
+    if isinstance(global_config, dict):
+        try:
+            phase_avg_gate = dict(global_config.get("MSCKF_PHASE_AVG_REPROJ_GATE_SCALE", phase_avg_gate))
+        except Exception:
+            pass
+        try:
+            health_avg_gate = dict(global_config.get("MSCKF_HEALTH_AVG_REPROJ_GATE_SCALE", health_avg_gate))
+        except Exception:
+            pass
+    avg_gate_factor *= float(phase_avg_gate.get(phase_key, 1.0))
+    avg_gate_factor *= float(health_avg_gate.get(health_key, 1.0))
+    avg_gate_factor *= float(reproj_policy.get("avg_gate_mult", 1.0))
+
+    if reproj_policy.get("quality_band", "mid") == "low" and bool(reproj_policy.get("low_quality_reject", True)):
+        MSCKF_STATS['fail_geometry_borderline'] += 1
+        return None
     
     for obs in obs_list:
         cam_id = obs['cam_id']
@@ -829,6 +958,7 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
         ray_gate = ray_threshold_deg * (ray_soft_factor if has_pixel_obs else 1.0)
         if ray_err_deg > ray_gate:
             reproj_rejects += 1
+            norm_rejects += 1
             continue
         obs_error_metric = float(norm_error)
         
@@ -848,12 +978,14 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
                     pixel_soft = MAX_REPROJ_ERROR_PX * pixel_soft_factor
                     if pixel_error > pixel_soft:
                         reproj_rejects += 1
+                        pixel_rejects += 1
                         continue
 
                     # Fail-soft: keep borderline observations but penalize quality.
                     obs_error_metric = min(pixel_error, pixel_soft) / max(1e-6, norm_scale_px)
                     if pixel_error > MAX_REPROJ_ERROR_PX:
                         obs_error_metric *= 1.15
+                        borderline_rejects += 1
 
         total_error += float(obs_error_metric)
         valid_obs.append(obs)
@@ -863,12 +995,21 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
             MSCKF_STATS['fail_depth_sign'] += 1
         else:
             MSCKF_STATS['fail_reproj_error'] += 1
+            if pixel_rejects >= norm_rejects:
+                MSCKF_STATS['fail_reproj_pixel'] += 1
+            else:
+                MSCKF_STATS['fail_reproj_normalized'] += 1
+            if borderline_rejects > 0:
+                MSCKF_STATS['fail_geometry_borderline'] += 1
         return None
 
     avg_error = total_error / len(valid_obs)
     
     if avg_error > (avg_gate_factor * norm_threshold):
         MSCKF_STATS['fail_reproj_error'] += 1
+        MSCKF_STATS['fail_reproj_normalized'] += 1
+        if reproj_policy.get("quality_band", "mid") == "mid" or borderline_rejects > 0:
+            MSCKF_STATS['fail_geometry_borderline'] += 1
         
         # [DIAGNOSTIC] Log reprojection failures to identify root cause
         # Causes: 1) intrinsic/extrinsic calibration error (especially fisheye KB params)
@@ -888,6 +1029,8 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
         'avg_reproj_error': avg_error,
         'num_obs_used': len(valid_obs),
         'num_obs_total': len(obs_list),
+        'quality_band': str(reproj_policy.get("quality_band", "mid")),
+        'feature_quality': float(feature_quality) if np.isfinite(feature_quality) else np.nan,
     }
     
     # Add pixel-level error if available
@@ -1742,6 +1885,8 @@ def perform_msckf_updates(vio_fe, cam_observations: List[dict],
                           global_config: dict = None,
                           chi2_scale: float = 1.0,
                           reproj_scale: float = 1.0,
+                          phase: int = 2,
+                          health_state: str = "HEALTHY",
                           stats_out: Optional[Dict[str, float]] = None) -> int:
     """
     Perform MSCKF updates for mature features.
@@ -1795,7 +1940,9 @@ def perform_msckf_updates(vio_fe, cam_observations: List[dict],
                                             debug=False,
                                             dem_reader=dem_reader,
                                             origin_lat=origin_lat, origin_lon=origin_lon,
-                                            reproj_scale=reproj_scale)
+                                            reproj_scale=reproj_scale,
+                                            phase=phase,
+                                            health_state=health_state)
             if tri_result is not None:
                 triangulated_points[fid] = tri_result['p_w']
         
@@ -1813,6 +1960,7 @@ def perform_msckf_updates(vio_fe, cam_observations: List[dict],
     # MSCKF Updates with Optional Plane Constraints
     # =========================================================================
     for i, fid in enumerate(mature_fids):
+        stats_before = dict(MSCKF_STATS)
         enable_debug = (i < 3)
         triangulated = triangulate_feature(fid, cam_observations, cam_states, kf, 
                                           use_plane_constraint=True, ground_altitude=0.0,
@@ -1820,15 +1968,33 @@ def perform_msckf_updates(vio_fe, cam_observations: List[dict],
                                           dem_reader=dem_reader,
                                           origin_lat=origin_lat, origin_lon=origin_lon,
                                           global_config=global_config,
-                                          reproj_scale=reproj_scale)
+                                          reproj_scale=reproj_scale,
+                                          phase=phase,
+                                          health_state=health_state)
         
         if triangulated is None:
+            fail_reason = "triangulation_failed"
+            for key in (
+                "fail_depth_sign",
+                "fail_reproj_pixel",
+                "fail_reproj_normalized",
+                "fail_reproj_error",
+                "fail_geometry_borderline",
+                "fail_parallax",
+                "fail_baseline",
+                "fail_nonlinear",
+                "fail_solver",
+                "fail_other",
+            ):
+                if int(MSCKF_STATS.get(key, 0)) > int(stats_before.get(key, 0)):
+                    fail_reason = key
+                    break
             if msckf_dbg_path:
                 num_obs = sum(1 for cam_obs in cam_observations 
                              for obs in cam_obs.get('observations', []) 
                              if obs.get('fid') == fid)
                 with open(msckf_dbg_path, "a", newline="") as mf:
-                    mf.write(f"{vio_fe.frame_idx},{fid},{num_obs},0,nan,nan,0,nan\n")
+                    mf.write(f"{vio_fe.frame_idx},{fid},{num_obs},0,nan,nan,0,nan,{fail_reason}\n")
             continue
         
         # Check if feature is associated with a plane
@@ -1877,9 +2043,11 @@ def perform_msckf_updates(vio_fe, cam_observations: List[dict],
         
         if msckf_dbg_path:
             avg_reproj = triangulated.get('avg_reproj_error', np.nan)
+            q_band = triangulated.get("quality_band", "")
+            status_reason = "success" if success else f"update_reject_{q_band}"
             with open(msckf_dbg_path, "a", newline="") as mf:
                 mf.write(f"{vio_fe.frame_idx},{fid},{num_obs},1,{avg_reproj:.3f},"
-                        f"{innovation_norm:.3f},{int(success)},{chi2_test:.3f}\n")
+                        f"{innovation_norm:.3f},{int(success)},{chi2_test:.3f},{status_reason}\n")
         
         if success:
             num_successful += 1
@@ -1920,6 +2088,7 @@ def trigger_msckf_update(kf, cam_states: list, cam_observations: list,
                          chi2_scale: float = 1.0,
                          reproj_scale: float = 1.0,
                          phase: int = 2,
+                         health_state: str = "HEALTHY",
                          adaptive_info: Optional[Dict[str, Any]] = None) -> int:
     """
     Trigger MSCKF multi-view geometric update.
@@ -1993,6 +2162,8 @@ def trigger_msckf_update(kf, cam_states: list, cam_observations: list,
                 global_config=global_config,
                 chi2_scale=chi2_scale,
                 reproj_scale=reproj_scale,
+                phase=int(phase),
+                health_state=str(health_state),
                 stats_out=stats,
             )
             if adaptive_info is not None:

@@ -329,7 +329,11 @@ def append_benchmark_health_summary(summary_csv: Optional[str],
                                     cov_large_rate: float,
                                     pos_rmse: float,
                                     final_pos_err: float,
-                                    final_alt_err: float):
+                                    final_alt_err: float,
+                                    frames_inlier_nonzero_ratio: float = float("nan"),
+                                    vio_vel_accept_ratio_vs_cam: float = float("nan"),
+                                    mag_cholfail_rate: float = float("nan"),
+                                    loop_applied_rate: float = float("nan")):
     """Append one benchmark-health summary row."""
     if summary_csv is None:
         return
@@ -338,7 +342,9 @@ def append_benchmark_health_summary(summary_csv: Optional[str],
             f.write(
                 f"{run_id},{int(projection_count)},{first_projection_time:.6f},"
                 f"{pcond_max:.6e},{pmax_max:.6e},{cov_large_rate:.6f},"
-                f"{pos_rmse:.6f},{final_pos_err:.6f},{final_alt_err:.6f}\n"
+                f"{pos_rmse:.6f},{final_pos_err:.6f},{final_alt_err:.6f},"
+                f"{frames_inlier_nonzero_ratio:.6f},{vio_vel_accept_ratio_vs_cam:.6f},"
+                f"{mag_cholfail_rate:.6f},{loop_applied_rate:.6f}\n"
             )
     except Exception:
         pass
@@ -1300,7 +1306,9 @@ def init_output_csvs(output_dir: str, save_debug_data: bool = False) -> Dict[str
     with open(paths['benchmark_health_summary_csv'], "w", newline="") as f:
         f.write(
             "run_id,projection_count,first_projection_time,pcond_max,pmax_max,"
-            "cov_large_rate,pos_rmse,final_pos_err,final_alt_err\n"
+            "cov_large_rate,pos_rmse,final_pos_err,final_alt_err,"
+            "frames_inlier_nonzero_ratio,vio_vel_accept_ratio_vs_cam,"
+            "mag_cholfail_rate,loop_applied_rate\n"
         )
 
     # Heavy per-frame/per-feature debug logs are opt-in via --save_debug_data.
@@ -1325,7 +1333,7 @@ def init_output_csvs(output_dir: str, save_debug_data: bool = False) -> Dict[str
         paths['msckf_dbg'] = os.path.join(output_dir, "msckf_debug.csv")
         with open(paths['msckf_dbg'], "w", newline="") as f:
             f.write("frame,feature_id,num_observations,triangulation_success,"
-                    "reprojection_error_px,innovation_norm,update_applied,chi2_test\n")
+                    "reprojection_error_px,innovation_norm,update_applied,chi2_test,fail_reason\n")
 
         # Time synchronization debug log
         paths['time_sync_csv'] = os.path.join(output_dir, "time_sync_debug.csv")

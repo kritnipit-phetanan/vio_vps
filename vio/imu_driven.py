@@ -339,6 +339,9 @@ def run_imu_driven_loop(runner):
                     lon0=runner.lon0,
                     current_time=t
                 )
+
+        # Position-velocity consistency guard (state-aware kinematic sanity).
+        runner.kinematic_guard_service.apply(t)
         
         # Log error vs ground truth (every sample, like vio_vps.py)
         runner.output_reporting.log_error(t)

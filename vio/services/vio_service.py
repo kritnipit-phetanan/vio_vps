@@ -345,6 +345,10 @@ class VIOService:
             ok, ninl, r_vo_mat, t_unit, dt_img = runner.vio_fe.step(img_for_tracking, t_cam)
 
             # Loop closure detection - check when we have sufficient position estimate
+            current_phase = int(getattr(runner.state, "current_phase", 2))
+            current_health = str(
+                getattr(getattr(runner, "current_adaptive_decision", None), "health_state", "HEALTHY")
+            )
             match_result = check_loop_closure(
                 loop_detector=runner.loop_detector,
                 img_gray=img,
@@ -352,17 +356,17 @@ class VIOService:
                 kf=runner.kf,
                 global_config=runner.global_config,
                 vio_fe=runner.vio_fe,
+                phase=current_phase,
+                health_state=current_health,
             )
             if match_result is not None:
-                relative_yaw, kf_idx, num_inliers = match_result
                 apply_loop_closure_correction(
                     kf=runner.kf,
-                    relative_yaw=relative_yaw,
-                    kf_idx=kf_idx,
-                    num_inliers=num_inliers,
+                    loop_info=match_result,
                     t=t_cam,
                     cam_states=runner.state.cam_states,
                     loop_detector=runner.loop_detector,
+                    global_config=runner.global_config,
                 )
 
             # Compute average optical flow (parallax) - use the new attributes
@@ -382,6 +386,9 @@ class VIOService:
             # Debug: log feature statistics - use actual tracked features from VIOFrontEnd
             num_features = runner.vio_fe.last_num_tracked
             num_inliers = runner.vio_fe.last_num_inliers
+            runner._cam_frames_processed += 1
+            if int(num_inliers) > 0:
+                runner._cam_frames_inlier_nonzero += 1
             tracking_ratio = 1.0 if num_features > 0 else 0.0
             inlier_ratio = num_inliers / max(1, num_features)
             runner.debug_writers.log_feature_stats(
@@ -476,6 +483,9 @@ class VIOService:
                             chi2_scale=float(msckf_apply_scales.get("chi2_scale", 1.0)) * phase_chi2,
                             reproj_scale=float(msckf_apply_scales.get("reproj_scale", 1.0)) * phase_reproj,
                             phase=int(getattr(runner.state, "current_phase", 2)),
+                            health_state=str(
+                                getattr(getattr(runner, "current_adaptive_decision", None), "health_state", "HEALTHY")
+                            ),
                             adaptive_info=msckf_adaptive_info,
                         )
                         runner.adaptive_service.record_adaptive_measurement(
@@ -509,7 +519,8 @@ class VIOService:
                 )
                 vio_policy_scales, vio_apply_scales = runner.adaptive_service.get_sensor_adaptive_scales("VIO_VEL")
                 vio_adaptive_info: Dict[str, Any] = {}
-                apply_vio_velocity_update(
+                runner._vio_vel_attempt_count += 1
+                vio_vel_accepted = apply_vio_velocity_update(
                     kf=runner.kf,
                     r_vo_mat=r_vo_mat if ok else None,
                     t_unit=t_unit if ok else None,
@@ -536,8 +547,14 @@ class VIOService:
                     soft_fail_r_cap=float(vio_apply_scales.get("soft_r_cap", 8.0)),
                     soft_fail_hard_reject_factor=float(vio_apply_scales.get("hard_reject_factor", 3.0)),
                     soft_fail_power=float(vio_apply_scales.get("soft_r_power", 1.0)),
+                    phase=int(getattr(runner.state, "current_phase", 2)),
+                    health_state=str(
+                        getattr(getattr(runner, "current_adaptive_decision", None), "health_state", "HEALTHY")
+                    ),
                     adaptive_info=vio_adaptive_info,
                 )
+                if bool(vio_vel_accepted):
+                    runner._vio_vel_accept_count += 1
                 runner.adaptive_service.record_adaptive_measurement(
                     "VIO_VEL",
                     adaptive_info=vio_adaptive_info,
@@ -639,30 +656,111 @@ class VIOService:
                         )
 
                     clone_id = f"vps_{runner.state.img_idx}"
-                    vps_applied, vps_innovation_m, vps_status = apply_vps_delayed_update(
-                        kf=runner.kf,
-                        clone_manager=runner.vps_clone_manager,
-                        image_id=clone_id,
-                        vps_lat=vps_result.lat,
-                        vps_lon=vps_result.lon,
-                        R_vps=np.array(vps_result.R_vps, dtype=float) * float(vps_apply_scales.get("r_scale", 1.0)),
-                        proj_cache=runner.proj_cache,
-                        lat0=runner.lat0,
-                        lon0=runner.lon0,
-                        time_since_last_vps=(t_cam - runner.last_vps_update_time),
+                    health_key = str(
+                        getattr(getattr(runner, "current_adaptive_decision", None), "health_state", "HEALTHY")
+                    ).upper()
+                    speed_now = float(np.linalg.norm(np.array(runner.kf.x[3:6, 0], dtype=float)))
+                    min_inliers_apply = int(runner.global_config.get("VPS_APPLY_MIN_INLIERS", 8))
+                    min_conf_apply = float(runner.global_config.get("VPS_APPLY_MIN_CONFIDENCE", 0.18))
+                    max_reproj_apply = float(runner.global_config.get("VPS_APPLY_MAX_REPROJ_ERROR", 1.2))
+                    max_speed_apply = float(runner.global_config.get("VPS_APPLY_MAX_SPEED_M_S", 80.0))
+                    if health_key == "WARNING":
+                        min_inliers_apply += int(runner.global_config.get("VPS_APPLY_WARNING_INLIER_BONUS", 2))
+                        min_conf_apply *= float(runner.global_config.get("VPS_APPLY_WARNING_CONF_MULT", 1.15))
+                        max_reproj_apply *= float(runner.global_config.get("VPS_APPLY_WARNING_REPROJ_MULT", 0.90))
+                    elif health_key == "DEGRADED":
+                        min_inliers_apply += int(runner.global_config.get("VPS_APPLY_DEGRADED_INLIER_BONUS", 4))
+                        min_conf_apply *= float(runner.global_config.get("VPS_APPLY_DEGRADED_CONF_MULT", 1.30))
+                        max_reproj_apply *= float(runner.global_config.get("VPS_APPLY_DEGRADED_REPROJ_MULT", 0.80))
+
+                    vps_num_inliers = int(getattr(vps_result, "num_inliers", 0))
+                    vps_conf = float(getattr(vps_result, "confidence", 0.0))
+                    vps_reproj = float(getattr(vps_result, "reproj_error", float("inf")))
+                    strict_quality_ok = (
+                        np.isfinite(vps_conf)
+                        and np.isfinite(vps_reproj)
+                        and vps_num_inliers >= max(1, min_inliers_apply)
+                        and vps_conf >= min_conf_apply
+                        and vps_reproj <= max_reproj_apply
+                        and speed_now <= max_speed_apply
                     )
-                    reason_code = "normal_accept" if vps_applied else "hard_reject"
+                    vps_offset = np.asarray(getattr(vps_result, "offset_m", (np.nan, np.nan)), dtype=float).reshape(-1)
+                    vps_offset_m = float(np.linalg.norm(vps_offset[:2])) if vps_offset.size >= 2 else float("nan")
+                    failsoft_enabled = bool(runner.global_config.get("VPS_APPLY_FAILSOFT_ENABLE", True))
+                    failsoft_allowed_state = (
+                        (health_key == "HEALTHY")
+                        or (health_key == "WARNING" and bool(runner.global_config.get("VPS_APPLY_FAILSOFT_ALLOW_WARNING", True)))
+                        or (health_key == "DEGRADED" and bool(runner.global_config.get("VPS_APPLY_FAILSOFT_ALLOW_DEGRADED", False)))
+                    )
+                    fs_min_inliers = int(runner.global_config.get("VPS_APPLY_FAILSOFT_MIN_INLIERS", 5))
+                    fs_min_conf = float(runner.global_config.get("VPS_APPLY_FAILSOFT_MIN_CONFIDENCE", 0.12))
+                    fs_max_reproj = float(runner.global_config.get("VPS_APPLY_FAILSOFT_MAX_REPROJ_ERROR", 1.2))
+                    fs_max_speed = float(runner.global_config.get("VPS_APPLY_FAILSOFT_MAX_SPEED_M_S", max_speed_apply))
+                    fs_max_offset_m = float(runner.global_config.get("VPS_APPLY_FAILSOFT_MAX_OFFSET_M", 180.0))
+                    failsoft_quality_ok = (
+                        failsoft_enabled
+                        and failsoft_allowed_state
+                        and np.isfinite(vps_conf)
+                        and np.isfinite(vps_reproj)
+                        and np.isfinite(vps_offset_m)
+                        and vps_num_inliers >= max(1, fs_min_inliers)
+                        and vps_conf >= fs_min_conf
+                        and vps_reproj <= fs_max_reproj
+                        and speed_now <= fs_max_speed
+                        and vps_offset_m <= fs_max_offset_m
+                    )
+                    quality_mode = "strict" if strict_quality_ok else ("failsoft" if failsoft_quality_ok else "reject")
+                    r_scale_apply = float(vps_apply_scales.get("r_scale", 1.0))
+
+                    if quality_mode == "reject":
+                        if hasattr(runner, "vps_clone_manager"):
+                            runner.vps_clone_manager.clones.pop(clone_id, None)
+                        vps_applied, vps_innovation_m = False, None
+                        vps_status = (
+                            f"SKIPPED_QUALITY: inliers={vps_num_inliers}/{min_inliers_apply}, "
+                            f"conf={vps_conf:.3f}/{min_conf_apply:.3f}, "
+                            f"reproj={vps_reproj:.3f}/{max_reproj_apply:.3f}, "
+                            f"speed={speed_now:.2f}/{max_speed_apply:.2f}, "
+                            f"offset={vps_offset_m:.1f}/{fs_max_offset_m:.1f}"
+                        )
+                    else:
+                        if quality_mode == "failsoft":
+                            r_scale_apply *= float(runner.global_config.get("VPS_APPLY_FAILSOFT_R_MULT", 1.5))
+                            if health_key == "WARNING":
+                                r_scale_apply *= 1.25
+                            elif health_key == "DEGRADED":
+                                r_scale_apply *= 1.5
+                        vps_applied, vps_innovation_m, vps_status = apply_vps_delayed_update(
+                            kf=runner.kf,
+                            clone_manager=runner.vps_clone_manager,
+                            image_id=clone_id,
+                            vps_lat=vps_result.lat,
+                            vps_lon=vps_result.lon,
+                            R_vps=np.array(vps_result.R_vps, dtype=float) * float(r_scale_apply),
+                            proj_cache=runner.proj_cache,
+                            lat0=runner.lat0,
+                            lon0=runner.lon0,
+                            time_since_last_vps=(t_cam - runner.last_vps_update_time),
+                        )
+                    if quality_mode == "failsoft" and vps_applied:
+                        reason_code = "soft_accept"
+                    else:
+                        reason_code = "normal_accept" if vps_applied else "hard_reject"
                     nis_norm_vps = np.nan
                     if isinstance(vps_status, str):
                         status_lower = vps_status.lower()
                         if "clone" in status_lower:
                             reason_code = "skip_missing_clone"
+                        elif "skipped_quality" in status_lower:
+                            reason_code = "skip_low_quality"
+                        elif quality_mode == "failsoft" and "gated" in status_lower:
+                            reason_code = "soft_reject"
                         elif "gated" in status_lower:
                             reason_code = "gated"
                         elif "failed" in status_lower:
-                            reason_code = "hard_reject"
+                            reason_code = "soft_reject" if quality_mode == "failsoft" else "hard_reject"
                         elif "applied" in status_lower:
-                            reason_code = "normal_accept"
+                            reason_code = "soft_accept" if quality_mode == "failsoft" else "normal_accept"
                     vps_adaptive_info.update({
                         "sensor": "VPS",
                         "accepted": bool(vps_applied),
@@ -671,7 +769,7 @@ class VIOService:
                         "nis_norm": nis_norm_vps,
                         "chi2": float(vps_innovation_m) if vps_innovation_m is not None and np.isfinite(float(vps_innovation_m)) else np.nan,
                         "threshold": np.nan,
-                        "r_scale_used": float(vps_apply_scales.get("r_scale", 1.0)),
+                        "r_scale_used": float(r_scale_apply),
                         "reason_code": reason_code,
                     })
                     runner.adaptive_service.record_adaptive_measurement(

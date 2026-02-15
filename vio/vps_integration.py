@@ -87,31 +87,31 @@ def compute_vps_acceptance_threshold(time_since_correction: float,
     """
     if time_since_correction > 60.0:
         # TIER 1: Very long drift
-        base_threshold_m = 200.0
-        max_drift_rate = 200.0  # m/s
-        r_scale = min(50.0, 10.0 + time_since_correction / 10.0)
+        base_threshold_m = 150.0
+        max_drift_rate = 6.0  # m/s equivalent budget
+        r_scale = min(12.0, 6.0 + time_since_correction / 20.0)
         tier_name = "FIRST VPS"
     elif time_since_correction > 10.0:
         # TIER 2: Long drift
-        base_threshold_m = 100.0
-        max_drift_rate = 100.0
-        r_scale = min(10.0, 1.0 + time_since_correction / 5.0)
+        base_threshold_m = 90.0
+        max_drift_rate = 5.0
+        r_scale = min(8.0, 1.0 + time_since_correction / 6.0)
         tier_name = "LONG DRIFT"
     elif time_since_correction > 3.0:
         # TIER 3a: Medium drift
-        base_threshold_m = 50.0
-        max_drift_rate = 60.0
-        r_scale = min(5.0, 1.0 + time_since_correction / 3.0)
+        base_threshold_m = 55.0
+        max_drift_rate = 4.0
+        r_scale = min(5.0, 1.0 + time_since_correction / 4.0)
         tier_name = "MEDIUM DRIFT"
     else:
         # TIER 3b: Recent VPS
-        base_threshold_m = 50.0
-        max_drift_rate = 50.0
+        base_threshold_m = 35.0
+        max_drift_rate = 3.0
         r_scale = 1.0
         tier_name = "RECENT"
     
     max_innovation_m = base_threshold_m + max_drift_rate * time_since_correction
-    max_innovation_m = min(max_innovation_m, 30000.0)  # Cap at 30km
+    max_innovation_m = min(max_innovation_m, 800.0)  # Keep delayed absolute updates bounded
     
     return max_innovation_m, r_scale, tier_name
 

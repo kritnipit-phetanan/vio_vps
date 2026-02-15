@@ -331,6 +331,66 @@ def load_config(config_path: str) -> VIOConfig:
     result['MAG_VISION_HEADING_STRONG_QUALITY'] = float(
         mag.get('vision_heading_strong_quality', 0.60)
     )
+    result['MAG_VISION_HEADING_PHASE_SOFT_DEG'] = mag.get(
+        'vision_heading_phase_soft_deg',
+        {'0': 36.0, '1': 28.0, '2': 24.0}
+    )
+    result['MAG_VISION_HEADING_PHASE_HARD_DEG'] = mag.get(
+        'vision_heading_phase_hard_deg',
+        {'0': 95.0, '1': 78.0, '2': 62.0}
+    )
+    result['MAG_VISION_HEADING_HEALTH_THRESHOLD_MULT'] = mag.get(
+        'vision_heading_health_threshold_mult',
+        {'HEALTHY': 1.0, 'WARNING': 0.90, 'DEGRADED': 0.80, 'RECOVERY': 0.95}
+    )
+    result['MAG_VISION_HEADING_HEALTH_R_MULT'] = mag.get(
+        'vision_heading_health_r_mult',
+        {'HEALTHY': 1.0, 'WARNING': 1.20, 'DEGRADED': 1.40, 'RECOVERY': 1.10}
+    )
+    result['MAG_VISION_HEADING_HIGH_SPEED_M_S'] = float(
+        mag.get('vision_heading_high_speed_m_s', 45.0)
+    )
+    result['MAG_VISION_HEADING_HIGH_SPEED_THRESH_MULT'] = float(
+        mag.get('vision_heading_high_speed_thresh_mult', 0.85)
+    )
+    result['MAG_VISION_HEADING_HIGH_SPEED_R_MULT'] = float(
+        mag.get('vision_heading_high_speed_r_mult', 1.20)
+    )
+    warning_weak_yaw = mag.get('warning_weak_yaw', {})
+    result['MAG_WARNING_R_MULT'] = float(warning_weak_yaw.get('warning_r_mult', 4.0))
+    result['MAG_DEGRADED_R_MULT'] = float(warning_weak_yaw.get('degraded_r_mult', 8.0))
+    result['MAG_WARNING_MAX_DYAW_DEG'] = float(warning_weak_yaw.get('warning_max_dyaw_deg', 1.5))
+    result['MAG_DEGRADED_MAX_DYAW_DEG'] = float(warning_weak_yaw.get('degraded_max_dyaw_deg', 1.0))
+    result['MAG_WARNING_SKIP_VISION_HARD_MISMATCH'] = bool(
+        warning_weak_yaw.get('skip_vision_hard_mismatch', True)
+    )
+    result['MAG_CONDITIONING_GUARD_ENABLE'] = bool(
+        warning_weak_yaw.get('conditioning_guard_enable', True)
+    )
+    result['MAG_CONDITIONING_GUARD_WARN_PCOND'] = float(
+        warning_weak_yaw.get('conditioning_guard_warn_pcond', 5e11)
+    )
+    result['MAG_CONDITIONING_GUARD_DEGRADED_PCOND'] = float(
+        warning_weak_yaw.get('conditioning_guard_degraded_pcond', 1e11)
+    )
+    result['MAG_CONDITIONING_GUARD_WARN_PMAX'] = float(
+        warning_weak_yaw.get('conditioning_guard_warn_pmax', 5e6)
+    )
+    result['MAG_CONDITIONING_GUARD_DEGRADED_PMAX'] = float(
+        warning_weak_yaw.get('conditioning_guard_degraded_pmax', 2e6)
+    )
+    result['MAG_BIAS_FREEZE_WARN_PCOND'] = float(
+        warning_weak_yaw.get('bias_freeze_warn_pcond', 1e10)
+    )
+    result['MAG_BIAS_FREEZE_DEGRADED_PCOND'] = float(
+        warning_weak_yaw.get('bias_freeze_degraded_pcond', 5e9)
+    )
+    result['MAG_WARNING_EXTRA_R_MULT'] = float(
+        warning_weak_yaw.get('warning_extra_r_mult', 1.6)
+    )
+    result['MAG_DEGRADED_EXTRA_R_MULT'] = float(
+        warning_weak_yaw.get('degraded_extra_r_mult', 2.2)
+    )
     result['VISION_HEADING_MIN_INLIERS'] = int(
         mag.get('vision_heading_min_inliers', 25)
     )
@@ -390,11 +450,37 @@ def load_config(config_path: str) -> VIOConfig:
     result['MSCKF_RAY_SOFT_FACTOR'] = float(msckf_cfg.get('ray_soft_factor', 1.8))
     result['MSCKF_PIXEL_SOFT_FACTOR'] = float(msckf_cfg.get('pixel_soft_factor', 1.6))
     result['MSCKF_AVG_REPROJ_GATE_FACTOR'] = float(msckf_cfg.get('avg_reproj_gate_factor', 2.0))
+    result['MSCKF_PHASE_REPROJ_GATE_SCALE'] = msckf_cfg.get(
+        'phase_reproj_gate_scale',
+        {'0': 1.20, '1': 1.08, '2': 1.00}
+    )
+    result['MSCKF_HEALTH_REPROJ_GATE_SCALE'] = msckf_cfg.get(
+        'health_reproj_gate_scale',
+        {'HEALTHY': 1.0, 'WARNING': 1.10, 'DEGRADED': 1.20, 'RECOVERY': 1.05}
+    )
+    result['MSCKF_PHASE_AVG_REPROJ_GATE_SCALE'] = msckf_cfg.get(
+        'phase_avg_reproj_gate_scale',
+        {'0': 1.15, '1': 1.05, '2': 1.00}
+    )
+    result['MSCKF_HEALTH_AVG_REPROJ_GATE_SCALE'] = msckf_cfg.get(
+        'health_avg_reproj_gate_scale',
+        {'HEALTHY': 1.0, 'WARNING': 1.08, 'DEGRADED': 1.15, 'RECOVERY': 1.04}
+    )
+    reproj_state_aware = msckf_cfg.get('reproj_state_aware', {})
+    result['MSCKF_REPROJ_QUALITY_HIGH_TH'] = float(reproj_state_aware.get('quality_high_th', 0.75))
+    result['MSCKF_REPROJ_QUALITY_LOW_TH'] = float(reproj_state_aware.get('quality_low_th', 0.45))
+    result['MSCKF_REPROJ_QUALITY_MID_GATE_MULT'] = float(reproj_state_aware.get('mid_gate_mult', 1.15))
+    result['MSCKF_REPROJ_QUALITY_LOW_REJECT'] = bool(reproj_state_aware.get('low_quality_reject', True))
+    result['MSCKF_REPROJ_WARNING_SCALE'] = float(reproj_state_aware.get('warning_scale', 1.20))
+    result['MSCKF_REPROJ_DEGRADED_SCALE'] = float(reproj_state_aware.get('degraded_scale', 1.35))
     result['VO_NADIR_ALIGN_DEG'] = vio['views']['nadir']['nadir_threshold_deg']
     result['VO_FRONT_ALIGN_DEG'] = vio['views']['front']['nadir_threshold_deg']
     
     # VIO velocity toggle (v3.1.0)
     result['USE_VIO_VELOCITY'] = vio.get('use_vio_velocity', True)
+    result['VIO_NADIR_XY_ONLY_VELOCITY'] = bool(vio.get('nadir_xy_only_velocity', False))
+    vio_vel_cfg = config.get('vio_vel', {})
+    result['VIO_VEL_XY_ONLY_CHI2_SCALE'] = float(vio_vel_cfg.get('xy_only_chi2_scale', 1.10))
     
     # v2.9.10.5: Store raw vio config dict for access to all parameters
     # This includes new parameters like initial_agl_override
@@ -481,14 +567,73 @@ def load_config(config_path: str) -> VIOConfig:
         result['LOOP_MIN_KEYFRAME_DIST'] = lc.get('min_keyframe_dist', 15.0)
         result['LOOP_MIN_KEYFRAME_YAW'] = lc.get('min_keyframe_yaw', 20.0)
         result['LOOP_MIN_FRAME_GAP'] = lc.get('min_frame_gap', 50)
+        result['LOOP_MIN_MATCH_RATIO'] = lc.get('min_match_ratio', 0.12)
         result['LOOP_MIN_INLIERS'] = lc.get('min_inliers', 15)
+        qg = lc.get('quality_gate', {})
+        result['LOOP_MIN_INLIERS_HARD'] = int(qg.get('min_inliers_hard', 35))
+        result['LOOP_MIN_INLIERS_FAILSOFT'] = int(qg.get('min_inliers_failsoft', 20))
+        result['LOOP_MIN_SPATIAL_SPREAD'] = float(qg.get('min_spatial_spread', 0.18))
+        result['LOOP_MAX_REPROJ_PX'] = float(qg.get('max_reproj_px', 2.5))
+        result['LOOP_YAW_RESIDUAL_BOUND_DEG'] = float(qg.get('yaw_residual_bound_deg', 25.0))
+        result['LOOP_DOUBLE_CONFIRM_ENABLE'] = bool(qg.get('double_confirm_enable', True))
+        result['LOOP_DOUBLE_CONFIRM_WINDOW_SEC'] = float(qg.get('double_confirm_window_sec', 2.0))
+        result['LOOP_DOUBLE_CONFIRM_YAW_DEG'] = float(qg.get('double_confirm_yaw_deg', 8.0))
+        result['LOOP_COOLDOWN_SEC'] = float(qg.get('cooldown_sec', 2.0))
+        result['LOOP_PHASE_DYNAMIC_INLIER_MULT'] = float(qg.get('phase_dynamic_inlier_mult', 1.15))
+        result['LOOP_WARNING_INLIER_MULT'] = float(qg.get('warning_inlier_mult', 1.10))
+        result['LOOP_DEGRADED_INLIER_MULT'] = float(qg.get('degraded_inlier_mult', 1.20))
+        fs = lc.get('fail_soft', {})
+        result['LOOP_FAIL_SOFT_ENABLE'] = bool(fs.get('enable', True))
+        result['LOOP_FAIL_SOFT_SIGMA_YAW_DEG'] = float(fs.get('fail_soft_sigma_yaw_deg', 18.0))
+        result['LOOP_BASE_SIGMA_YAW_DEG'] = float(fs.get('base_sigma_yaw_deg', 5.0))
+        result['LOOP_MAX_ABS_YAW_CORR_DEG'] = float(fs.get('max_abs_yaw_corr_deg', 4.0))
+        result['LOOP_MIN_ABS_YAW_CORR_DEG'] = float(fs.get('min_abs_yaw_corr_deg', 1.5))
+        result['LOOP_DYNAMIC_PHASE_SIGMA_MULT'] = float(fs.get('dynamic_phase_sigma_mult', 1.15))
+        result['LOOP_WARNING_SIGMA_MULT'] = float(fs.get('warning_sigma_mult', 1.20))
+        result['LOOP_DEGRADED_SIGMA_MULT'] = float(fs.get('degraded_sigma_mult', 1.40))
     else:
         result['USE_LOOP_CLOSURE'] = True
         result['LOOP_POSITION_THRESHOLD'] = 30.0
         result['LOOP_MIN_KEYFRAME_DIST'] = 15.0
         result['LOOP_MIN_KEYFRAME_YAW'] = 20.0
         result['LOOP_MIN_FRAME_GAP'] = 50
+        result['LOOP_MIN_MATCH_RATIO'] = 0.12
         result['LOOP_MIN_INLIERS'] = 15
+        result['LOOP_MIN_INLIERS_HARD'] = 35
+        result['LOOP_MIN_INLIERS_FAILSOFT'] = 20
+        result['LOOP_MIN_SPATIAL_SPREAD'] = 0.18
+        result['LOOP_MAX_REPROJ_PX'] = 2.5
+        result['LOOP_YAW_RESIDUAL_BOUND_DEG'] = 25.0
+        result['LOOP_DOUBLE_CONFIRM_ENABLE'] = True
+        result['LOOP_DOUBLE_CONFIRM_WINDOW_SEC'] = 2.0
+        result['LOOP_DOUBLE_CONFIRM_YAW_DEG'] = 8.0
+        result['LOOP_COOLDOWN_SEC'] = 2.0
+        result['LOOP_PHASE_DYNAMIC_INLIER_MULT'] = 1.15
+        result['LOOP_WARNING_INLIER_MULT'] = 1.10
+        result['LOOP_DEGRADED_INLIER_MULT'] = 1.20
+        result['LOOP_FAIL_SOFT_ENABLE'] = True
+        result['LOOP_FAIL_SOFT_SIGMA_YAW_DEG'] = 18.0
+        result['LOOP_BASE_SIGMA_YAW_DEG'] = 5.0
+        result['LOOP_MAX_ABS_YAW_CORR_DEG'] = 4.0
+        result['LOOP_MIN_ABS_YAW_CORR_DEG'] = 1.5
+        result['LOOP_DYNAMIC_PHASE_SIGMA_MULT'] = 1.15
+        result['LOOP_WARNING_SIGMA_MULT'] = 1.20
+        result['LOOP_DEGRADED_SIGMA_MULT'] = 1.40
+
+    # =========================================================================
+    # Kinematic consistency guard
+    # =========================================================================
+    kin_cfg = config.get('kinematic_guard', {})
+    result['KIN_GUARD_ENABLED'] = bool(kin_cfg.get('enabled', True))
+    result['KIN_GUARD_WINDOW_SEC'] = float(kin_cfg.get('window_sec', 0.5))
+    result['KIN_GUARD_VEL_MISMATCH_WARN'] = float(kin_cfg.get('vel_mismatch_warn', 8.0))
+    result['KIN_GUARD_VEL_MISMATCH_HARD'] = float(kin_cfg.get('vel_mismatch_hard', 15.0))
+    result['KIN_GUARD_MAX_INFLATE'] = float(kin_cfg.get('max_inflate', 1.25))
+    result['KIN_GUARD_HARD_BLEND_ALPHA'] = float(kin_cfg.get('hard_blend_alpha', 0.0))
+    result['KIN_GUARD_MIN_ACTION_DT_SEC'] = float(kin_cfg.get('min_action_dt_sec', 0.25))
+    result['KIN_GUARD_MAX_STATE_SPEED_M_S'] = float(kin_cfg.get('max_state_speed_m_s', 120.0))
+    result['KIN_GUARD_MAX_BLEND_SPEED_M_S'] = float(kin_cfg.get('max_blend_speed_m_s', 60.0))
+    result['KIN_GUARD_MAX_KIN_SPEED_M_S'] = float(kin_cfg.get('max_kin_speed_m_s', 80.0))
     
     # =========================================================================
     # NEW: Vibration Detection (v2.8.0)
@@ -535,6 +680,41 @@ def load_config(config_path: str) -> VIOConfig:
     # =========================================================================
     vps_cfg = config.get('vps', {})
     result['VPS_ACCURACY_MODE'] = bool(vps_cfg.get('accuracy_mode', False))
+    result['VPS_APPLY_MIN_INLIERS'] = int(vps_cfg.get('apply_min_inliers', 8))
+    result['VPS_APPLY_MIN_CONFIDENCE'] = float(vps_cfg.get('apply_min_confidence', 0.18))
+    result['VPS_APPLY_MAX_REPROJ_ERROR'] = float(vps_cfg.get('apply_max_reproj_error', 1.2))
+    result['VPS_APPLY_MAX_SPEED_M_S'] = float(vps_cfg.get('apply_max_speed_m_s', 80.0))
+    result['VPS_APPLY_WARNING_INLIER_BONUS'] = int(vps_cfg.get('apply_warning_inlier_bonus', 2))
+    result['VPS_APPLY_DEGRADED_INLIER_BONUS'] = int(vps_cfg.get('apply_degraded_inlier_bonus', 4))
+    result['VPS_APPLY_WARNING_CONF_MULT'] = float(vps_cfg.get('apply_warning_conf_mult', 1.15))
+    result['VPS_APPLY_DEGRADED_CONF_MULT'] = float(vps_cfg.get('apply_degraded_conf_mult', 1.30))
+    result['VPS_APPLY_WARNING_REPROJ_MULT'] = float(vps_cfg.get('apply_warning_reproj_mult', 0.90))
+    result['VPS_APPLY_DEGRADED_REPROJ_MULT'] = float(vps_cfg.get('apply_degraded_reproj_mult', 0.80))
+    result['VPS_APPLY_FAILSOFT_ENABLE'] = bool(vps_cfg.get('apply_failsoft_enable', True))
+    result['VPS_APPLY_FAILSOFT_MIN_INLIERS'] = int(
+        vps_cfg.get('apply_failsoft_min_inliers', vps_cfg.get('min_inliers_failsoft', 5))
+    )
+    result['VPS_APPLY_FAILSOFT_MIN_CONFIDENCE'] = float(
+        vps_cfg.get('apply_failsoft_min_confidence', vps_cfg.get('min_confidence_failsoft', 0.12))
+    )
+    result['VPS_APPLY_FAILSOFT_MAX_REPROJ_ERROR'] = float(
+        vps_cfg.get('apply_failsoft_max_reproj_error', vps_cfg.get('max_reproj_error_failsoft', 1.2))
+    )
+    result['VPS_APPLY_FAILSOFT_MAX_SPEED_M_S'] = float(
+        vps_cfg.get('apply_failsoft_max_speed_m_s', vps_cfg.get('apply_max_speed_m_s', 80.0))
+    )
+    result['VPS_APPLY_FAILSOFT_R_MULT'] = float(
+        vps_cfg.get('apply_failsoft_r_mult', 1.5)
+    )
+    result['VPS_APPLY_FAILSOFT_MAX_OFFSET_M'] = float(
+        vps_cfg.get('apply_failsoft_max_offset_m', 180.0)
+    )
+    result['VPS_APPLY_FAILSOFT_ALLOW_WARNING'] = bool(
+        vps_cfg.get('apply_failsoft_allow_warning', True)
+    )
+    result['VPS_APPLY_FAILSOFT_ALLOW_DEGRADED'] = bool(
+        vps_cfg.get('apply_failsoft_allow_degraded', False)
+    )
 
     vps_reloc_defaults = {
         'enabled': True,
