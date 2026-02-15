@@ -231,6 +231,24 @@ magnetometer:
   vision_heading_min_parallax_px: 1.0
   vision_heading_max_delta_deg: 20.0
   vision_heading_quality_decay: 0.92
+
+  # Accuracy-first quality policy (weak fail-soft)
+  # good: normal R, mid: inflate R, bad: skip sample (if skip_on_bad=true)
+  accuracy_policy:
+    enabled: true
+    good_min_score: 0.72
+    mid_min_score: 0.45
+    r_inflate_mid: 1.8
+    r_inflate_bad: 3.0
+    norm_window: 200
+    norm_dev_good: 0.12
+    norm_dev_bad: 0.30
+    gyro_delta_soft_deg: 20.0
+    gyro_delta_hard_deg: 65.0
+    vision_delta_soft_deg: 30.0
+    vision_delta_hard_deg: 90.0
+    vision_weight: 0.25
+    skip_on_bad: true
   
   # ===== NEW: Online Mag Bias Estimation (v3.9.7) =====
   # Mag bias (hard iron) is now estimated online in EKF state
@@ -269,6 +287,12 @@ vio:
   # v2.9.10.4 with computed AGL=6.2m: 746m error
   # v2.9.10.5 with override AGL=100m: 1495m error (2x worse!)
   # The computed AGL from DEM/GPS MSL difference actually works better for VIO scale
+  # v2026-02-15: use HYBRID dynamic AGL for flow scale (takeoff/cruise/landing aware)
+  flow_agl_mode: hybrid           # fixed | dynamic | hybrid
+  flow_min_agl: 3.0               # Lower bound for optical-flow scale recovery [m]
+  flow_max_agl: 400.0             # Upper bound for optical-flow scale recovery [m]
+  nadir_prefer_flow_direction: true   # Use flow direction over E-matrix t for nadir
+  nadir_enforce_xy_motion: true       # Keep nadir VO velocity as horizontal-only cue
   
   # Parallax thresholds
   # CRITICAL FIX: was 1.0px but actual parallax ~0.3-0.9px during hover/slow motion
@@ -287,7 +311,7 @@ vio:
   
   # Optical flow velocity parameters (v2.9.9.10: Increased measurement noise)
   # v2.9.9.9 innovation mean = 6.57 m/s → need larger R to match reality
-  sigma_vo: 1.5              # INCREASED 3× (was 0.5) - realistic measurement uncertainty
+  sigma_vo: 0.8              # Accuracy-first: stronger VO velocity correction (was 1.5)
   min_tracked_features: 50   # Minimum features for velocity update
   fast_rotation_threshold: 0.5236  # Skip if rotation > 30°/s (rad/s)
   
@@ -296,6 +320,17 @@ vio:
   msckf:
     max_clone_size: 11       # Maximum camera poses in sliding window (11 is OpenVINS default)
     min_track_length: 4      # Minimum observations for MSCKF triangulation
+    ray_soft_factor: 2.0     # Allow larger angular residual when pixel reproj is available
+    pixel_soft_factor: 1.8   # Fail-soft bound for pixel reprojection residual
+    avg_reproj_gate_factor: 2.2  # Borderline features are kept with quality penalty
+    phase_chi2_scale:
+      "0": 1.20
+      "1": 1.08
+      "2": 1.00
+    phase_reproj_scale:
+      "0": 1.15
+      "1": 1.05
+      "2": 0.95
   
   # Camera view configurations
   # CRITICAL FIX: use_vz_only=true for nadir camera
@@ -305,7 +340,7 @@ vio:
   views:
     nadir:
       nadir_threshold_deg: 30.0
-      sigma_scale_xy: 3.0          # INCREASED: high uncertainty for XY from nadir flow
+      sigma_scale_xy: 1.5          # Accuracy-first: reduce over-conservative XY damping
       sigma_scale_z: 2.0           # Nadir camera has GOOD Z observability actually
       use_vz_only: false           # CRITICAL FIX v2.9.8.4: Enable XY velocity (was true)
       min_parallax: 0.3            # LOWERED: accept slow motion flow (was 0.5)
@@ -345,6 +380,13 @@ fast_mode:
   frame_skip: 1           # Process every N frames (1=all, 2=half, etc.)
 
 # ============================================================================
+# Optimization Objective (Accuracy-first profile)
+# ============================================================================
+optimization:
+  objective: "accuracy"      # accuracy | stability | realtime
+  compute_budget: "medium"   # low | medium | high
+
+# ============================================================================
 # ZUPT (Zero Velocity Update) Configuration (v2.9.8)
 # ============================================================================
 # Detects stationary periods to apply zero-velocity constraints.
@@ -356,6 +398,9 @@ zupt:
   gyro_threshold: 0.05            # Gyroscope threshold [rad/s] (~3°/s)
   min_duration: 2.0               # Minimum stationary duration [seconds]
   velocity_threshold: 0.2         # Velocity magnitude threshold [m/s]
+  max_v_for_zupt: 3.0             # Hard guard: don't apply ZUPT when clearly moving
+  flow_guard_px: 1.0              # Suppress stationary detection when recent camera flow is present
+  flow_guard_window_sec: 0.30     # Camera-flow recency window [s] for ZUPT suppression
   consecutive_required: 5         # Consecutive stationary samples required
 
 # ============================================================================
@@ -486,6 +531,10 @@ adaptive:
     degraded_r_extra: 1.2
     degraded_chi2_extra: 0.95
     phase_profiles:
+      VIO_VEL:
+        "0": {chi2_scale: 1.20, r_scale: 1.35}
+        "1": {chi2_scale: 1.10, r_scale: 1.20}
+        "2": {chi2_scale: 1.00, r_scale: 1.00}
       ZUPT:
         "0": {chi2_scale: 0.80, r_scale: 1.50, acc_threshold_scale: 0.80, gyro_threshold_scale: 0.80, max_v_scale: 0.70}
         "1": {chi2_scale: 0.90, r_scale: 1.20, acc_threshold_scale: 0.90, gyro_threshold_scale: 0.90, max_v_scale: 0.85}
@@ -513,6 +562,21 @@ adaptive:
         WARNING: 1.2
         DEGRADED: 1.4
         RECOVERY: 1.1
+    vio_vel_fail_soft:
+      enabled: true
+      hard_reject_factor: 3.0
+      max_r_scale: 12.0
+      inflate_power: 1.0
+      health_hard_factor:
+        HEALTHY: 1.0
+        WARNING: 1.15
+        DEGRADED: 1.30
+        RECOVERY: 1.10
+      health_r_cap_factor:
+        HEALTHY: 1.0
+        WARNING: 1.15
+        DEGRADED: 1.30
+        RECOVERY: 1.10
     gravity_alignment:
       enabled_imu_only: true
       phase_sigma_deg: {"0": 3.5, "1": 10.0, "2": 8.5}
@@ -653,16 +717,26 @@ trn:
 # ============================================================================
 vps:
   enabled: true                    # Enable VPS module
+  accuracy_mode: true              # Enable accuracy-first VPS policy
   
   # Processing parameters
   output_size: [512, 512]          # Output patch size for matching
+  patch_size_px: 640               # Base map patch size [px] (larger coverage for drift)
+  patch_size_failover_px: 896      # Expanded patch after repeated failures
+  failover_fail_streak: 6          # Failure streak before enlarged patch
   device: "cuda"                   # 'cuda' or 'cpu' for matcher
   max_keypoints: 2048              # Maximum keypoints to extract
   
   # Quality thresholds
-  min_inliers: 20                  # Minimum inliers for valid match
+  min_inliers: 12                  # Strict minimum inliers for valid match
   max_reproj_error: 5.0            # Maximum reprojection error [px]
   min_confidence: 0.3              # Minimum confidence score
+  allow_failsoft_accept: true      # Allow conservative low-inlier fallback
+  min_inliers_failsoft: 5          # Fail-soft minimum inliers
+  max_reproj_error_failsoft: 1.2   # Fail-soft reprojection bound [px]
+  min_confidence_failsoft: 0.12    # Fail-soft minimum confidence
+  max_offset_px_failsoft: 900.0    # Reject fail-soft matches with extreme pixel offset
+  failsoft_r_inflate: 4.0          # Inflate R for fail-soft accepted matches
   
   # Altitude limits (AGL)
   min_altitude: 30.0               # Minimum altitude for VPS [m]
@@ -670,6 +744,27 @@ vps:
   
   # Timing
   min_update_interval: 0.5         # Minimum seconds between VPS updates
+
+  # Preprocess multi-hypothesis policy
+  yaw_hypotheses_deg: [0, 180, 90, -90]
+  scale_hypotheses: [1.0, 0.90, 1.10]
+  max_candidates: 6
+  min_content_ratio: 0.20
+  min_texture_std: 8.0
+
+  # Periodic global-local relocalization policy (accuracy mode)
+  relocalization:
+    enabled: true
+    global_interval_sec: 12.0
+    fail_streak_trigger: 6
+    stale_success_sec: 8.0
+    xy_sigma_trigger_m: 35.0
+    max_centers: 10
+    ring_radius_m: [35.0, 80.0]
+    ring_samples: 8
+    global_yaw_hypotheses_deg: [0, 45, 90, 135, 180, -45, -90, -135]
+    global_scale_hypotheses: [0.80, 0.90, 1.00, 1.10, 1.20]
+    force_global_on_warning_phase: false
   
   # Stochastic Cloning (Latency Handling)
   max_delay_sec: 0.5               # Maximum delay before clone expires [sec]

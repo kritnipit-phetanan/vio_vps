@@ -13,7 +13,7 @@ from ..config import CAMERA_VIEW_CONFIGS
 from ..loop_closure import check_loop_closure, apply_loop_closure_correction
 from ..math_utils import quaternion_to_yaw
 from ..measurement_updates import apply_vio_velocity_update
-from ..msckf import trigger_msckf_update
+from ..msckf import trigger_msckf_update, find_mature_features_for_msckf
 from ..output_utils import (
     get_ground_truth_error,
     log_fej_consistency,
@@ -77,13 +77,20 @@ class VIOService:
         if runner._vision_yaw_ref is None:
             runner._vision_yaw_ref = float(quaternion_to_yaw(runner.kf.x[6:10, 0]))
         yaw_next = float(runner._vision_yaw_ref) + float(np.deg2rad(yaw_delta_deg))
-        runner._vision_yaw_ref = float(np.arctan2(np.sin(yaw_next), np.cos(yaw_next)))
+        yaw_next = float(np.arctan2(np.sin(yaw_next), np.cos(yaw_next)))
+        yaw_state = float(quaternion_to_yaw(runner.kf.x[6:10, 0]))
         runner._vision_yaw_last_t = float(t_cam)
 
         q_inlier = min(1.0, float(num_inliers) / 120.0)
         q_parallax = min(1.0, float(avg_flow_px) / 10.0)
         q_now = q_inlier * q_parallax
-        runner._vision_heading_quality = float(np.clip(0.85 * runner._vision_heading_quality + 0.15 * q_now, 0.0, 1.0))
+        yaw_delta_state_deg = abs(np.degrees(np.arctan2(np.sin(yaw_next - yaw_state), np.cos(yaw_next - yaw_state))))
+        if yaw_delta_state_deg > 45.0:
+            q_now *= 0.6
+        anchor_alpha = float(np.clip(0.08 + 0.30 * q_now, 0.08, 0.38))
+        yaw_blend = (1.0 - anchor_alpha) * yaw_next + anchor_alpha * yaw_state
+        runner._vision_yaw_ref = float(np.arctan2(np.sin(yaw_blend), np.cos(yaw_blend)))
+        runner._vision_heading_quality = float(np.clip(0.80 * runner._vision_heading_quality + 0.20 * q_now, 0.0, 1.0))
 
     def _should_run_vps(self, t_cam: float, img: np.ndarray) -> Tuple[bool, str]:
         """
@@ -99,7 +106,12 @@ class VIOService:
             return False, "disabled"
 
         phase = int(getattr(runner.state, "current_phase", 2))
-        phase_mult = {0: 2.5, 1: 1.6, 2: 1.0}.get(phase, 1.0)
+        objective_mode = str(runner.global_config.get("OBJECTIVE_MODE", "stability")).lower()
+        vps_accuracy_mode = bool(runner.global_config.get("VPS_ACCURACY_MODE", False))
+        if objective_mode == "accuracy" or vps_accuracy_mode:
+            phase_mult = {0: 1.8, 1: 1.2, 2: 0.85}.get(phase, 1.0)
+        else:
+            phase_mult = {0: 2.5, 1: 1.6, 2: 1.0}.get(phase, 1.0)
         base_interval = float(getattr(runner.vps_runner.config, "min_update_interval", 0.5))
 
         quality = self._compute_vps_quality_metrics(img)
@@ -132,7 +144,10 @@ class VIOService:
         fail_match = int(stats.get("fail_match", 0))
         fail_quality = int(stats.get("fail_quality", 0))
         fail_rate = float(fail_match + fail_quality) / float(total_attempts)
-        fail_mult = 1.0 + min(2.0, 2.0 * fail_rate)
+        fail_mult = 1.0 + min(
+            2.0,
+            (1.25 * fail_rate) if (objective_mode == "accuracy" or vps_accuracy_mode) else (2.0 * fail_rate),
+        )
 
         adaptive_interval = max(0.05, base_interval * phase_mult * quality_mult * fail_mult)
         next_allowed = float(getattr(runner, "_vps_next_allowed_t", 0.0))
@@ -290,6 +305,7 @@ class VIOService:
                     # Define VPS processing function for thread
                     def run_vps_in_thread():
                         try:
+                            est_cov_xy = np.array(runner.kf.P[0:2, 0:2], dtype=float)
                             result = runner.vps_runner.process_frame(
                                 img=img,  # Use original image (not rectified)
                                 t_cam=t_cam,
@@ -298,6 +314,9 @@ class VIOService:
                                 est_yaw=est_yaw,
                                 est_alt=agl,  # Send AGL for 30m min_altitude check
                                 frame_idx=runner.state.img_idx,
+                                est_cov_xy=est_cov_xy,
+                                phase=int(getattr(runner.state, "current_phase", 2)),
+                                objective=str(runner.global_config.get("OBJECTIVE_MODE", "stability")),
                             )
                             vps_result_container[0] = result
                         except Exception as e:
@@ -381,11 +400,17 @@ class VIOService:
             # - Low parallax (<2px): Skip velocity update, but ALLOW cloning/MSCKF
             # - This lets plane-aided MSCKF help even in nadir scenarios
             is_insufficient_parallax_for_velocity = avg_flow_px < min_parallax
+            current_tracks = runner.vio_fe.get_tracks_for_frame(runner.vio_fe.frame_idx)
+            current_track_count = len(current_tracks)
 
             # Camera cloning for MSCKF (lower threshold than velocity)
             # Allow cloning even with low parallax to enable plane-aided MSCKF
             clone_threshold = min_parallax * 0.5  # Much lower: 1px instead of 4px
-            should_clone = avg_flow_px >= clone_threshold and not is_fast_rotation
+            should_clone = (
+                avg_flow_px >= clone_threshold
+                and not is_fast_rotation
+                and current_track_count > 0
+            )
 
             if should_clone:
                 clone_idx = clone_camera_for_msckf(
@@ -402,6 +427,16 @@ class VIOService:
                 # Log MSCKF window state
                 if clone_idx >= 0:
                     num_tracked = len(runner.state.cam_observations[-1]["observations"]) if runner.state.cam_observations else 0
+                    try:
+                        num_mature = len(
+                            find_mature_features_for_msckf(
+                                runner.vio_fe,
+                                runner.state.cam_observations,
+                                min_observations=2,
+                            )
+                        )
+                    except Exception:
+                        num_mature = 0
                     window_start = runner.state.cam_states[0]["t"] if runner.state.cam_states else t_cam
                     log_msckf_window(
                         msckf_window_csv=runner.msckf_window_csv,
@@ -409,7 +444,7 @@ class VIOService:
                         t=t_cam,
                         num_clones=len(runner.state.cam_states),
                         num_tracked=num_tracked,
-                        num_mature=0,
+                        num_mature=num_mature,
                         window_start=window_start,
                         marginalized_clone=-1,
                     )
@@ -418,6 +453,13 @@ class VIOService:
                     if len(runner.state.cam_states) >= 3:
                         msckf_policy_scales, msckf_apply_scales = runner.adaptive_service.get_sensor_adaptive_scales("MSCKF")
                         msckf_adaptive_info: Dict[str, Any] = {}
+                        phase_key = str(int(getattr(runner.state, "current_phase", 2)))
+                        phase_chi2 = float(
+                            runner.global_config.get("MSCKF_PHASE_CHI2_SCALE", {}).get(phase_key, 1.0)
+                        )
+                        phase_reproj = float(
+                            runner.global_config.get("MSCKF_PHASE_REPROJ_SCALE", {}).get(phase_key, 1.0)
+                        )
                         num_updates = trigger_msckf_update(
                             kf=runner.kf,
                             cam_states=runner.state.cam_states,
@@ -431,8 +473,9 @@ class VIOService:
                             plane_detector=runner.plane_detector,
                             plane_config=runner.global_config if runner.plane_detector else None,
                             global_config=runner.global_config,
-                            chi2_scale=float(msckf_apply_scales.get("chi2_scale", 1.0)),
-                            reproj_scale=float(msckf_apply_scales.get("reproj_scale", 1.0)),
+                            chi2_scale=float(msckf_apply_scales.get("chi2_scale", 1.0)) * phase_chi2,
+                            reproj_scale=float(msckf_apply_scales.get("reproj_scale", 1.0)) * phase_reproj,
+                            phase=int(getattr(runner.state, "current_phase", 2)),
                             adaptive_info=msckf_adaptive_info,
                         )
                         runner.adaptive_service.record_adaptive_measurement(
@@ -453,21 +496,24 @@ class VIOService:
                             )
 
             # Optical Flow Velocity Update - run EVERY camera frame as XY drift reduction fallback
-            # This is independent of VO (Essential matrix) success and works even with low parallax
-            # Key for outdoor flights: reduce XY drift when VPS unavailable
-            if runner.config.use_vio_velocity and avg_flow_px > 0.5:  # Very low threshold: any motion
-                # Get ground truth error for NEES calculation (v2.9.9.8)
+            # This is independent of VO (Essential matrix) success and works even with low parallax.
+            is_dt_valid = np.isfinite(float(dt_img)) and (1e-4 < float(dt_img) < 0.25)
+            if (
+                runner.config.use_vio_velocity
+                and avg_flow_px > 0.5
+                and current_track_count > 0
+                and is_dt_valid
+            ):
                 vel_error, vel_cov = get_ground_truth_error(
                     t_cam, runner.kf, runner.ppk_trajectory, runner.lat0, runner.lon0, runner.proj_cache, "velocity"
                 )
                 vio_policy_scales, vio_apply_scales = runner.adaptive_service.get_sensor_adaptive_scales("VIO_VEL")
                 vio_adaptive_info: Dict[str, Any] = {}
-
                 apply_vio_velocity_update(
                     kf=runner.kf,
-                    r_vo_mat=r_vo_mat if ok else None,  # Can be None - will use optical flow direction
-                    t_unit=t_unit if ok else None,      # Can be None - will use optical flow direction
-                    t=t_cam,  # Use camera time for velocity update
+                    r_vo_mat=r_vo_mat if ok else None,
+                    t_unit=t_unit if ok else None,
+                    t=t_cam,
                     dt_img=dt_img,
                     avg_flow_px=avg_flow_px,
                     imu_rec=rec,
@@ -476,16 +522,20 @@ class VIOService:
                     dem_reader=runner.dem,
                     lat0=runner.lat0,
                     lon0=runner.lon0,
-                    use_vio_velocity=True,  # Always True when entering this block
+                    use_vio_velocity=True,
                     proj_cache=runner.proj_cache,
                     save_debug=runner.config.save_debug_data,
                     residual_csv=runner.residual_csv if runner.config.save_debug_data else None,
                     vio_frame=runner.state.vio_frame,
                     vio_fe=runner.vio_fe,
-                    state_error=vel_error,  # For NEES calculation
-                    state_cov=vel_cov,      # For NEES calculation
+                    state_error=vel_error,
+                    state_cov=vel_cov,
                     chi2_scale=float(vio_apply_scales.get("chi2_scale", 1.0)),
                     r_scale_extra=float(vio_apply_scales.get("r_scale", 1.0)),
+                    soft_fail_enable=bool(float(vio_apply_scales.get("fail_soft_enable", 0.0)) >= 0.5),
+                    soft_fail_r_cap=float(vio_apply_scales.get("soft_r_cap", 8.0)),
+                    soft_fail_hard_reject_factor=float(vio_apply_scales.get("hard_reject_factor", 3.0)),
+                    soft_fail_power=float(vio_apply_scales.get("soft_r_power", 1.0)),
                     adaptive_info=vio_adaptive_info,
                 )
                 runner.adaptive_service.record_adaptive_measurement(
@@ -494,160 +544,154 @@ class VIOService:
                     timestamp=t_cam,
                     policy_scales=vio_policy_scales,
                 )
+                used_vo = bool(ok and r_vo_mat is not None)
+            elif runner.config.use_vio_velocity and (
+                avg_flow_px > 0.5 and (current_track_count == 0 or not is_dt_valid)
+            ):
+                print(
+                    f"[VIO] Skip velocity update (stale guard): "
+                    f"tracks={current_track_count}, dt_img={float(dt_img):.3f}, flow={float(avg_flow_px):.2f}"
+                )
 
-                # Increment VIO frame
-                runner.state.vio_frame += 1
-                used_vo = (ok and r_vo_mat is not None)  # Only True if VO succeeded
+            # Store VO increments / visual-heading hint for MAG consistency policy.
+            rot_angle_deg = 0.0
+            if ok and r_vo_mat is not None and t_unit is not None:
+                t_norm = t_unit / (np.linalg.norm(t_unit) + 1e-12)
+                vo_dx, vo_dy, vo_dz = float(t_norm[0]), float(t_norm[1]), float(t_norm[2])
+                r_eul = R_scipy.from_matrix(r_vo_mat).as_euler("zyx", degrees=True)
+                vo_y, vo_p, vo_r = float(r_eul[0]), float(r_eul[1]), float(r_eul[2])
+                self._update_visual_heading_reference(
+                    t_cam=t_cam,
+                    yaw_delta_deg=vo_y,
+                    num_inliers=num_inliers,
+                    avg_flow_px=avg_flow_px,
+                    accepted=True,
+                )
+                vo_data = {
+                    "dx": vo_dx, "dy": vo_dy, "dz": vo_dz,
+                    "roll": vo_r, "pitch": vo_p, "yaw": vo_y,
+                }
+                rot_angle_deg = np.degrees(np.arccos(np.clip((np.trace(r_vo_mat) - 1) / 2, -1, 1)))
+            else:
+                vo_dx = vo_dy = vo_dz = 0.0
+                vo_r = vo_p = vo_y = 0.0
+                vo_data = None
+                self._update_visual_heading_reference(
+                    t_cam=t_cam,
+                    yaw_delta_deg=0.0,
+                    num_inliers=num_inliers,
+                    avg_flow_px=avg_flow_px,
+                    accepted=False,
+                )
 
-                # Store VO data (if available)
-                if ok and r_vo_mat is not None and t_unit is not None:
-                    t_norm = t_unit / (np.linalg.norm(t_unit) + 1e-12)
-                    vo_dx, vo_dy, vo_dz = float(t_norm[0]), float(t_norm[1]), float(t_norm[2])
-                    r_eul = R_scipy.from_matrix(r_vo_mat).as_euler("zyx", degrees=True)
-                    vo_y, vo_p, vo_r = float(r_eul[0]), float(r_eul[1]), float(r_eul[2])
-                    self._update_visual_heading_reference(
-                        t_cam=t_cam,
-                        yaw_delta_deg=vo_y,
-                        num_inliers=num_inliers,
-                        avg_flow_px=avg_flow_px,
-                        accepted=True,
+            # Increment VIO frame once per processed camera frame.
+            runner.state.vio_frame += 1
+
+            # Log VO debug
+            vel_vx = float(runner.kf.x[3, 0])
+            vel_vy = float(runner.kf.x[4, 0])
+            vel_vz = float(runner.kf.x[5, 0])
+
+            view_cfg = CAMERA_VIEW_CONFIGS.get(runner.config.camera_view, CAMERA_VIEW_CONFIGS["nadir"])
+            use_vz_only_default = view_cfg.get("use_vz_only", True)
+            vio_config = runner.global_config.get("vio", {})
+            use_vz_only = vio_config.get("use_vz_only", use_vz_only_default)
+
+            if runner.vo_dbg_csv:
+                log_vo_debug(
+                    runner.vo_dbg_csv, runner.vio_fe.frame_idx, num_inliers, rot_angle_deg,
+                    0.0,
+                    rotation_rate_deg_s, use_vz_only,
+                    not used_vo,
+                    vo_dx, vo_dy, vo_dz, vel_vx, vel_vy, vel_vz,
+                )
+
+            # ================================================================
+            # VPS Result Collection (after VIO completes)
+            # ================================================================
+            if vps_thread is not None:
+                vps_thread.join(timeout=2.0)
+                vps_result = vps_result_container[0]
+                if vps_result is not None:
+                    from ..vps_integration import apply_vps_delayed_update
+
+                    vps_policy_scales, vps_apply_scales = runner.adaptive_service.get_sensor_adaptive_scales("VPS")
+                    vps_adaptive_info: Dict[str, Any] = {}
+                    vps_sync_threshold = float(runner.global_config.get("VPS_TIME_SYNC_THRESHOLD_SEC", 0.25))
+                    vps_dt = abs(float(getattr(vps_result, "t_measurement", t_cam)) - float(t_cam))
+                    runner.output_reporting.log_convention_check(
+                        t=float(t_cam),
+                        sensor="VPS",
+                        check="cam_vps_abs_dt",
+                        value=float(vps_dt),
+                        threshold=float(vps_sync_threshold),
+                        status="PASS" if vps_dt <= vps_sync_threshold else "WARN",
+                        note=f"vps_t={float(getattr(vps_result, 't_measurement', t_cam)):.6f}",
                     )
 
-                    vo_data = {
-                        "dx": vo_dx, "dy": vo_dy, "dz": vo_dz,
-                        "roll": vo_r, "pitch": vo_p, "yaw": vo_y,
-                    }
+                    # Create clone manager if not exists
+                    if not hasattr(runner, "vps_clone_manager"):
+                        from vps import VPSDelayedUpdateManager
 
-                    rot_angle_deg = np.degrees(np.arccos(np.clip((np.trace(r_vo_mat) - 1) / 2, -1, 1)))
-                else:
-                    # OF-velocity fallback mode (no VO)
-                    vo_dx = vo_dy = vo_dz = 0.0
-                    vo_r = vo_p = vo_y = 0.0
-                    vo_data = None
-                    self._update_visual_heading_reference(
-                        t_cam=t_cam,
-                        yaw_delta_deg=0.0,
-                        num_inliers=num_inliers,
-                        avg_flow_px=avg_flow_px,
-                        accepted=False,
-                    )
-                    rot_angle_deg = 0.0
-
-                # Log VO debug
-                vel_vx = float(runner.kf.x[3, 0])
-                vel_vy = float(runner.kf.x[4, 0])
-                vel_vz = float(runner.kf.x[5, 0])
-
-                # Determine use_vz_only from config (for logging)
-                view_cfg = CAMERA_VIEW_CONFIGS.get(runner.config.camera_view, CAMERA_VIEW_CONFIGS["nadir"])
-                use_vz_only_default = view_cfg.get("use_vz_only", True)
-                # Check if overridden by config
-                vio_config = runner.global_config.get("vio", {})
-                use_vz_only = vio_config.get("use_vz_only", use_vz_only_default)
-
-                if runner.vo_dbg_csv:
-                    log_vo_debug(
-                        runner.vo_dbg_csv, runner.vio_fe.frame_idx, num_inliers, rot_angle_deg,
-                        0.0,  # alignment_deg
-                        rotation_rate_deg_s, use_vz_only,
-                        not used_vo,  # skip_vo (True if using OF-velocity fallback)
-                        vo_dx, vo_dy, vo_dz, vel_vx, vel_vy, vel_vz,
-                    )
-
-                # ================================================================
-                # VPS Result Collection (after VIO completes)
-                # ================================================================
-                # Wait for VPS thread to finish and apply updates
-                if vps_thread is not None:
-                    # Wait for VPS processing to complete
-                    vps_thread.join(timeout=2.0)  # Max 2 seconds wait
-
-                    # Get result from thread
-                    vps_result = vps_result_container[0]
-
-                    # Apply VPS update using stochastic cloning
-                    if vps_result is not None:
-                        from ..vps_integration import apply_vps_delayed_update
-
-                        vps_policy_scales, vps_apply_scales = runner.adaptive_service.get_sensor_adaptive_scales("VPS")
-                        vps_adaptive_info: Dict[str, Any] = {}
-                        vps_sync_threshold = float(runner.global_config.get("VPS_TIME_SYNC_THRESHOLD_SEC", 0.25))
-                        vps_dt = abs(float(getattr(vps_result, "t_measurement", t_cam)) - float(t_cam))
-                        runner.output_reporting.log_convention_check(
-                            t=float(t_cam),
-                            sensor="VPS",
-                            check="cam_vps_abs_dt",
-                            value=float(vps_dt),
-                            threshold=float(vps_sync_threshold),
-                            status="PASS" if vps_dt <= vps_sync_threshold else "WARN",
-                            note=f"vps_t={float(getattr(vps_result, 't_measurement', t_cam)):.6f}",
+                        runner.vps_clone_manager = VPSDelayedUpdateManager(
+                            max_delay_sec=0.5,
+                            max_clones=3,
                         )
 
-                        # Create clone manager if not exists
-                        if not hasattr(runner, "vps_clone_manager"):
-                            from vps import VPSDelayedUpdateManager
-
-                            runner.vps_clone_manager = VPSDelayedUpdateManager(
-                                max_delay_sec=0.5,  # From config
-                                max_clones=3,
-                            )
-
-                        # Apply delayed update with stochastic cloning
-                        clone_id = f"vps_{runner.state.img_idx}"
-                        vps_applied, vps_innovation_m, vps_status = apply_vps_delayed_update(
-                            kf=runner.kf,
-                            clone_manager=runner.vps_clone_manager,
-                            image_id=clone_id,
-                            vps_lat=vps_result.lat,
-                            vps_lon=vps_result.lon,
-                            R_vps=np.array(vps_result.R_vps, dtype=float) * float(vps_apply_scales.get("r_scale", 1.0)),
-                            proj_cache=runner.proj_cache,
-                            lat0=runner.lat0,
-                            lon0=runner.lon0,
-                            time_since_last_vps=(t_cam - runner.last_vps_update_time),
-                        )
-                        reason_code = "normal_accept" if vps_applied else "hard_reject"
-                        nis_norm_vps = np.nan
-                        if isinstance(vps_status, str):
-                            status_lower = vps_status.lower()
-                            if "clone" in status_lower:
-                                reason_code = "skip_missing_clone"
-                            elif "gated" in status_lower:
-                                reason_code = "gated"
-                            elif "failed" in status_lower:
-                                reason_code = "hard_reject"
-                            elif "applied" in status_lower:
-                                reason_code = "normal_accept"
-                        vps_adaptive_info.update({
-                            "sensor": "VPS",
-                            "accepted": bool(vps_applied),
-                            "attempted": 1,
-                            "dof": 2,
-                            "nis_norm": nis_norm_vps,
-                            "chi2": float(vps_innovation_m) if vps_innovation_m is not None and np.isfinite(float(vps_innovation_m)) else np.nan,
-                            "threshold": np.nan,
-                            "r_scale_used": float(vps_apply_scales.get("r_scale", 1.0)),
-                            "reason_code": reason_code,
-                        })
-                        runner.adaptive_service.record_adaptive_measurement(
-                            "VPS",
-                            adaptive_info=vps_adaptive_info,
-                            timestamp=float(t_cam),
-                            policy_scales=vps_policy_scales,
-                        )
-                        if vps_applied:
-                            runner.last_vps_update_time = t_cam
-                            runner.state.vps_idx += 1
-
-                # Save keyframe image with visualization overlay
-                if runner.config.save_keyframe_images and hasattr(runner, "keyframe_dir"):
-                    # Overlay should use the same image domain as tracking (rectified if enabled).
-                    save_keyframe_with_overlay(
-                        img_for_tracking,
-                        runner.vio_fe.frame_idx,
-                        runner.keyframe_dir,
-                        runner.vio_fe,
+                    clone_id = f"vps_{runner.state.img_idx}"
+                    vps_applied, vps_innovation_m, vps_status = apply_vps_delayed_update(
+                        kf=runner.kf,
+                        clone_manager=runner.vps_clone_manager,
+                        image_id=clone_id,
+                        vps_lat=vps_result.lat,
+                        vps_lon=vps_result.lon,
+                        R_vps=np.array(vps_result.R_vps, dtype=float) * float(vps_apply_scales.get("r_scale", 1.0)),
+                        proj_cache=runner.proj_cache,
+                        lat0=runner.lat0,
+                        lon0=runner.lon0,
+                        time_since_last_vps=(t_cam - runner.last_vps_update_time),
                     )
+                    reason_code = "normal_accept" if vps_applied else "hard_reject"
+                    nis_norm_vps = np.nan
+                    if isinstance(vps_status, str):
+                        status_lower = vps_status.lower()
+                        if "clone" in status_lower:
+                            reason_code = "skip_missing_clone"
+                        elif "gated" in status_lower:
+                            reason_code = "gated"
+                        elif "failed" in status_lower:
+                            reason_code = "hard_reject"
+                        elif "applied" in status_lower:
+                            reason_code = "normal_accept"
+                    vps_adaptive_info.update({
+                        "sensor": "VPS",
+                        "accepted": bool(vps_applied),
+                        "attempted": 1,
+                        "dof": 2,
+                        "nis_norm": nis_norm_vps,
+                        "chi2": float(vps_innovation_m) if vps_innovation_m is not None and np.isfinite(float(vps_innovation_m)) else np.nan,
+                        "threshold": np.nan,
+                        "r_scale_used": float(vps_apply_scales.get("r_scale", 1.0)),
+                        "reason_code": reason_code,
+                    })
+                    runner.adaptive_service.record_adaptive_measurement(
+                        "VPS",
+                        adaptive_info=vps_adaptive_info,
+                        timestamp=float(t_cam),
+                        policy_scales=vps_policy_scales,
+                    )
+                    if vps_applied:
+                        runner.last_vps_update_time = t_cam
+                        runner.state.vps_idx += 1
+
+            # Save keyframe image with visualization overlay
+            if runner.config.save_keyframe_images and hasattr(runner, "keyframe_dir"):
+                save_keyframe_with_overlay(
+                    img_for_tracking,
+                    runner.vio_fe.frame_idx,
+                    runner.keyframe_dir,
+                    runner.vio_fe,
+                )
 
             runner.state.img_idx += 1
 

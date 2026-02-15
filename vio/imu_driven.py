@@ -140,6 +140,7 @@ def run_imu_driven_loop(runner):
     runner.state.t0 = runner.imu[0].t
     runner.state.last_t = runner.state.t0
     runner.output_reporting.run_bootstrap_convention_checks()
+    runner.output_reporting.run_sensor_time_audit()
     
     # Initialize preintegration cache for MSCKF Jacobians
     # Keep runtime-adjusted imu_params (e.g., imu_only conservative profile).

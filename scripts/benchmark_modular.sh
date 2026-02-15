@@ -80,6 +80,7 @@ IMAGES_DIR="${DATASET_BASE}/extracted_data_new/cam_data/camera__image_mono/image
 IMAGES_INDEX="${DATASET_BASE}/extracted_data_new/cam_data/camera__image_mono/images_index.csv"
 # v3.9.0: Add timeref.csv for camera time_ref matching
 TIMEREF_CSV="${DATASET_BASE}/extracted_data_new/imu_data/imu__time_ref_cam/timeref.csv"
+TIMEREF_PPS_CSV="${DATASET_BASE}/extracted_data_new/imu_data/imu__time_ref_pps/timeref.csv"
 MAG_PATH="${DATASET_BASE}/extracted_data_new/imu_data/imu__mag/vector3.csv"
 DEM_PATH="${DATASET_BASE}/Copernicus_DSM_10_N45_00_W076_00_DEM.tif"
 GROUND_TRUTH="${DATASET_BASE}/bell412_dataset3_frl.pos"
@@ -90,8 +91,8 @@ GROUND_TRUTH="${DATASET_BASE}/bell412_dataset3_frl.pos"
 #   imu_cam: require IMU+GT+CAM
 #   imu_only: IMU+GT only
 RUN_MODE="${RUN_MODE:-auto}"
-SAVE_DEBUG_DATA="${SAVE_DEBUG_DATA:-1}"  # 1 => pass --save_debug_data (heavy CSV logs)
-SAVE_KEYFRAME_IMAGES="${SAVE_KEYFRAME_IMAGES:-1}"  # 1 => pass --save_keyframe_images (keyframe JPGs)
+SAVE_DEBUG_DATA="${SAVE_DEBUG_DATA:-0}"  # 1 => pass --save_debug_data (heavy CSV logs)
+SAVE_KEYFRAME_IMAGES="${SAVE_KEYFRAME_IMAGES:-0}"  # 1 => pass --save_keyframe_images (keyframe JPGs)
 
 # Output directory
 OUTPUT_DIR="benchmark_modular_${TEST_ID}/preintegration"
@@ -122,11 +123,13 @@ HAS_CAM=0
 HAS_MAG=0
 HAS_DEM=0
 HAS_TIMEREF=0
+HAS_TIMEREF_PPS=0
 
 [ -d "$IMAGES_DIR" ] && [ -f "$IMAGES_INDEX" ] && HAS_CAM=1
 [ -f "$MAG_PATH" ] && HAS_MAG=1
 [ -f "$DEM_PATH" ] && HAS_DEM=1
 [ -f "$TIMEREF_CSV" ] && HAS_TIMEREF=1
+[ -f "$TIMEREF_PPS_CSV" ] && HAS_TIMEREF_PPS=1
 
 if { [ -d "$IMAGES_DIR" ] && [ ! -f "$IMAGES_INDEX" ]; } || { [ ! -d "$IMAGES_DIR" ] && [ -f "$IMAGES_INDEX" ]; }; then
     fail_fast "Camera inputs incomplete (need both images dir and images index): $IMAGES_DIR | $IMAGES_INDEX"
@@ -136,6 +139,7 @@ USE_CAM=0
 USE_MAG=0
 USE_DEM=0
 USE_TIMEREF=0
+USE_TIMEREF_PPS=0
 USE_QUARRY=0
 
 case "$RUN_MODE" in
@@ -145,14 +149,16 @@ case "$RUN_MODE" in
         [ "$HAS_MAG" -eq 1 ] || fail_fast "RUN_MODE=full requires magnetometer CSV"
         [ "$HAS_DEM" -eq 1 ] || fail_fast "RUN_MODE=full requires DEM file"
         USE_CAM=1; USE_MAG=1; USE_DEM=1; USE_TIMEREF=1; USE_QUARRY=1
+        [ "$HAS_TIMEREF_PPS" -eq 1 ] && USE_TIMEREF_PPS=1
         ;;
     imu_cam)
         [ "$HAS_CAM" -eq 1 ] || fail_fast "RUN_MODE=imu_cam requires camera inputs"
         [ "$HAS_TIMEREF" -eq 1 ] || fail_fast "RUN_MODE=imu_cam requires timeref CSV"
         USE_CAM=1; USE_TIMEREF=1; USE_QUARRY=0
+        [ "$HAS_TIMEREF_PPS" -eq 1 ] && USE_TIMEREF_PPS=1
         ;;
     imu_only)
-        USE_CAM=0; USE_MAG=0; USE_DEM=0; USE_TIMEREF=0; USE_QUARRY=0
+        USE_CAM=0; USE_MAG=0; USE_DEM=0; USE_TIMEREF=0; USE_TIMEREF_PPS=0; USE_QUARRY=0
         ;;
     auto)
         USE_CAM="$HAS_CAM"
@@ -161,6 +167,9 @@ case "$RUN_MODE" in
         USE_QUARRY="$HAS_DEM"
         if [ "$HAS_TIMEREF" -eq 1 ] && { [ "$USE_CAM" -eq 1 ] || [ "$USE_MAG" -eq 1 ]; }; then
             USE_TIMEREF=1
+        fi
+        if [ "$USE_TIMEREF" -eq 1 ] && [ "$HAS_TIMEREF_PPS" -eq 1 ]; then
+            USE_TIMEREF_PPS=1
         fi
         ;;
     *)
@@ -180,6 +189,9 @@ esac
 if [ "$SAVE_KEYFRAME_IMAGES" = "1" ] && [ "$USE_CAM" -ne 1 ]; then
     echo "⚠️  SAVE_KEYFRAME_IMAGES=1 ignored (camera input not enabled in RUN_MODE=${RUN_MODE})"
     SAVE_KEYFRAME_IMAGES=0
+fi
+if [ "$USE_TIMEREF" -eq 1 ] && [ "$USE_TIMEREF_PPS" -eq 0 ]; then
+    echo "⚠️  TimeRef PPS CSV not found; running without --timeref_pps_csv"
 fi
 
 RUN_MODE_LABEL="IMU+GT"
@@ -201,6 +213,7 @@ echo "  Active sensors: ${RUN_MODE_LABEL}"
 [ "$USE_MAG" -eq 1 ] && echo "    - Magnetometer: ${MAG_PATH}"
 [ "$USE_DEM" -eq 1 ] && echo "    - DEM: ${DEM_PATH}"
 [ "$USE_TIMEREF" -eq 1 ] && echo "    - TimeRef: ${TIMEREF_CSV}"
+[ "$USE_TIMEREF_PPS" -eq 1 ] && echo "    - TimeRef PPS: ${TIMEREF_PPS_CSV}"
 [ "$USE_QUARRY" -eq 1 ] && echo "    - Quarry: ${QUARRY_PATH}"
 if [ -f "$MBTILES_PATH" ]; then
     echo "    - VPS Tiles: ${MBTILES_PATH}"
@@ -249,6 +262,9 @@ if [ "$USE_DEM" -eq 1 ]; then
 fi
 if [ "$USE_TIMEREF" -eq 1 ]; then
     PYTHON_ARGS+=(--timeref_csv "$TIMEREF_CSV")
+fi
+if [ "$USE_TIMEREF_PPS" -eq 1 ]; then
+    PYTHON_ARGS+=(--timeref_pps_csv "$TIMEREF_PPS_CSV")
 fi
 
 # Add MBTiles path if VPS is enabled
@@ -314,6 +330,113 @@ EOF
 
 echo "=== Accuracy Analysis ==="
 analyze_errors "$OUTPUT_DIR/error_log.csv"
+echo ""
+
+echo "=== Accuracy-First Summary ==="
+python3 - <<EOF
+import os
+import re
+import numpy as np
+import pandas as pd
+
+out_dir = "$OUTPUT_DIR"
+run_id = os.path.basename(os.path.dirname(os.path.normpath(out_dir))) if os.path.basename(os.path.normpath(out_dir)) == "preintegration" else os.path.basename(os.path.normpath(out_dir))
+summary_csv = os.path.join(out_dir, "accuracy_first_summary.csv")
+
+def summarize_run(run_dir: str):
+    res = {
+        "run_id": run_id,
+        "err3d_mean": np.nan,
+        "err3d_median": np.nan,
+        "err3d_final": np.nan,
+        "heading_final_abs_deg": np.nan,
+        "vps_used": np.nan,
+        "msckf_fail_depth_sign": np.nan,
+        "msckf_fail_reproj_error": np.nan,
+        "msckf_fail_nonlinear": np.nan,
+    }
+
+    err_csv = os.path.join(run_dir, "error_log.csv")
+    if os.path.isfile(err_csv):
+        try:
+            err_df = pd.read_csv(err_csv)
+            if len(err_df) > 0:
+                pos = pd.to_numeric(err_df.get("pos_error_m", np.nan), errors="coerce").to_numpy(dtype=float)
+                yaw = pd.to_numeric(err_df.get("yaw_error_deg", np.nan), errors="coerce").to_numpy(dtype=float)
+                pos = pos[np.isfinite(pos)]
+                yaw = yaw[np.isfinite(yaw)]
+                if pos.size > 0:
+                    res["err3d_mean"] = float(np.nanmean(pos))
+                    res["err3d_median"] = float(np.nanmedian(pos))
+                    res["err3d_final"] = float(pos[-1])
+                if yaw.size > 0:
+                    res["heading_final_abs_deg"] = float(abs(yaw[-1]))
+        except Exception:
+            pass
+
+    run_log = os.path.join(run_dir, "run.log")
+    if os.path.isfile(run_log):
+        try:
+            with open(run_log, "r", errors="ignore") as f:
+                lines = f.readlines()
+            for line in lines:
+                m = re.search(r"VPS used:\\s*(\\d+)", line)
+                if m:
+                    res["vps_used"] = float(m.group(1))
+                m = re.search(r"fail_depth_sign:\\s*(\\d+)", line)
+                if m:
+                    res["msckf_fail_depth_sign"] = float(m.group(1))
+                m = re.search(r"fail_reproj_error:\\s*(\\d+)", line)
+                if m:
+                    res["msckf_fail_reproj_error"] = float(m.group(1))
+                m = re.search(r"fail_nonlinear:\\s*(\\d+)", line)
+                if m:
+                    res["msckf_fail_nonlinear"] = float(m.group(1))
+        except Exception:
+            pass
+    return res
+
+cur = summarize_run(out_dir)
+cur["run_id"] = run_id
+pd.DataFrame([cur]).to_csv(summary_csv, index=False)
+
+print(f"mean 3D error      : {cur['err3d_mean']:.3f} m")
+print(f"median 3D error    : {cur['err3d_median']:.3f} m")
+print(f"final 3D error     : {cur['err3d_final']:.3f} m")
+print(f"final |heading err|: {cur['heading_final_abs_deg']:.3f} deg")
+print(f"VPS used           : {int(cur['vps_used']) if np.isfinite(cur['vps_used']) else 'nan'}")
+print(
+    "MSCKF fails        : "
+    f"depth_sign={int(cur['msckf_fail_depth_sign']) if np.isfinite(cur['msckf_fail_depth_sign']) else 'nan'}, "
+    f"reproj={int(cur['msckf_fail_reproj_error']) if np.isfinite(cur['msckf_fail_reproj_error']) else 'nan'}, "
+    f"nonlinear={int(cur['msckf_fail_nonlinear']) if np.isfinite(cur['msckf_fail_nonlinear']) else 'nan'}"
+)
+print(f"saved: {summary_csv}")
+
+base_dir = "$BASELINE_RUN"
+if base_dir and os.path.isdir(base_dir):
+    base = summarize_run(base_dir)
+    print("")
+    print(f"Baseline accuracy delta vs: {base_dir}")
+    keys = [
+        "err3d_mean",
+        "err3d_median",
+        "err3d_final",
+        "heading_final_abs_deg",
+        "vps_used",
+        "msckf_fail_depth_sign",
+        "msckf_fail_reproj_error",
+        "msckf_fail_nonlinear",
+    ]
+    for k in keys:
+        c = float(cur[k]) if np.isfinite(cur[k]) else np.nan
+        b = float(base[k]) if np.isfinite(base[k]) else np.nan
+        if np.isfinite(b) and abs(b) > 1e-12 and np.isfinite(c):
+            pct = 100.0 * (c - b) / abs(b)
+            print(f"{k:24s} base={b: .6e} cur={c: .6e} delta={pct:+7.2f}%")
+        else:
+            print(f"{k:24s} base={b: .6e} cur={c: .6e} delta=   n/a")
+EOF
 echo ""
 
 CURRENT_SUMMARY="$OUTPUT_DIR/benchmark_health_summary.csv"
@@ -628,6 +751,7 @@ echo "  - error_log.csv    : Error statistics"
 echo "  - cov_health.csv   : Covariance health timeline"
 echo "  - conditioning_events.csv : Conditioning fallback events"
 echo "  - benchmark_health_summary.csv : Run health one-line summary"
+echo "  - accuracy_first_summary.csv : Accuracy-first metrics + baseline deltas"
 echo "  - sensor_phase_summary.csv : accept-rate/NIS summary by sensor+phase"
 echo "  - run.log          : Full debug output"
 echo ""

@@ -87,6 +87,11 @@ class BootstrapService:
         """Load all input data sources."""
         runner = self.runner
 
+        # Optional PPS time_ref mapping (for runtime time audit only)
+        runner.time_ref_pps_csv = self.resolve_timeref_pps_csv()
+        if runner.time_ref_pps_csv:
+            print(f"[TIME] PPS mapping enabled for audit: {runner.time_ref_pps_csv}")
+
         # Load PPK ground truth if available
         runner.ppk_state = None
         if runner.config.ground_truth_path:
@@ -163,6 +168,51 @@ class BootstrapService:
         if len(runner.imu) == 0:
             raise RuntimeError("IMU is required. Aborting.")
 
+    def resolve_timeref_pps_csv(self) -> str | None:
+        """
+        Resolve PPS timeref CSV path.
+
+        Priority:
+        1) explicit CLI path (--timeref_pps_csv)
+        2) sibling folder next to timeref_csv
+        3) sibling folder next to imu CSV root
+        """
+        cfg = self.runner.config
+        candidates = []
+
+        explicit = getattr(cfg, "timeref_pps_csv", None)
+        if explicit:
+            candidates.append(str(explicit))
+
+        timeref_csv = getattr(cfg, "timeref_csv", None)
+        if timeref_csv:
+            tr = str(timeref_csv)
+            candidates.extend([
+                tr.replace("imu__time_ref_cam", "imu__time_ref_pps"),
+                tr.replace("imu__time_ref", "imu__time_ref_pps"),
+                os.path.join(os.path.dirname(os.path.dirname(tr)), "imu__time_ref_pps", "timeref.csv"),
+            ])
+
+        imu_path = getattr(cfg, "imu_path", None)
+        if imu_path:
+            imu_dir = os.path.dirname(str(imu_path))
+            candidates.extend([
+                os.path.join(os.path.dirname(imu_dir), "imu__time_ref_pps", "timeref.csv"),
+                os.path.join(os.path.dirname(os.path.dirname(imu_dir)), "imu__time_ref_pps", "timeref.csv"),
+            ])
+
+        seen = set()
+        for p in candidates:
+            if not p:
+                continue
+            p_norm = os.path.normpath(p)
+            if p_norm in seen:
+                continue
+            seen.add(p_norm)
+            if os.path.isfile(p_norm):
+                return p_norm
+        return None
+
     def configure_error_time_mapping(self):
         """
         Configure timestamp mapping used by log_error().
@@ -208,6 +258,7 @@ class BootstrapService:
                 f"[TIME] GT mapping enabled: time_ref -> {abs_col} | "
                 f"scale={runner.error_time_scale:.12f}, offset={runner.error_time_offset:.6f}, rms={rms_ms:.3f}ms"
             )
+            print("[TIME] NOTE: GT mapping is evaluation-only (error_log). It is not used for EKF correction.")
         except Exception as e:
             print(f"[TIME] WARNING: Failed to configure GT time mapping: {e}")
             runner.error_time_scale = 1.0
@@ -411,6 +462,9 @@ class BootstrapService:
         runner.convention_csv = csv_paths.get("convention_csv")
         runner.adaptive_debug_csv = csv_paths.get("adaptive_debug_csv")
         runner.sensor_health_csv = csv_paths.get("sensor_health_csv")
+        runner.mag_quality_csv = csv_paths.get("mag_quality_csv")
+        runner.sensor_time_audit_csv = csv_paths.get("sensor_time_audit_csv")
+        runner.vps_reloc_summary_csv = csv_paths.get("vps_reloc_summary_csv")
         runner.conditioning_events_csv = csv_paths.get("conditioning_events_csv")
         runner.benchmark_health_summary_csv = csv_paths.get("benchmark_health_summary_csv")
         runner.inf_csv = csv_paths["inf_csv"]
@@ -496,6 +550,8 @@ class BootstrapService:
                     if hasattr(runner, "vps_matches_dir") and runner.vps_matches_dir:
                         runner.vps_runner.save_matches_dir = runner.vps_matches_dir
                         print(f"[VPS] Match visualizations will be saved")
+                    if getattr(runner, "vps_reloc_summary_csv", None):
+                        runner.vps_runner.reloc_summary_csv = runner.vps_reloc_summary_csv
 
                     from vps import VPSDelayedUpdateManager
 

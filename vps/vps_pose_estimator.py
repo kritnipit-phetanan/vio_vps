@@ -106,7 +106,9 @@ class VPSPoseEstimator:
                             gsd: float,
                             num_inliers: int,
                             reproj_error: float,
-                            confidence: float) -> np.ndarray:
+                            confidence: float,
+                            num_matches: Optional[int] = None,
+                            offset_px: Optional[Tuple[float, float]] = None) -> np.ndarray:
         """
         Estimate measurement covariance based on match quality.
         
@@ -124,37 +126,41 @@ class VPSPoseEstimator:
         Returns:
             2x2 covariance matrix (m²)
         """
-        # Base uncertainty from GSD
-        sigma = max(self.base_sigma, gsd)
-        
-        # Scale by inlier count
-        if num_inliers < 30:
-            sigma *= 2.0
-        elif num_inliers < 50:
-            sigma *= 1.5
-        elif num_inliers > 100:
-            sigma *= 0.8  # More confident with many inliers
-        
-        # Scale by reprojection error
-        if reproj_error > 5.0:
-            sigma *= 2.0
-        elif reproj_error > 3.0:
-            sigma *= 1.5
-        elif reproj_error > 2.0:
-            sigma *= 1.2
-        elif reproj_error < 1.0:
-            sigma *= 0.9  # Very good match
-        
-        # Scale by confidence
-        if confidence < 0.3:
-            sigma *= 3.0
-        elif confidence < 0.5:
-            sigma *= 2.0
-        elif confidence < 0.7:
-            sigma *= 1.3
-        
-        # Clamp
-        sigma = max(self.min_sigma, min(self.max_sigma, sigma))
+        # Base uncertainty from map resolution (GSD).
+        sigma = max(float(self.base_sigma), float(max(1e-4, gsd)))
+
+        # Scale by inlier count with smooth decay.
+        n_inl = max(1, int(num_inliers))
+        inlier_factor = np.clip(np.sqrt(30.0 / float(n_inl)), 0.6, 3.0)
+        sigma *= float(inlier_factor)
+
+        # Scale by inlier ratio (when total matches are known).
+        if num_matches is not None and int(num_matches) > 0:
+            inlier_ratio = float(n_inl) / float(max(1, int(num_matches)))
+            ratio_factor = np.clip(0.45 / max(1e-3, inlier_ratio), 0.7, 2.5)
+            sigma *= float(ratio_factor)
+
+        # Reprojection error contribution.
+        reproj = float(reproj_error) if np.isfinite(reproj_error) else 10.0
+        reproj_factor = np.clip(1.0 + max(0.0, reproj - 0.8) * 0.35, 1.0, 4.0)
+        sigma *= float(reproj_factor)
+
+        # Confidence contribution.
+        conf = float(confidence) if np.isfinite(confidence) else 0.0
+        conf = np.clip(conf, 0.0, 1.0)
+        conf_factor = np.clip(1.0 + max(0.0, 0.75 - conf) * 1.5, 1.0, 4.0)
+        sigma *= float(conf_factor)
+
+        # Large pixel offsets are usually less reliable (edge/crop effects).
+        if offset_px is not None:
+            off = np.asarray(offset_px, dtype=float).reshape(-1)
+            if off.size >= 2 and np.all(np.isfinite(off[:2])):
+                off_norm = float(np.linalg.norm(off[:2]))
+                offset_factor = np.clip(1.0 + 0.8 * min(off_norm / 1024.0, 1.5), 1.0, 2.2)
+                sigma *= float(offset_factor)
+
+        # Clamp final sigma.
+        sigma = float(np.clip(sigma, self.min_sigma, self.max_sigma))
         
         # 2x2 covariance (diagonal, assume isotropic)
         R = np.diag([sigma ** 2, sigma ** 2])
@@ -198,7 +204,9 @@ class VPSPoseEstimator:
             gsd=map_gsd,
             num_inliers=match_result.num_inliers,
             reproj_error=match_result.reproj_error,
-            confidence=match_result.confidence
+            confidence=match_result.confidence,
+            num_matches=getattr(match_result, "num_matches", None),
+            offset_px=getattr(match_result, "offset_px", None),
         )
         
         return VPSMeasurement(

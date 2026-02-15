@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from collections import deque
 from typing import Any, Dict
 
 import numpy as np
 
 from ..magnetometer import calibrate_magnetometer, apply_mag_filter
 from ..measurement_updates import apply_magnetometer_update
+from ..output_utils import log_mag_quality
 
 
 class MagnetometerService:
@@ -15,10 +17,151 @@ class MagnetometerService:
 
     def __init__(self, runner: Any):
         self.runner = runner
+        self._mag_norm_hist = deque(maxlen=200)
+        self._mag_norm_ewma: float = float("nan")
+        self._last_mag_yaw: float | None = None
+        self._last_mag_t: float | None = None
 
     @staticmethod
     def _wrap_angle(rad: float) -> float:
         return float(np.arctan2(np.sin(float(rad)), np.cos(float(rad))))
+
+    def _score_linear(self, value: float, good: float, bad: float) -> float:
+        if not np.isfinite(value):
+            return float("nan")
+        if value <= good:
+            return 1.0
+        if value >= bad:
+            return 0.0
+        return float(1.0 - (value - good) / max(1e-9, bad - good))
+
+    def _evaluate_accuracy_policy(self,
+                                  yaw_mag_filtered: float,
+                                  mag_norm: float,
+                                  timestamp: float) -> Dict[str, Any]:
+        """
+        Quality-aware magnetometer policy for accuracy-first mode.
+
+        Returns dict:
+          decision: good | mid_inflate | bad_skip | bad_inflate | disabled
+          r_scale: multiplicative R factor
+          quality_score: [0,1]
+          norm_ewma, norm_dev, gyro_delta_deg, vision_delta_deg
+        """
+        cfg = self.runner.global_config
+        enabled = bool(cfg.get("MAG_ACCURACY_ENABLED", True))
+        if not enabled:
+            return {
+                "decision": "disabled",
+                "r_scale": 1.0,
+                "quality_score": 1.0,
+                "norm_ewma": float(mag_norm) if np.isfinite(mag_norm) else np.nan,
+                "norm_dev": 0.0,
+                "gyro_delta_deg": np.nan,
+                "vision_delta_deg": np.nan,
+                "reason": "policy_disabled",
+            }
+
+        window = max(20, int(cfg.get("MAG_ACCURACY_NORM_WINDOW", 200)))
+        if self._mag_norm_hist.maxlen != window:
+            self._mag_norm_hist = deque(self._mag_norm_hist, maxlen=window)
+        if np.isfinite(mag_norm):
+            self._mag_norm_hist.append(float(mag_norm))
+
+        alpha = float(np.clip(2.0 / float(window + 1), 0.01, 0.5))
+        if np.isfinite(self._mag_norm_ewma):
+            self._mag_norm_ewma = (1.0 - alpha) * self._mag_norm_ewma + alpha * float(mag_norm)
+        else:
+            self._mag_norm_ewma = float(mag_norm)
+
+        norm_ewma = float(self._mag_norm_ewma)
+        norm_dev = abs(float(mag_norm) - norm_ewma) / max(1e-6, abs(norm_ewma))
+        norm_score = self._score_linear(
+            norm_dev,
+            float(cfg.get("MAG_ACCURACY_NORM_DEV_GOOD", 0.12)),
+            float(cfg.get("MAG_ACCURACY_NORM_DEV_BAD", 0.30)),
+        )
+
+        gyro_delta_deg = np.nan
+        if self._last_mag_yaw is not None and self._last_mag_t is not None:
+            dt = float(timestamp) - float(self._last_mag_t)
+            if dt > 1e-4:
+                yaw_pred_delta = float(self.runner.last_gyro_z) * dt
+                yaw_meas_delta = self._wrap_angle(float(yaw_mag_filtered) - float(self._last_mag_yaw))
+                gyro_delta_deg = abs(np.degrees(self._wrap_angle(yaw_meas_delta - yaw_pred_delta)))
+        gyro_score = self._score_linear(
+            gyro_delta_deg,
+            float(cfg.get("MAG_ACCURACY_GYRO_DELTA_SOFT_DEG", 20.0)),
+            float(cfg.get("MAG_ACCURACY_GYRO_DELTA_HARD_DEG", 65.0)),
+        )
+
+        vision_delta_deg = np.nan
+        vis_yaw = getattr(self.runner, "_vision_yaw_ref", None)
+        vis_t = getattr(self.runner, "_vision_yaw_last_t", None)
+        if vis_yaw is not None and vis_t is not None:
+            vis_age = float(timestamp) - float(vis_t)
+            vis_max_age = float(self.runner.global_config.get("MAG_VISION_HEADING_MAX_AGE_SEC", 1.0))
+            if 0.0 <= vis_age <= vis_max_age:
+                vision_delta_deg = abs(
+                    np.degrees(self._wrap_angle(float(yaw_mag_filtered) - float(vis_yaw)))
+                )
+        vision_score = self._score_linear(
+            vision_delta_deg,
+            float(cfg.get("MAG_ACCURACY_VISION_DELTA_SOFT_DEG", 30.0)),
+            float(cfg.get("MAG_ACCURACY_VISION_DELTA_HARD_DEG", 90.0)),
+        )
+
+        # Weighted fusion of available quality terms.
+        vision_w = float(np.clip(cfg.get("MAG_ACCURACY_VISION_WEIGHT", 0.25), 0.0, 0.5))
+        gyro_w = 0.35
+        norm_w = max(0.0, 1.0 - gyro_w - vision_w)
+        score_terms = []
+        weight_terms = []
+        if np.isfinite(norm_score):
+            score_terms.append(float(norm_score))
+            weight_terms.append(norm_w)
+        if np.isfinite(gyro_score):
+            score_terms.append(float(gyro_score))
+            weight_terms.append(gyro_w)
+        if np.isfinite(vision_score):
+            score_terms.append(float(vision_score))
+            weight_terms.append(vision_w)
+        if len(score_terms) == 0 or np.sum(weight_terms) <= 1e-9:
+            quality_score = 0.5
+        else:
+            quality_score = float(np.sum(np.array(score_terms) * np.array(weight_terms)) / np.sum(weight_terms))
+
+        good_min = float(cfg.get("MAG_ACCURACY_GOOD_MIN_SCORE", 0.72))
+        mid_min = float(cfg.get("MAG_ACCURACY_MID_MIN_SCORE", 0.45))
+        r_mid = float(max(1.0, cfg.get("MAG_ACCURACY_R_INFLATE_MID", 1.8)))
+        r_bad = float(max(r_mid, cfg.get("MAG_ACCURACY_R_INFLATE_BAD", 3.0)))
+        skip_on_bad = bool(cfg.get("MAG_ACCURACY_SKIP_ON_BAD", True))
+
+        if quality_score >= good_min:
+            decision = "good"
+            r_scale = 1.0
+        elif quality_score >= mid_min:
+            decision = "mid_inflate"
+            r_scale = r_mid
+        else:
+            if skip_on_bad:
+                decision = "bad_skip"
+            else:
+                decision = "bad_inflate"
+            r_scale = r_bad
+
+        self._last_mag_yaw = float(yaw_mag_filtered)
+        self._last_mag_t = float(timestamp)
+        return {
+            "decision": decision,
+            "r_scale": float(r_scale),
+            "quality_score": float(quality_score),
+            "norm_ewma": float(norm_ewma),
+            "norm_dev": float(norm_dev),
+            "gyro_delta_deg": float(gyro_delta_deg) if np.isfinite(gyro_delta_deg) else np.nan,
+            "vision_delta_deg": float(vision_delta_deg) if np.isfinite(vision_delta_deg) else np.nan,
+            "reason": f"score={quality_score:.3f}",
+        }
 
     def _apply_visual_heading_consistency(self,
                                           yaw_mag_filtered: float,
@@ -151,6 +294,7 @@ class MagnetometerService:
                 hard_iron = self.runner.global_config.get("MAG_HARD_IRON_OFFSET", None)
             soft_iron = self.runner.global_config.get("MAG_SOFT_IRON_MATRIX", None)
             mag_cal = calibrate_magnetometer(mag_rec.mag, hard_iron=hard_iron, soft_iron=soft_iron)
+            mag_norm = float(np.linalg.norm(mag_cal))
 
             # Compute raw yaw from calibrated magnetometer
             from ..magnetometer import compute_yaw_from_mag
@@ -182,10 +326,34 @@ class MagnetometerService:
             sigma_mag_scaled = sigma_mag * r_scale
             mag_policy_scales, mag_apply_scales = self.runner.adaptive_service.get_sensor_adaptive_scales("MAG")
             mag_adaptive_info: Dict[str, Any] = {}
+            mag_quality = self._evaluate_accuracy_policy(
+                yaw_mag_filtered=yaw_mag_filtered,
+                mag_norm=mag_norm,
+                timestamp=float(mag_rec.t),
+            )
+            sigma_mag_scaled *= float(mag_quality.get("r_scale", 1.0))
             skip_mag, sigma_mag_scaled, consistency_reason = self._apply_visual_heading_consistency(
                 yaw_mag_filtered=yaw_mag_filtered,
                 sigma_mag_scaled=sigma_mag_scaled,
                 timestamp=float(mag_rec.t),
+            )
+            decision = str(mag_quality.get("decision", "good"))
+            if decision == "bad_skip":
+                skip_mag = True
+                if not consistency_reason:
+                    consistency_reason = "skip_quality_bad"
+            log_mag_quality(
+                getattr(self.runner, "mag_quality_csv", None),
+                t=float(mag_rec.t),
+                raw_norm=float(mag_norm),
+                norm_ewma=float(mag_quality.get("norm_ewma", np.nan)),
+                norm_dev=float(mag_quality.get("norm_dev", np.nan)),
+                gyro_delta_deg=float(mag_quality.get("gyro_delta_deg", np.nan)),
+                vision_delta_deg=float(mag_quality.get("vision_delta_deg", np.nan)),
+                quality_score=float(mag_quality.get("quality_score", np.nan)),
+                decision=decision if consistency_reason == "" else f"{decision}+{consistency_reason}",
+                r_scale=float(max(1e-6, sigma_mag_scaled / max(1e-6, sigma_mag))),
+                reason=str(mag_quality.get("reason", "")),
             )
             if skip_mag:
                 mag_adaptive_info = {
@@ -318,10 +486,31 @@ class MagnetometerService:
 
         # Scale measurement noise based on filter confidence
         sigma_mag_scaled = sigma_mag * r_scale
+        mag_quality = self._evaluate_accuracy_policy(
+            yaw_mag_filtered=yaw_mag_filtered,
+            mag_norm=float(np.linalg.norm(mag_cal)),
+            timestamp=float(mag_rec.t),
+        )
+        sigma_mag_scaled *= float(mag_quality.get("r_scale", 1.0))
         skip_mag, sigma_mag_scaled, _ = self._apply_visual_heading_consistency(
             yaw_mag_filtered=yaw_mag_filtered,
             sigma_mag_scaled=sigma_mag_scaled,
             timestamp=float(mag_rec.t),
+        )
+        if str(mag_quality.get("decision", "")) == "bad_skip":
+            skip_mag = True
+        log_mag_quality(
+            getattr(self.runner, "mag_quality_csv", None),
+            t=float(mag_rec.t),
+            raw_norm=float(np.linalg.norm(mag_cal)),
+            norm_ewma=float(mag_quality.get("norm_ewma", np.nan)),
+            norm_dev=float(mag_quality.get("norm_dev", np.nan)),
+            gyro_delta_deg=float(mag_quality.get("gyro_delta_deg", np.nan)),
+            vision_delta_deg=float(mag_quality.get("vision_delta_deg", np.nan)),
+            quality_score=float(mag_quality.get("quality_score", np.nan)),
+            decision=str(mag_quality.get("decision", "good")),
+            r_scale=float(max(1e-6, sigma_mag_scaled / max(1e-6, sigma_mag))),
+            reason=str(mag_quality.get("reason", "")),
         )
         if skip_mag:
             self.runner.state.mag_rejects += 1

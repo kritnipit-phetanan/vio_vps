@@ -664,6 +664,10 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
                                state_cov: Optional[np.ndarray] = None,
                                chi2_scale: float = 1.0,
                                r_scale_extra: float = 1.0,
+                               soft_fail_enable: bool = False,
+                               soft_fail_r_cap: float = 8.0,
+                               soft_fail_hard_reject_factor: float = 3.0,
+                               soft_fail_power: float = 1.0,
                                adaptive_info: Optional[Dict[str, Any]] = None) -> bool:
     """
     Apply VIO velocity update with scale recovery and chi-square gating.
@@ -700,7 +704,10 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
                            dof: int,
                            chi2: Optional[float],
                            threshold: Optional[float],
-                           r_scale_used: float):
+                           r_scale_used: float,
+                           reason_code: str = "",
+                           hard_threshold: Optional[float] = None,
+                           attempted: int = 1):
         if adaptive_info is None:
             return
         adaptive_info.clear()
@@ -716,6 +723,9 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
             "chi2": float(chi2) if chi2 is not None and np.isfinite(chi2) else np.nan,
             "threshold": float(threshold) if threshold is not None and np.isfinite(threshold) else np.nan,
             "r_scale_used": float(r_scale_used),
+            "attempted": int(max(0, attempted)),
+            "reason_code": str(reason_code),
+            "hard_threshold": float(hard_threshold) if hard_threshold is not None and np.isfinite(hard_threshold) else np.nan,
         })
 
     from scipy.spatial.transform import Rotation as R_scipy
@@ -742,62 +752,98 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
     else:
         body_t_cam = global_config.get('BODY_T_CAMDOWN', np.eye(4))
     
-    R_cam_to_body = body_t_cam[:3, :3]
+    # YAML extrinsics follow T_BC (body -> camera) from calibration docs.
+    # For mapping camera vectors into body frame we must use R_CB = R_BC^T.
+    R_body_to_cam = body_t_cam[:3, :3]
+    R_cam_to_body = R_body_to_cam.T
     
-    # Map direction (from VO if available, else from optical flow)
-    if t_unit is not None and np.linalg.norm(t_unit) > 1e-6:
-        t_norm = t_unit / (np.linalg.norm(t_unit) + 1e-12)
-        t_body = R_cam_to_body @ t_norm
-    else:
-        # Fallback: use median optical flow direction (no VO available)
-        # This is the KEY for XY drift reduction when VO fails
-        if vio_fe is not None and vio_fe.last_matches is not None:
-            pts_prev, pts_cur = vio_fe.last_matches
-            if len(pts_prev) > 5:  # Need minimum features
-                flows = pts_cur - pts_prev
-                median_flow = np.median(flows, axis=0)
-                flow_norm = np.linalg.norm(median_flow)
-                if flow_norm > 1e-6:
-                    # Flow direction in normalized camera coordinates
-                    flow_dir = median_flow / flow_norm
-                    # Convert to 3D camera direction (assume small angle)
-                    t_cam_fallback = np.array([-flow_dir[0], -flow_dir[1], 0.0])
-                    t_cam_fallback = t_cam_fallback / (np.linalg.norm(t_cam_fallback) + 1e-9)
-                    t_body = R_cam_to_body @ t_cam_fallback
-                else:
-                    # No motion detected
-                    t_body = np.array([0.0, 0.0, 1.0])  # Default: forward
-            else:
-                t_body = np.array([0.0, 0.0, 1.0])
+    vio_config = global_config.get('vio', {})
+    nadir_prefer_flow_direction = bool(vio_config.get('nadir_prefer_flow_direction', True))
+    nadir_enforce_xy_motion = bool(vio_config.get('nadir_enforce_xy_motion', True))
+
+    def _flow_direction_body() -> Optional[np.ndarray]:
+        if vio_fe is None or vio_fe.last_matches is None:
+            return None
+        pts_prev, pts_cur = vio_fe.last_matches
+        if pts_prev is None or pts_cur is None or len(pts_prev) <= 5:
+            return None
+        flows = pts_cur - pts_prev
+        if flows.size == 0:
+            return None
+        median_flow = np.median(flows, axis=0)
+        flow_norm = np.linalg.norm(median_flow)
+        if flow_norm <= 1e-6:
+            return None
+        flow_dir = median_flow / flow_norm
+        # For nadir, image flow direction is a better cue than essential-matrix t_unit
+        # under planar-scene degeneracy.
+        t_cam = np.array([-flow_dir[0], -flow_dir[1], 0.0], dtype=float)
+        t_cam /= max(1e-9, np.linalg.norm(t_cam))
+        return R_cam_to_body @ t_cam
+
+    # Map direction.
+    # For nadir camera, prefer optical-flow direction to reduce E-matrix translation ambiguity.
+    t_body = None
+    if camera_view == "nadir" and nadir_prefer_flow_direction:
+        t_body = _flow_direction_body()
+
+    if t_body is None:
+        if t_unit is not None and np.linalg.norm(t_unit) > 1e-6:
+            t_norm = t_unit / (np.linalg.norm(t_unit) + 1e-12)
+            t_body = R_cam_to_body @ t_norm
         else:
-            t_body = np.array([0.0, 0.0, 1.0])
+            t_body = _flow_direction_body()
+
+    if t_body is None:
+        # Fall back to current horizontal velocity direction, then body X.
+        v_curr = np.array(kf.x[3:6, 0], dtype=float)
+        if np.linalg.norm(v_curr[:2]) > 1e-6:
+            t_body = np.array([v_curr[0], v_curr[1], 0.0], dtype=float)
+        else:
+            t_body = np.array([1.0, 0.0, 0.0], dtype=float)
+
+    if camera_view == "nadir" and nadir_enforce_xy_motion:
+        t_body = np.array(t_body, dtype=float)
+        t_body[2] = 0.0
+        if np.linalg.norm(t_body[:2]) <= 1e-6:
+            t_body = np.array([1.0, 0.0, 0.0], dtype=float)
+    t_body = t_body / max(1e-9, np.linalg.norm(t_body))
     
     # Get rotation from IMU quaternion
     q_imu = imu_rec.q
     Rwb = R_scipy.from_quat(q_imu).as_matrix()
     
     # Scale recovery using AGL
-    # v2.9.10.4: Use initial AGL from config to prevent feedback loop
-    # Problem: z_drift -> wrong_dynamic_AGL -> wrong_VIO_scale -> more_drift  
-    # Solution: Use fixed initial_agl from t=0 (GPS-denied compliant)
+    # Default behavior is HYBRID dynamic AGL so velocity scale can follow takeoff/cruise/landing.
+    # Fixed-only mode can be re-enabled for debugging via config:
+    #   vio.flow_agl_mode: fixed
     initial_agl = global_config.get('INITIAL_AGL', None)
-    
-    if initial_agl is not None:
-        # Use fixed initial AGL (GPS-denied compliant: from t=0)
-        agl = initial_agl
+    flow_agl_mode = str(global_config.get('VIO_FLOW_AGL_MODE', 'hybrid')).lower()
+    flow_min_agl = float(global_config.get('VIO_FLOW_MIN_AGL', 1.0))
+    flow_max_agl = float(global_config.get('VIO_FLOW_MAX_AGL', 500.0))
+
+    lat_now, lon_now = proj_cache.xy_to_latlon(kf.x[0, 0], kf.x[1, 0], lat0, lon0)
+    dem_now = dem_reader.sample_m(lat_now, lon_now) if dem_reader.ds else 0.0
+    if dem_now is None or np.isnan(dem_now):
+        dem_now = 0.0
+    agl_dynamic = abs(float(kf.x[2, 0]) - float(dem_now))
+
+    if flow_agl_mode == 'fixed' and initial_agl is not None:
+        agl = float(initial_agl)
+    elif flow_agl_mode == 'dynamic':
+        agl = float(agl_dynamic)
     else:
-        # Fallback: dynamic AGL from current state (original behavior)
-        lat_now, lon_now = proj_cache.xy_to_latlon(kf.x[0, 0], kf.x[1, 0], lat0, lon0)
-        dem_now = dem_reader.sample_m(lat_now, lon_now) if dem_reader.ds else 0.0
-        if dem_now is None or np.isnan(dem_now):
-            dem_now = 0.0
-        
-        agl = abs(kf.x[2, 0] - dem_now)
-    
-    agl = max(1.0, agl)
+        # hybrid: follow dynamic altitude but never collapse below a fraction
+        # of initial AGL, preventing extreme scale drops from local DEM noise.
+        if initial_agl is not None:
+            agl_floor = max(flow_min_agl, 0.5 * float(initial_agl))
+            agl = max(float(agl_dynamic), float(agl_floor))
+        else:
+            agl = float(agl_dynamic)
+
+    agl = float(np.clip(agl, flow_min_agl, max(flow_min_agl, flow_max_agl)))
     
     # Get flow threshold from config (default 0.3px for slow motion)
-    vio_config = global_config.get('vio', {})
     min_flow_px = vio_config.get('min_parallax_px', 0.3)
     
     # Optical flow-based scale
@@ -865,8 +911,23 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
             vel_body = t_body * speed_final
     else:
         vel_body = t_body * speed_final
+
+    if camera_view == "nadir" and nadir_enforce_xy_motion:
+        # Keep nadir VO velocity as horizontal-only cue; vertical is handled by DEM/MSL.
+        vxy = np.linalg.norm(vel_body[:2])
+        if vxy > 1e-6:
+            scale_xy = speed_final / vxy
+            vel_body[0] *= scale_xy
+            vel_body[1] *= scale_xy
+            vel_body[2] = 0.0
+        else:
+            vel_body = np.array([speed_final, 0.0, 0.0], dtype=float)
     
     vel_world = Rwb @ vel_body
+
+    if camera_view == "nadir" and nadir_enforce_xy_motion:
+        # Avoid injecting synthetic vertical velocity from nadir XY flow.
+        vel_world[2] = float(kf.x[5, 0])
     
     # Determine if using VZ only (for nadir cameras)
     # Allow config override for OF-velocity drift reduction
@@ -918,8 +979,8 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
         has_invalid_p = np.any(np.isinf(kf.P)) or np.any(np.isnan(kf.P))
         if has_invalid_p:
             # P corrupted - cannot compute valid innovation, skip update
-            print(f"[VIO] Velocity REJECTED: P matrix contains inf/nan")
-            _set_adaptive_info(False, dof, None, None, extra_scale)
+            _log_vio_vel_update("[VIO] Velocity REJECTED: P matrix contains inf/nan")
+            _set_adaptive_info(False, dof, None, None, extra_scale, reason_code="hard_reject")
             return False
         
         # Clamp large P values to prevent overflow in matmul
@@ -928,24 +989,24 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
             # Scale P down to prevent numerical explosion
             scale_factor = 1e8 / P_max
             kf.P = kf.P * scale_factor
-            print(f"[VIO] Velocity REJECTED: P matrix overflow clamped (max={P_max:.2e})")
-            _set_adaptive_info(False, dof, None, None, extra_scale)
+            _log_vio_vel_update(f"[VIO] Velocity REJECTED: P matrix overflow clamped (max={P_max:.2e})")
+            _set_adaptive_info(False, dof, None, None, extra_scale, reason_code="hard_reject")
             return False
         
         from .numerical_checks import assert_finite
         
         # [TRIPWIRE] Validate inputs before S matrix computation
         if not assert_finite("vel_h_vel", h_vel, extra_info={"h_vel_norm": np.linalg.norm(h_vel)}):
-            print(f"[VIO] Velocity REJECTED: h_vel contains inf/nan")
-            _set_adaptive_info(False, dof, None, None, extra_scale)
+            _log_vio_vel_update("[VIO] Velocity REJECTED: h_vel contains inf/nan")
+            _set_adaptive_info(False, dof, None, None, extra_scale, reason_code="hard_reject")
             return False
         
         if not assert_finite("vel_kf_P", kf.P, extra_info={
             "P_max": np.max(np.abs(kf.P)),
             "P_trace": np.trace(kf.P)
         }):
-            print(f"[VIO] Velocity REJECTED: kf.P contains inf/nan")
-            _set_adaptive_info(False, dof, None, None, extra_scale)
+            _log_vio_vel_update("[VIO] Velocity REJECTED: kf.P contains inf/nan")
+            _set_adaptive_info(False, dof, None, None, extra_scale, reason_code="hard_reject")
             return False
         
         # Compute innovation for gating with overflow protection
@@ -957,8 +1018,8 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
             try:
                 s_mat = h_vel @ kf.P @ h_vel.T + r_mat
             except Exception as e:
-                print(f"[VIO] Velocity REJECTED: s_mat computation failed: {e}")
-                _set_adaptive_info(False, dof, None, None, extra_scale)
+                _log_vio_vel_update(f"[VIO] Velocity REJECTED: s_mat computation failed: {e}")
+                _set_adaptive_info(False, dof, None, None, extra_scale, reason_code="hard_reject")
                 return False
         
         # [TRIPWIRE] Check s_mat validity after computation
@@ -968,30 +1029,39 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
             "h_norm": np.linalg.norm(h_vel),
             "P_max": np.max(np.abs(kf.P))
         }):
-            print(f"[VIO] Velocity REJECTED: s_mat contains inf/nan after computation")
-            _set_adaptive_info(False, dof, None, None, extra_scale)
+            _log_vio_vel_update("[VIO] Velocity REJECTED: s_mat contains inf/nan after computation")
+            _set_adaptive_info(False, dof, None, None, extra_scale, reason_code="hard_reject")
             return False
-        
-        # Chi-square test
-        try:
-            s_inv = safe_matrix_inverse(s_mat, damping=1e-9, method='cholesky')
-            m2 = innovation.T @ s_inv @ innovation
-            chi2_value = float(m2)
-            mahal_dist = np.sqrt(chi2_value)
-        except Exception:
-            chi2_value = float('inf')
-            mahal_dist = float('nan')
+
+        def _compute_chi2(s_matrix: np.ndarray) -> Tuple[float, float]:
+            try:
+                s_inv = safe_matrix_inverse(s_matrix, damping=1e-9, method='cholesky')
+                m2 = innovation.T @ s_inv @ innovation
+                chi2_val = float(m2)
+                return chi2_val, float(np.sqrt(max(0.0, chi2_val)))
+            except Exception:
+                return float("inf"), float("nan")
+
+        chi2_value, mahal_dist = _compute_chi2(s_mat)
         
         # Chi-square thresholds
         # v2.9.9.7: RELAXED from 95% to 99.5% to accept more valid updates
         # Analysis: Filter overconfident (11.8σ vel error) → rejects valid VIO_VEL → divergence
         chi2_threshold = 6.63 if use_vz_only else 11.34  # 1-DOF: 99%, 3-DOF: 99.5% (was 3.84/7.81)
         chi2_threshold *= max(1e-3, float(chi2_scale))
-        
+        hard_threshold = chi2_threshold * max(1.0, float(soft_fail_hard_reject_factor))
+        accepted = False
+        reason_code = "hard_reject"
+        s_used = s_mat
+        r_used = r_mat
+        r_scale_used = extra_scale
+        chi2_used = chi2_value
+        mahal_used = mahal_dist
+
         if chi2_value < chi2_threshold:
             # Accept update
             kf.update(
-                z=vel_meas, HJacobian=h_fun, Hx=hx_fun, R=r_mat,
+                z=vel_meas, HJacobian=h_fun, Hx=hx_fun, R=r_used,
                 update_type="VIO_VEL", timestamp=t
             )
             vo_mode = "VO" if (t_unit is not None and np.linalg.norm(t_unit) > 1e-6) else "OF-fallback"
@@ -1000,23 +1070,66 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
                 f"flow={avg_flow_px:.1f}px, R_scale={flow_quality_scale:.1f}x, mode={vo_mode}, chi2={chi2_value:.2f}"
             )
             accepted = True
+            reason_code = "normal_accept"
+        elif bool(soft_fail_enable):
+            soft_ratio = max(1.0, float(chi2_value) / max(chi2_threshold, 1e-9))
+            soft_factor = soft_ratio ** max(0.1, float(soft_fail_power))
+            soft_factor = min(max(1.0, float(soft_fail_r_cap)), soft_factor)
+            r_used = r_mat * soft_factor
+            with np.errstate(all='ignore'):
+                s_soft = h_vel @ kf.P @ h_vel.T + r_used
+            if np.all(np.isfinite(s_soft)):
+                chi2_soft, mahal_soft = _compute_chi2(s_soft)
+                chi2_used = chi2_soft
+                mahal_used = mahal_soft
+                s_used = s_soft
+                r_scale_used = extra_scale * soft_factor
+                if np.isfinite(chi2_soft) and (chi2_soft <= hard_threshold):
+                    kf.update(
+                        z=vel_meas, HJacobian=h_fun, Hx=hx_fun, R=r_used,
+                        update_type="VIO_VEL", timestamp=t
+                    )
+                    vo_mode = "VO" if (t_unit is not None and np.linalg.norm(t_unit) > 1e-6) else "OF-fallback"
+                    _log_vio_vel_update(
+                        f"[VIO] Velocity soft-accept: chi2={chi2_value:.2f}->{chi2_soft:.2f}, "
+                        f"th={chi2_threshold:.2f}, hard={hard_threshold:.2f}, infl={soft_factor:.2f}x, mode={vo_mode}"
+                    )
+                    accepted = True
+                    reason_code = "soft_accept"
+                else:
+                    _log_vio_vel_update(
+                        f"[VIO] Velocity REJECTED: chi2={chi2_soft:.2f} > hard={hard_threshold:.2f} "
+                        f"(raw={chi2_value:.2f}, infl={soft_factor:.2f}x, flow={avg_flow_px:.1f}px)"
+                    )
+            else:
+                _log_vio_vel_update(
+                    f"[VIO] Velocity REJECTED: soft S invalid (raw_chi2={chi2_value:.2f}, flow={avg_flow_px:.1f}px)"
+                )
         else:
-            # Reject outlier
-            print(f"[VIO] Velocity REJECTED: chi2={chi2_value:.2f} > {chi2_threshold:.1f}, "
-                  f"flow={avg_flow_px:.1f}px, speed={speed_final:.2f}m/s")
-            accepted = False
+            _log_vio_vel_update(
+                f"[VIO] Velocity REJECTED: chi2={chi2_value:.2f} > {chi2_threshold:.1f}, "
+                f"flow={avg_flow_px:.1f}px, speed={speed_final:.2f}m/s"
+            )
 
-        _set_adaptive_info(accepted, dof, chi2_value, chi2_threshold, extra_scale)
+        _set_adaptive_info(
+            accepted,
+            dof,
+            chi2_used,
+            chi2_threshold,
+            r_scale_used,
+            reason_code=reason_code,
+            hard_threshold=hard_threshold,
+        )
         
         # Log to debug_residuals.csv (v2.9.9.8: with NEES)
         if save_debug and residual_csv:
             log_measurement_update(
                 residual_csv, t, vio_frame, 'VIO_VEL',
                 innovation=innovation.flatten(),
-                mahalanobis_dist=mahal_dist,
+                mahalanobis_dist=mahal_used,
                 chi2_threshold=chi2_threshold,
                 accepted=accepted,
-                s_matrix=s_mat,
+                s_matrix=s_used,
                 p_prior=getattr(kf, 'P_prior', kf.P),
                 state_error=state_error,  # Ground truth error for NEES
                 state_cov=state_cov       # Velocity covariance for NEES
@@ -1024,5 +1137,5 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
         
         return accepted
     
-    _set_adaptive_info(False, dof, None, None, extra_scale)
+    _set_adaptive_info(False, dof, None, None, extra_scale, reason_code="hard_reject")
     return False

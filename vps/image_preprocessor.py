@@ -26,6 +26,9 @@ class PreprocessResult:
     rotation_deg: float        # Rotation applied (degrees, clockwise)
     drone_gsd: float           # GSD of drone image after preprocessing
     target_gsd: float          # Target GSD (satellite)
+    content_ratio: float = 0.0 # Non-empty pixel ratio in final image
+    texture_std: float = 0.0   # Std-dev of valid pixels (texture proxy)
+    target_gsd_scale: float = 1.0  # Applied multiplier on target_gsd
 
 
 class VPSImagePreprocessor:
@@ -117,12 +120,11 @@ class VPSImagePreprocessor:
         center = (w // 2, h // 2)
         M = cv2.getRotationMatrix2D(center, rotation_angle, 1.0)
         
-        # Rotate with black border
+        # Use reflected border to avoid large black corners destroying features.
         rotated = cv2.warpAffine(
             img, M, (w, h),
             flags=cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_CONSTANT,
-            borderValue=0
+            borderMode=cv2.BORDER_REFLECT_101
         )
         
         return rotated
@@ -231,6 +233,52 @@ class VPSImagePreprocessor:
         y1 = (h - target_h) // 2
         
         return img[y1:y1+target_h, x1:x1+target_w]
+
+    def center_crop_valid_content(self,
+                                  img: np.ndarray,
+                                  output_size: Optional[Tuple[int, int]] = None,
+                                  intensity_threshold: float = 8.0) -> np.ndarray:
+        """
+        Crop around valid texture content instead of strict image center.
+
+        This reduces degenerate crops where most of the patch is empty/invalid.
+        """
+        if output_size is None:
+            output_size = self.output_size
+
+        h, w = img.shape[:2]
+        target_w, target_h = output_size
+
+        if w <= target_w and h <= target_h:
+            return self.center_crop(img, output_size=output_size)
+
+        gray = img if len(img.shape) == 2 else cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        valid = gray > float(intensity_threshold)
+        if not np.any(valid):
+            return self.center_crop(img, output_size=output_size)
+
+        ys, xs = np.nonzero(valid)
+        cx = int(np.round(np.median(xs)))
+        cy = int(np.round(np.median(ys)))
+
+        x1 = int(np.clip(cx - target_w // 2, 0, max(0, w - target_w)))
+        y1 = int(np.clip(cy - target_h // 2, 0, max(0, h - target_h)))
+        return img[y1:y1+target_h, x1:x1+target_w]
+
+    def compute_content_metrics(self, img: np.ndarray, intensity_threshold: float = 8.0) -> Tuple[float, float]:
+        """
+        Return lightweight content diagnostics for matcher quality policy.
+        """
+        if img is None or getattr(img, "size", 0) == 0:
+            return 0.0, 0.0
+        gray = img if len(img.shape) == 2 else cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        valid = gray > float(intensity_threshold)
+        content_ratio = float(np.mean(valid)) if valid.size > 0 else 0.0
+        if np.any(valid):
+            texture_std = float(np.std(gray[valid]))
+        else:
+            texture_std = float(np.std(gray))
+        return content_ratio, texture_std
     
     def to_grayscale(self, img: np.ndarray) -> np.ndarray:
         """Convert to grayscale if needed."""
@@ -243,7 +291,8 @@ class VPSImagePreprocessor:
                    yaw_rad: float,
                    altitude_m: float,
                    target_gsd: float,
-                   grayscale: bool = True) -> PreprocessResult:
+                   grayscale: bool = True,
+                   target_gsd_scale: float = 1.0) -> PreprocessResult:
         """
         Full preprocessing pipeline.
         
@@ -253,6 +302,7 @@ class VPSImagePreprocessor:
             altitude_m: Altitude AGL in meters
             target_gsd: Satellite map GSD (m/px)
             grayscale: Convert to grayscale (most matchers prefer this)
+            target_gsd_scale: Multiplier for target GSD (for scale hypothesis search)
             
         Returns:
             PreprocessResult with processed image and metadata
@@ -265,23 +315,32 @@ class VPSImagePreprocessor:
         
         # 3. Scale to match satellite GSD
         drone_gsd = self.compute_drone_gsd(altitude_m)
-        scaled, scale_factor = self.scale_to_gsd(rotated, drone_gsd, target_gsd)
+        scale_mult = float(target_gsd_scale) if np.isfinite(target_gsd_scale) else 1.0
+        if scale_mult <= 0.0:
+            scale_mult = 1.0
+        target_gsd_eff = float(target_gsd) * scale_mult
+        scaled, scale_factor = self.scale_to_gsd(rotated, drone_gsd, target_gsd_eff)
         
-        # 4. Center crop to output size
-        cropped = self.center_crop(scaled)
+        # 4. Crop around valid content to avoid empty/degenerate patches.
+        cropped = self.center_crop_valid_content(scaled)
         
         # 5. Grayscale (optional)
         if grayscale:
             final = self.to_grayscale(cropped)
         else:
             final = cropped
+
+        content_ratio, texture_std = self.compute_content_metrics(final)
         
         return PreprocessResult(
             image=final,
             scale_factor=scale_factor,
             rotation_deg=-math.degrees(yaw_rad),
             drone_gsd=drone_gsd,
-            target_gsd=target_gsd
+            target_gsd=target_gsd_eff,
+            content_ratio=content_ratio,
+            texture_std=texture_std,
+            target_gsd_scale=scale_mult,
         )
 
 

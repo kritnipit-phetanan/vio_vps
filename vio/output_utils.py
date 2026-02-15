@@ -272,6 +272,33 @@ def log_sensor_health(sensor_csv: Optional[str],
         pass
 
 
+def log_mag_quality(mag_quality_csv: Optional[str],
+                    t: float,
+                    raw_norm: float,
+                    norm_ewma: float,
+                    norm_dev: float,
+                    gyro_delta_deg: float,
+                    vision_delta_deg: float,
+                    quality_score: float,
+                    decision: str,
+                    r_scale: float,
+                    reason: str = ""):
+    """Log one magnetometer quality-policy row."""
+    if mag_quality_csv is None:
+        return
+    try:
+        reason_txt = str(reason).replace(",", ";")
+        with open(mag_quality_csv, "a", newline="") as f:
+            f.write(
+                f"{float(t):.6f},{float(raw_norm):.6f},{float(norm_ewma):.6f},"
+                f"{float(norm_dev):.6f},{float(gyro_delta_deg):.6f},"
+                f"{float(vision_delta_deg):.6f},{float(quality_score):.6f},"
+                f"{decision},{float(r_scale):.4f},{reason_txt}\n"
+            )
+    except Exception:
+        pass
+
+
 def log_convention_event(convention_csv: Optional[str],
                          t: float,
                          sensor: str,
@@ -1236,6 +1263,31 @@ def init_output_csvs(output_dir: str, save_debug_data: bool = False) -> Dict[str
         f.write(
             "t,sensor,accepted,nis_norm,nis_ewma,accept_rate,mode,health_state,"
             "r_scale,chi2_scale,threshold_scale,reproj_scale,reason_code\n"
+        )
+
+    # MAG quality policy diagnostics (accuracy-first)
+    paths['mag_quality_csv'] = os.path.join(output_dir, "mag_quality.csv")
+    with open(paths['mag_quality_csv'], "w", newline="") as f:
+        f.write(
+            "t,raw_norm,norm_ewma,norm_dev,gyro_delta_deg,vision_delta_deg,"
+            "quality_score,decision,r_scale,reason\n"
+        )
+
+    # Runtime sensor time-base audit
+    paths['sensor_time_audit_csv'] = os.path.join(output_dir, "sensor_time_audit.csv")
+    with open(paths['sensor_time_audit_csv'], "w", newline="") as f:
+        f.write(
+            "sensor,start_t,end_t,samples,overlap_start,overlap_end,overlap_sec,"
+            "in_range_frac,nn_dt_mean_s,nn_dt_p95_s,nn_dt_max_s,warn\n"
+        )
+
+    # VPS relocalization summary (local/global attempts)
+    paths['vps_reloc_summary_csv'] = os.path.join(output_dir, "vps_reloc_summary.csv")
+    with open(paths['vps_reloc_summary_csv'], "w", newline="") as f:
+        f.write(
+            "t,frame,mode,force_global,trigger_reason,est_lat,est_lon,"
+            "best_center_lat,best_center_lon,best_score,best_inliers,best_reproj_error,"
+            "best_confidence,selected_yaw_deg,selected_scale,success,reason\n"
         )
 
     # Conditioning events (trigger-only log for covariance repairs)

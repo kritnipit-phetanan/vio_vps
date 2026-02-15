@@ -361,12 +361,11 @@ class SatelliteMatcher:
         H, inlier_mask, reproj_error = self.estimate_homography(pts_drone, pts_sat)
         
         num_inliers = int(np.sum(inlier_mask)) if len(inlier_mask) > 0 else 0
-        
-        # Check minimum inliers
-        if H is None or num_inliers < self.min_inliers:
+
+        if H is None:
             return MatchResult(
                 success=False,
-                H=H,
+                H=None,
                 num_matches=num_matches,
                 num_inliers=num_inliers,
                 reproj_error=reproj_error,
@@ -375,6 +374,12 @@ class SatelliteMatcher:
                 keypoints_drone=pts_drone,
                 keypoints_sat=pts_sat
             )
+
+        # Compute confidence even if inlier count is below strict threshold.
+        # This supports fail-soft policies in the caller.
+        inlier_ratio = num_inliers / num_matches if num_matches > 0 else 0.0
+        reproj_score = max(0.0, 1.0 - float(reproj_error) / 10.0) if np.isfinite(reproj_error) else 0.0
+        confidence = float(inlier_ratio * reproj_score)
         
         # Reject inlier sets that are too spatially concentrated.
         # This avoids false "good" matches where many correspondences collapse
@@ -416,16 +421,25 @@ class SatelliteMatcher:
                 num_matches=num_matches,
                 num_inliers=num_inliers,
                 reproj_error=float('inf'),
-                confidence=0.0,
-                offset_px=(0.0, 0.0),
-                keypoints_drone=pts_drone,
-                keypoints_sat=pts_sat
+                    confidence=confidence,
+                    offset_px=(0.0, 0.0),
+                    keypoints_drone=pts_drone,
+                    keypoints_sat=pts_sat
             )
-        
-        # Compute confidence
-        inlier_ratio = num_inliers / num_matches if num_matches > 0 else 0
-        reproj_score = max(0, 1 - reproj_error / 10.0)  # 0-1 score
-        confidence = inlier_ratio * reproj_score
+
+        # Check minimum inliers after geometric sanity checks.
+        if num_inliers < self.min_inliers:
+            return MatchResult(
+                success=False,
+                H=H,
+                num_matches=num_matches,
+                num_inliers=num_inliers,
+                reproj_error=reproj_error,
+                confidence=confidence,
+                offset_px=offset_px,
+                keypoints_drone=inlier_pts_drone if len(inlier_pts_drone) > 0 else pts_drone,
+                keypoints_sat=inlier_pts_sat if len(inlier_pts_sat) > 0 else pts_sat
+            )
         
         return MatchResult(
             success=True,

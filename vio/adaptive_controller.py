@@ -187,6 +187,11 @@ class AdaptiveController:
             "degraded_r_extra": 1.2,
             "degraded_chi2_extra": 0.95,
             "phase_profiles": {
+                "VIO_VEL": {
+                    "0": {"chi2_scale": 1.20, "r_scale": 1.35},
+                    "1": {"chi2_scale": 1.10, "r_scale": 1.20},
+                    "2": {"chi2_scale": 1.00, "r_scale": 1.00},
+                },
                 "ZUPT": {
                     "0": {"chi2_scale": 0.80, "r_scale": 1.50, "acc_threshold_scale": 0.80, "gyro_threshold_scale": 0.80, "max_v_scale": 0.70},
                     "1": {"chi2_scale": 0.90, "r_scale": 1.20, "acc_threshold_scale": 0.90, "gyro_threshold_scale": 0.90, "max_v_scale": 0.85},
@@ -219,6 +224,24 @@ class AdaptiveController:
                     WARNING: 1.2,
                     DEGRADED: 1.4,
                     RECOVERY: 1.1,
+                },
+            },
+            "vio_vel_fail_soft": {
+                "enabled": True,
+                "hard_reject_factor": 3.0,
+                "max_r_scale": 12.0,
+                "inflate_power": 1.0,
+                "health_hard_factor": {
+                    HEALTHY: 1.0,
+                    WARNING: 1.15,
+                    DEGRADED: 1.30,
+                    RECOVERY: 1.10,
+                },
+                "health_r_cap_factor": {
+                    HEALTHY: 1.0,
+                    WARNING: 1.15,
+                    DEGRADED: 1.30,
+                    RECOVERY: 1.10,
                 },
             },
             "gravity_alignment": {
@@ -574,6 +597,21 @@ class AdaptiveController:
                 sensor_scales["hard_reject_factor"] = max(1.0, hard_factor)
                 sensor_scales["soft_r_cap"] = max(1.0, r_cap)
                 sensor_scales["soft_r_power"] = max(0.1, float(zupt_cfg.get("inflate_power", 1.0)))
+
+            if sensor == "VIO_VEL":
+                vio_soft_cfg = meas_cfg.get("vio_vel_fail_soft", {})
+                hard_factor = float(vio_soft_cfg.get("hard_reject_factor", 3.0))
+                hard_factor *= float(
+                    vio_soft_cfg.get("health_hard_factor", {}).get(self.health_state, 1.0)
+                )
+                r_cap = float(vio_soft_cfg.get("max_r_scale", 12.0))
+                r_cap *= float(
+                    vio_soft_cfg.get("health_r_cap_factor", {}).get(self.health_state, 1.0)
+                )
+                sensor_scales["fail_soft_enable"] = 1.0 if bool(vio_soft_cfg.get("enabled", True)) else 0.0
+                sensor_scales["hard_reject_factor"] = max(1.0, hard_factor)
+                sensor_scales["soft_r_cap"] = max(1.0, r_cap)
+                sensor_scales["soft_r_power"] = max(0.1, float(vio_soft_cfg.get("inflate_power", 1.0)))
 
             if sensor == "GRAVITY_RP":
                 grav_cfg = meas_cfg.get("gravity_alignment", {})

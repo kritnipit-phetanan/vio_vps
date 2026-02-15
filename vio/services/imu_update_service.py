@@ -56,6 +56,7 @@ class IMUUpdateService:
         zupt_enabled = bool(runner.global_config.get("ZUPT_ENABLED", True))
         base_acc_threshold = float(runner.global_config.get("ZUPT_ACCEL_THRESHOLD", 0.5))
         base_gyro_threshold = float(runner.global_config.get("ZUPT_GYRO_THRESHOLD", 0.05))
+        base_vel_threshold = float(runner.global_config.get("ZUPT_VELOCITY_THRESHOLD", 0.3))
         base_max_v_for_zupt = float(runner.global_config.get("ZUPT_MAX_V_FOR_UPDATE", 20.0))
         zupt_policy_scales, zupt_apply_scales = runner.adaptive_service.get_sensor_adaptive_scales("ZUPT")
         if zupt_scales is not None:
@@ -71,7 +72,27 @@ class IMUUpdateService:
             imu_params=imu_params,
             acc_threshold=acc_threshold,
             gyro_threshold=gyro_threshold,
+            vel_threshold=base_vel_threshold * float(zupt_apply_scales.get("vel_threshold_scale", 1.0)),
         )
+
+        # Camera-motion guard: if recent optical flow indicates motion, suppress ZUPT.
+        # This prevents false stationary detection during smooth forward flight.
+        flow_guard_px = float(runner.global_config.get("ZUPT_FLOW_GUARD_PX", 1.0))
+        flow_guard_window_sec = float(runner.global_config.get("ZUPT_FLOW_GUARD_WINDOW_SEC", 0.30))
+        if is_stationary and getattr(runner, "vio_fe", None) is not None:
+            try:
+                last_cam_t = getattr(runner.vio_fe, "last_frame_time", None)
+                last_flow_px = float(getattr(runner.vio_fe, "last_flow_px", 0.0))
+                if (
+                    last_cam_t is not None
+                    and np.isfinite(last_cam_t)
+                    and abs(float(rec.t) - float(last_cam_t)) <= flow_guard_window_sec
+                    and np.isfinite(last_flow_px)
+                    and last_flow_px >= flow_guard_px
+                ):
+                    is_stationary = False
+            except Exception:
+                pass
 
         if zupt_enabled and is_stationary:
             runner.state.zupt_detected += 1

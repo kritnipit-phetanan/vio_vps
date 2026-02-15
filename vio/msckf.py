@@ -156,6 +156,21 @@ def _get_active_body_to_camera_transform(global_config: Optional[dict]) -> np.nd
     return np.asarray(BODY_T_CAMDOWN, dtype=np.float64)
 
 
+def _decompose_body_to_camera_transform(T_body_cam: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Decompose body->camera transform into forward and inverse components.
+
+    Returns:
+        R_BC, t_BC, R_CB, t_CB
+    """
+    t_mat = np.asarray(T_body_cam, dtype=np.float64)
+    R_BC = t_mat[:3, :3]
+    t_BC = t_mat[:3, 3]
+    R_CB = R_BC.T
+    t_CB = -R_CB @ t_BC
+    return R_BC, t_BC, R_CB, t_CB
+
+
 def imu_pose_to_camera_pose(q_imu: np.ndarray, p_imu: np.ndarray, 
                             T_body_cam: np.ndarray = None,
                             global_config: dict = None) -> Tuple[np.ndarray, np.ndarray]:
@@ -174,27 +189,22 @@ def imu_pose_to_camera_pose(q_imu: np.ndarray, p_imu: np.ndarray,
     """
     if T_body_cam is None:
         T_body_cam = _get_active_body_to_camera_transform(global_config)
-    
-    # Extract Body→Camera transform
-    R_BC = T_body_cam[:3, :3]
-    t_BC = T_body_cam[:3, 3]
-    
-    # Invert to get Camera→Body
-    R_CB = R_BC.T
-    t_CB = -R_BC.T @ t_BC
-    
-    # IMU/Body rotation
+
+    # Body->camera extrinsics (T_BC) from calibration.
+    _, _, R_CB, t_CB = _decompose_body_to_camera_transform(T_body_cam)
+
+    # IMU/body orientation (R_BW: body -> world)
     q_imu_xyzw = np.array([q_imu[1], q_imu[2], q_imu[3], q_imu[0]])
     R_BW = R_scipy.from_quat(q_imu_xyzw).as_matrix()
-    
-    # Camera orientation: R_CW = R_BW @ R_CB
+
+    # Camera pose in world.
     R_CW = R_BW @ R_CB
     q_cam_xyzw = R_scipy.from_matrix(R_CW).as_quat()
     q_cam = np.array([q_cam_xyzw[3], q_cam_xyzw[0], q_cam_xyzw[1], q_cam_xyzw[2]])
-    
-    # Camera position: t_WC = t_WB + R_BW @ t_CB
+
+    # t_CB is camera origin in body frame.
     p_cam = p_imu + R_BW @ t_CB
-    
+
     return q_cam, p_cam
 
 
@@ -656,12 +666,17 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
         p_ray1 = p1 + t_pair * ray1_w
         p_candidate = 0.5 * (p_ray0 + p_ray1)
 
-        depth0 = float(np.dot(p_candidate - p0, ray0_w))
-        depth1 = float(np.dot(p_candidate - p1, ray1_w))
-        if depth0 < -0.5 or depth1 < -0.5:
+        # Use camera-frame cheirality check (z>0) for consistency with projection model.
+        p_c0 = R0_cw.T @ (p_candidate - p0)
+        p_c1 = R1_cw.T @ (p_candidate - p1)
+        depth0 = float(p_c0[2])
+        depth1 = float(p_c1[2])
+        min_depth_m = 0.05
+        max_depth_m = 700.0
+        if depth0 <= min_depth_m or depth1 <= min_depth_m:
             fail_counts["depth"] += 1
             continue
-        if depth0 > 500.0 or depth1 > 500.0:
+        if depth0 > max_depth_m or depth1 > max_depth_m:
             fail_counts["depth"] += 1
             continue
 
@@ -754,6 +769,19 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
     norm_threshold = MAX_REPROJ_ERROR_PX / max(1e-6, norm_scale_px)
     ray_threshold_deg = float(np.degrees(np.arctan(MAX_REPROJ_ERROR_PX / max(1e-6, norm_scale_px))))
     ray_threshold_deg = float(np.clip(ray_threshold_deg, 0.3, 8.0))
+    ray_soft_factor = 1.8
+    pixel_soft_factor = 1.6
+    avg_gate_factor = 2.0
+    try:
+        if isinstance(global_config, dict):
+            ray_soft_factor = float(global_config.get("MSCKF_RAY_SOFT_FACTOR", ray_soft_factor))
+            pixel_soft_factor = float(global_config.get("MSCKF_PIXEL_SOFT_FACTOR", pixel_soft_factor))
+            avg_gate_factor = float(global_config.get("MSCKF_AVG_REPROJ_GATE_FACTOR", avg_gate_factor))
+    except Exception:
+        pass
+    ray_soft_factor = float(np.clip(ray_soft_factor, 1.0, 6.0))
+    pixel_soft_factor = float(np.clip(pixel_soft_factor, 1.0, 6.0))
+    avg_gate_factor = float(np.clip(avg_gate_factor, 1.0, 6.0))
     
     for obs in obs_list:
         cam_id = obs['cam_id']
@@ -797,31 +825,37 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
         ray_pred /= max(1e-9, np.linalg.norm(ray_pred))
         ray_obs = normalized_to_unit_ray(float(x_obs), float(y_obs))
         ray_err_deg = float(np.degrees(np.arccos(np.clip(np.dot(ray_pred, ray_obs), -1.0, 1.0))))
-        if ray_err_deg > ray_threshold_deg:
+        has_pixel_obs = bool(use_pixel_reprojection and ('pt_px' in obs) and (obs['pt_px'] is not None))
+        ray_gate = ray_threshold_deg * (ray_soft_factor if has_pixel_obs else 1.0)
+        if ray_err_deg > ray_gate:
             reproj_rejects += 1
             continue
+        obs_error_metric = float(norm_error)
         
         # NEW: Pixel-level reprojection validation (if K, D available)
-        if use_pixel_reprojection:
+        if has_pixel_obs:
             # Project 3D point to pixel coordinates
             pts_reproj = kannala_brandt_project(p_c.reshape(1, 3), K, D)
             
             if pts_reproj.size > 0:
-                # Get observed pixel coordinates (if stored in obs)
-                if 'pt_px' in obs and obs['pt_px'] is not None:
-                    pt_obs_px = np.array(obs['pt_px'])
-                    pt_pred_px = pts_reproj[0]
-                    
-                    pixel_error = np.linalg.norm(pt_pred_px - pt_obs_px)
+                pt_obs_px = np.array(obs['pt_px'], dtype=float).reshape(-1)
+                if pt_obs_px.size >= 2:
+                    pt_obs_px = pt_obs_px[:2]
+                    pt_pred_px = np.array(pts_reproj[0], dtype=float).reshape(2,)
+                    pixel_error = float(np.linalg.norm(pt_pred_px - pt_obs_px))
                     max_pixel_error = max(max_pixel_error, pixel_error)
-                    
-                    # Reject if pixel error exceeds adaptive threshold
-                    # v2.9.10.0: Use same adaptive threshold as normalized error
-                    if pixel_error > MAX_REPROJ_ERROR_PX:
+
+                    pixel_soft = MAX_REPROJ_ERROR_PX * pixel_soft_factor
+                    if pixel_error > pixel_soft:
                         reproj_rejects += 1
                         continue
 
-        total_error += float(norm_error)
+                    # Fail-soft: keep borderline observations but penalize quality.
+                    obs_error_metric = min(pixel_error, pixel_soft) / max(1e-6, norm_scale_px)
+                    if pixel_error > MAX_REPROJ_ERROR_PX:
+                        obs_error_metric *= 1.15
+
+        total_error += float(obs_error_metric)
         valid_obs.append(obs)
 
     if len(valid_obs) < 2:
@@ -833,7 +867,7 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
 
     avg_error = total_error / len(valid_obs)
     
-    if avg_error > (1.5 * norm_threshold):
+    if avg_error > (avg_gate_factor * norm_threshold):
         MSCKF_STATS['fail_reproj_error'] += 1
         
         # [DIAGNOSTIC] Log reprojection failures to identify root cause
@@ -897,9 +931,7 @@ def compute_measurement_jacobian(p_w: np.ndarray, cam_state: dict,
     """
     if T_cam_imu is None:
         T_cam_imu = _get_active_body_to_camera_transform(global_config)
-    
-    R_cam_imu = T_cam_imu[:3, :3]
-    t_cam_imu = T_cam_imu[:3, 3]
+    R_BC, _, _, t_CB = _decompose_body_to_camera_transform(T_cam_imu)
     
     # Get IMU pose (FEJ if available)
     if 'q_fej' in cam_state and 'p_fej' in cam_state:
@@ -913,14 +945,14 @@ def compute_measurement_jacobian(p_w: np.ndarray, cam_state: dict,
     
     # Transform to camera pose
     q_imu_xyzw = np.array([q_imu[1], q_imu[2], q_imu[3], q_imu[0]])
-    R_w_imu = R_scipy.from_quat(q_imu_xyzw).as_matrix()
-    
-    R_w_cam = R_w_imu @ R_cam_imu.T
-    p_cam = p_imu + R_w_imu @ t_cam_imu
+    R_BW = R_scipy.from_quat(q_imu_xyzw).as_matrix()
+    R_CW = R_BW @ R_BC.T
+    R_WC = R_CW.T
+    p_cam = p_imu + R_BW @ t_CB
     
     # Transform point to camera frame
     p_rel = p_w - p_cam
-    p_c = R_w_cam.T @ p_rel
+    p_c = R_WC @ p_rel
     
     # Projection Jacobian
     inv_z = 1.0 / p_c[2]
@@ -932,7 +964,7 @@ def compute_measurement_jacobian(p_w: np.ndarray, cam_state: dict,
     ])
     
     # Jacobian w.r.t. feature
-    h_feat = j_proj @ R_w_cam.T
+    h_feat = j_proj @ R_WC
     
     # Jacobian w.r.t. error state
     h_cam = np.zeros((2, err_state_size))
@@ -941,13 +973,12 @@ def compute_measurement_jacobian(p_w: np.ndarray, cam_state: dict,
     err_p_idx = cam_state['err_p_idx']
     
     # Position Jacobian
-    h_cam[:, err_p_idx:err_p_idx+3] = j_proj @ (-R_w_cam.T)
+    h_cam[:, err_p_idx:err_p_idx+3] = j_proj @ (-R_WC)
     
-    # Rotation Jacobian
-    t_cam_world = R_w_imu @ t_cam_imu
-    p_rel_total = p_rel + t_cam_world
-    skew_p_rel = skew_symmetric(p_rel_total)
-    j_rot = j_proj @ (-R_w_cam.T @ skew_p_rel @ R_cam_imu)
+    # Rotation Jacobian (body error-state): p_c = R_BC * R_BW^T * (p_w - p_imu) + t_BC
+    p_wi = p_w - p_imu
+    p_b = R_BW.T @ p_wi
+    j_rot = j_proj @ (-R_BC @ skew_symmetric(p_b))
     h_cam[:, err_theta_idx:err_theta_idx+3] = j_rot
     
     # Preintegration Jacobians (bias coupling)
@@ -968,11 +999,11 @@ def compute_measurement_jacobian(p_w: np.ndarray, cam_state: dict,
     # Apply bias Jacobians only if valid 3x3 matrices
     if J_R_bg is not None and hasattr(J_R_bg, 'shape') and J_R_bg.shape == (3, 3):
         
-        R_clone = R_w_imu
+        R_clone = R_BW
         
         # Gyro bias
-        h_cam[:, 9:12] += j_rot @ R_cam_imu @ J_R_bg
-        j_pos = j_proj @ (-R_w_cam.T)
+        h_cam[:, 9:12] += j_rot @ J_R_bg
+        j_pos = j_proj @ (-R_WC)
         h_cam[:, 9:12] += j_pos @ R_clone @ J_p_bg
         
         # Accel bias
@@ -1888,6 +1919,7 @@ def trigger_msckf_update(kf, cam_states: list, cam_observations: list,
                          global_config: dict = None,
                          chi2_scale: float = 1.0,
                          reproj_scale: float = 1.0,
+                         phase: int = 2,
                          adaptive_info: Optional[Dict[str, Any]] = None) -> int:
     """
     Trigger MSCKF multi-view geometric update.
@@ -1921,6 +1953,7 @@ def trigger_msckf_update(kf, cam_states: list, cam_observations: list,
                 "chi2": np.nan,
                 "threshold": np.nan,
                 "r_scale_used": 1.0,
+                "phase": int(phase),
             })
         return 0
     
@@ -1964,15 +1997,20 @@ def trigger_msckf_update(kf, cam_states: list, cam_observations: list,
             )
             if adaptive_info is not None:
                 adaptive_info.clear()
-                adaptive_info.update(stats if len(stats) > 0 else {
-                    "sensor": "MSCKF",
-                    "accepted": bool(num_updates > 0),
-                    "dof": 1,
-                    "nis_norm": np.nan,
-                    "chi2": np.nan,
-                    "threshold": np.nan,
-                    "r_scale_used": 1.0,
-                })
+                if len(stats) > 0:
+                    adaptive_info.update(stats)
+                    adaptive_info["phase"] = int(phase)
+                else:
+                    adaptive_info.update({
+                        "sensor": "MSCKF",
+                        "accepted": bool(num_updates > 0),
+                        "dof": 1,
+                        "nis_norm": np.nan,
+                        "chi2": np.nan,
+                        "threshold": np.nan,
+                        "r_scale_used": 1.0,
+                        "phase": int(phase),
+                    })
             if num_updates > 0:
                 _log_msckf_update(f"[MSCKF] Updated {num_updates} features at t={t:.3f}s")
             return num_updates
@@ -1988,6 +2026,7 @@ def trigger_msckf_update(kf, cam_states: list, cam_observations: list,
                     "chi2": np.nan,
                     "threshold": np.nan,
                     "r_scale_used": 1.0,
+                    "phase": int(phase),
                 })
             return 0
     
@@ -2002,6 +2041,7 @@ def trigger_msckf_update(kf, cam_states: list, cam_observations: list,
             "threshold": np.nan,
             "r_scale_used": 1.0,
             "attempted": 0,
+            "phase": int(phase),
         })
     
     return 0

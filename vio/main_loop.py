@@ -122,6 +122,9 @@ class VIORunner:
         self.convention_csv = None
         self.adaptive_debug_csv = None
         self.sensor_health_csv = None
+        self.mag_quality_csv = None
+        self.sensor_time_audit_csv = None
+        self.vps_reloc_summary_csv = None
         self.conditioning_events_csv = None
         self.benchmark_health_summary_csv = None
         
@@ -155,6 +158,7 @@ class VIORunner:
         
         # Timestamp base tracking (for GT/error alignment)
         self.imu_time_col: Optional[str] = None
+        self.time_ref_pps_csv: Optional[str] = None
         self.error_time_scale: float = 1.0
         self.error_time_offset: float = 0.0
         self.error_time_mode: str = "identity"

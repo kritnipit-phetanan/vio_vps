@@ -44,6 +44,7 @@ class VPSDebugLogger:
         self.attempts_csv = None
         self.matches_csv = None
         self.profile_csv = None
+        self.diagnostics_csv = None
         
         if self.enabled:
             self._init_files()
@@ -55,7 +56,12 @@ class VPSDebugLogger:
         # VPS Attempts CSV
         self.attempts_csv = os.path.join(self.output_dir, "debug_vps_attempts.csv")
         with open(self.attempts_csv, "w", newline="") as f:
-            f.write("t,frame,est_lat,est_lon,est_alt,est_yaw_deg,success,reason,processing_time_ms\n")
+            f.write(
+                "t,frame,est_lat,est_lon,est_alt,est_yaw_deg,success,reason,processing_time_ms,"
+                "patch_size_px,candidate_idx,num_candidates,selected_yaw_deg,selected_scale_mult,"
+                "selected_content_ratio,selected_texture_std,best_num_matches,best_num_inliers,"
+                "best_reproj_error,best_confidence\n"
+            )
         
         # VPS Matches CSV
         self.matches_csv = os.path.join(self.output_dir, "debug_vps_matches.csv")
@@ -66,7 +72,19 @@ class VPSDebugLogger:
         # VPS Stage Profile CSV (tile/preprocess/match/pose breakdown)
         self.profile_csv = os.path.join(self.output_dir, "debug_vps_profile.csv")
         with open(self.profile_csv, "w", newline="") as f:
-            f.write("t,frame,success,reason,total_ms,tile_ms,preprocess_ms,match_ms,pose_ms\n")
+            f.write(
+                "t,frame,success,reason,total_ms,tile_ms,preprocess_ms,match_ms,pose_ms,"
+                "num_matches,num_inliers,reproj_error,confidence,content_ratio,texture_std\n"
+            )
+
+        # Candidate diagnostics (one row per hypothesis)
+        self.diagnostics_csv = os.path.join(self.output_dir, "debug_vps_diagnostics.csv")
+        with open(self.diagnostics_csv, "w", newline="") as f:
+            f.write(
+                "t,frame,candidate_idx,num_candidates,patch_size_px,yaw_delta_deg,scale_mult,"
+                "rotation_deg,content_ratio,texture_std,num_matches,num_inliers,reproj_error,"
+                "confidence,match_success,decision\n"
+            )
     
     def log_attempt(self, 
                    t: float,
@@ -77,7 +95,18 @@ class VPSDebugLogger:
                    est_yaw_deg: float,
                    success: bool,
                    reason: str,
-                   processing_time_ms: float = 0.0):
+                   processing_time_ms: float = 0.0,
+                   patch_size_px: int = 0,
+                   candidate_idx: int = -1,
+                   num_candidates: int = 0,
+                   selected_yaw_deg: float = float("nan"),
+                   selected_scale_mult: float = float("nan"),
+                   selected_content_ratio: float = float("nan"),
+                   selected_texture_std: float = float("nan"),
+                   best_num_matches: int = 0,
+                   best_num_inliers: int = 0,
+                   best_reproj_error: float = float("nan"),
+                   best_confidence: float = float("nan")):
         """
         Log a VPS processing attempt.
         
@@ -97,8 +126,15 @@ class VPSDebugLogger:
         
         try:
             with open(self.attempts_csv, "a", newline="") as f:
-                f.write(f"{t:.6f},{frame},{est_lat:.8f},{est_lon:.8f},{est_alt:.2f},"
-                       f"{est_yaw_deg:.2f},{int(success)},{reason},{processing_time_ms:.2f}\n")
+                f.write(
+                    f"{t:.6f},{frame},{est_lat:.8f},{est_lon:.8f},{est_alt:.2f},"
+                    f"{est_yaw_deg:.2f},{int(success)},{reason},{processing_time_ms:.2f},"
+                    f"{int(patch_size_px)},{int(candidate_idx)},{int(num_candidates)},"
+                    f"{selected_yaw_deg:.2f},{selected_scale_mult:.3f},"
+                    f"{selected_content_ratio:.4f},{selected_texture_std:.3f},"
+                    f"{int(best_num_matches)},{int(best_num_inliers)},"
+                    f"{best_reproj_error:.3f},{best_confidence:.3f}\n"
+                )
         except Exception:
             pass
     
@@ -153,7 +189,13 @@ class VPSDebugLogger:
                     tile_ms: float,
                     preprocess_ms: float,
                     match_ms: float,
-                    pose_ms: float):
+                    pose_ms: float,
+                    num_matches: int = 0,
+                    num_inliers: int = 0,
+                    reproj_error: float = float("nan"),
+                    confidence: float = float("nan"),
+                    content_ratio: float = float("nan"),
+                    texture_std: float = float("nan")):
         """Log per-stage VPS processing time for profiling."""
         if not self.enabled or self.profile_csv is None:
             return
@@ -162,7 +204,40 @@ class VPSDebugLogger:
                 f.write(
                     f"{t:.6f},{frame},{int(success)},{reason},"
                     f"{total_ms:.2f},{tile_ms:.2f},{preprocess_ms:.2f},"
-                    f"{match_ms:.2f},{pose_ms:.2f}\n"
+                    f"{match_ms:.2f},{pose_ms:.2f},"
+                    f"{int(num_matches)},{int(num_inliers)},{reproj_error:.3f},"
+                    f"{confidence:.3f},{content_ratio:.4f},{texture_std:.3f}\n"
+                )
+        except Exception:
+            pass
+
+    def log_candidate(self,
+                      t: float,
+                      frame: int,
+                      candidate_idx: int,
+                      num_candidates: int,
+                      patch_size_px: int,
+                      yaw_delta_deg: float,
+                      scale_mult: float,
+                      rotation_deg: float,
+                      content_ratio: float,
+                      texture_std: float,
+                      num_matches: int,
+                      num_inliers: int,
+                      reproj_error: float,
+                      confidence: float,
+                      match_success: bool,
+                      decision: str):
+        """Log per-candidate VPS matching diagnostics."""
+        if not self.enabled or self.diagnostics_csv is None:
+            return
+        try:
+            with open(self.diagnostics_csv, "a", newline="") as f:
+                f.write(
+                    f"{t:.6f},{frame},{int(candidate_idx)},{int(num_candidates)},{int(patch_size_px)},"
+                    f"{yaw_delta_deg:.2f},{scale_mult:.3f},{rotation_deg:.2f},"
+                    f"{content_ratio:.4f},{texture_std:.3f},{int(num_matches)},{int(num_inliers)},"
+                    f"{reproj_error:.3f},{confidence:.3f},{int(match_success)},{decision}\n"
                 )
         except Exception:
             pass

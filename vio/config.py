@@ -107,6 +107,7 @@ class VIOConfig:
     images_dir: Optional[str] = None
     images_index_csv: Optional[str] = None
     timeref_csv: Optional[str] = None
+    timeref_pps_csv: Optional[str] = None
     vps_csv: Optional[str] = None
     mbtiles_path: Optional[str] = None  # VPS MBTiles file (like dem_path)
     mag_csv: Optional[str] = None
@@ -281,6 +282,8 @@ def load_config(config_path: str) -> VIOConfig:
     result['ZUPT_GYRO_THRESHOLD'] = float(zupt.get('gyro_threshold', 0.05))
     result['ZUPT_VELOCITY_THRESHOLD'] = float(zupt.get('velocity_threshold', 0.3))
     result['ZUPT_MAX_V_FOR_UPDATE'] = float(zupt.get('max_v_for_zupt', 20.0))
+    result['ZUPT_FLOW_GUARD_PX'] = float(zupt.get('flow_guard_px', 1.0))
+    result['ZUPT_FLOW_GUARD_WINDOW_SEC'] = float(zupt.get('flow_guard_window_sec', 0.30))
     
     # Magnetometer calibration
     mag = config['magnetometer']
@@ -367,11 +370,26 @@ def load_config(config_path: str) -> VIOConfig:
     result['MSCKF_MAX_REPROJECTION_ERROR'] = vio['msckf_max_reprojection_error']
     result['VO_MIN_INLIERS'] = vio['min_inliers']
     result['VO_RATIO_TEST'] = vio['ratio_test']
+    # Optical-flow velocity scale mode: fixed | dynamic | hybrid
+    result['VIO_FLOW_AGL_MODE'] = str(vio.get('flow_agl_mode', 'hybrid')).lower()
+    result['VIO_FLOW_MIN_AGL'] = float(vio.get('flow_min_agl', 1.0))
+    result['VIO_FLOW_MAX_AGL'] = float(vio.get('flow_max_agl', 500.0))
     
     # MSCKF sliding window parameters (v3.9.1)
     msckf_cfg = vio.get('msckf', {})
     result['MSCKF_MAX_CLONE_SIZE'] = msckf_cfg.get('max_clone_size', 11)
     result['MSCKF_MIN_TRACK_LENGTH'] = msckf_cfg.get('min_track_length', 4)
+    result['MSCKF_PHASE_CHI2_SCALE'] = msckf_cfg.get(
+        'phase_chi2_scale',
+        {'0': 1.20, '1': 1.08, '2': 1.00}
+    )
+    result['MSCKF_PHASE_REPROJ_SCALE'] = msckf_cfg.get(
+        'phase_reproj_scale',
+        {'0': 1.15, '1': 1.05, '2': 0.95}
+    )
+    result['MSCKF_RAY_SOFT_FACTOR'] = float(msckf_cfg.get('ray_soft_factor', 1.8))
+    result['MSCKF_PIXEL_SOFT_FACTOR'] = float(msckf_cfg.get('pixel_soft_factor', 1.6))
+    result['MSCKF_AVG_REPROJ_GATE_FACTOR'] = float(msckf_cfg.get('avg_reproj_gate_factor', 2.0))
     result['VO_NADIR_ALIGN_DEG'] = vio['views']['nadir']['nadir_threshold_deg']
     result['VO_FRONT_ALIGN_DEG'] = vio['views']['front']['nadir_threshold_deg']
     
@@ -506,6 +524,54 @@ def load_config(config_path: str) -> VIOConfig:
         result['trn'] = {}
 
     # =========================================================================
+    # Objective / optimization mode (accuracy-first vs runtime-first)
+    # =========================================================================
+    opt_cfg = config.get('optimization', {})
+    result['OBJECTIVE_MODE'] = str(opt_cfg.get('objective', 'stability')).lower()
+    result['COMPUTE_BUDGET'] = str(opt_cfg.get('compute_budget', 'low')).lower()
+
+    # =========================================================================
+    # VPS accuracy mode + relocalization policy
+    # =========================================================================
+    vps_cfg = config.get('vps', {})
+    result['VPS_ACCURACY_MODE'] = bool(vps_cfg.get('accuracy_mode', False))
+
+    vps_reloc_defaults = {
+        'enabled': True,
+        'global_interval_sec': 12.0,
+        'fail_streak_trigger': 6,
+        'stale_success_sec': 8.0,
+        'xy_sigma_trigger_m': 35.0,
+        'max_centers': 10,
+        'ring_radius_m': [35.0, 80.0],
+        'ring_samples': 8,
+        'global_yaw_hypotheses_deg': [0.0, 45.0, 90.0, 135.0, 180.0, -45.0, -90.0, -135.0],
+        'global_scale_hypotheses': [0.80, 0.90, 1.00, 1.10, 1.20],
+        'force_global_on_warning_phase': False,
+    }
+    result['VPS_RELOCALIZATION'] = _merge_dict_defaults(
+        vps_reloc_defaults, vps_cfg.get('relocalization', {})
+    )
+    _vps_reloc = result['VPS_RELOCALIZATION']
+    result['VPS_RELOC_ENABLED'] = bool(_vps_reloc.get('enabled', True))
+    result['VPS_RELOC_GLOBAL_INTERVAL_SEC'] = float(_vps_reloc.get('global_interval_sec', 12.0))
+    result['VPS_RELOC_FAIL_STREAK_TRIGGER'] = int(_vps_reloc.get('fail_streak_trigger', 6))
+    result['VPS_RELOC_STALE_SUCCESS_SEC'] = float(_vps_reloc.get('stale_success_sec', 8.0))
+    result['VPS_RELOC_XY_SIGMA_TRIGGER_M'] = float(_vps_reloc.get('xy_sigma_trigger_m', 35.0))
+    result['VPS_RELOC_MAX_CENTERS'] = int(_vps_reloc.get('max_centers', 10))
+    result['VPS_RELOC_RING_RADIUS_M'] = list(_vps_reloc.get('ring_radius_m', [35.0, 80.0]))
+    result['VPS_RELOC_RING_SAMPLES'] = int(_vps_reloc.get('ring_samples', 8))
+    result['VPS_RELOC_GLOBAL_YAW_HYPOTHESES_DEG'] = list(
+        _vps_reloc.get('global_yaw_hypotheses_deg', [0.0, 45.0, 90.0, 135.0, 180.0, -45.0, -90.0, -135.0])
+    )
+    result['VPS_RELOC_GLOBAL_SCALE_HYPOTHESES'] = list(
+        _vps_reloc.get('global_scale_hypotheses', [0.80, 0.90, 1.00, 1.10, 1.20])
+    )
+    result['VPS_RELOC_FORCE_GLOBAL_ON_WARNING_PHASE'] = bool(
+        _vps_reloc.get('force_global_on_warning_phase', False)
+    )
+
+    # =========================================================================
     # NEW: Adaptive + State-aware control policy (IMU-driven)
     # =========================================================================
     adaptive_defaults = {
@@ -610,6 +676,11 @@ def load_config(config_path: str) -> VIOConfig:
             'degraded_r_extra': 1.2,
             'degraded_chi2_extra': 0.95,
             'phase_profiles': {
+                'VIO_VEL': {
+                    '0': {'chi2_scale': 1.20, 'r_scale': 1.35},
+                    '1': {'chi2_scale': 1.10, 'r_scale': 1.20},
+                    '2': {'chi2_scale': 1.00, 'r_scale': 1.00},
+                },
                 'ZUPT': {
                     '0': {'chi2_scale': 0.80, 'r_scale': 1.50, 'acc_threshold_scale': 0.80, 'gyro_threshold_scale': 0.80, 'max_v_scale': 0.70},
                     '1': {'chi2_scale': 0.90, 'r_scale': 1.20, 'acc_threshold_scale': 0.90, 'gyro_threshold_scale': 0.90, 'max_v_scale': 0.85},
@@ -642,6 +713,24 @@ def load_config(config_path: str) -> VIOConfig:
                     'WARNING': 1.2,
                     'DEGRADED': 1.4,
                     'RECOVERY': 1.1,
+                },
+            },
+            'vio_vel_fail_soft': {
+                'enabled': True,
+                'hard_reject_factor': 3.0,
+                'max_r_scale': 12.0,
+                'inflate_power': 1.0,
+                'health_hard_factor': {
+                    'HEALTHY': 1.0,
+                    'WARNING': 1.15,
+                    'DEGRADED': 1.30,
+                    'RECOVERY': 1.10,
+                },
+                'health_r_cap_factor': {
+                    'HEALTHY': 1.0,
+                    'WARNING': 1.15,
+                    'DEGRADED': 1.30,
+                    'RECOVERY': 1.10,
                 },
             },
             'gravity_alignment': {
@@ -768,12 +857,51 @@ def load_config(config_path: str) -> VIOConfig:
     }
     result['ADAPTIVE'] = _merge_dict_defaults(adaptive_defaults, config.get('adaptive', {}))
 
+    # =========================================================================
+    # Magnetometer accuracy policy (quality-aware, weak fail-soft)
+    # =========================================================================
+    mag_accuracy_defaults = {
+        'enabled': True,
+        'good_min_score': 0.72,
+        'mid_min_score': 0.45,
+        'r_inflate_mid': 1.8,
+        'r_inflate_bad': 3.0,
+        'norm_window': 200,
+        'norm_dev_good': 0.12,
+        'norm_dev_bad': 0.30,
+        'gyro_delta_soft_deg': 20.0,
+        'gyro_delta_hard_deg': 65.0,
+        'vision_delta_soft_deg': 30.0,
+        'vision_delta_hard_deg': 90.0,
+        'vision_weight': 0.25,
+        'skip_on_bad': True,
+    }
+    result['MAG_ACCURACY_POLICY'] = _merge_dict_defaults(
+        mag_accuracy_defaults, mag.get('accuracy_policy', {})
+    )
+    _mag_acc = result['MAG_ACCURACY_POLICY']
+    result['MAG_ACCURACY_ENABLED'] = bool(_mag_acc.get('enabled', True))
+    result['MAG_ACCURACY_GOOD_MIN_SCORE'] = float(_mag_acc.get('good_min_score', 0.72))
+    result['MAG_ACCURACY_MID_MIN_SCORE'] = float(_mag_acc.get('mid_min_score', 0.45))
+    result['MAG_ACCURACY_R_INFLATE_MID'] = float(_mag_acc.get('r_inflate_mid', 1.8))
+    result['MAG_ACCURACY_R_INFLATE_BAD'] = float(_mag_acc.get('r_inflate_bad', 3.0))
+    result['MAG_ACCURACY_NORM_WINDOW'] = int(_mag_acc.get('norm_window', 200))
+    result['MAG_ACCURACY_NORM_DEV_GOOD'] = float(_mag_acc.get('norm_dev_good', 0.12))
+    result['MAG_ACCURACY_NORM_DEV_BAD'] = float(_mag_acc.get('norm_dev_bad', 0.30))
+    result['MAG_ACCURACY_GYRO_DELTA_SOFT_DEG'] = float(_mag_acc.get('gyro_delta_soft_deg', 20.0))
+    result['MAG_ACCURACY_GYRO_DELTA_HARD_DEG'] = float(_mag_acc.get('gyro_delta_hard_deg', 65.0))
+    result['MAG_ACCURACY_VISION_DELTA_SOFT_DEG'] = float(_mag_acc.get('vision_delta_soft_deg', 30.0))
+    result['MAG_ACCURACY_VISION_DELTA_HARD_DEG'] = float(_mag_acc.get('vision_delta_hard_deg', 90.0))
+    result['MAG_ACCURACY_VISION_WEIGHT'] = float(_mag_acc.get('vision_weight', 0.25))
+    result['MAG_ACCURACY_SKIP_ON_BAD'] = bool(_mag_acc.get('skip_on_bad', True))
+
     # Compiler metadata (for debug/traceability)
     result['CONFIG_COMPILE_META'] = {
         'source': os.path.abspath(config_path),
         'estimator_mode': result['ESTIMATOR_MODE'],
         'accel_includes_gravity': bool(result['IMU_PARAMS']['accel_includes_gravity']),
         'adaptive_mode': result['ADAPTIVE']['mode'],
+        'objective_mode': result['OBJECTIVE_MODE'],
     }
     
     # =========================================================================

@@ -1870,6 +1870,25 @@ def clone_camera_for_msckf(kf: ExtendedKalmanFilter, t: float,
     """
     p_imu = kf.x[0:3, 0].reshape(3,)
     q_imu = kf.x[6:10, 0].reshape(4,)
+
+    # Collect observations first; if none, skip clone augmentation to avoid
+    # polluting MSCKF window with empty clones.
+    obs_data = []
+    if hasattr(vio_fe, 'get_tracks_for_frame'):
+        tracks = vio_fe.get_tracks_for_frame(frame_idx)
+        for fid, pt in tracks:
+            pt_array = np.array([[pt[0], pt[1]]], dtype=np.float32)
+            pt_norm = vio_fe._undistort_pts(pt_array).reshape(2,)
+            obs_data.append({
+                'fid': int(fid),
+                'pt_pixel': (float(pt[0]), float(pt[1])),
+                'pt_norm': (float(pt_norm[0]), float(pt_norm[1])),
+                'quality': 1.0
+            })
+
+    if len(obs_data) == 0:
+        _log_throttled("clone_skip_empty", f"[CLONE] Skip clone at frame={frame_idx} (0 observations)")
+        return -1
     
     try:
         start_idx = augment_state_with_camera(
@@ -1887,20 +1906,6 @@ def clone_camera_for_msckf(kf: ExtendedKalmanFilter, t: float,
         clone_idx = len(cam_states)
         err_theta_idx = 18 + 6 * clone_idx  # v3.9.7: 18D core error
         err_p_idx = 18 + 6 * clone_idx + 3
-        
-        # Record observations
-        obs_data = []
-        if hasattr(vio_fe, 'get_tracks_for_frame'):
-            tracks = vio_fe.get_tracks_for_frame(frame_idx)
-            for fid, pt in tracks:
-                pt_array = np.array([[pt[0], pt[1]]], dtype=np.float32)
-                pt_norm = vio_fe._undistort_pts(pt_array).reshape(2,)
-                obs_data.append({
-                    'fid': int(fid),
-                    'pt_pixel': (float(pt[0]), float(pt[1])),
-                    'pt_norm': (float(pt_norm[0]), float(pt_norm[1])),
-                    'quality': 1.0
-                })
         
         cam_state_entry = {
             'start_idx': start_idx,

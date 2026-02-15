@@ -345,6 +345,12 @@ class VIOFrontEnd:
             return False, 0, None, None, 0.0
         
         self.frame_idx += 1
+        # Reset per-frame motion outputs early to avoid stale fallback values
+        # when this frame exits early (e.g., low inliers / invalid E).
+        self.mean_parallax = 0.0
+        self.last_flow_px = 0.0
+        self.last_matches = None
+        self.last_num_inliers = 0
         num_tracked_successfully = 0
         
         # KLT tracking
@@ -437,7 +443,12 @@ class VIOFrontEnd:
             self._prune_old_tracks()
         
         # Pose estimation
-        dt_img = max(1e-3, t - (self.last_frame_time or t))
+        # NOTE: dt_img must be based on consecutive camera timestamps, even when
+        # pose recovery fails in previous frames. Otherwise dt_img inflates
+        # spuriously and downstream VO-velocity stale guards reject updates.
+        prev_frame_time = self.last_frame_time if self.last_frame_time is not None else t
+        dt_img = max(1e-3, float(t) - float(prev_frame_time))
+        self.last_frame_time = float(t)
         
         prev_pts = []
         curr_pts = []
@@ -585,8 +596,6 @@ class VIOFrontEnd:
             self.keyframe_gray = img_gray.copy()
             self.keyframe_frame_idx = self.frame_idx
             self.keyframe_tracked_ratio = 1.0
-        
-        self.last_frame_time = t
         
         # Replenish features
         self._replenish_features(img_gray)

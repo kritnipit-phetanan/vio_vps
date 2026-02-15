@@ -7,12 +7,13 @@ This module contains CSV logging and end-of-run summary/reporting logic so
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
 from scipy.spatial.transform import Rotation as R_scipy
 
+from ..data_loaders import interpolate_time_ref
 from ..math_utils import quaternion_to_yaw
 from ..msckf import print_msckf_stats
 from ..output_utils import (
@@ -21,6 +22,89 @@ from ..output_utils import (
     print_error_statistics,
 )
 from ..state_manager import imu_to_gnss_position
+
+
+def build_sensor_time_audit_rows(sensor_times: Dict[str, np.ndarray],
+                                 reference_sensor: str = "IMU",
+                                 in_range_frac_warn: float = 0.995,
+                                 nn_dt_p95_warn_sec: float = 0.005) -> List[Dict[str, float]]:
+    """
+    Build runtime time-base audit rows for all sensors against a reference stream.
+
+    Returns one dict per sensor with overlap and nearest-neighbor dt statistics.
+    """
+    rows: List[Dict[str, float]] = []
+    if reference_sensor not in sensor_times:
+        return rows
+
+    ref = np.asarray(sensor_times.get(reference_sensor, []), dtype=float)
+    ref = ref[np.isfinite(ref)]
+    if ref.size == 0:
+        return rows
+    ref = np.sort(ref)
+    ref_start = float(ref[0])
+    ref_end = float(ref[-1])
+
+    for sensor, arr in sensor_times.items():
+        t = np.asarray(arr, dtype=float)
+        t = t[np.isfinite(t)]
+        t = np.sort(t)
+        n = int(t.size)
+        if n == 0:
+            rows.append({
+                "sensor": sensor,
+                "start_t": np.nan,
+                "end_t": np.nan,
+                "samples": 0,
+                "overlap_start": np.nan,
+                "overlap_end": np.nan,
+                "overlap_sec": 0.0,
+                "in_range_frac": 0.0,
+                "nn_dt_mean_s": np.nan,
+                "nn_dt_p95_s": np.nan,
+                "nn_dt_max_s": np.nan,
+                "warn": 1.0,
+            })
+            continue
+
+        start_t = float(t[0])
+        end_t = float(t[-1])
+        overlap_start = float(max(start_t, ref_start))
+        overlap_end = float(min(end_t, ref_end))
+        overlap_sec = float(max(0.0, overlap_end - overlap_start))
+
+        in_range = (t >= ref_start) & (t <= ref_end)
+        in_range_frac = float(np.mean(in_range)) if n > 0 else 0.0
+
+        idx = np.searchsorted(ref, t, side="left")
+        idx_right = np.clip(idx, 0, ref.size - 1)
+        idx_left = np.clip(idx - 1, 0, ref.size - 1)
+        dt_right = np.abs(t - ref[idx_right])
+        dt_left = np.abs(t - ref[idx_left])
+        nn_dt = np.minimum(dt_left, dt_right)
+        nn_dt_mean = float(np.nanmean(nn_dt)) if nn_dt.size > 0 else np.nan
+        nn_dt_p95 = float(np.nanpercentile(nn_dt, 95)) if nn_dt.size > 0 else np.nan
+        nn_dt_max = float(np.nanmax(nn_dt)) if nn_dt.size > 0 else np.nan
+
+        warn = (
+            (in_range_frac < float(in_range_frac_warn))
+            or (np.isfinite(nn_dt_p95) and nn_dt_p95 > float(nn_dt_p95_warn_sec))
+        )
+        rows.append({
+            "sensor": sensor,
+            "start_t": start_t,
+            "end_t": end_t,
+            "samples": n,
+            "overlap_start": overlap_start,
+            "overlap_end": overlap_end,
+            "overlap_sec": overlap_sec,
+            "in_range_frac": in_range_frac,
+            "nn_dt_mean_s": nn_dt_mean,
+            "nn_dt_p95_s": nn_dt_p95,
+            "nn_dt_max_s": nn_dt_max,
+            "warn": 1.0 if warn else 0.0,
+        })
+    return rows
 
 
 class OutputReportingService:
@@ -113,6 +197,186 @@ class OutputReportingService:
             "PASS" if g_world_z < 0.0 else "WARN",
             "ENU expects gravity on -Z",
         )
+
+    def run_sensor_time_audit(self):
+        """Write one runtime time-base audit table for loaded sensors."""
+        audit_csv = getattr(self.runner, "sensor_time_audit_csv", None)
+        if not audit_csv:
+            return
+
+        sensor_times: Dict[str, np.ndarray] = {
+            "IMU": np.array([rec.t for rec in (self.runner.imu or [])], dtype=float),
+            "CAM": np.array([item.t for item in (self.runner.imgs or [])], dtype=float),
+            "MAG": np.array([item.t for item in (self.runner.mag_list or [])], dtype=float),
+            "GT": np.array(
+                pd.to_numeric(
+                    (self.runner.ppk_trajectory["stamp_log"] if self.runner.ppk_trajectory is not None and "stamp_log" in self.runner.ppk_trajectory else []),
+                    errors="coerce",
+                ),
+                dtype=float,
+            ),
+        }
+        if getattr(self.runner, "msl_interpolator", None) is not None and hasattr(self.runner.msl_interpolator, "times"):
+            sensor_times["MSL"] = np.array(self.runner.msl_interpolator.times, dtype=float)
+        if getattr(self.runner, "vps_list", None):
+            sensor_times["VPS_LIST"] = np.array([item.t for item in self.runner.vps_list], dtype=float)
+
+        rows = build_sensor_time_audit_rows(sensor_times, reference_sensor="IMU")
+        rows.extend(self._build_pps_mapping_rows(sensor_times.get("IMU", np.array([], dtype=float))))
+        if len(rows) == 0:
+            return
+
+        with open(audit_csv, "a", newline="") as f:
+            for row in rows:
+                f.write(
+                    f"{row['sensor']},{row['start_t']:.6f},{row['end_t']:.6f},{int(row['samples'])},"
+                    f"{row['overlap_start']:.6f},{row['overlap_end']:.6f},{row['overlap_sec']:.6f},"
+                    f"{row['in_range_frac']:.6f},{row['nn_dt_mean_s']:.6f},{row['nn_dt_p95_s']:.6f},"
+                    f"{row['nn_dt_max_s']:.6f},{int(row['warn'])}\n"
+                )
+
+        warns = [r for r in rows if int(r.get("warn", 0)) == 1]
+        if warns:
+            print("[TIME-AUDIT] WARN sensors:")
+            for row in warns:
+                print(
+                    f"  - {row['sensor']}: in_range_frac={row['in_range_frac']:.4f}, "
+                    f"nn_dt_p95={row['nn_dt_p95_s']*1000.0:.2f}ms"
+                )
+        else:
+            print("[TIME-AUDIT] PASS all sensors (reference=IMU)")
+
+    def _build_pps_mapping_rows(self, imu_ref_times: np.ndarray) -> List[Dict[str, float]]:
+        """
+        Build additional audit rows from /imu/time_ref_pps mapping quality.
+
+        Row semantics:
+        - sensor: "<SOURCE>_PPS_MAP"
+        - nn_dt_* columns store absolute mapping residual statistics (seconds)
+          between source time_ref and PPS-predicted time_ref from source ROS stamps.
+        """
+        rows: List[Dict[str, float]] = []
+        pps_csv = getattr(self.runner, "time_ref_pps_csv", None)
+        if not pps_csv or not os.path.isfile(pps_csv):
+            return rows
+
+        try:
+            pps_df = pd.read_csv(pps_csv)
+        except Exception:
+            return rows
+
+        if "time_ref" not in pps_df.columns:
+            return rows
+
+        ros_col = next((c for c in ("stamp_msg", "stamp_bag", "stamp_log") if c in pps_df.columns), None)
+        if ros_col is None:
+            return rows
+
+        map_df = pps_df[[ros_col, "time_ref"]].replace([np.inf, -np.inf], np.nan).dropna().copy()
+        if len(map_df) < 2:
+            return rows
+        map_df[ros_col] = pd.to_numeric(map_df[ros_col], errors="coerce")
+        map_df["time_ref"] = pd.to_numeric(map_df["time_ref"], errors="coerce")
+        map_df = map_df.dropna().sort_values(ros_col).drop_duplicates(subset=[ros_col], keep="first")
+        if len(map_df) < 2:
+            return rows
+
+        pairs = list(zip(map_df[ros_col].to_numpy(dtype=float), map_df["time_ref"].to_numpy(dtype=float)))
+        ros_min = float(map_df[ros_col].iloc[0])
+        ros_max = float(map_df[ros_col].iloc[-1])
+        ref = np.asarray(imu_ref_times, dtype=float)
+        ref = ref[np.isfinite(ref)]
+        ref_start = float(np.min(ref)) if ref.size else np.nan
+        ref_end = float(np.max(ref)) if ref.size else np.nan
+
+        source_streams: List[tuple[str, np.ndarray, np.ndarray]] = []
+
+        # IMU mapping: stamp_* -> time_ref from imu_with_ref.csv
+        try:
+            imu_df = pd.read_csv(self.runner.config.imu_path, usecols=["time_ref", ros_col])
+            imu_df = imu_df.replace([np.inf, -np.inf], np.nan).dropna()
+            if len(imu_df) > 0:
+                source_streams.append((
+                    "IMU",
+                    pd.to_numeric(imu_df[ros_col], errors="coerce").to_numpy(dtype=float),
+                    pd.to_numeric(imu_df["time_ref"], errors="coerce").to_numpy(dtype=float),
+                ))
+        except Exception:
+            pass
+
+        # Camera time_ref mapping (timeref_csv) if present.
+        if getattr(self.runner.config, "timeref_csv", None) and os.path.isfile(self.runner.config.timeref_csv):
+            try:
+                cam_df = pd.read_csv(self.runner.config.timeref_csv, usecols=["time_ref", ros_col])
+                cam_df = cam_df.replace([np.inf, -np.inf], np.nan).dropna()
+                if len(cam_df) > 0:
+                    source_streams.append((
+                        "CAM_TIMEREF",
+                        pd.to_numeric(cam_df[ros_col], errors="coerce").to_numpy(dtype=float),
+                        pd.to_numeric(cam_df["time_ref"], errors="coerce").to_numpy(dtype=float),
+                    ))
+            except Exception:
+                pass
+
+        # Magnetometer mapping: stamp_* from vector3.csv paired with converted mag_list time_ref.
+        if getattr(self.runner.config, "mag_csv", None) and os.path.isfile(self.runner.config.mag_csv) and getattr(self.runner, "mag_list", None):
+            try:
+                mag_df = pd.read_csv(self.runner.config.mag_csv, usecols=[ros_col]).replace([np.inf, -np.inf], np.nan).dropna()
+                mag_ros = pd.to_numeric(mag_df[ros_col], errors="coerce").to_numpy(dtype=float)
+                mag_ref = np.array([float(m.t) for m in self.runner.mag_list], dtype=float)
+                n = int(min(mag_ros.size, mag_ref.size))
+                if n > 0:
+                    source_streams.append(("MAG", mag_ros[:n], mag_ref[:n]))
+            except Exception:
+                pass
+
+        for src_name, t_ros_raw, t_ref_raw in source_streams:
+            t_ros = np.asarray(t_ros_raw, dtype=float)
+            t_ref = np.asarray(t_ref_raw, dtype=float)
+            n = int(min(t_ros.size, t_ref.size))
+            if n < 2:
+                continue
+            t_ros = t_ros[:n]
+            t_ref = t_ref[:n]
+            mask = np.isfinite(t_ros) & np.isfinite(t_ref)
+            if int(np.sum(mask)) < 2:
+                continue
+            t_ros = t_ros[mask]
+            t_ref = t_ref[mask]
+
+            t_ref_pred = interpolate_time_ref(t_ros, pairs)
+            residual = t_ref_pred - t_ref
+            residual_abs = np.abs(residual)
+            in_range = (t_ros >= ros_min) & (t_ros <= ros_max)
+            in_range_frac = float(np.mean(in_range)) if t_ros.size > 0 else 0.0
+
+            residual_eval = residual_abs[in_range] if np.any(in_range) else residual_abs
+            mean_res = float(np.nanmean(residual_eval)) if residual_eval.size > 0 else np.nan
+            p95_res = float(np.nanpercentile(residual_eval, 95)) if residual_eval.size > 0 else np.nan
+            max_res = float(np.nanmax(residual_eval)) if residual_eval.size > 0 else np.nan
+
+            start_t = float(np.nanmin(t_ref))
+            end_t = float(np.nanmax(t_ref))
+            overlap_start = float(max(start_t, ref_start)) if np.isfinite(ref_start) else start_t
+            overlap_end = float(min(end_t, ref_end)) if np.isfinite(ref_end) else end_t
+            overlap_sec = float(max(0.0, overlap_end - overlap_start))
+            warn = (in_range_frac < 0.995) or (np.isfinite(p95_res) and p95_res > 0.005)
+
+            rows.append({
+                "sensor": f"{src_name}_PPS_MAP",
+                "start_t": start_t,
+                "end_t": end_t,
+                "samples": int(t_ref.size),
+                "overlap_start": overlap_start,
+                "overlap_end": overlap_end,
+                "overlap_sec": overlap_sec,
+                "in_range_frac": in_range_frac,
+                "nn_dt_mean_s": mean_res,
+                "nn_dt_p95_s": p95_res,
+                "nn_dt_max_s": max_res,
+                "warn": 1.0 if warn else 0.0,
+            })
+        return rows
 
     def log_error(self, t: float):
         """Log VIO error vs ground truth."""

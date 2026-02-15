@@ -13,6 +13,7 @@ import math
 import sqlite3
 import numpy as np
 import cv2
+import threading
 from pathlib import Path
 from typing import Tuple, Optional, Dict, Any
 from dataclasses import dataclass
@@ -137,7 +138,8 @@ class TileCache:
         
         self.mbtiles_path = mbtiles_path
         self.conn = sqlite3.connect(mbtiles_path, check_same_thread=False)
-        self.cursor = self.conn.cursor()
+        # Thread-safe DB access: never share one cursor across calls/threads.
+        self._db_lock = threading.RLock()
         
         # Get zoom level from metadata
         self.zoom = self._get_zoom_level()
@@ -152,18 +154,24 @@ class TileCache:
         
         print(f"[TileCache] Loaded: {mbtiles_path}")
         print(f"[TileCache] Zoom: {self.zoom}, Bounds: {self.bounds}")
+
+    def _fetchone(self, query: str, params: tuple = ()) -> Optional[tuple]:
+        """Execute query safely and return a single row."""
+        with self._db_lock:
+            cur = self.conn.execute(query, params)
+            row = cur.fetchone()
+            cur.close()
+            return row
     
     def _get_zoom_level(self) -> int:
         """Get zoom level from metadata or infer from tiles."""
         # Try metadata first
-        self.cursor.execute("SELECT value FROM metadata WHERE name='maxzoom'")
-        row = self.cursor.fetchone()
+        row = self._fetchone("SELECT value FROM metadata WHERE name='maxzoom'")
         if row:
             return int(row[0])
         
         # Infer from tiles
-        self.cursor.execute("SELECT MAX(zoom_level) FROM tiles")
-        row = self.cursor.fetchone()
+        row = self._fetchone("SELECT MAX(zoom_level) FROM tiles")
         if row and row[0] is not None:
             return int(row[0])
         
@@ -171,8 +179,7 @@ class TileCache:
     
     def _get_bounds(self) -> Optional[Dict[str, float]]:
         """Get bounds from metadata."""
-        self.cursor.execute("SELECT value FROM metadata WHERE name='bounds'")
-        row = self.cursor.fetchone()
+        row = self._fetchone("SELECT value FROM metadata WHERE name='bounds'")
         if row:
             parts = row[0].split(',')
             if len(parts) == 4:
@@ -204,11 +211,11 @@ class TileCache:
     def _tile_exists(self, tile_x: int, tile_y: int) -> bool:
         """Check if tile exists in database."""
         y_tms = (2 ** self.zoom) - 1 - tile_y
-        self.cursor.execute(
+        row = self._fetchone(
             "SELECT 1 FROM tiles WHERE zoom_level=? AND tile_column=? AND tile_row=?",
             (self.zoom, tile_x, y_tms)
         )
-        return self.cursor.fetchone() is not None
+        return row is not None
     
     def get_tile(self, tile_x: int, tile_y: int) -> Optional[np.ndarray]:
         """
@@ -232,11 +239,10 @@ class TileCache:
         
         # Load from database
         y_tms = (2 ** self.zoom) - 1 - tile_y
-        self.cursor.execute(
+        row = self._fetchone(
             "SELECT tile_data FROM tiles WHERE zoom_level=? AND tile_column=? AND tile_row=?",
             (self.zoom, tile_x, y_tms)
         )
-        row = self.cursor.fetchone()
         
         if row is None:
             return None
@@ -393,8 +399,7 @@ class TileCache:
     
     def get_tile_count(self) -> int:
         """Get total number of tiles in cache."""
-        self.cursor.execute("SELECT COUNT(*) FROM tiles")
-        row = self.cursor.fetchone()
+        row = self._fetchone("SELECT COUNT(*) FROM tiles")
         return row[0] if row else 0
     
     def close(self):

@@ -874,6 +874,8 @@ def run_event_driven_loop(runner):
     # Also store in runner.state for compatibility
     runner.state.t0 = filter_state.t0
     runner.state.last_t = filter_state.t0
+    runner.output_reporting.run_bootstrap_convention_checks()
+    runner.output_reporting.run_sensor_time_audit()
     
     # =========================================================================
     # Step 3: Build Event Queue
