@@ -89,7 +89,7 @@ src_old/
 module_old/
 vio_backup_src/
 *.aux.xml
-misc_src/
+misc_scripts/
 tests/
 old_docs/
 
