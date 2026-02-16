@@ -219,16 +219,16 @@ magnetometer:
     degraded_max_dyaw_deg: 1.0
     skip_vision_hard_mismatch: true
     conditioning_guard_enable: true
-    conditioning_guard_warn_pcond: 5.0e11
+    conditioning_guard_warn_pcond: 800000000000.0
     conditioning_guard_degraded_pcond: 1.0e11
-    conditioning_guard_warn_pmax: 5.0e6
+    conditioning_guard_warn_pmax: 8000000.0
     conditioning_guard_degraded_pmax: 2.0e6
-    conditioning_guard_hard_pcond: 8.0e11
-    conditioning_guard_hard_pmax: 8.0e6
+    conditioning_guard_hard_pcond: 1000000000000.0
+    conditioning_guard_hard_pmax: 10000000.0
     bias_freeze_warn_pcond: 1.0e10
     bias_freeze_degraded_pcond: 5.0e9
-    warning_extra_r_mult: 1.5
-    degraded_extra_r_mult: 2.0
+    warning_extra_r_mult: 2.0
+    degraded_extra_r_mult: 2.8
 process_noise:
   sigma_accel: 1.5
   sigma_vps_xy: 0.8

@@ -340,7 +340,16 @@ def append_benchmark_health_summary(summary_csv: Optional[str],
                                     loop_abs_yaw_corr_sum_deg: float = float("nan"),
                                     vps_soft_accept_count: float = float("nan"),
                                     vps_soft_reject_count: float = float("nan"),
-                                    mag_accept_rate: float = float("nan")):
+                                    mag_accept_rate: float = float("nan"),
+                                    vps_jump_reject_count: float = float("nan"),
+                                    vps_temporal_confirm_count: float = float("nan"),
+                                    abs_corr_apply_count: float = float("nan"),
+                                    abs_corr_soft_count: float = float("nan"),
+                                    backend_apply_count: float = float("nan"),
+                                    backend_stale_drop_count: float = float("nan"),
+                                    backend_poll_count: float = float("nan"),
+                                    vps_attempt_count: float = float("nan"),
+                                    rtf_proc_sim: float = float("nan")):
     """Append one benchmark-health summary row."""
     if summary_csv is None:
         return
@@ -354,7 +363,11 @@ def append_benchmark_health_summary(summary_csv: Optional[str],
                 f"{mag_cholfail_rate:.6f},{loop_applied_rate:.6f},"
                 f"{speed_max_m_s:.6f},{speed_p99_m_s:.6f},{loop_corr_count:.6f},"
                 f"{loop_abs_yaw_corr_sum_deg:.6f},{vps_soft_accept_count:.6f},"
-                f"{vps_soft_reject_count:.6f},{mag_accept_rate:.6f}\n"
+                f"{vps_soft_reject_count:.6f},{mag_accept_rate:.6f},"
+                f"{vps_jump_reject_count:.6f},{vps_temporal_confirm_count:.6f},"
+                f"{abs_corr_apply_count:.6f},{abs_corr_soft_count:.6f},"
+                f"{backend_apply_count:.6f},{backend_stale_drop_count:.6f},"
+                f"{backend_poll_count:.6f},{vps_attempt_count:.6f},{rtf_proc_sim:.6f}\n"
             )
     except Exception:
         pass
@@ -1320,7 +1333,11 @@ def init_output_csvs(output_dir: str, save_debug_data: bool = False) -> Dict[str
             "frames_inlier_nonzero_ratio,vio_vel_accept_ratio_vs_cam,"
             "mag_cholfail_rate,loop_applied_rate,"
             "speed_max_m_s,speed_p99_m_s,loop_corr_count,loop_abs_yaw_corr_sum_deg,"
-            "vps_soft_accept_count,vps_soft_reject_count,mag_accept_rate\n"
+            "vps_soft_accept_count,vps_soft_reject_count,mag_accept_rate,"
+            "vps_jump_reject_count,vps_temporal_confirm_count,"
+            "abs_corr_apply_count,abs_corr_soft_count,"
+            "backend_apply_count,backend_stale_drop_count,backend_poll_count,"
+            "vps_attempt_count,rtf_proc_sim\n"
         )
 
     # Heavy per-frame/per-feature debug logs are opt-in via --save_debug_data.

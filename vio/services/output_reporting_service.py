@@ -616,6 +616,7 @@ class OutputReportingService:
         final_alt_err = float("nan")
         speed_max_m_s = float("nan")
         speed_p99_m_s = float("nan")
+        rtf_proc_sim = float("nan")
         if self.runner.error_csv and os.path.isfile(self.runner.error_csv):
             try:
                 err_df = pd.read_csv(self.runner.error_csv)
@@ -639,6 +640,22 @@ class OutputReportingService:
                     if speed.size > 0:
                         speed_max_m_s = float(np.max(speed))
                         speed_p99_m_s = float(np.percentile(speed, 99.0))
+            except Exception:
+                pass
+        if self.runner.inf_csv and os.path.isfile(self.runner.inf_csv) and self.runner.pose_csv and os.path.isfile(self.runner.pose_csv):
+            try:
+                inf_df = pd.read_csv(self.runner.inf_csv)
+                pose_df = pd.read_csv(self.runner.pose_csv)
+                inf_col = "dt_proc_sec" if "dt_proc_sec" in inf_df.columns else (
+                    "Inference Time (s)" if "Inference Time (s)" in inf_df.columns else None
+                )
+                pose_col = "t" if "t" in pose_df.columns else ("Timestamp(s)" if "Timestamp(s)" in pose_df.columns else None)
+                if len(inf_df) > 0 and len(pose_df) > 1 and inf_col is not None and pose_col is not None:
+                    proc_sum = float(np.nansum(pd.to_numeric(inf_df[inf_col], errors="coerce").to_numpy(dtype=float)))
+                    t_vals = pd.to_numeric(pose_df[pose_col], errors="coerce").to_numpy(dtype=float)
+                    sim_span = float(np.nanmax(t_vals) - np.nanmin(t_vals))
+                    if np.isfinite(proc_sum) and np.isfinite(sim_span) and sim_span > 1e-6:
+                        rtf_proc_sim = float(proc_sum / sim_span)
             except Exception:
                 pass
 
@@ -688,6 +705,14 @@ class OutputReportingService:
 
         vps_soft_accept_count = float(int(getattr(self.runner, "_vps_soft_accept_count", 0)))
         vps_soft_reject_count = float(int(getattr(self.runner, "_vps_soft_reject_count", 0)))
+        vps_jump_reject_count = float(int(getattr(self.runner, "_vps_jump_reject_count", 0)))
+        vps_temporal_confirm_count = float(int(getattr(self.runner, "_vps_temporal_confirm_count", 0)))
+        vps_attempt_count = float(int(getattr(self.runner, "_vps_attempt_count", 0)))
+        abs_corr_apply_count = float(int(getattr(self.runner, "_abs_corr_apply_count", 0)))
+        abs_corr_soft_count = float(int(getattr(self.runner, "_abs_corr_soft_count", 0)))
+        backend_apply_count = float(int(getattr(self.runner, "_backend_apply_count", 0)))
+        backend_stale_drop_count = float(int(getattr(self.runner, "_backend_stale_drop_count", 0)))
+        backend_poll_count = float(int(getattr(self.runner, "_backend_poll_count", 0)))
         mag_accept_rate = float("nan")
         mag_total = int(getattr(self.runner.state, "mag_updates", 0)) + int(getattr(self.runner.state, "mag_rejects", 0))
         if mag_total > 0:
@@ -723,6 +748,15 @@ class OutputReportingService:
             vps_soft_accept_count=vps_soft_accept_count,
             vps_soft_reject_count=vps_soft_reject_count,
             mag_accept_rate=mag_accept_rate,
+            vps_jump_reject_count=vps_jump_reject_count,
+            vps_temporal_confirm_count=vps_temporal_confirm_count,
+            abs_corr_apply_count=abs_corr_apply_count,
+            abs_corr_soft_count=abs_corr_soft_count,
+            backend_apply_count=backend_apply_count,
+            backend_stale_drop_count=backend_stale_drop_count,
+            backend_poll_count=backend_poll_count,
+            vps_attempt_count=vps_attempt_count,
+            rtf_proc_sim=rtf_proc_sim,
         )
         print(
             f"[SUMMARY] projection_count={projection_count}, "
@@ -732,7 +766,8 @@ class OutputReportingService:
             f"vio_vel_ratio={vio_vel_accept_ratio_vs_cam:.3f}, "
             f"mag_cholfail_rate={mag_cholfail_rate:.3f}, "
             f"loop_applied_rate={loop_applied_rate:.3f}, "
-            f"speed_p99={speed_p99_m_s:.2f}m/s"
+            f"speed_p99={speed_p99_m_s:.2f}m/s, "
+            f"rtf_proc_sim={rtf_proc_sim:.3f}"
         )
 
     def print_summary(self):

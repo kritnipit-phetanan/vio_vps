@@ -135,6 +135,7 @@ def run_imu_driven_loop(runner):
     
     # Setup output files
     runner.bootstrap_service.setup_output_files()
+    runner.bootstrap_service.initialize_backend_optimizer()
     
     # Initialize timing
     runner.state.t0 = runner.imu[0].t
@@ -342,7 +343,25 @@ def run_imu_driven_loop(runner):
 
         # Position-velocity consistency guard (state-aware kinematic sanity).
         runner.kinematic_guard_service.apply(t)
-        
+
+        # Async backend correction polling + blended apply (non-blocking frontend).
+        if runner.backend_optimizer is not None:
+            poll_interval_sec = float(runner.global_config.get("BACKEND_POLL_INTERVAL_SEC", 0.5))
+            if (t - float(getattr(runner, "_backend_last_poll_t", -1e9))) >= poll_interval_sec:
+                runner._backend_last_poll_t = float(t)
+                runner._backend_poll_count = int(getattr(runner, "_backend_poll_count", 0)) + 1
+                corr = runner.backend_optimizer.poll_correction(t_now=float(t))
+                stale_drops = int(getattr(runner.backend_optimizer, "last_poll_stale_drops", 0))
+                if stale_drops > 0:
+                    runner._backend_stale_drop_count = int(getattr(runner, "_backend_stale_drop_count", 0)) + stale_drops
+                if corr is not None:
+                    max_age = float(runner.global_config.get("BACKEND_MAX_CORRECTION_AGE_SEC", 2.0))
+                    if float(getattr(corr, "age_sec", 0.0)) > max_age:
+                        runner._backend_stale_drop_count = int(getattr(runner, "_backend_stale_drop_count", 0)) + 1
+                    else:
+                        runner.vio_service.schedule_backend_correction(corr)
+            runner.vio_service.apply_pending_backend_blend(float(t))
+
         # Log error vs ground truth (every sample, like vio_vps.py)
         runner.output_reporting.log_error(t)
         

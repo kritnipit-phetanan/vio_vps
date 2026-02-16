@@ -158,9 +158,24 @@ class VIORunner:
         self._vps_skip_streak = 0
         self._vps_soft_accept_count: int = 0
         self._vps_soft_reject_count: int = 0
+        self._vps_jump_reject_count: int = 0
+        self._vps_temporal_confirm_count: int = 0
+        self._vps_attempt_count: int = 0
         self._vps_last_accepted_offset_vec: Optional[np.ndarray] = None
         self._vps_pending_large_offset_vec: Optional[np.ndarray] = None
         self._vps_pending_large_offset_hits: int = 0
+        self._abs_corr_apply_count: int = 0
+        self._abs_corr_soft_count: int = 0
+
+        # Async backend correction runtime counters/state
+        self.backend_optimizer = None
+        self._backend_apply_count: int = 0
+        self._backend_stale_drop_count: int = 0
+        self._backend_poll_count: int = 0
+        self._backend_pending_dp_enu: Optional[np.ndarray] = None
+        self._backend_pending_dyaw_deg: float = 0.0
+        self._backend_pending_steps_left: int = 0
+        self._backend_last_poll_t: float = -1e9
         
         # Timestamp base tracking (for GT/error alignment)
         self.imu_time_col: Optional[str] = None
@@ -233,6 +248,12 @@ class VIORunner:
             duration_sec = run_imu_driven_loop(self)
         else:
             raise ValueError(f"Unknown estimator_mode: {self.config.estimator_mode}")
+
+        if self.backend_optimizer is not None:
+            try:
+                self.backend_optimizer.stop()
+            except Exception:
+                pass
 
         # Finalize reporting in one place.
         self.output_reporting.print_summary()

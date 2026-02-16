@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 
 from ..camera import make_KD_for_size
+from ..backend_optimizer import BackendOptimizer
 from ..config import load_config
 from ..data_loaders import (
     DEMReader,
@@ -607,3 +608,35 @@ class BootstrapService:
             )
             save_calibration_log(output_path=cal_path, **cal_params)
             print(f"[DEBUG] Calibration snapshot saved: {cal_path}")
+
+    def initialize_backend_optimizer(self):
+        """Initialize optional async backend optimizer (fixed-lag)."""
+        runner = self.runner
+        if runner.backend_optimizer is not None:
+            try:
+                runner.backend_optimizer.stop()
+            except Exception:
+                pass
+            runner.backend_optimizer = None
+
+        if not bool(runner.global_config.get("BACKEND_ENABLED", False)):
+            return
+        try:
+            runner.backend_optimizer = BackendOptimizer(
+                fixed_lag_window=int(runner.global_config.get("BACKEND_FIXED_LAG_WINDOW", 10)),
+                optimize_rate_hz=float(runner.global_config.get("BACKEND_OPTIMIZE_RATE_HZ", 2.0)),
+                max_iteration_ms=float(runner.global_config.get("BACKEND_MAX_ITERATION_MS", 35.0)),
+                max_correction_age_sec=float(runner.global_config.get("BACKEND_MAX_CORRECTION_AGE_SEC", 2.0)),
+                min_quality_score=float(runner.global_config.get("BACKEND_MIN_QUALITY_SCORE", 0.20)),
+                max_abs_dp_xy_m=float(runner.global_config.get("BACKEND_MAX_ABS_DP_XY_M", 60.0)),
+                max_abs_dyaw_deg=float(runner.global_config.get("BACKEND_MAX_ABS_DYAW_DEG", 8.0)),
+            )
+            runner.backend_optimizer.start()
+            print(
+                "[BACKEND] Async fixed-lag optimizer enabled: "
+                f"window={runner.global_config.get('BACKEND_FIXED_LAG_WINDOW', 10)}, "
+                f"rate={runner.global_config.get('BACKEND_OPTIMIZE_RATE_HZ', 2.0)}Hz"
+            )
+        except Exception as exc:
+            print(f"[BACKEND] WARNING: failed to initialize backend optimizer: {exc}")
+            runner.backend_optimizer = None

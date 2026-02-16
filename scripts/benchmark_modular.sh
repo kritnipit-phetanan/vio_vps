@@ -97,6 +97,7 @@ HAS_VPS=0
 RUN_MODE="${RUN_MODE:-auto}"
 SAVE_DEBUG_DATA="${SAVE_DEBUG_DATA:-1}"  # 1 => pass --save_debug_data (heavy CSV logs)
 SAVE_KEYFRAME_IMAGES="${SAVE_KEYFRAME_IMAGES:-1}"  # 1 => pass --save_keyframe_images (keyframe JPGs)
+LOCK_PROFILE="${LOCK_PROFILE:-backend}"
 
 # Output directory
 OUTPUT_DIR="benchmark_modular_${TEST_ID}/preintegration"
@@ -263,6 +264,7 @@ echo "  Output directory: ${OUTPUT_DIR}/"
 echo "  RUN_MODE: ${RUN_MODE}"
 echo "  SAVE_DEBUG_DATA: ${SAVE_DEBUG_DATA}"
 echo "  SAVE_KEYFRAME_IMAGES: ${SAVE_KEYFRAME_IMAGES}"
+echo "  LOCK_PROFILE: ${LOCK_PROFILE}"
 echo "  Active sensors: ${RUN_MODE_LABEL}"
 [ -n "$BASELINE_RUN" ] && echo "  Baseline run: ${BASELINE_RUN}"
 [ "$USE_CAM" -eq 1 ] && echo "    - Camera: ${IMAGES_DIR}"
@@ -361,6 +363,7 @@ COMPARE_ARGS=(python3 scripts/compare_benchmark.py --output_dir "$OUTPUT_DIR")
 if [ -n "$BASELINE_RUN" ]; then
     COMPARE_ARGS+=(--baseline_run "$BASELINE_RUN")
 fi
+COMPARE_ARGS+=(--lock_profile "$LOCK_PROFILE")
 "${COMPARE_ARGS[@]}"
 
 echo ""

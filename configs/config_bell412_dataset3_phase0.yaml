@@ -1,0 +1,915 @@
+# ============================================================================
+# VIO Configuration: Bell 412 - Dataset 3 (Forward Motion)
+# ============================================================================
+# Camera: Fisheye (Kannala-Brandt model) - NEEDS CALIBRATION
+# IMU: Onboard IMU @ 400 Hz - NEEDS CALIBRATION
+# Dataset: bell412_dataset3 - forward motion without heavy rotation
+# ============================================================================
+
+# Camera Intrinsics (Kannala-Brandt Fisheye Model)
+# Source: https://mun-frl-vil-dataset.readthedocs.io/en/latest/Calibration.html
+# Calibrated using VINS-Fusion camera calibration tool
+camera:
+  model: "kannala_brandt"
+  image_width: 1440
+  image_height: 1080
+  
+  # Kannala-Brandt distortion parameters (CALIBRATED)
+  k2: -0.0764245
+  k3:  0.0322856
+  k4: -0.0445168
+  k5:  0.0163317
+  
+  # Principal point and focal length (CALIBRATED)
+  mu:  829.224
+  mv:  829.454
+  u0:  833.937
+  v0:  562.509
+
+# Camera-IMU Extrinsics (Body frame to Camera frame)
+# Source: https://mun-frl-vil-dataset.readthedocs.io/en/latest/Calibration.html
+# Calibrated using Kalibr package
+extrinsics:
+  # Nadir camera (downward-facing) - CALIBRATED
+  nadir:
+    name: "BODY_T_CAMDOWN"
+    transform:
+      - [-0.01039363,  0.99994595,  0.00027614, -0.27939175]
+      - [-0.99982944, -0.01038820, -0.01527021,  0.00394073]
+      - [-0.01526652, -0.00043481,  0.99988337, -0.00039529]
+      - [ 0.0,         0.0,         0.0,         1.0        ]
+  
+  # Front camera (forward-facing) - CALIBRATED
+  front:
+    name: "BODY_T_CAMFRONT"
+    transform:
+      - [-0.04200713, -0.01166497,  0.99904921,  0.17666233]
+      - [ 0.99899047,  0.01544242,  0.04218496, -0.05171531]
+      - [-0.01591983,  0.99981271,  0.01100451, -0.04656282]
+      - [ 0.0,         0.0,         0.0,         1.0        ]
+  
+  # Side camera (not available in Bell 412 dataset, using placeholder)
+  side:
+    name: "BODY_T_CAMSIDE"
+    transform:
+      - [ 1.0,  0.0,  0.0,  0.0]
+      - [ 0.0,  0.0,  1.0,  0.2]
+      - [ 0.0,  1.0,  0.0, -0.05]
+      - [ 0.0,  0.0,  0.0,  1.0]
+
+# IMU Parameters (Noise characteristics)
+# Source: https://mun-frl-vil-dataset.readthedocs.io/en/latest/Calibration.html
+imu:
+  # Standard noise parameters (CALIBRATED)
+  acc_n: 0.08      # Accelerometer noise density [m/s²/√Hz]
+  gyr_n: 0.004     # Gyroscope noise density [rad/s/√Hz]
+  acc_w: 0.00004   # Accelerometer random walk [m/s³/√Hz]
+  gyr_w: 0.0001    # Gyroscope random walk [rad/s²/√Hz]
+  g_norm: 9.803    # Gravity magnitude [m/s²]
+  accel_includes_gravity: true  # IMU linear acceleration includes gravity component
+  
+  # Initial gyro bias (estimated from static period at start)
+  # CRITICAL: Raw data shows gyro mean = -2.58°/s which causes yaw drift!
+  # Initial static samples show: [-0.0023, -0.0038, -0.0077] rad/s
+  initial_gyro_bias: [-0.0023, -0.0038, -0.0077]
+  
+  # Initial accelerometer bias (estimated from first 100 samples)
+  # ENU frame: measured [-0.103, 0.392, -9.682], expected [0, 0, -9.803]
+  # Bias = measured - expected
+  initial_accel_bias: [0.391959, -0.103155, 0.121209]
+  
+  # Enable bias estimation from initial static samples
+  estimate_bias: true
+  
+  # Estimator Mode (v3.7.0: enum instead of boolean)
+  # "imu_step_preint_cache": IMU-driven @ 400Hz with preintegration cache + sub-sample timestamp precision
+  # "event_queue_output_predictor": Event-driven with propagate-to-timestamp (TODO: not implemented yet)
+  estimator_mode: "imu_step_preint_cache"
+  
+  # Flight phase detection (v3.4.0: State-based with configurable thresholds)
+  # - SPINUP (0): High vibration + low velocity (rotor spinup)
+  # - EARLY (1): High velocity uncertainty (filter not converged)
+  # - NORMAL (2): Stable flight with converged estimates
+  phase_detection:
+    spinup_velocity_thresh: 1.0        # m/s - horizontal velocity below this = stationary
+    spinup_vibration_thresh: 0.3       # rad/s - gyro std above this = high vibration
+    spinup_altitude_change_thresh: 5.0 # m - altitude change below this = still on ground
+    early_velocity_sigma_thresh: 3.0   # m/s - velocity uncertainty above this = unconverged
+    hysteresis_enabled: true
+    up_hold_sec: 0.75
+    down_hold_sec: 6.0
+    allow_normal_to_early: true
+    revert_max_speed: 18.0
+    revert_max_alt_change: 60.0
+  
+  # Preintegration-specific (v3.7.2: REDUCE bias random walk to prevent divergence)
+  # Previous v2.9.9.10 with 3× increase caused MASSIVE bias drift:
+  #   - Accel bias: 0 → 3483 mg over flight (DIVERGED!)
+  #   - Gyro bias: 0 → 204 mrad/s (DIVERGED!)
+  #   - Root cause: acc_w/gyr_w too high → bias drifts unconstrained
+  # Strategy: Keep acc_n/gyr_n high for velocity uncertainty, but LOCK DOWN bias drift
+  preintegration:
+    acc_n: 0.60        # Keep 3× (measurement noise for velocity)
+    gyr_n: 0.030       # Keep 3× (measurement noise for attitude)
+    acc_w: 0.00004     # REDUCED 37× (was 0.0015) - LOCK bias estimates
+    gyr_w: 0.0001      # REDUCED 15× (was 0.0015) - LOCK bias estimates
+
+# IMU-GNSS Lever Arm (Body frame to GNSS antenna)
+# Source: https://mun-frl-vil-dataset.readthedocs.io/en/latest/Calibration.html#imu-gnss-extrinsic-calibration
+# This is T_BG (Body to GNSS) - the translation from IMU to GNSS antenna
+# In FRD body frame: X=Forward, Y=Right, Z=Down
+imu_gnss_extrinsics:
+  # Lever arm in body frame [meters]
+  # X = -0.1444 → GNSS antenna is 14.4 cm BEHIND IMU
+  # Y =  0.0553 → GNSS antenna is 5.5 cm to the RIGHT of IMU  
+  # Z = -0.5347 → GNSS antenna is 53.5 cm ABOVE IMU (negative Z in FRD = up)
+  lever_arm: [-0.14440, 0.05530, -0.53470]
+  
+  # Full 4x4 transformation matrix (rotation is identity for Bell 412)
+  transform:
+    - [1.0, 0.0, 0.0, -0.14440]
+    - [0.0, 1.0, 0.0,  0.05530]
+    - [0.0, 0.0, 1.0, -0.53470]
+    - [0.0, 0.0, 0.0,  1.0]
+
+# Plane-Aided MSCKF Configuration
+# Detects planar surfaces to constrain triangulation depth
+# Helps reduce fail_depth_sign failures (43.2% in baseline)
+plane:
+  enabled: true  # ENABLED for Phase 3 testing
+  min_points_per_plane: 10  # Minimum 3D points needed to fit a plane
+  angle_threshold_deg: 15.0  # Max angle difference (°) for normal clustering
+  distance_threshold_m: 0.15  # Max point-to-plane distance (m) for inliers
+  min_area_m2: 0.5  # Minimum plane area (m²) to be considered valid
+  measurement_noise_m: 0.05  # Plane constraint measurement noise (m)
+  use_aided_triangulation: true  # Project triangulated points onto detected planes
+  use_constraints: true  # Apply plane constraints as EKF updates
+  max_planes: 10  # Maximum number of planes to track simultaneously
+
+# Magnetometer Calibration
+# Data is pre-normalized (unit vectors), not in standard µT
+# Calibration recomputed using PPK GPS ground truth heading
+# Date: 2025-02-07
+# 
+# DISABLED v2.9.10.4: MAG calibration shows 36° drift by end of flight
+# Analysis: innovation_z grows from -2.5° (early) to +36° (late)
+# Root cause: Hard/soft iron calibration doesn't account for helicopter field distortion
+# v2.9.10.8: RE-ENABLING magnetometer to fix yaw drift
+# Results: v2.9.10.4 (mag off) = 746m, 100°+ yaw drift in first 30s
+# v2.9.10.7 (mag off) = 726m, similar yaw drift
+# v2.9.10.12: Re-enabling magnetometer to fix yaw drift
+# Without magnetometer, yaw drifts 90° in 51 seconds from gyro bias alone
+magnetometer:
+  enabled: true   # v3.9.6: RE-ENABLED with full recalibration
+  
+  # Hard-iron offset (v3.9.6: RECALIBRATED from data range center)
+  # Old: [0.243467, -0.194837, 0.341668]
+  hard_iron_offset: [0.249140, -0.261974, 0.317021]
+  
+  # Soft-iron matrix (v3.9.6: RECALIBRATED - diagonal scale factors)
+  # Old Z-scale was 5.6 (too high), now 3.4 (more reasonable)
+  soft_iron_matrix:
+    - [0.753133, 0.0, 0.0]
+    - [0.0, 0.726562, 0.0]
+    - [0.0, 0.0, 3.379869]
+  
+  # Heading formula: atan2(-mag_y, mag_x) - Y-axis flipped for correct NED alignment
+  # IMPORTANT: Must flip Y-axis sign when computing heading from calibrated mag
+  heading_formula: "atan2(-mag_y, mag_x)"
+  
+  # Magnetic declination [radians]
+  # v3.9.6: RECALIBRATED - with correct hard/soft iron, declination is now minimal
+  # Previously -35.8° was compensating for incorrect soft iron
+  declination: 0.0009  # 0.1° (was -35.8° with old calibration)
+  
+  # Field strength bounds (normalized units, not µT)
+  expected_field_strength: 0.63  # Mean normalized field
+  min_field_strength: 0.10       # REDUCED: allow weaker field readings
+  max_field_strength: 0.95       # RELAXED for noisy environment
+  
+  # Update rate limiting
+  update_rate_limit: 1   # REDUCED: Process every sample for faster convergence
+  
+  # Convergence window (seconds) - skip mag during initial settling
+  # FIX 2025-12-01b: Reduced from 5s to 0s - START IMMEDIATELY!
+  # Problem: Even 5s delay causes 19.8° initial yaw error (gyro bias ~4°/s)
+  # Solution: Start mag updates immediately to prevent any gyro-only drift
+  # Note: PPK initial yaw is accurate, but VIO gyro integration drifts fast
+  convergence_window: 0.0  # 0s = start mag updates immediately
+  
+  # Use raw body-frame heading (GPS-calibrated)
+  # This bypasses IMU tilt compensation which has frame alignment issues
+  # NOTE: declination=-35.8° was calibrated for this mode
+  use_raw_heading: true
+  
+  # Apply initial yaw correction from magnetometer at startup
+  # v2.9.10.12: RE-ENABLED to align initial yaw with mag reference
+  # This ensures zero initial innovation and prevents runaway yaw drift
+  apply_initial_correction: true
+  
+  # ===== NEW: Enhanced Magnetometer Filtering (v2.9.1) =====
+  # EMA (Exponential Moving Average) smoothing and gyro consistency check
+  # TUNED 2025-12-11: Relaxed parameters for helicopter dynamics
+  ema_alpha: 0.3                # Smoothing factor: 0.3 = 30% new, 70% old
+  max_yaw_rate_deg: 150.0       # Maximum expected yaw rate [deg/s] (was 30.0, too low for helicopter)
+  gyro_consistency_threshold_deg: 30.0  # Max deviation from gyro integration [deg] (was 10.0)
+  r_inflate: 2.0                # R inflation factor for inconsistent measurements (was 5.0)
+
+  # MAG + Vision heading consistency (full sensor mode, fail-soft)
+  # Uses VO relative yaw as weak consistency reference:
+  # - mismatch <= soft_deg: normal MAG update
+  # - soft_deg < mismatch < hard_deg: inflate R
+  # - mismatch >= hard_deg: skip MAG update for this sample
+  vision_heading_consistency_enable: true
+  vision_heading_max_age_sec: 0.8
+  vision_heading_min_quality: 0.30
+  vision_heading_soft_deg: 30.0
+  vision_heading_hard_deg: 85.0
+  vision_heading_r_inflate_max: 4.0
+  vision_heading_strong_quality: 0.65
+  vision_heading_phase_soft_deg: {"0": 36.0, "1": 28.0, "2": 24.0}
+  vision_heading_phase_hard_deg: {"0": 95.0, "1": 78.0, "2": 62.0}
+  vision_heading_health_threshold_mult:
+    HEALTHY: 1.0
+    WARNING: 0.90
+    DEGRADED: 0.80
+    RECOVERY: 0.95
+  vision_heading_health_r_mult:
+    HEALTHY: 1.0
+    WARNING: 1.2
+    DEGRADED: 1.4
+    RECOVERY: 1.1
+  vision_heading_high_speed_m_s: 45.0
+  vision_heading_high_speed_thresh_mult: 0.85
+  vision_heading_high_speed_r_mult: 1.20
+  vision_heading_min_inliers: 25
+  vision_heading_min_parallax_px: 1.0
+  vision_heading_max_delta_deg: 20.0
+  vision_heading_quality_decay: 0.92
+
+  # Accuracy-first quality policy (weak fail-soft)
+  # good: normal R, mid: inflate R, bad: skip sample (if skip_on_bad=true)
+  accuracy_policy:
+    enabled: true
+    good_min_score: 0.72
+    mid_min_score: 0.45
+    r_inflate_mid: 1.8
+    r_inflate_bad: 3.0
+    norm_window: 200
+    norm_dev_good: 0.12
+    norm_dev_bad: 0.30
+    gyro_delta_soft_deg: 20.0
+    gyro_delta_hard_deg: 65.0
+    vision_delta_soft_deg: 30.0
+    vision_delta_hard_deg: 90.0
+    vision_weight: 0.25
+    skip_on_bad: true
+  
+  # ===== NEW: Online Mag Bias Estimation (v3.9.7) =====
+  # Mag bias (hard iron) is now estimated online in EKF state
+  sigma_mag_bias_init: 0.01      # Initial uncertainty for mag bias [normalized]
+  sigma_mag_bias: 0.0001         # Process noise for mag bias (random walk) [normalized/sqrt(s)]
+  use_estimated_bias: true      # Use EKF-estimated bias instead of config hard_iron
+
+  # State-aware weak-yaw path (for WARNING/DEGRADED health)
+  warning_weak_yaw:
+    warning_r_mult: 4.0
+    degraded_r_mult: 8.0
+    warning_max_dyaw_deg: 1.5
+    degraded_max_dyaw_deg: 1.0
+    skip_vision_hard_mismatch: true
+    conditioning_guard_enable: true
+    conditioning_guard_warn_pcond: 5.0e11
+    conditioning_guard_degraded_pcond: 1.0e11
+    conditioning_guard_warn_pmax: 5.0e6
+    conditioning_guard_degraded_pmax: 2.0e6
+    conditioning_guard_hard_pcond: 8.0e11
+    conditioning_guard_hard_pmax: 8.0e6
+    bias_freeze_warn_pcond: 1.0e10
+    bias_freeze_degraded_pcond: 5.0e9
+    warning_extra_r_mult: 1.5
+    degraded_extra_r_mult: 2.0
+
+# EKF Process Noise
+# v2.9.9.10: AGGRESSIVE 3× increase (v2.9.9.9's 2× still showed 13.1σ overconfidence)
+# DIAGNOSIS: v2.9.9.9 velocity σ = 0.5 m/s, but actual error = 6.5 m/s
+#   → Filter severely overconfident, NEES = 1903 (should be ~3.0)
+# SOLUTION: 3× increase to reach target velocity σ of 2-3 m/s
+process_noise:
+  sigma_accel: 1.5           # INCREASED 3× (was 0.5) - aggressive increase
+  # NOTE: sigma_vo removed - use vio.sigma_vo instead (line 211)
+  sigma_vps_xy: 0.8          # VPS position measurement [m]
+  sigma_agl_z: 1.0           # Height/DEM constraint
+  sigma_mag_yaw: 0.10        # ~5.7° (reduced after fixing declination) - tighter MAG correction
+
+# VIO/VO Parameters
+# TUNED FOR SLOW MOTION / HOVERING (Bell 412 dataset characteristics)
+# Key fix: min_msckf_baseline reduced from 0.03 → 0.01 to allow more triangulation
+# (observed baseline ~0.026m was failing the 0.03m threshold)
+vio:
+  # Enable optical flow velocity updates (v2.9.8.2: gyro-compensated)
+  # Helps reduce XY drift in outdoor long-range flights without VPS
+  use_vio_velocity: true     # Enable optical flow → velocity → EKF updates
+  nadir_xy_only_velocity: false  # Phase0: start before XY-only tuning
+  
+  # v2.9.10.5: Fixed AGL for VIO velocity scale (GPS-denied compliant)
+  # Problem: DEM elevation (110.5m) vs GPS MSL (116.7m) have ~6m offset
+  #          This gives AGL=6.2m but helicopter actually flies at ~100-200m AGL
+  #          Wrong AGL → wrong VIO velocity scale (100/6.2 = 16x error!)
+  # Solution: Override with reasonable helicopter cruise AGL
+  # Analysis: GPS altitude varies 116-232m, so max AGL ~120m, typical ~80m
+  # initial_agl_override: 100.0  # DISABLED - v2.9.10.5 showed AGL=100m makes things WORSE
+  # v2.9.10.4 with computed AGL=6.2m: 746m error
+  # v2.9.10.5 with override AGL=100m: 1495m error (2x worse!)
+  # The computed AGL from DEM/GPS MSL difference actually works better for VIO scale
+  # v2026-02-15: use HYBRID dynamic AGL for flow scale (takeoff/cruise/landing aware)
+  flow_agl_mode: hybrid           # fixed | dynamic | hybrid
+  flow_min_agl: 3.0               # Lower bound for optical-flow scale recovery [m]
+  flow_max_agl: 400.0             # Upper bound for optical-flow scale recovery [m]
+  nadir_prefer_flow_direction: true   # Use flow direction over E-matrix t for nadir
+  nadir_enforce_xy_motion: true       # Keep nadir VO velocity as horizontal-only cue
+  
+  # Parallax thresholds
+  # CRITICAL FIX: was 1.0px but actual parallax ~0.3-0.9px during hover/slow motion
+  # VIO velocity was ALWAYS SKIPPED because parallax < threshold
+  min_parallax_px: 0.3       # Minimum optical flow [pixels] - REDUCED for slow Bell 412 flight
+  min_msckf_baseline: 0.01   # CRITICAL FIX: was 0.03 (baseline ~0.026m was failing) → now 0.01
+  
+  # MSCKF parameters (PERMISSIVE for noisy/slow motion)
+  # TUNED v3.9.2: Increased from 8.0→12.0 to reduce fail_reproj_error (was 36.6%)
+  msckf_chi2_multiplier: 15.0        # Chi-square threshold multiplier
+  msckf_max_reprojection_error: 12.0  # Max reprojection error [pixels] (increased from 8.0)
+  
+  # Feature tracking
+  min_inliers: 6             # Minimum RANSAC inliers
+  ratio_test: 0.80           # Lowe's ratio test threshold (more permissive)
+  
+  # Optical flow velocity parameters (v2.9.9.10: Increased measurement noise)
+  # v2.9.9.9 innovation mean = 6.57 m/s → need larger R to match reality
+  sigma_vo: 0.8              # Accuracy-first: stronger VO velocity correction (was 1.5)
+  min_tracked_features: 50   # Minimum features for velocity update
+  fast_rotation_threshold: 0.5236  # Skip if rotation > 30°/s (rad/s)
+  
+  # MSCKF sliding window configuration (v3.9.1)
+  # Controls camera clone management and feature track lifetime
+  msckf:
+    max_clone_size: 11       # Maximum camera poses in sliding window (11 is OpenVINS default)
+    min_track_length: 4      # Minimum observations for MSCKF triangulation
+    ray_soft_factor: 2.0     # Allow larger angular residual when pixel reproj is available
+    pixel_soft_factor: 1.8   # Fail-soft bound for pixel reprojection residual
+    avg_reproj_gate_factor: 2.2  # Borderline features are kept with quality penalty
+    phase_chi2_scale:
+      "0": 1.20
+      "1": 1.08
+      "2": 1.00
+    phase_reproj_scale:
+      "0": 1.15
+      "1": 1.05
+      "2": 0.95
+    phase_reproj_gate_scale:
+      "0": 1.20
+      "1": 1.08
+      "2": 1.00
+    health_reproj_gate_scale:
+      HEALTHY: 1.00
+      WARNING: 1.10
+      DEGRADED: 1.20
+      RECOVERY: 1.05
+    phase_avg_reproj_gate_scale:
+      "0": 1.15
+      "1": 1.05
+      "2": 1.00
+    health_avg_reproj_gate_scale:
+      HEALTHY: 1.00
+      WARNING: 1.08
+      DEGRADED: 1.15
+      RECOVERY: 1.04
+    reproj_state_aware:
+      quality_high_th: 0.75
+      quality_low_th: 0.45
+      mid_gate_mult: 1.15
+      low_quality_reject: true
+      warning_scale: 1.20
+      degraded_scale: 1.35
+  
+  # Camera view configurations
+  # CRITICAL FIX: use_vz_only=true for nadir camera
+  # Reason: Nadir camera has translation direction ambiguity - we don't know
+  # horizontal velocity DIRECTION without absolute heading reference (MSCKF or VPS)
+  # When MSCKF fails (100%), using horizontal velocity causes massive drift (5km in 5min)
+  views:
+    nadir:
+      nadir_threshold_deg: 30.0
+      sigma_scale_xy: 1.5          # Accuracy-first: reduce over-conservative XY damping
+      sigma_scale_z: 2.0           # Nadir camera has GOOD Z observability actually
+      use_vz_only: false           # CRITICAL FIX v2.9.8.4: Enable XY velocity (was true)
+      min_parallax: 0.3            # LOWERED: accept slow motion flow (was 0.5)
+      max_corners: 2500            # More features for stability
+    
+    front:
+      nadir_threshold_deg: 60.0
+      sigma_scale_xy: 0.8          # Slightly increased from 0.6
+      sigma_scale_z: 1.5           # Slightly increased from 1.2
+      use_vz_only: false
+      min_parallax: 1.0            # VERY LOW for slow forward motion
+      max_corners: 2500
+    
+    side:
+      nadir_threshold_deg: 60.0
+      sigma_scale_xy: 1.0
+      sigma_scale_z: 1.2
+      use_vz_only: false
+      min_parallax: 8
+      max_corners: 2000
+
+# Default camera view (nadir/front/side)
+default_camera_view: "nadir"
+
+vio_vel:
+  xy_only_chi2_scale: 1.10
+  speed_r_inflate_breakpoints_m_s: [30.0, 45.0, 60.0]
+  speed_r_inflate_values: [1.0, 1.5, 2.0]
+  max_delta_v_xy_per_update_m_s: 4.0
+  min_flow_px_high_speed: 0.5
+
+# Use fisheye undistortion backend
+use_fisheye: true
+
+# ============================================================================
+# Performance Optimization (v3.1.0)
+# ============================================================================
+# Trade-off: Speed vs Accuracy
+# use_fast_mode=false, frame_skip=1: Full accuracy, ~700-800s runtime (2.5x realtime)
+# use_fast_mode=true,  frame_skip=1: 60% faster (~400-500s), minimal accuracy loss
+# use_fast_mode=true,  frame_skip=2: 80% faster (~300-350s), slight accuracy loss
+fast_mode:
+  use_fast_mode: false    # Reduce features (540 vs 640) + faster KLT (15x15 win, 3 levels)
+  frame_skip: 1           # Process every N frames (1=all, 2=half, etc.)
+
+# ============================================================================
+# Optimization Objective (Accuracy-first profile)
+# ============================================================================
+optimization:
+  objective: "accuracy"      # accuracy | stability | realtime
+  compute_budget: "medium"   # low | medium | high
+
+# ============================================================================
+# ZUPT (Zero Velocity Update) Configuration (v2.9.8)
+# ============================================================================
+# Detects stationary periods to apply zero-velocity constraints.
+# DISABLED for helicopters: continuous vibration prevents true zero-velocity state.
+# Use vibration detection instead for adaptive measurement uncertainty.
+zupt:
+  enabled: true                   # Enabled for adaptive fail-soft testing (state-aware gating handles motion)
+  accel_threshold: 0.5            # Acceleration threshold [m/s²] (reduced for helicopter vibration)
+  gyro_threshold: 0.05            # Gyroscope threshold [rad/s] (~3°/s)
+  min_duration: 2.0               # Minimum stationary duration [seconds]
+  velocity_threshold: 0.2         # Velocity magnitude threshold [m/s]
+  max_v_for_zupt: 3.0             # Hard guard: don't apply ZUPT when clearly moving
+  flow_guard_px: 1.0              # Suppress stationary detection when recent camera flow is present
+  flow_guard_window_sec: 0.30     # Camera-flow recency window [s] for ZUPT suppression
+  consecutive_required: 5         # Consecutive stationary samples required
+
+# ============================================================================
+# NEW: Fisheye Rectification (v2.8.0)
+# ============================================================================
+# Converts fisheye images to pinhole for better feature tracking.
+# DISABLED: Bell412 dataset already uses calibrated Kannala-Brandt model.
+# Enabling causes parallax scale errors due to rectification.
+# Only enable for uncalibrated or severely distorted fisheye cameras.
+rectification:
+  use_rectifier: false       # DISABLED: VIO already handles fisheye correctly
+  rectify_fov_deg: 90.0      # Output field of view for virtual pinhole camera
+
+# ============================================================================
+# NEW: Loop Closure Detection (v2.8.0)
+# ============================================================================
+# Detects when vehicle returns to previously visited location.
+# Corrects accumulated yaw drift using visual feature matching.
+# DISABLED for long-range outdoor flights without loops (CPU-intensive, low benefit)
+loop_closure:
+  use_loop_closure: true
+  position_threshold: 30.0    # Distance threshold to consider loop candidate [m]
+  min_keyframe_dist: 15.0     # Minimum distance between keyframes [m]
+  min_keyframe_yaw: 20.0      # Minimum yaw change between keyframes [deg]
+  min_frame_gap: 50           # Minimum frame gap for loop detection
+  min_match_ratio: 0.12
+  min_inliers: 15
+  quality_gate:
+    min_inliers_hard: 35
+    min_inliers_failsoft: 20
+    min_spatial_spread: 0.18
+    max_reproj_px: 2.5
+    yaw_residual_bound_deg: 25.0
+    double_confirm_enable: true
+    double_confirm_window_sec: 2.0
+    double_confirm_yaw_deg: 8.0
+    cooldown_sec: 2.0
+    phase_dynamic_inlier_mult: 1.15
+    warning_inlier_mult: 1.10
+    degraded_inlier_mult: 1.20
+  fail_soft:
+    enable: true
+    fail_soft_sigma_yaw_deg: 18.0
+    base_sigma_yaw_deg: 5.0
+    max_abs_yaw_corr_deg: 4.0
+    min_abs_yaw_corr_deg: 1.5
+    dynamic_phase_sigma_mult: 1.15
+    warning_sigma_mult: 1.20
+    degraded_sigma_mult: 1.40
+    speed_skip_m_s: 35.0
+    speed_sigma_inflate_m_s: 25.0
+    speed_sigma_mult: 1.5
+
+# ============================================================================
+# NEW: Vibration Detection (v2.8.0)
+# ============================================================================
+# Detects high vibration periods (helicopter rotor effects).
+# Can be used to adjust measurement uncertainties.
+vibration:
+  use_vibration_detector: true
+  window_size: 50             # Number of samples for vibration detection
+  threshold_multiplier: 5.0   # Multiplier of acc_n for vibration threshold
+
+kinematic_guard:
+  enabled: true
+  window_sec: 0.5
+  vel_mismatch_warn: 8.0
+  vel_mismatch_hard: 15.0
+  max_inflate: 1.08
+  hard_blend_alpha: 0.20
+  min_action_dt_sec: 0.25
+  max_state_speed_m_s: 85.0
+  max_blend_speed_m_s: 70.0
+  max_kin_speed_m_s: 80.0
+  hard_hold_sec: 0.50
+  release_hysteresis_ratio: 0.65
+
+# ============================================================================
+# Adaptive + State-aware Policy (IMU-driven)
+# ============================================================================
+adaptive:
+  # rollout: off | shadow | active
+  mode: active
+  objective: stability_first
+
+  health:
+    warning:
+      p_cond: 1.0e10
+      p_max: 1.0e6
+      growth_ratio: 1.05
+    degraded:
+      p_cond: 1.0e12
+      p_max: 1.0e7
+      growth_ratio: 1.10
+      hold_sec: 0.25
+    recovery:
+      healthy_sec: 3.0
+      to_healthy_sec: 3.0
+    aiding_age:
+      full_sec: 0.25
+      partial_sec: 2.0
+
+  nis_feedback:
+    enabled: true
+    alpha: 0.1
+    high: 2.5
+    low: 0.5
+    accept_rate_hi: 0.85
+    window: 200
+    high_r_scale: 1.5
+    high_chi2_scale: 0.9
+    low_r_scale: 0.9
+    low_chi2_scale: 1.05
+
+  process_noise:
+    aiding_multiplier:
+      FULL: 1.0
+      PARTIAL: 0.85
+      NONE: 0.60
+    health_profile:
+      HEALTHY:
+        sigma_accel_scale: 1.0
+        gyr_w_scale: 1.0
+        acc_w_scale: 1.0
+        sigma_unmodeled_gyr_scale: 1.0
+        min_yaw_scale: 1.0
+      WARNING:
+        sigma_accel_scale: 0.85
+        gyr_w_scale: 0.70
+        acc_w_scale: 0.70
+        sigma_unmodeled_gyr_scale: 0.80
+        min_yaw_scale: 0.80
+      DEGRADED:
+        sigma_accel_scale: 0.70
+        gyr_w_scale: 0.50
+        acc_w_scale: 0.50
+        sigma_unmodeled_gyr_scale: 0.65
+        min_yaw_scale: 0.65
+      RECOVERY:
+        sigma_accel_scale: 0.90
+        gyr_w_scale: 0.80
+        acc_w_scale: 0.80
+        sigma_unmodeled_gyr_scale: 0.90
+        min_yaw_scale: 0.85
+    min_yaw_floor_deg: 0.05
+    scale_clamp:
+      sigma_accel: [0.20, 2.0]
+      gyr_w: [0.10, 2.0]
+      acc_w: [0.10, 2.0]
+      sigma_unmodeled_gyr: [0.10, 2.0]
+      min_yaw: [0.20, 2.0]
+
+  measurement:
+    sensor_defaults:
+      MAG: {r_scale: 1.0}
+      DEM: {r_scale: 1.0, threshold_scale: 1.0}
+      VIO_VEL: {r_scale: 1.0, chi2_scale: 1.0}
+      MSCKF: {chi2_scale: 1.0, reproj_scale: 1.0}
+      ZUPT: {r_scale: 1.0, chi2_scale: 1.0}
+      GRAVITY_RP: {r_scale: 1.0, chi2_scale: 1.0}
+      YAW_AID: {r_scale: 1.0, chi2_scale: 1.0}
+      BIAS_GUARD: {r_scale: 1.0, chi2_scale: 1.0}
+    clamp:
+      r_scale: [0.5, 10.0]
+      chi2_scale: [0.5, 2.0]
+      threshold_scale: [0.5, 2.0]
+      reproj_scale: [0.5, 2.0]
+    degraded_r_extra: 1.2
+    degraded_chi2_extra: 0.95
+    phase_profiles:
+      VIO_VEL:
+        "0": {chi2_scale: 1.20, r_scale: 1.35}
+        "1": {chi2_scale: 1.10, r_scale: 1.20}
+        "2": {chi2_scale: 1.00, r_scale: 1.00}
+      ZUPT:
+        "0": {chi2_scale: 0.80, r_scale: 1.50, acc_threshold_scale: 0.80, gyro_threshold_scale: 0.80, max_v_scale: 0.70}
+        "1": {chi2_scale: 0.90, r_scale: 1.20, acc_threshold_scale: 0.90, gyro_threshold_scale: 0.90, max_v_scale: 0.85}
+        "2": {chi2_scale: 1.00, r_scale: 1.00, acc_threshold_scale: 1.00, gyro_threshold_scale: 1.00, max_v_scale: 1.00}
+      YAW_AID:
+        "0": {chi2_scale: 1.05, r_scale: 0.90}
+        "1": {chi2_scale: 0.90, r_scale: 1.40}
+        "2": {chi2_scale: 0.95, r_scale: 1.20}
+      BIAS_GUARD:
+        "0": {r_scale: 0.95}
+        "1": {r_scale: 1.05}
+        "2": {r_scale: 1.00}
+    zupt_fail_soft:
+      enabled: true
+      hard_reject_factor: 4.5
+      max_r_scale: 40.0
+      inflate_power: 1.0
+      health_hard_factor:
+        HEALTHY: 1.0
+        WARNING: 1.15
+        DEGRADED: 1.35
+        RECOVERY: 1.1
+      health_r_cap_factor:
+        HEALTHY: 1.0
+        WARNING: 1.2
+        DEGRADED: 1.4
+        RECOVERY: 1.1
+    vio_vel_fail_soft:
+      enabled: true
+      hard_reject_factor: 3.0
+      max_r_scale: 12.0
+      inflate_power: 1.0
+      burst_accept_rate_low: 0.35
+      burst_nis_high: 5.0
+      burst_chi2_relax: 1.35
+      burst_threshold_relax: 1.35
+      burst_r_boost: 1.25
+      high_nis_relax_chi2_mult: 1.15
+      high_nis_relax_threshold_mult: 1.15
+      health_chi2_relax:
+        HEALTHY: 1.00
+        WARNING: 1.10
+        DEGRADED: 1.25
+        RECOVERY: 1.05
+      health_hard_factor:
+        HEALTHY: 1.0
+        WARNING: 1.15
+        DEGRADED: 1.30
+        RECOVERY: 1.10
+      health_r_cap_factor:
+        HEALTHY: 1.0
+        WARNING: 1.15
+        DEGRADED: 1.30
+        RECOVERY: 1.10
+    gravity_alignment:
+      enabled_imu_only: true
+      phase_sigma_deg: {"0": 3.5, "1": 10.0, "2": 8.5}
+      phase_period_steps: {"0": 1, "1": 2, "2": 2}
+      phase_acc_norm_tolerance: {"0": 0.15, "1": 0.35, "2": 0.30}
+      phase_max_gyro_rad_s: {"0": 0.25, "1": 0.65, "2": 0.50}
+      health_sigma_mult:
+        HEALTHY: 1.0
+        WARNING: 1.2
+        DEGRADED: 1.5
+        RECOVERY: 1.1
+      acc_norm_tolerance: 0.25
+      max_gyro_rad_s: 0.40
+      chi2_scale: 1.0
+
+    yaw_aid:
+      enabled_imu_only: true
+      phase_sigma_deg: {"0": 20.0, "1": 50.0, "2": 38.0}
+      phase_min_sigma_deg: {"0": 18.0, "1": 35.0, "2": 28.0}
+      phase_period_steps: {"0": 4, "1": 24, "2": 16}
+      max_accept_rate_for_active: 0.98
+      high_accept_backoff_factor: 1.5
+      high_accept_r_scale: 1.1
+      phase_acc_norm_tolerance: {"0": 0.15, "1": 0.30, "2": 0.25}
+      phase_max_gyro_rad_s: {"0": 0.20, "1": 0.55, "2": 0.40}
+      high_speed_m_s: 180.0
+      high_speed_sigma_mult: 1.15
+      high_speed_period_mult: 1.2
+      motion_consistency_enable: true
+      motion_min_speed_m_s: 20.0
+      motion_speed_full_m_s: 90.0
+      motion_weight_max: 0.18
+      motion_max_yaw_error_deg: 70.0
+      health_sigma_mult:
+        HEALTHY: 1.0
+        WARNING: 1.2
+        DEGRADED: 1.5
+        RECOVERY: 1.1
+      chi2_scale: 1.0
+      ref_alpha: 0.005
+      dynamic_ref_alpha: 0.05
+      soft_fail:
+        enabled: true
+        hard_reject_factor: 3.0
+        max_r_scale: 12.0
+        inflate_power: 1.0
+
+    bias_guard:
+      enabled_imu_only: true
+      apply_when_aiding_level: [NONE]
+      period_steps: 8
+      phase_period_steps: {"0": 8, "1": 24, "2": 20}
+      max_accept_rate_for_active: 0.98
+      high_accept_backoff_factor: 1.6
+      high_accept_r_scale: 1.05
+      phase_sigma_bg_deg_s: {"0": 0.25, "1": 0.45, "2": 0.35}
+      phase_sigma_ba_m_s2: {"0": 0.08, "1": 0.25, "2": 0.18}
+      phase_acc_norm_tolerance: {"0": 0.20, "1": 0.20, "2": 0.22}
+      phase_max_gyro_rad_s: {"0": 0.20, "1": 0.30, "2": 0.32}
+      high_speed_m_s: 180.0
+      high_speed_period_mult: 1.2
+      health_sigma_mult:
+        HEALTHY: 1.0
+        WARNING: 0.8
+        DEGRADED: 0.6
+        RECOVERY: 0.9
+      chi2_scale: 1.0
+      max_bg_norm_rad_s: 0.20
+      max_ba_norm_m_s2: 2.5
+      soft_fail:
+        enabled: true
+        hard_reject_factor: 4.0
+        max_r_scale: 8.0
+        inflate_power: 1.0
+
+    conditioning_backoff:
+      HEALTHY: {period_mult: 1.0, r_scale_mult: 1.0}
+      WARNING: {period_mult: 1.2, r_scale_mult: 1.05}
+      DEGRADED: {period_mult: 1.5, r_scale_mult: 1.15}
+      RECOVERY: {period_mult: 1.1, r_scale_mult: 1.02}
+
+  conditioning:
+    caps:
+      HEALTHY: 1.0e8
+      WARNING: 1.0e7
+      DEGRADED: 1.0e6
+      RECOVERY: 1.0e7
+    cond_hard:
+      HEALTHY: 1.2e12
+      WARNING: 1.2e12
+      DEGRADED: 1.1e12
+      RECOVERY: 1.2e12
+    cond_hard_window:
+      HEALTHY: 16
+      WARNING: 16
+      DEGRADED: 16
+      RECOVERY: 16
+    projection_min_interval_steps:
+      HEALTHY: 64
+      WARNING: 64
+      DEGRADED: 64
+      RECOVERY: 64
+
+  logging:
+    enabled: true
+
+# ============================================================================
+# NEW: Terrain Referenced Navigation (TRN) v3.3.0
+# ============================================================================
+# Provides periodic XY position fixes using terrain profile matching.
+# GPS-denied compliant - uses pre-loaded DSM/DEM terrain data.
+# 
+# How it works:
+# 1. Collects altitude history over a window (30-60 seconds)
+# 2. Searches nearby positions for terrain profile that best matches
+# 3. When good match found, applies position correction to EKF
+#
+# Effectiveness depends on:
+# - Terrain variation (better in hilly areas, worse over flat terrain)
+# - DEM resolution (30m DSM is adequate for regional navigation)
+# - Altitude measurement accuracy (baro + DEM-derived AGL)
+#
+# Expected accuracy: ~50-100m horizontal (depends on terrain)
+trn:
+  enabled: false               # Enable Terrain Referenced Navigation
+  profile_window_sec: 30.0    # Seconds of altitude history for matching
+  min_samples: 20             # Minimum samples for valid profile
+  search_radius_m: 500.0      # Search radius around current estimate [m]
+  search_step_m: 30.0         # Grid step size [m] - match DEM resolution
+  min_terrain_variation_m: 10.0  # Minimum terrain variation for match [m]
+  max_correlation_threshold: 0.7  # Minimum correlation for valid fix
+  min_altitude_variation_m: 5.0   # Minimum altitude variation in profile [m]
+  update_interval_sec: 10.0   # Seconds between TRN updates
+  sigma_trn_xy: 50.0          # Position uncertainty from TRN [m]
+
+# ============================================================================
+# VPS Configuration (Visual Positioning System - Satellite Matching)
+# ============================================================================
+vps:
+  enabled: true                    # Enable VPS module
+  accuracy_mode: true              # Enable accuracy-first VPS policy
+  
+  # Processing parameters
+  output_size: [512, 512]          # Output patch size for matching
+  patch_size_px: 640               # Base map patch size [px] (larger coverage for drift)
+  patch_size_failover_px: 896      # Expanded patch after repeated failures
+  failover_fail_streak: 6          # Failure streak before enlarged patch
+  device: "cuda"                   # 'cuda' or 'cpu' for matcher
+  max_keypoints: 2048              # Maximum keypoints to extract
+  
+  # Quality thresholds
+  min_inliers: 12                  # Strict minimum inliers for valid match
+  max_reproj_error: 5.0            # Maximum reprojection error [px]
+  min_confidence: 0.3              # Minimum confidence score
+  allow_failsoft_accept: true      # Allow conservative low-inlier fallback
+  min_inliers_failsoft: 5          # Fail-soft minimum inliers
+  max_reproj_error_failsoft: 1.2   # Fail-soft reprojection bound [px]
+  min_confidence_failsoft: 0.12    # Fail-soft minimum confidence
+  max_offset_px_failsoft: 900.0    # Reject fail-soft matches with extreme pixel offset
+  failsoft_r_inflate: 4.0          # Inflate R for fail-soft accepted matches
+  apply_min_inliers: 8             # Runtime gate before delayed EKF update
+  apply_min_confidence: 0.18       # Runtime gate before delayed EKF update
+  apply_max_reproj_error: 1.20     # Runtime gate before delayed EKF update [px]
+  apply_max_speed_m_s: 80.0        # Skip VPS correction when state speed is implausibly high
+  apply_warning_inlier_bonus: 2
+  apply_degraded_inlier_bonus: 4
+  apply_warning_conf_mult: 1.15
+  apply_degraded_conf_mult: 1.30
+  apply_warning_reproj_mult: 0.90
+  apply_degraded_reproj_mult: 0.80
+  apply_failsoft_enable: true
+  apply_failsoft_min_inliers: 5
+  apply_failsoft_min_confidence: 0.12
+  apply_failsoft_max_reproj_error: 1.2
+  apply_failsoft_max_speed_m_s: 95.0
+  apply_failsoft_max_offset_m: 100.0
+  apply_failsoft_max_dir_change_deg: 45.0
+  apply_failsoft_large_offset_confirm_m: 60.0
+  apply_failsoft_large_offset_confirm_hits: 3
+  apply_failsoft_r_mult: 3.5
+  apply_failsoft_allow_warning: false
+  apply_failsoft_allow_degraded: false
+  
+  # Altitude limits (AGL)
+  min_altitude: 30.0               # Minimum altitude for VPS [m]
+  max_altitude: 500.0              # Maximum altitude for VPS [m]
+  
+  # Timing
+  min_update_interval: 0.5         # Minimum seconds between VPS updates
+
+  # Preprocess multi-hypothesis policy
+  yaw_hypotheses_deg: [0, 180, 90, -90]
+  scale_hypotheses: [1.0, 0.90, 1.10]
+  max_candidates: 6
+  min_content_ratio: 0.20
+  min_texture_std: 8.0
+
+  # Periodic global-local relocalization policy (accuracy mode)
+  relocalization:
+    enabled: true
+    global_interval_sec: 12.0
+    fail_streak_trigger: 6
+    stale_success_sec: 8.0
+    xy_sigma_trigger_m: 35.0
+    max_centers: 10
+    ring_radius_m: [35.0, 80.0]
+    ring_samples: 8
+    global_yaw_hypotheses_deg: [0, 45, 90, 135, 180, -45, -90, -135]
+    global_scale_hypotheses: [0.80, 0.90, 1.00, 1.10, 1.20]
+    force_global_on_warning_phase: false
+  
+  # Stochastic Cloning (Latency Handling)
+  max_delay_sec: 0.5               # Maximum delay before clone expires [sec]
+  max_clones: 3                    # Maximum number of clones to maintain
+  
+  # Camera selection (which extrinsics to use)
+  camera_view: "nadir"             # 'nadir', 'front', or 'side'

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Phase-by-phase accuracy tuning orchestrator with auto rollback.
+"""Phase-by-phase accuracy tuning orchestrator with stage-aware lock profiles.
 
-Implements One-Knob-at-a-Time protocol:
-  - fixed order: Phase 1 -> 2 -> 3 -> 4 -> 5
-  - each phase mutates only that phase keys
-  - rollback immediately when hard locks fail or err3d_mean regresses > threshold
-  - persist best run and baseline pointer automatically
+Implements one-knob-at-a-time protocol:
+- fixed order phases (default: A1 -> A2 -> A3 -> A4)
+- each phase mutates only that phase keys
+- rollback immediately when lock profile fails or err3d_mean regresses beyond threshold
+- persist best run + baseline pointer automatically
 """
 
 from __future__ import annotations
@@ -30,47 +30,45 @@ except Exception as exc:  # pragma: no cover
     raise SystemExit(f"PyYAML required: {exc}")
 
 
-PHASE_SEQUENCE = ["1", "2", "3", "4", "5"]
+DEFAULT_PHASE_SEQUENCE = ["A1", "A2", "A3", "A4"]
 
+# One-knob assignments for Stage-A pre-backend tuning (Phase4-base roadmap).
 PHASE_ASSIGNMENTS: dict[str, dict[str, Any]] = {
-    "1": {
-        "loop_closure.fail_soft.max_abs_yaw_corr_deg": 2.5,
-        "loop_closure.quality_gate.cooldown_sec": 4.0,
+    "A1": {
+        "vps.apply_failsoft_allow_warning": True,
+        "vps.apply_failsoft_r_mult": 2.2,
+        "vps.apply_failsoft_large_offset_confirm_hits": 2,
+        "vps.apply_failsoft_max_dir_change_deg": 55.0,
+        "vps.apply_failsoft_max_offset_m": 130.0,
     },
-    "2": {
+    "A2": {
+        "magnetometer.warning_weak_yaw.conditioning_guard_warn_pcond": 8.0e11,
+        "magnetometer.warning_weak_yaw.conditioning_guard_warn_pmax": 8.0e6,
+        "magnetometer.warning_weak_yaw.warning_extra_r_mult": 2.0,
+        "magnetometer.warning_weak_yaw.degraded_extra_r_mult": 2.8,
+    },
+    "A3": {
         "vio.nadir_xy_only_velocity": True,
         "vio_vel.speed_r_inflate_breakpoints_m_s": [25.0, 40.0, 55.0],
         "vio_vel.speed_r_inflate_values": [1.5, 2.5, 4.0],
         "vio_vel.max_delta_v_xy_per_update_m_s": 2.0,
         "vio_vel.min_flow_px_high_speed": 0.8,
     },
-    "3": {
-        "kinematic_guard.vel_mismatch_warn": 6.0,
-        "kinematic_guard.vel_mismatch_hard": 12.0,
-        "kinematic_guard.hard_blend_alpha": 0.12,
-        "kinematic_guard.max_state_speed_m_s": 70.0,
-        "kinematic_guard.max_kin_speed_m_s": 65.0,
-        "kinematic_guard.hard_hold_sec": 0.30,
-        "kinematic_guard.release_hysteresis_ratio": 0.75,
+    "A4": {
+        "vio.msckf.reproj_state_aware.warning_scale": 1.20,
+        "vio.msckf.reproj_state_aware.degraded_scale": 1.35,
+        "vio.msckf.reproj_state_aware.mid_gate_mult": 1.15,
     },
-    "4": {
-        "magnetometer.warning_weak_yaw.conditioning_guard_warn_pcond": 8.0e11,
-        "magnetometer.warning_weak_yaw.conditioning_guard_warn_pmax": 8.0e6,
-        "magnetometer.warning_weak_yaw.conditioning_guard_hard_pcond": 1.0e12,
-        "magnetometer.warning_weak_yaw.conditioning_guard_hard_pmax": 1.0e7,
-        "magnetometer.warning_weak_yaw.warning_extra_r_mult": 2.0,
-        "magnetometer.warning_weak_yaw.degraded_extra_r_mult": 2.8,
-    },
-    "5": {
-        "vps.apply_failsoft_r_mult": 2.5,
-        "vps.apply_failsoft_max_offset_m": 140.0,
-        "vps.apply_failsoft_max_dir_change_deg": 60.0,
-        "vps.apply_failsoft_large_offset_confirm_m": 80.0,
-        "vps.apply_failsoft_large_offset_confirm_hits": 2,
-        "vps.apply_failsoft_allow_warning": True,
-        "vps.apply_failsoft_allow_degraded": False,
-    },
+    # Backward-compatible aliases.
+    "1": {},
+    "2": {},
+    "3": {},
+    "4": {},
 }
+PHASE_ASSIGNMENTS["1"] = PHASE_ASSIGNMENTS["A1"]
+PHASE_ASSIGNMENTS["2"] = PHASE_ASSIGNMENTS["A2"]
+PHASE_ASSIGNMENTS["3"] = PHASE_ASSIGNMENTS["A3"]
+PHASE_ASSIGNMENTS["4"] = PHASE_ASSIGNMENTS["A4"]
 
 
 def list_run_dirs(repo_dir: Path) -> list[Path]:
@@ -81,11 +79,16 @@ def list_run_dirs(repo_dir: Path) -> list[Path]:
     return runs
 
 
+def resolve_path(repo_dir: Path, value: str) -> Path:
+    p = Path(value)
+    if not p.is_absolute():
+        p = (repo_dir / p).resolve()
+    return p
+
+
 def resolve_baseline(repo_dir: Path, explicit: str, baseline_file: Path) -> Path | None:
     if explicit:
-        p = Path(explicit)
-        if not p.is_absolute():
-            p = (repo_dir / p).resolve()
+        p = resolve_path(repo_dir, explicit)
         if p.is_dir():
             return p
         return None
@@ -93,9 +96,7 @@ def resolve_baseline(repo_dir: Path, explicit: str, baseline_file: Path) -> Path
     if baseline_file.is_file():
         val = baseline_file.read_text(encoding="utf-8", errors="ignore").splitlines()
         if val:
-            p = Path(val[0].strip())
-            if not p.is_absolute():
-                p = (repo_dir / p).resolve()
+            p = resolve_path(repo_dir, val[0].strip())
             if p.is_dir():
                 return p
 
@@ -111,6 +112,46 @@ def set_nested(cfg: dict[str, Any], key: str, value: Any) -> None:
             cur[part] = {}
         cur = cur[part]
     cur[parts[-1]] = value
+
+
+_MISSING = object()
+
+
+def get_nested(cfg: dict[str, Any], key: str, default: Any = _MISSING) -> Any:
+    cur: Any = cfg
+    for part in key.split("."):
+        if not isinstance(cur, dict) or part not in cur:
+            if default is _MISSING:
+                raise KeyError(key)
+            return default
+        cur = cur[part]
+    return cur
+
+
+def values_equal(a: Any, b: Any) -> bool:
+    if isinstance(a, bool) or isinstance(b, bool):
+        return a is b
+    if isinstance(a, list) and isinstance(b, list):
+        if len(a) != len(b):
+            return False
+        return all(values_equal(x, y) for x, y in zip(a, b))
+    try:
+        af = float(a)
+        bf = float(b)
+        if np.isfinite(af) and np.isfinite(bf):
+            return bool(np.isclose(af, bf, rtol=1e-12, atol=1e-12))
+    except Exception:
+        pass
+    return a == b
+
+
+def phase_changed_keys(cfg: dict[str, Any], phase: str) -> list[str]:
+    changed: list[str] = []
+    for key, target in PHASE_ASSIGNMENTS.get(phase, {}).items():
+        cur_val = get_nested(cfg, key, default=_MISSING)
+        if cur_val is _MISSING or not values_equal(cur_val, target):
+            changed.append(key)
+    return changed
 
 
 def apply_phase(cfg: dict[str, Any], phase: str) -> dict[str, Any]:
@@ -133,6 +174,7 @@ def run_benchmark(
     run_mode: str,
     save_debug_data: int,
     save_keyframe_images: int,
+    lock_profile: str,
 ) -> tuple[int, Path | None]:
     before = {p.resolve() for p in list_run_dirs(repo_dir)}
     env = os.environ.copy()
@@ -140,6 +182,7 @@ def run_benchmark(
     env["RUN_MODE"] = run_mode
     env["SAVE_DEBUG_DATA"] = str(int(save_debug_data))
     env["SAVE_KEYFRAME_IMAGES"] = str(int(save_keyframe_images))
+    env["LOCK_PROFILE"] = str(lock_profile)
     if baseline_run is not None:
         env["BASELINE_RUN"] = str(baseline_run)
 
@@ -167,9 +210,7 @@ def run_benchmark(
 
     m = re.search(r"Output directory:\s*([^\s]+/preintegration)", "".join(captured))
     if m:
-        p = Path(m.group(1))
-        if not p.is_absolute():
-            p = (repo_dir / p).resolve()
+        p = resolve_path(repo_dir, m.group(1))
         if p.is_dir():
             return ret, p
 
@@ -207,6 +248,21 @@ def read_health_row(run_dir: Path | None) -> pd.Series | None:
     return df.iloc[-1]
 
 
+def read_heading_final_abs(run_dir: Path | None) -> float:
+    if run_dir is None:
+        return float("nan")
+    p = run_dir / "accuracy_first_summary.csv"
+    if not p.is_file():
+        return float("nan")
+    try:
+        df = pd.read_csv(p)
+        if len(df) == 0:
+            return float("nan")
+        return float(pd.to_numeric(df.iloc[-1].get("heading_final_abs_deg"), errors="coerce"))
+    except Exception:
+        return float("nan")
+
+
 def parse_vps_used(run_log: Path) -> float:
     if not run_log.is_file():
         return float("nan")
@@ -232,32 +288,125 @@ def overflow_hits(run_log: Path) -> list[str]:
     return hits
 
 
-def evaluate_hard_locks(run_dir: Path | None) -> tuple[bool, dict[str, Any]]:
+def _to_float(row: pd.Series, key: str) -> float:
+    try:
+        return float(pd.to_numeric(row.get(key), errors="coerce"))
+    except Exception:
+        return float("nan")
+
+
+def evaluate_lock_profile(run_dir: Path | None, profile_name: str) -> tuple[bool, dict[str, Any]]:
     row = read_health_row(run_dir)
     if row is None:
-        return False, {"reason": "missing benchmark_health_summary.csv"}
+        return False, {
+            "reason": "missing benchmark_health_summary.csv",
+            "checks": [],
+            "failed_items": ["missing benchmark_health_summary.csv"],
+        }
 
-    mag_cholfail = float(pd.to_numeric(row.get("mag_cholfail_rate"), errors="coerce"))
-    cov_large = float(pd.to_numeric(row.get("cov_large_rate"), errors="coerce"))
-    pmax_max = float(pd.to_numeric(row.get("pmax_max"), errors="coerce"))
-    vps_used = parse_vps_used((run_dir / "run.log") if run_dir else Path(""))
-    over = overflow_hits((run_dir / "run.log") if run_dir else Path(""))
+    run_log = (run_dir / "run.log") if run_dir else Path("")
+    over = overflow_hits(run_log)
 
-    checks = {
-        "mag_cholfail_rate<=0.08": bool(np.isfinite(mag_cholfail) and mag_cholfail <= 0.08),
-        "vps_used>=20": bool(np.isfinite(vps_used) and vps_used >= 20.0),
-        "cov_large_rate==0": bool(np.isfinite(cov_large) and abs(cov_large) <= 1e-12),
-        "pmax_max<=1e6": bool(np.isfinite(pmax_max) and pmax_max <= 1.0e6),
-        "no_overflow_nonfinite": bool(len(over) == 0),
-    }
-    ok = all(checks.values())
+    mag_cholfail = _to_float(row, "mag_cholfail_rate")
+    cov_large = _to_float(row, "cov_large_rate")
+    pmax_max = _to_float(row, "pmax_max")
+    vps_used = parse_vps_used(run_log)
+    heading_final_abs = read_heading_final_abs(run_dir)
+    vps_jump_reject_count = _to_float(row, "vps_jump_reject_count")
+    vps_attempt_count = _to_float(row, "vps_attempt_count")
+    backend_stale_drop_count = _to_float(row, "backend_stale_drop_count")
+    backend_poll_count = _to_float(row, "backend_poll_count")
+
+    jump_ratio = float("nan")
+    if np.isfinite(vps_jump_reject_count) and np.isfinite(vps_attempt_count) and vps_attempt_count > 0:
+        jump_ratio = float(vps_jump_reject_count / vps_attempt_count)
+
+    stale_ratio = float("nan")
+    if np.isfinite(backend_stale_drop_count) and np.isfinite(backend_poll_count) and backend_poll_count > 0:
+        stale_ratio = float(backend_stale_drop_count / backend_poll_count)
+
+    checks: list[tuple[str, bool, str]] = []
+    checks.append((
+        "cov_large_rate == 0",
+        bool(np.isfinite(cov_large) and abs(cov_large) <= 1e-12),
+        f"value={cov_large:.6f}" if np.isfinite(cov_large) else "value=nan",
+    ))
+    checks.append((
+        "pmax_max <= 1e6",
+        bool(np.isfinite(pmax_max) and pmax_max <= 1.0e6),
+        f"value={pmax_max:.3e}" if np.isfinite(pmax_max) else "value=nan",
+    ))
+    checks.append((
+        "no overflow/non-finite flood",
+        bool(len(over) == 0),
+        f"hits={len(over)}",
+    ))
+
+    profile = str(profile_name).strip().lower()
+    if profile == "pre_backend":
+        checks.extend([
+            (
+                "mag_cholfail_rate <= 0.10",
+                bool(np.isfinite(mag_cholfail) and mag_cholfail <= 0.10),
+                f"value={mag_cholfail:.6f}" if np.isfinite(mag_cholfail) else "value=nan",
+            ),
+            (
+                "VPS used >= 10",
+                bool(np.isfinite(vps_used) and vps_used >= 10.0),
+                f"value={vps_used:.0f}" if np.isfinite(vps_used) else "value=nan",
+            ),
+            (
+                "vps_jump_reject_count/vps_attempts <= 0.5",
+                bool(np.isfinite(jump_ratio) and jump_ratio <= 0.5),
+                f"value={jump_ratio:.4f}" if np.isfinite(jump_ratio) else "value=nan",
+            ),
+            (
+                "heading_final_abs_deg <= 15",
+                bool(np.isfinite(heading_final_abs) and heading_final_abs <= 15.0),
+                f"value={heading_final_abs:.3f}" if np.isfinite(heading_final_abs) else "value=nan",
+            ),
+        ])
+    elif profile == "backend":
+        checks.extend([
+            (
+                "mag_cholfail_rate <= 0.08",
+                bool(np.isfinite(mag_cholfail) and mag_cholfail <= 0.08),
+                f"value={mag_cholfail:.6f}" if np.isfinite(mag_cholfail) else "value=nan",
+            ),
+            (
+                "VPS used >= 20",
+                bool(np.isfinite(vps_used) and vps_used >= 20.0),
+                f"value={vps_used:.0f}" if np.isfinite(vps_used) else "value=nan",
+            ),
+            (
+                "backend_stale_drop_count/backend_poll_count <= 0.2",
+                bool(np.isfinite(stale_ratio) and stale_ratio <= 0.2),
+                f"value={stale_ratio:.4f}" if np.isfinite(stale_ratio) else "value=nan",
+            ),
+            (
+                "heading_final_abs_deg <= 10",
+                bool(np.isfinite(heading_final_abs) and heading_final_abs <= 10.0),
+                f"value={heading_final_abs:.3f}" if np.isfinite(heading_final_abs) else "value=nan",
+            ),
+        ])
+    else:
+        checks.append(("lock profile recognized", False, f"profile={profile}"))
+
+    failed_items = [name for name, ok, _ in checks if not ok]
+    ok = len(failed_items) == 0
     detail = {
         "checks": checks,
+        "failed_items": failed_items,
+        "profile_name": profile,
         "mag_cholfail_rate": mag_cholfail,
         "cov_large_rate": cov_large,
         "pmax_max": pmax_max,
         "vps_used": vps_used,
+        "heading_final_abs_deg": heading_final_abs,
+        "vps_jump_reject_ratio": jump_ratio,
+        "backend_stale_drop_ratio": stale_ratio,
         "overflow_hits": len(over),
+        "rtf_proc_sim": _to_float(row, "rtf_proc_sim"),
     }
     return ok, detail
 
@@ -277,36 +426,51 @@ def print_phase_table(rows: list[dict[str, Any]]) -> None:
         print("No phase results.")
         return
     print("\n=== Phase Tuning Summary ===")
-    print(
-        "phase  status    err3d_mean(m)  delta_vs_baseline(%)  locks  run_dir"
-    )
+    print("phase  profile      status    err3d_mean(m)  delta_vs_baseline(%)  locks  run_dir")
     for r in rows:
         d = r.get("err3d_delta_pct", np.nan)
         d_s = f"{d:+.2f}" if np.isfinite(d) else "n/a"
         print(
-            f"{r['phase']:>5s}  {r['status']:<8s}  "
-            f"{r['err3d_mean']:>13.3f}  {d_s:>21s}  "
-            f"{str(r['locks_ok']):<5s}  {r['run_dir']}"
+            f"{str(r['phase']):>5s}  {str(r.get('profile_name', '')):<11s}  {str(r['status']):<8s}  "
+            f"{float(r.get('err3d_mean', np.nan)):>13.3f}  {d_s:>21s}  "
+            f"{str(r.get('locks_ok', np.nan)):<5s}  {r.get('run_dir', '')}"
         )
+
+
+def snapshot_path_for_profile(repo_dir: Path, profile_name: str) -> Path:
+    profile = str(profile_name).lower()
+    if profile == "pre_backend":
+        return (repo_dir / "configs" / "config_bell412_dataset3_backend_stage1.yaml").resolve()
+    if profile == "backend":
+        return (repo_dir / "configs" / "config_bell412_dataset3_backend_stage2.yaml").resolve()
+    return (repo_dir / "configs" / "config_bell412_dataset3_accuracy_stage2.yaml").resolve()
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Orchestrate Bell412 one-knob phase tuning.")
     parser.add_argument("--config", default="configs/config_bell412_dataset3.yaml")
+    parser.add_argument("--base_phase_config", default="", help="Optional config used as phase base (read-only source)")
     parser.add_argument("--run_mode", default="auto")
     parser.add_argument("--save_debug_data", type=int, default=0, choices=[0, 1])
     parser.add_argument("--save_keyframe_images", type=int, default=0, choices=[0, 1])
     parser.add_argument("--baseline_run", default="")
+    parser.add_argument("--lock_profile", default="pre_backend", choices=["pre_backend", "backend"])
     parser.add_argument("--max_regress_pct", type=float, default=15.0)
     parser.add_argument("--apply_best_config", type=int, default=0, choices=[0, 1])
-    parser.add_argument("--phases", default="1,2,3,4,5")
+    parser.add_argument("--phases", default=",".join(DEFAULT_PHASE_SEQUENCE))
     parser.add_argument("--dry_run", action="store_true", help="Plan and emit phase table without running benchmarks")
+    parser.add_argument("--force_run_noop", action="store_true", help="Run phase even when no keys would change")
     args = parser.parse_args()
 
     repo_dir = Path(__file__).resolve().parents[1]
-    config_path = (repo_dir / args.config).resolve()
+    config_path = resolve_path(repo_dir, args.config)
     if not config_path.is_file():
         print(f"❌ config not found: {config_path}")
+        return 2
+
+    base_cfg_path = resolve_path(repo_dir, args.base_phase_config) if args.base_phase_config else config_path
+    if not base_cfg_path.is_file():
+        print(f"❌ base_phase_config not found: {base_cfg_path}")
         return 2
 
     baseline_file = (repo_dir / "scripts" / "baseline_run.txt").resolve()
@@ -314,8 +478,10 @@ def main() -> int:
     baseline_err = read_err3d_mean(baseline_run)
     print(f"Baseline run: {baseline_run if baseline_run else 'None'}")
     print(f"Baseline err3d_mean: {baseline_err:.3f} m" if np.isfinite(baseline_err) else "Baseline err3d_mean: nan")
+    print(f"Lock profile: {args.lock_profile}")
+    print(f"Phase base config: {base_cfg_path}")
 
-    with config_path.open("r", encoding="utf-8") as f:
+    with base_cfg_path.open("r", encoding="utf-8") as f:
         base_cfg = yaml.safe_load(f) or {}
 
     phases = [p.strip() for p in args.phases.split(",") if p.strip()]
@@ -335,17 +501,54 @@ def main() -> int:
 
     for phase in phases:
         print(f"\n================ Phase {phase} ================")
-        candidate_cfg = apply_phase(current_cfg, phase)
         assignments = PHASE_ASSIGNMENTS.get(phase, {})
         for k, v in assignments.items():
             print(f"  set {k} = {v}")
+        changed_keys = phase_changed_keys(current_cfg, phase)
+        if changed_keys:
+            print(f"  changed keys ({len(changed_keys)}):")
+            for ck in changed_keys:
+                print(f"    - {ck}")
+        else:
+            print("  changed keys (0): phase is already at target values")
+
+        if not changed_keys and not args.force_run_noop:
+            rows.append(
+                {
+                    "phase": phase,
+                    "profile_name": args.lock_profile,
+                    "status": "SKIP",
+                    "reason": "no_change",
+                    "lock_failed_items": "",
+                    "run_dir": "",
+                    "returncode": 0,
+                    "err3d_mean": baseline_err,
+                    "err3d_baseline": baseline_err,
+                    "err3d_delta_pct": 0.0,
+                    "locks_ok": np.nan,
+                    "vps_used": np.nan,
+                    "heading_final_abs_deg": np.nan,
+                    "mag_cholfail_rate": np.nan,
+                    "cov_large_rate": np.nan,
+                    "pmax_max": np.nan,
+                    "overflow_hits": np.nan,
+                    "rtf_proc_sim": np.nan,
+                    "changed_key_count": 0,
+                    "changed_keys": "",
+                }
+            )
+            continue
+
+        candidate_cfg = apply_phase(current_cfg, phase)
 
         if args.dry_run:
             rows.append(
                 {
                     "phase": phase,
+                    "profile_name": args.lock_profile,
                     "status": "DRYRUN",
                     "reason": "dry_run",
+                    "lock_failed_items": "",
                     "run_dir": "",
                     "returncode": 0,
                     "err3d_mean": np.nan,
@@ -353,10 +556,14 @@ def main() -> int:
                     "err3d_delta_pct": np.nan,
                     "locks_ok": np.nan,
                     "vps_used": np.nan,
+                    "heading_final_abs_deg": np.nan,
                     "mag_cholfail_rate": np.nan,
                     "cov_large_rate": np.nan,
                     "pmax_max": np.nan,
                     "overflow_hits": np.nan,
+                    "rtf_proc_sim": np.nan,
+                    "changed_key_count": len(changed_keys),
+                    "changed_keys": "|".join(changed_keys),
                 }
             )
             current_cfg = candidate_cfg
@@ -372,14 +579,17 @@ def main() -> int:
             run_mode=args.run_mode,
             save_debug_data=args.save_debug_data,
             save_keyframe_images=args.save_keyframe_images,
+            lock_profile=args.lock_profile,
         )
 
         if run_dir is None:
             rows.append(
                 {
                     "phase": phase,
+                    "profile_name": args.lock_profile,
                     "status": "FAIL",
                     "reason": "no_run_dir_detected",
+                    "lock_failed_items": "",
                     "run_dir": "",
                     "returncode": ret,
                     "err3d_mean": np.nan,
@@ -387,10 +597,14 @@ def main() -> int:
                     "err3d_delta_pct": np.nan,
                     "locks_ok": False,
                     "vps_used": np.nan,
+                    "heading_final_abs_deg": np.nan,
                     "mag_cholfail_rate": np.nan,
                     "cov_large_rate": np.nan,
                     "pmax_max": np.nan,
                     "overflow_hits": np.nan,
+                    "rtf_proc_sim": np.nan,
+                    "changed_key_count": len(changed_keys),
+                    "changed_keys": "|".join(changed_keys),
                 }
             )
             print(f"[Phase {phase}] FAIL: no run directory detected")
@@ -406,7 +620,7 @@ def main() -> int:
             delta_pct = 100.0 * (err_cur - baseline_err) / abs(baseline_err)
             regress_fail = bool(delta_pct > args.max_regress_pct)
 
-        locks_ok, lock_detail = evaluate_hard_locks(run_dir)
+        locks_ok, lock_detail = evaluate_lock_profile(run_dir, args.lock_profile)
         phase_ok = bool(ret == 0 and locks_ok and not regress_fail and np.isfinite(err_cur))
         reason = []
         if ret != 0:
@@ -421,8 +635,10 @@ def main() -> int:
 
         row = {
             "phase": phase,
+            "profile_name": args.lock_profile,
             "status": "PASS" if phase_ok else "FAIL",
             "reason": reason_text,
+            "lock_failed_items": "|".join(lock_detail.get("failed_items", [])),
             "run_dir": str(run_dir),
             "returncode": ret,
             "err3d_mean": err_cur,
@@ -430,10 +646,14 @@ def main() -> int:
             "err3d_delta_pct": delta_pct,
             "locks_ok": locks_ok,
             "vps_used": lock_detail.get("vps_used", np.nan),
+            "heading_final_abs_deg": lock_detail.get("heading_final_abs_deg", np.nan),
             "mag_cholfail_rate": lock_detail.get("mag_cholfail_rate", np.nan),
             "cov_large_rate": lock_detail.get("cov_large_rate", np.nan),
             "pmax_max": lock_detail.get("pmax_max", np.nan),
             "overflow_hits": lock_detail.get("overflow_hits", np.nan),
+            "rtf_proc_sim": lock_detail.get("rtf_proc_sim", np.nan),
+            "changed_key_count": len(changed_keys),
+            "changed_keys": "|".join(changed_keys),
         }
         rows.append(row)
 
@@ -454,7 +674,6 @@ def main() -> int:
         print(f"\nSaved summary CSV: {summary_csv}")
         return 0
 
-    # Pick best run among accepted phase runs (lowest err3d_mean).
     accepted = [r for r in rows if r["status"] == "PASS" and np.isfinite(r["err3d_mean"])]
     best_run: Path | None = None
     if accepted:
@@ -463,7 +682,7 @@ def main() -> int:
     elif baseline_run is not None and baseline_run.is_dir():
         best_run = baseline_run
 
-    snapshot_path = (repo_dir / "configs" / "config_bell412_dataset3_accuracy_stage2.yaml").resolve()
+    snapshot_path = snapshot_path_for_profile(repo_dir, args.lock_profile)
     if best_run is not None:
         cfg_src = best_run / "phase_config_snapshot.yaml"
         if cfg_src.is_file():
@@ -473,7 +692,6 @@ def main() -> int:
                 shutil.copy2(cfg_src, config_path)
                 print(f"Applied best config to: {config_path}")
         else:
-            # Fallback: save current accepted config.
             write_yaml(snapshot_path, current_cfg)
             print(f"Best snapshot fallback saved: {snapshot_path}")
             if int(args.apply_best_config) == 1:

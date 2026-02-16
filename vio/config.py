@@ -752,6 +752,15 @@ def load_config(config_path: str) -> VIOConfig:
     result['VPS_APPLY_FAILSOFT_ALLOW_DEGRADED'] = bool(
         vps_cfg.get('apply_failsoft_allow_degraded', False)
     )
+    result['VPS_ABS_HARD_REJECT_OFFSET_M'] = float(
+        vps_cfg.get('abs_hard_reject_offset_m', 180.0)
+    )
+    result['VPS_ABS_HARD_REJECT_DIR_CHANGE_DEG'] = float(
+        vps_cfg.get('abs_hard_reject_dir_change_deg', 75.0)
+    )
+    result['VPS_ABS_MAX_APPLY_DP_XY_M'] = float(
+        vps_cfg.get('abs_max_apply_dp_xy_m', 25.0)
+    )
 
     vps_reloc_defaults = {
         'enabled': True,
@@ -787,6 +796,24 @@ def load_config(config_path: str) -> VIOConfig:
     result['VPS_RELOC_FORCE_GLOBAL_ON_WARNING_PHASE'] = bool(
         _vps_reloc.get('force_global_on_warning_phase', False)
     )
+
+    # =========================================================================
+    # Async backend optimizer (fixed-lag, non-blocking frontend)
+    # =========================================================================
+    backend_cfg = config.get('backend', {})
+    result['BACKEND_ENABLED'] = bool(backend_cfg.get('enabled', False))
+    result['BACKEND_FIXED_LAG_WINDOW'] = int(backend_cfg.get('fixed_lag_window', 10))
+    result['BACKEND_OPTIMIZE_RATE_HZ'] = float(backend_cfg.get('optimize_rate_hz', 2.0))
+    result['BACKEND_MAX_ITERATION_MS'] = float(backend_cfg.get('max_iteration_ms', 35.0))
+    result['BACKEND_POLL_INTERVAL_SEC'] = float(backend_cfg.get('poll_interval_sec', 0.5))
+    result['BACKEND_MAX_CORRECTION_AGE_SEC'] = float(backend_cfg.get('max_correction_age_sec', 2.0))
+    result['BACKEND_BLEND_STEPS'] = int(backend_cfg.get('blend_steps', 3))
+    result['BACKEND_MAX_APPLY_DYAW_DEG'] = float(backend_cfg.get('max_apply_dyaw_deg', 2.5))
+    result['BACKEND_MAX_APPLY_DP_XY_M'] = float(backend_cfg.get('max_apply_dp_xy_m', 25.0))
+    result['BACKEND_APPLY_COV_INFLATE'] = float(backend_cfg.get('apply_cov_inflate', 1.05))
+    result['BACKEND_MIN_QUALITY_SCORE'] = float(backend_cfg.get('min_quality_score', 0.20))
+    result['BACKEND_MAX_ABS_DP_XY_M'] = float(backend_cfg.get('max_abs_dp_xy_m', 60.0))
+    result['BACKEND_MAX_ABS_DYAW_DEG'] = float(backend_cfg.get('max_abs_dyaw_deg', 8.0))
 
     # =========================================================================
     # NEW: Adaptive + State-aware control policy (IMU-driven)

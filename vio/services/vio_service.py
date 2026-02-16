@@ -189,6 +189,7 @@ class VIOService:
                 cosang = float(np.clip(np.dot(cur, last) / (cur_norm * last_norm), -1.0, 1.0))
                 dir_delta_deg = float(np.degrees(np.arccos(cosang)))
                 if dir_delta_deg > max_dir_change_deg:
+                    runner._vps_jump_reject_count = int(getattr(runner, "_vps_jump_reject_count", 0)) + 1
                     return False, f"SOFT_REJECT_DIR_CHANGE: dir={dir_delta_deg:.1f}deg>{max_dir_change_deg:.1f}deg"
 
         large_offset_m = float(
@@ -217,6 +218,7 @@ class VIOService:
                     f"SOFT_REJECT_LARGE_OFFSET_PENDING: hits={pending_hits}/{required_hits}, "
                     f"offset={vps_offset_m:.1f}m"
                 )
+            runner._vps_temporal_confirm_count = int(getattr(runner, "_vps_temporal_confirm_count", 0)) + 1
             runner._vps_pending_large_offset_vec = None
             runner._vps_pending_large_offset_hits = 0
         elif np.isfinite(vps_offset_m) and vps_offset_m <= large_offset_m:
@@ -224,6 +226,69 @@ class VIOService:
             runner._vps_pending_large_offset_hits = 0
 
         return True, ""
+
+    def _check_vps_hard_reject(self,
+                               vps_offset: np.ndarray,
+                               vps_offset_m: float) -> Tuple[bool, str]:
+        """
+        Hard safety gate for absolute correction before delayed-update apply.
+
+        Rejects obviously unsafe updates:
+        - huge offset magnitude
+        - abrupt direction change vs previous accepted offset
+        """
+        runner = self.runner
+        hard_max_offset_m = float(runner.global_config.get("VPS_ABS_HARD_REJECT_OFFSET_M", 180.0))
+        if np.isfinite(vps_offset_m) and vps_offset_m > hard_max_offset_m:
+            runner._vps_jump_reject_count = int(getattr(runner, "_vps_jump_reject_count", 0)) + 1
+            return False, f"HARD_REJECT_OFFSET: {vps_offset_m:.1f}m>{hard_max_offset_m:.1f}m"
+
+        hard_max_dir_change_deg = float(runner.global_config.get("VPS_ABS_HARD_REJECT_DIR_CHANGE_DEG", 75.0))
+        cur = np.asarray(vps_offset[:2], dtype=float).reshape(-1)
+        if cur.size < 2 or not np.all(np.isfinite(cur[:2])):
+            return True, ""
+        cur_norm = float(np.linalg.norm(cur[:2]))
+        if cur_norm <= 1e-6:
+            return True, ""
+
+        last_vec = getattr(runner, "_vps_last_accepted_offset_vec", None)
+        if isinstance(last_vec, np.ndarray) and last_vec.size >= 2:
+            prev = np.asarray(last_vec[:2], dtype=float).reshape(-1)
+            prev_norm = float(np.linalg.norm(prev[:2]))
+            if np.isfinite(prev_norm) and prev_norm > 1e-6:
+                cosang = float(np.clip(np.dot(cur[:2], prev[:2]) / (cur_norm * prev_norm), -1.0, 1.0))
+                dir_delta_deg = float(np.degrees(np.arccos(cosang)))
+                if dir_delta_deg > hard_max_dir_change_deg:
+                    runner._vps_jump_reject_count = int(getattr(runner, "_vps_jump_reject_count", 0)) + 1
+                    return False, (
+                        f"HARD_REJECT_DIR_CHANGE: {dir_delta_deg:.1f}deg>"
+                        f"{hard_max_dir_change_deg:.1f}deg"
+                    )
+        return True, ""
+
+    def _clamp_vps_latlon(self,
+                          current_xy: np.ndarray,
+                          vps_lat: float,
+                          vps_lon: float) -> Tuple[float, float, float]:
+        """
+        Clamp one-shot VPS correction magnitude in XY before delayed-update apply.
+        """
+        runner = self.runner
+        max_apply_dp_xy = float(runner.global_config.get("VPS_ABS_MAX_APPLY_DP_XY_M", 25.0))
+        vps_xy = np.array(
+            runner.proj_cache.latlon_to_xy(float(vps_lat), float(vps_lon), runner.lat0, runner.lon0),
+            dtype=float,
+        ).reshape(2,)
+        cur_xy = np.asarray(current_xy, dtype=float).reshape(2,)
+        delta = vps_xy - cur_xy
+        delta_norm = float(np.linalg.norm(delta))
+        if not np.isfinite(delta_norm) or delta_norm <= max_apply_dp_xy or delta_norm <= 1e-9:
+            return float(vps_lat), float(vps_lon), 1.0
+
+        scale = float(max_apply_dp_xy / max(delta_norm, 1e-9))
+        vps_xy_clamped = cur_xy + delta * scale
+        lat_c, lon_c = runner.proj_cache.xy_to_latlon(vps_xy_clamped[0], vps_xy_clamped[1], runner.lat0, runner.lon0)
+        return float(lat_c), float(lon_c), scale
 
     def process_vio(self, rec, t: float, ongoing_preint=None) -> Tuple[bool, Optional[Dict[str, float]]]:
         """
@@ -335,6 +400,7 @@ class VIOService:
                         except Exception:
                             pass
                 else:
+                    runner._vps_attempt_count = int(getattr(runner, "_vps_attempt_count", 0)) + 1
                     # Get current EKF estimates for VPS processing
                     # Extract IMU position from EKF state
                     p_imu_enu = runner.kf.x[:3].flatten()  # Position in ENU
@@ -667,6 +733,21 @@ class VIOService:
             # Increment VIO frame once per processed camera frame.
             runner.state.vio_frame += 1
 
+            if runner.backend_optimizer is not None:
+                try:
+                    yaw_deg_state = float(np.degrees(quaternion_to_yaw(runner.kf.x[6:10, 0])))
+                    q_inlier = min(1.0, float(num_inliers) / 120.0)
+                    q_flow = min(1.0, float(avg_flow_px) / 10.0)
+                    quality = float(np.clip(0.65 * q_inlier + 0.35 * q_flow, 0.0, 1.0))
+                    runner.backend_optimizer.push_keyframe(
+                        t_ref=float(t_cam),
+                        p_enu=np.array(runner.kf.x[0:3, 0], dtype=float),
+                        yaw_deg=yaw_deg_state,
+                        quality_score=quality,
+                    )
+                except Exception:
+                    pass
+
             # Log VO debug
             vel_vx = float(runner.kf.x[3, 0])
             vel_vy = float(runner.kf.x[4, 0])
@@ -739,6 +820,13 @@ class VIOService:
                     vps_num_inliers = int(getattr(vps_result, "num_inliers", 0))
                     vps_conf = float(getattr(vps_result, "confidence", 0.0))
                     vps_reproj = float(getattr(vps_result, "reproj_error", float("inf")))
+                    current_xy = np.array(runner.kf.x[0:2, 0], dtype=float).reshape(2,)
+                    vps_xy = np.array(
+                        runner.proj_cache.latlon_to_xy(float(vps_result.lat), float(vps_result.lon), runner.lat0, runner.lon0),
+                        dtype=float,
+                    ).reshape(2,)
+                    abs_offset_vec = vps_xy - current_xy
+                    abs_offset_m = float(np.linalg.norm(abs_offset_vec))
                     strict_quality_ok = (
                         np.isfinite(vps_conf)
                         and np.isfinite(vps_reproj)
@@ -775,11 +863,16 @@ class VIOService:
                     quality_mode = "strict" if strict_quality_ok else ("failsoft" if failsoft_quality_ok else "reject")
                     r_scale_apply = float(vps_apply_scales.get("r_scale", 1.0))
                     temporal_reject_note = ""
+                    hard_reject_note = ""
+                    hard_ok, hard_note = self._check_vps_hard_reject(abs_offset_vec, abs_offset_m)
+                    if not hard_ok:
+                        quality_mode = "reject"
+                        hard_reject_note = str(hard_note)
 
                     if quality_mode == "failsoft":
                         temporal_ok, temporal_note = self._evaluate_vps_failsoft_temporal_gate(
-                            vps_offset=vps_offset,
-                            vps_offset_m=vps_offset_m,
+                            vps_offset=abs_offset_vec,
+                            vps_offset_m=abs_offset_m,
                         )
                         if not temporal_ok:
                             quality_mode = "reject"
@@ -794,8 +887,10 @@ class VIOService:
                             f"conf={vps_conf:.3f}/{min_conf_apply:.3f}, "
                             f"reproj={vps_reproj:.3f}/{max_reproj_apply:.3f}, "
                             f"speed={speed_now:.2f}/{max_speed_apply:.2f}, "
-                            f"offset={vps_offset_m:.1f}/{fs_max_offset_m:.1f}"
+                            f"offset={abs_offset_m:.1f}/{fs_max_offset_m:.1f}"
                         )
+                        if hard_reject_note:
+                            vps_status = f"{hard_reject_note} | {vps_status}"
                         if temporal_reject_note:
                             vps_status = f"{temporal_reject_note} | {vps_status}"
                     else:
@@ -805,18 +900,29 @@ class VIOService:
                                 r_scale_apply *= 1.25
                             elif health_key == "DEGRADED":
                                 r_scale_apply *= 1.5
+                        vps_lat_apply = float(vps_result.lat)
+                        vps_lon_apply = float(vps_result.lon)
+                        clamp_scale = 1.0
+                        if quality_mode == "failsoft":
+                            vps_lat_apply, vps_lon_apply, clamp_scale = self._clamp_vps_latlon(
+                                current_xy=current_xy,
+                                vps_lat=vps_lat_apply,
+                                vps_lon=vps_lon_apply,
+                            )
                         vps_applied, vps_innovation_m, vps_status = apply_vps_delayed_update(
                             kf=runner.kf,
                             clone_manager=runner.vps_clone_manager,
                             image_id=clone_id,
-                            vps_lat=vps_result.lat,
-                            vps_lon=vps_result.lon,
+                            vps_lat=vps_lat_apply,
+                            vps_lon=vps_lon_apply,
                             R_vps=np.array(vps_result.R_vps, dtype=float) * float(r_scale_apply),
                             proj_cache=runner.proj_cache,
                             lat0=runner.lat0,
                             lon0=runner.lon0,
                             time_since_last_vps=(t_cam - runner.last_vps_update_time),
                         )
+                        if vps_applied and clamp_scale < 0.999:
+                            vps_status = f"{vps_status} | CLAMPED(scale={clamp_scale:.3f})"
                     if quality_mode == "failsoft" and vps_applied:
                         reason_code = "soft_accept"
                     else:
@@ -830,14 +936,20 @@ class VIOService:
                             reason_code = "skip_low_quality"
                             if "soft_reject" in status_lower:
                                 reason_code = "soft_reject"
+                        elif "hard_reject" in status_lower:
+                            reason_code = "abs_corr_hard_reject"
+                        elif "large_offset_pending" in status_lower:
+                            reason_code = "abs_corr_temporal_wait"
                         elif quality_mode == "failsoft" and "gated" in status_lower:
                             reason_code = "soft_reject"
                         elif "gated" in status_lower:
                             reason_code = "gated"
                         elif "failed" in status_lower:
                             reason_code = "soft_reject" if quality_mode == "failsoft" else "hard_reject"
+                        elif "clamped" in status_lower:
+                            reason_code = "abs_corr_clamped_apply"
                         elif "applied" in status_lower:
-                            reason_code = "soft_accept" if quality_mode == "failsoft" else "normal_accept"
+                            reason_code = "abs_corr_soft_apply" if quality_mode == "failsoft" else "normal_accept"
                     vps_adaptive_info.update({
                         "sensor": "VPS",
                         "accepted": bool(vps_applied),
@@ -855,17 +967,39 @@ class VIOService:
                         timestamp=float(t_cam),
                         policy_scales=vps_policy_scales,
                     )
-                    if reason_code.startswith("soft_accept"):
+                    if reason_code.startswith("soft_accept") or reason_code == "abs_corr_soft_apply":
                         runner._vps_soft_accept_count = int(getattr(runner, "_vps_soft_accept_count", 0)) + 1
-                    elif reason_code.startswith("soft_reject"):
+                    elif reason_code.startswith("soft_reject") or reason_code == "abs_corr_temporal_wait":
                         runner._vps_soft_reject_count = int(getattr(runner, "_vps_soft_reject_count", 0)) + 1
                     if vps_applied:
+                        runner._abs_corr_apply_count = int(getattr(runner, "_abs_corr_apply_count", 0)) + 1
+                        if quality_mode == "failsoft":
+                            runner._abs_corr_soft_count = int(getattr(runner, "_abs_corr_soft_count", 0)) + 1
                         runner.last_vps_update_time = t_cam
                         runner.state.vps_idx += 1
                         runner._vps_pending_large_offset_vec = None
                         runner._vps_pending_large_offset_hits = 0
-                        if vps_offset.size >= 2:
-                            runner._vps_last_accepted_offset_vec = np.array(vps_offset[:2], dtype=float)
+                        if abs_offset_vec.size >= 2:
+                            runner._vps_last_accepted_offset_vec = np.array(abs_offset_vec[:2], dtype=float)
+                        if runner.backend_optimizer is not None:
+                            try:
+                                quality_score = float(
+                                    np.clip(
+                                        0.45 * np.clip(vps_conf, 0.0, 1.0)
+                                        + 0.35 * np.clip(vps_num_inliers / 80.0, 0.0, 1.0)
+                                        + 0.20 * np.clip(1.2 / max(vps_reproj, 0.1), 0.0, 1.0),
+                                        0.0,
+                                        1.0,
+                                    )
+                                )
+                                runner.backend_optimizer.report_absolute_hint(
+                                    t_ref=float(t_cam),
+                                    dp_enu=np.array([abs_offset_vec[0], abs_offset_vec[1], 0.0], dtype=float),
+                                    dyaw_deg=0.0,
+                                    quality_score=quality_score,
+                                )
+                            except Exception:
+                                pass
 
             # Save keyframe image with visualization overlay
             if runner.config.save_keyframe_images and hasattr(runner, "keyframe_dir"):
@@ -879,3 +1013,79 @@ class VIOService:
             runner.state.img_idx += 1
 
         return used_vo, vo_data
+
+    def schedule_backend_correction(self, corr) -> None:
+        """
+        Schedule backend correction for gradual blend-in to avoid EKF state jumps.
+        """
+        runner = self.runner
+        if corr is None:
+            return
+        try:
+            dp = np.asarray(getattr(corr, "dp_enu", np.zeros(3)), dtype=float).reshape(3,)
+        except Exception:
+            return
+        if not np.all(np.isfinite(dp)):
+            return
+        dyaw_deg = float(getattr(corr, "dyaw_deg", 0.0))
+        if not np.isfinite(dyaw_deg):
+            dyaw_deg = 0.0
+
+        max_dp = float(runner.global_config.get("BACKEND_MAX_APPLY_DP_XY_M", 25.0))
+        dp_xy_norm = float(np.linalg.norm(dp[:2]))
+        if dp_xy_norm > max_dp and dp_xy_norm > 1e-9:
+            dp[:2] *= float(max_dp / dp_xy_norm)
+        max_dyaw_deg = float(runner.global_config.get("BACKEND_MAX_APPLY_DYAW_DEG", 2.5))
+        dyaw_deg = float(np.clip(dyaw_deg, -max_dyaw_deg, max_dyaw_deg))
+
+        blend_steps = max(1, int(runner.global_config.get("BACKEND_BLEND_STEPS", 3)))
+        runner._backend_pending_dp_enu = dp.copy()
+        runner._backend_pending_dyaw_deg = float(dyaw_deg)
+        runner._backend_pending_steps_left = int(blend_steps)
+
+    def apply_pending_backend_blend(self, t_now: float) -> bool:
+        """
+        Apply one blend step from pending backend correction.
+        """
+        runner = self.runner
+        steps_left = int(getattr(runner, "_backend_pending_steps_left", 0))
+        if steps_left <= 0:
+            return False
+        dp_rem = getattr(runner, "_backend_pending_dp_enu", None)
+        if dp_rem is None:
+            runner._backend_pending_steps_left = 0
+            return False
+
+        dp_rem = np.asarray(dp_rem, dtype=float).reshape(3,)
+        dyaw_rem = float(getattr(runner, "_backend_pending_dyaw_deg", 0.0))
+        step_dp = dp_rem / float(steps_left)
+        step_dyaw_deg = dyaw_rem / float(steps_left)
+
+        inflate = float(runner.global_config.get("BACKEND_APPLY_COV_INFLATE", 1.05))
+        if np.isfinite(inflate) and inflate > 1.0:
+            runner.kf.P[0:6, 0:6] *= float(min(inflate, 1.25))
+
+        runner.kf.x[0:3, 0] = runner.kf.x[0:3, 0] + step_dp.reshape(3,)
+        if abs(step_dyaw_deg) > 1e-9:
+            q_wxyz = runner.kf.x[6:10, 0].astype(float).reshape(4,)
+            q_xyzw = np.array([q_wxyz[1], q_wxyz[2], q_wxyz[3], q_wxyz[0]], dtype=float)
+            r_now = R_scipy.from_quat(q_xyzw)
+            yaw, pitch, roll = r_now.as_euler("zyx", degrees=False)
+            yaw_new = float(np.arctan2(np.sin(yaw + np.deg2rad(step_dyaw_deg)), np.cos(yaw + np.deg2rad(step_dyaw_deg))))
+            r_new = R_scipy.from_euler("zyx", [yaw_new, pitch, roll], degrees=False)
+            q_new_xyzw = r_new.as_quat()
+            runner.kf.x[6:10, 0] = np.array(
+                [q_new_xyzw[3], q_new_xyzw[0], q_new_xyzw[1], q_new_xyzw[2]],
+                dtype=float,
+            )
+
+        runner._backend_pending_dp_enu = dp_rem - step_dp
+        runner._backend_pending_dyaw_deg = dyaw_rem - step_dyaw_deg
+        runner._backend_pending_steps_left = steps_left - 1
+        runner._backend_apply_count = int(getattr(runner, "_backend_apply_count", 0)) + 1
+
+        if int(runner._backend_pending_steps_left) <= 0:
+            runner._backend_pending_dp_enu = None
+            runner._backend_pending_dyaw_deg = 0.0
+            runner._backend_pending_steps_left = 0
+        return True

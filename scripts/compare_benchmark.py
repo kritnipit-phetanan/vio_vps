@@ -33,6 +33,15 @@ HEALTH_COLUMNS = [
     "vps_soft_accept_count",
     "vps_soft_reject_count",
     "mag_accept_rate",
+    "vps_jump_reject_count",
+    "vps_temporal_confirm_count",
+    "abs_corr_apply_count",
+    "abs_corr_soft_count",
+    "backend_apply_count",
+    "backend_stale_drop_count",
+    "backend_poll_count",
+    "vps_attempt_count",
+    "rtf_proc_sim",
 ]
 
 
@@ -236,6 +245,15 @@ def _print_health_summary(current_row: pd.Series) -> None:
         "vps_soft_accept_count",
         "vps_soft_reject_count",
         "mag_accept_rate",
+        "vps_jump_reject_count",
+        "vps_temporal_confirm_count",
+        "abs_corr_apply_count",
+        "abs_corr_soft_count",
+        "backend_apply_count",
+        "backend_stale_drop_count",
+        "backend_poll_count",
+        "vps_attempt_count",
+        "rtf_proc_sim",
     ]:
         if col in current_row.index:
             print(f"{col:20s}: {_to_float(current_row[col]):.6f}")
@@ -256,10 +274,33 @@ def _print_health_delta(current_row: pd.Series, base_row: pd.Series, baseline_ru
     print("")
 
 
-def evaluate_locks(current_row: pd.Series, run_log: Path) -> tuple[bool, list[tuple[str, bool, str]], list[str], float]:
+def _load_heading_final_abs_deg(output_dir: Path) -> float:
+    p = output_dir / "accuracy_first_summary.csv"
+    if not p.is_file():
+        return float("nan")
+    try:
+        df = pd.read_csv(p)
+    except Exception:
+        return float("nan")
+    if len(df) == 0:
+        return float("nan")
+    return _to_float(df.iloc[-1].get("heading_final_abs_deg"))
+
+
+def evaluate_locks(
+    current_row: pd.Series,
+    output_dir: Path,
+    run_log: Path,
+    profile_name: str,
+) -> tuple[bool, list[tuple[str, bool, str]], list[str], float]:
     mag_cholfail = _to_float(current_row.get("mag_cholfail_rate"))
     cov_large = _to_float(current_row.get("cov_large_rate"))
     pmax_max = _to_float(current_row.get("pmax_max"))
+    vps_jump_reject_count = _to_float(current_row.get("vps_jump_reject_count"))
+    vps_attempt_count = _to_float(current_row.get("vps_attempt_count"))
+    backend_stale_drop_count = _to_float(current_row.get("backend_stale_drop_count"))
+    backend_poll_count = _to_float(current_row.get("backend_poll_count"))
+    heading_final_abs_deg = _load_heading_final_abs_deg(output_dir)
     vps_used = np.nan
     overflow_hits: list[str] = []
 
@@ -278,17 +319,14 @@ def evaluate_locks(current_row: pd.Series, run_log: Path) -> tuple[bool, list[tu
                     continue
                 overflow_hits.append(line.strip())
 
-    checks = [
-        (
-            "mag_cholfail_rate <= 0.08",
-            np.isfinite(mag_cholfail) and mag_cholfail <= 0.08,
-            f"value={mag_cholfail:.6f}" if np.isfinite(mag_cholfail) else "value=nan",
-        ),
-        (
-            "VPS used >= 20",
-            np.isfinite(vps_used) and vps_used >= 20.0,
-            f"value={vps_used:.0f}" if np.isfinite(vps_used) else "value=nan",
-        ),
+    jump_ratio = np.nan
+    if np.isfinite(vps_jump_reject_count) and np.isfinite(vps_attempt_count) and vps_attempt_count > 0:
+        jump_ratio = float(vps_jump_reject_count / vps_attempt_count)
+    stale_ratio = np.nan
+    if np.isfinite(backend_stale_drop_count) and np.isfinite(backend_poll_count) and backend_poll_count > 0:
+        stale_ratio = float(backend_stale_drop_count / backend_poll_count)
+
+    checks: list[tuple[str, bool, str]] = [
         (
             "cov_large_rate == 0",
             np.isfinite(cov_large) and abs(cov_large) <= 1e-12,
@@ -305,6 +343,58 @@ def evaluate_locks(current_row: pd.Series, run_log: Path) -> tuple[bool, list[tu
             f"hits={len(overflow_hits)}",
         ),
     ]
+
+    profile = str(profile_name).strip().lower()
+    if profile == "pre_backend":
+        checks.extend(
+            [
+                (
+                    "mag_cholfail_rate <= 0.10",
+                    np.isfinite(mag_cholfail) and mag_cholfail <= 0.10,
+                    f"value={mag_cholfail:.6f}" if np.isfinite(mag_cholfail) else "value=nan",
+                ),
+                (
+                    "VPS used >= 10",
+                    np.isfinite(vps_used) and vps_used >= 10.0,
+                    f"value={vps_used:.0f}" if np.isfinite(vps_used) else "value=nan",
+                ),
+                (
+                    "vps_jump_reject_count/vps_attempts <= 0.5",
+                    np.isfinite(jump_ratio) and jump_ratio <= 0.5,
+                    f"value={jump_ratio:.6f}" if np.isfinite(jump_ratio) else "value=nan",
+                ),
+                (
+                    "heading_final_abs_deg <= 15",
+                    np.isfinite(heading_final_abs_deg) and heading_final_abs_deg <= 15.0,
+                    f"value={heading_final_abs_deg:.3f}" if np.isfinite(heading_final_abs_deg) else "value=nan",
+                ),
+            ]
+        )
+    else:
+        checks.extend(
+            [
+                (
+                    "mag_cholfail_rate <= 0.08",
+                    np.isfinite(mag_cholfail) and mag_cholfail <= 0.08,
+                    f"value={mag_cholfail:.6f}" if np.isfinite(mag_cholfail) else "value=nan",
+                ),
+                (
+                    "VPS used >= 20",
+                    np.isfinite(vps_used) and vps_used >= 20.0,
+                    f"value={vps_used:.0f}" if np.isfinite(vps_used) else "value=nan",
+                ),
+                (
+                    "backend_stale_drop_count/backend_poll_count <= 0.2",
+                    np.isfinite(stale_ratio) and stale_ratio <= 0.2,
+                    f"value={stale_ratio:.6f}" if np.isfinite(stale_ratio) else "value=nan",
+                ),
+                (
+                    "heading_final_abs_deg <= 10",
+                    np.isfinite(heading_final_abs_deg) and heading_final_abs_deg <= 10.0,
+                    f"value={heading_final_abs_deg:.3f}" if np.isfinite(heading_final_abs_deg) else "value=nan",
+                ),
+            ]
+        )
     all_ok = all(ok for _, ok, _ in checks)
     return all_ok, checks, overflow_hits, vps_used
 
@@ -313,6 +403,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Compare benchmark output with baseline and check locks.")
     parser.add_argument("--output_dir", required=True, help="Current run output directory")
     parser.add_argument("--baseline_run", default="", help="Optional baseline run directory")
+    parser.add_argument("--lock_profile", default="backend", choices=["pre_backend", "backend"])
     parser.add_argument("--enforce_locks", action="store_true", help="Return non-zero when any hard lock fails")
     args = parser.parse_args()
 
@@ -347,7 +438,10 @@ def main() -> int:
         print("")
 
     print("=== Hard Lock Checks ===")
-    all_ok, checks, overflow_hits, _ = evaluate_locks(cur_row, out_dir / "run.log")
+    print(f"Profile: {args.lock_profile}")
+    all_ok, checks, overflow_hits, _ = evaluate_locks(
+        cur_row, out_dir, out_dir / "run.log", args.lock_profile
+    )
     for name, ok, detail in checks:
         tag = "PASS" if ok else "FAIL"
         print(f"[{tag}] {name:40s} ({detail})")
