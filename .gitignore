@@ -4,6 +4,7 @@
 
 # Python
 __pycache__/
+.pytest_cache/
 *.py[cod]
 *$py.class
 *.so
@@ -88,6 +89,9 @@ src_old/
 module_old/
 vio_backup_src/
 *.aux.xml
+misc_src/
+tests/
+old_docs/
 
 # MBTiles files
 *.mbtiles
