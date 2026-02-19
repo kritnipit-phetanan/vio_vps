@@ -378,6 +378,8 @@ class BootstrapService:
             D,
             use_fisheye=use_fisheye,
             fast_mode=runner.config.fast_mode,
+            runtime_verbosity=str(runner.global_config.get("LOG_RUNTIME_VERBOSITY", "debug")),
+            runtime_log_interval_sec=float(runner.global_config.get("LOG_RUNTIME_MIN_INTERVAL_SEC", 1.0)),
         )
 
         # Override min_track_length from config
@@ -496,6 +498,17 @@ class BootstrapService:
         runner.conditioning_events_csv = csv_paths.get("conditioning_events_csv")
         runner.benchmark_health_summary_csv = csv_paths.get("benchmark_health_summary_csv")
         runner.inf_csv = csv_paths["inf_csv"]
+        if runner._inf_fh is not None:
+            try:
+                runner._inf_fh.close()
+            except Exception:
+                pass
+            runner._inf_fh = None
+        try:
+            # Keep inference log file open for the whole run to avoid per-sample open/close overhead.
+            runner._inf_fh = open(runner.inf_csv, "a", newline="", buffering=1024 * 1024)
+        except Exception:
+            runner._inf_fh = None
         runner.vo_dbg_csv = csv_paths.get("vo_dbg")
         runner.msckf_dbg_csv = csv_paths.get("msckf_dbg")
 

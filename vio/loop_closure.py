@@ -803,6 +803,15 @@ def apply_loop_closure_correction(kf, loop_info: Dict[str, Any], t: float,
             update_type="LOOP_CLOSURE",
             timestamp=t
         )
+
+        # Keep detector statistics consistent with actually-applied EKF corrections.
+        if hasattr(loop_detector, "stats") and isinstance(loop_detector.stats, dict):
+            loop_detector.stats["yaw_corrections_applied"] = int(
+                loop_detector.stats.get("yaw_corrections_applied", 0)
+            ) + 1
+            loop_detector.stats["total_yaw_correction"] = float(
+                loop_detector.stats.get("total_yaw_correction", 0.0)
+            ) + abs(float(yaw_error))
         
         loop_detector._last_apply_t = float(t)
         tag = "FAILSOFT" if fail_soft else "NORMAL"

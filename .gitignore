@@ -92,6 +92,7 @@ vio_backup_src/
 misc_scripts/
 tests/
 old_docs/
+tests_backup/
 
 # MBTiles files
 *.mbtiles

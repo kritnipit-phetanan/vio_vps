@@ -9,6 +9,7 @@ Called at camera frame rate from VIO main loop.
 Author: VIO project
 """
 
+import os
 import time
 import numpy as np
 from typing import Optional, Dict, Any, List, Tuple
@@ -81,6 +82,8 @@ class VPSConfig:
     reloc_global_yaw_hypotheses_deg: tuple = (0.0, 45.0, 90.0, 135.0, 180.0, -45.0, -90.0, -135.0)
     reloc_global_scale_hypotheses: tuple = (0.80, 0.90, 1.00, 1.10, 1.20)
     reloc_force_global_on_warning_phase: bool = False
+    runtime_verbosity: str = "debug"
+    runtime_log_interval_sec: float = 1.0
 
 
 class VPSRunner:
@@ -121,6 +124,10 @@ class VPSRunner:
         if config is None:
             config = VPSConfig(mbtiles_path=mbtiles_path, device=device)
         self.config = config
+        self._runtime_verbosity = str(self.config.runtime_verbosity).lower()
+        self._runtime_quiet = self._runtime_verbosity in ("release", "quiet", "minimal")
+        self._runtime_log_interval_sec = max(0.0, float(self.config.runtime_log_interval_sec))
+        self._last_runtime_log_ts: Dict[str, float] = {}
         
         # Initialize components
         print("[VPSRunner] Initializing...")
@@ -185,6 +192,18 @@ class VPSRunner:
         }
         
         print("[VPSRunner] Ready")
+
+    def _runtime_log(self, key: str, msg: str, force: bool = False):
+        """Rate-limited logging for per-frame runtime messages."""
+        if force or not self._runtime_quiet:
+            print(msg)
+            self._last_runtime_log_ts[key] = time.time()
+            return
+        now = time.time()
+        last = self._last_runtime_log_ts.get(key, -1e9)
+        if (now - last) >= self._runtime_log_interval_sec:
+            print(msg)
+            self._last_runtime_log_ts[key] = now
     
     @classmethod
     def create_from_config(cls, 
@@ -217,6 +236,7 @@ class VPSRunner:
         camera_intrinsics = None
         camera_yaw_offset_rad = 0.0
         vps_cfg: Dict[str, Any] = {}
+        logging_cfg: Dict[str, Any] = {}
         vps_config = VPSConfig(mbtiles_path=mbtiles_path, device=device)
         
         # Load camera intrinsics from config
@@ -242,6 +262,9 @@ class VPSRunner:
                 print(f"[VPSRunner] Camera: mu={camera_intrinsics['mu']:.1f}, "
                       f"mv={camera_intrinsics['mv']:.1f}")
             vps_cfg = config_yaml.get("vps", {}) if isinstance(config_yaml, dict) else {}
+            logging_cfg = config_yaml.get("logging", {}) if isinstance(config_yaml, dict) else {}
+            if not isinstance(logging_cfg, dict):
+                logging_cfg = {}
             
             # Create fisheye rectifier
             try:
@@ -301,6 +324,11 @@ class VPSRunner:
                 "global_scale_hypotheses", [0.80, 0.90, 1.00, 1.10, 1.20]
             ))
 
+            runtime_verbosity_default = os.environ.get("VIO_RUNTIME_VERBOSITY", "debug")
+            runtime_log_interval_default = float(
+                os.environ.get("VIO_RUNTIME_LOG_INTERVAL_SEC", "1.0")
+            )
+
             vps_config = VPSConfig(
                 mbtiles_path=mbtiles_path,
                 output_size=(int(output_size[0]), int(output_size[1])),
@@ -339,6 +367,18 @@ class VPSRunner:
                 reloc_global_yaw_hypotheses_deg=reloc_global_yaw if len(reloc_global_yaw) > 0 else (0.0, 45.0, 90.0, 135.0, 180.0, -45.0, -90.0, -135.0),
                 reloc_global_scale_hypotheses=reloc_global_scale if len(reloc_global_scale) > 0 else (0.80, 0.90, 1.00, 1.10, 1.20),
                 reloc_force_global_on_warning_phase=bool(reloc_cfg.get("force_global_on_warning_phase", False)),
+                runtime_verbosity=str(
+                    vps_cfg.get(
+                        "runtime_verbosity",
+                        logging_cfg.get("runtime_verbosity", runtime_verbosity_default),
+                    )
+                ),
+                runtime_log_interval_sec=float(
+                    vps_cfg.get(
+                        "runtime_log_interval_sec",
+                        logging_cfg.get("runtime_log_interval_sec", runtime_log_interval_default),
+                    )
+                ),
             )
             print(
                 f"[VPSRunner] VPS cfg: patch={vps_config.patch_size_px}/{vps_config.patch_size_failover_px}, "
@@ -980,14 +1020,17 @@ class VPSRunner:
             )
         
         # Console log
-        print(f"[VPS] t={t_cam:.2f}: "
-              f"cand={selected_candidate_idx+1}/{max(1, num_candidates)}, "
-              f"patch={patch_size_px}px, "
-              f"inliers={match_result.num_inliers}, "
-              f"err={match_result.reproj_error:.2f}px, "
-              f"Δ=({vps_measurement.offset_m[0]:.1f}, {vps_measurement.offset_m[1]:.1f})m, "
-              f"σ={np.sqrt(vps_measurement.R_vps[0,0]):.2f}m, "
-              f"time={processing_time_ms:.0f}ms")
+        self._runtime_log(
+            "vps_result",
+            f"[VPS] t={t_cam:.2f}: "
+            f"cand={selected_candidate_idx+1}/{max(1, num_candidates)}, "
+            f"patch={patch_size_px}px, "
+            f"inliers={match_result.num_inliers}, "
+            f"err={match_result.reproj_error:.2f}px, "
+            f"Δ=({vps_measurement.offset_m[0]:.1f}, {vps_measurement.offset_m[1]:.1f})m, "
+            f"σ={np.sqrt(vps_measurement.R_vps[0,0]):.2f}m, "
+            f"time={processing_time_ms:.0f}ms",
+        )
         
         # Save match visualization if directory is set
         if success_reason == "matched_failsoft":

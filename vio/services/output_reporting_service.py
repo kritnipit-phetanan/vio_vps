@@ -631,10 +631,15 @@ class OutputReportingService:
         if self.runner.pose_csv and os.path.isfile(self.runner.pose_csv):
             try:
                 pose_df = pd.read_csv(self.runner.pose_csv)
-                if len(pose_df) > 0 and all(c in pose_df.columns for c in ("vx", "vy", "vz")):
-                    vx = pd.to_numeric(pose_df["vx"], errors="coerce").to_numpy(dtype=float)
-                    vy = pd.to_numeric(pose_df["vy"], errors="coerce").to_numpy(dtype=float)
-                    vz = pd.to_numeric(pose_df["vz"], errors="coerce").to_numpy(dtype=float)
+                if len(pose_df) > 0:
+                    vx_col = "vx" if "vx" in pose_df.columns else ("VX" if "VX" in pose_df.columns else None)
+                    vy_col = "vy" if "vy" in pose_df.columns else ("VY" if "VY" in pose_df.columns else None)
+                    vz_col = "vz" if "vz" in pose_df.columns else ("VZ" if "VZ" in pose_df.columns else None)
+                    if vx_col is None or vy_col is None or vz_col is None:
+                        raise KeyError("velocity columns vx/VX, vy/VY, vz/VZ not found")
+                    vx = pd.to_numeric(pose_df[vx_col], errors="coerce").to_numpy(dtype=float)
+                    vy = pd.to_numeric(pose_df[vy_col], errors="coerce").to_numpy(dtype=float)
+                    vz = pd.to_numeric(pose_df[vz_col], errors="coerce").to_numpy(dtype=float)
                     speed = np.sqrt(vx * vx + vy * vy + vz * vz)
                     speed = speed[np.isfinite(speed)]
                     if speed.size > 0:

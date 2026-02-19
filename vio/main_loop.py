@@ -115,6 +115,7 @@ class VIORunner:
         self.pose_csv = None
         self.error_csv = None
         self.inf_csv = None
+        self._inf_fh = None
         self.state_dbg_csv = None
         self.vo_dbg_csv = None
         self.msckf_dbg_csv = None
@@ -254,6 +255,12 @@ class VIORunner:
                 self.backend_optimizer.stop()
             except Exception:
                 pass
+        if self._inf_fh is not None:
+            try:
+                self._inf_fh.close()
+            except Exception:
+                pass
+            self._inf_fh = None
 
         # Finalize reporting in one place.
         self.output_reporting.print_summary()

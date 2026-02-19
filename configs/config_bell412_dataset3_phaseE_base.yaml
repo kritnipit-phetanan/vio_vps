@@ -369,9 +369,6 @@ backend:
   min_quality_score: 0.2
   optimize_rate_hz: 1.0
   poll_interval_sec: 1.0
-logging:
-  runtime_log_interval_sec: 1.0
-  runtime_verbosity: debug
 camera:
   image_height: 1080
   image_width: 1440
@@ -803,7 +800,6 @@ vps:
   enabled: true
   failover_fail_streak: 6
   failsoft_r_inflate: 4.0
-  global_max_candidates: 20
   max_altitude: 500.0
   max_candidates: 6
   max_clones: 3
@@ -820,8 +816,6 @@ vps:
   min_inliers_failsoft: 5
   min_texture_std: 8.0
   min_update_interval: 0.5
-  runtime_log_interval_sec: 1.0
-  runtime_verbosity: debug
   output_size:
   - 512
   - 512

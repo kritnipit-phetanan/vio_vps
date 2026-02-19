@@ -553,6 +553,14 @@ def load_config(config_path: str) -> VIOConfig:
         perf = config.get('performance', {})
         result['FAST_MODE'] = perf.get('fast_mode', False)
         result['FRAME_SKIP'] = perf.get('frame_skip', 1)
+
+    # Runtime logging policy (separate from adaptive.logging)
+    runtime_logging = config.get("logging", {}) if isinstance(config.get("logging", {}), dict) else {}
+    runtime_verbosity_default = os.environ.get("VIO_RUNTIME_VERBOSITY", "debug")
+    result["LOG_RUNTIME_VERBOSITY"] = str(
+        runtime_logging.get("runtime_verbosity", runtime_verbosity_default)
+    ).lower()
+    result["LOG_RUNTIME_MIN_INTERVAL_SEC"] = float(runtime_logging.get("runtime_log_interval_sec", 1.0))
     
     # IMU-GNSS Lever Arm (optional - defaults to zero if not specified)
     if 'imu_gnss_extrinsics' in config:

@@ -30,7 +30,9 @@ except Exception as exc:  # pragma: no cover
     raise SystemExit(f"PyYAML required: {exc}")
 
 
-DEFAULT_PHASE_SEQUENCE = ["A1", "A2", "A3", "A4"]
+DEFAULT_PHASE_SEQUENCE_STAGE_A = ["A1", "A2", "A3", "A4", "A5"]
+DEFAULT_PHASE_SEQUENCE_STAGE_E = ["E1", "E2", "E3", "E4", "E5"]
+DEFAULT_PHASE_SEQUENCE = list(DEFAULT_PHASE_SEQUENCE_STAGE_A)
 
 # One-knob assignments for Stage-A pre-backend tuning (Phase4-base roadmap).
 PHASE_ASSIGNMENTS: dict[str, dict[str, Any]] = {
@@ -59,6 +61,55 @@ PHASE_ASSIGNMENTS: dict[str, dict[str, Any]] = {
         "vio.msckf.reproj_state_aware.degraded_scale": 1.35,
         "vio.msckf.reproj_state_aware.mid_gate_mult": 1.15,
     },
+    "A5": {
+        # Absolute-source quality-first tuning (VPS retrieval/geometry policy)
+        # Keep candidate budget bounded for near-RT; tighten content/texture gates.
+        "vps.max_candidates": 5,
+        "vps.global_max_candidates": 10,
+        "vps.min_content_ratio": 0.24,
+        "vps.min_texture_std": 10.0,
+        "vps.relocalization.fail_streak_trigger": 4,
+        "vps.relocalization.xy_sigma_trigger_m": 25.0,
+        "vps.relocalization.max_centers": 8,
+    },
+    "D1": {
+        # Near-RT budget knob 1: reduce async backend cadence.
+        "backend.optimize_rate_hz": 1.0,
+        "backend.poll_interval_sec": 1.0,
+    },
+    "D2": {
+        # Near-RT budget knob 2: reduce VPS invocation/candidate load.
+        "vps.min_update_interval": 0.8,
+        "vps.max_candidates": 4,
+        "vps.global_max_candidates": 8,
+        "vps.relocalization.max_centers": 6,
+        "vps.relocalization.ring_samples": 6,
+    },
+    "E1": {
+        # Phase-E base marker (no knob change by design).
+    },
+    "E2": {
+        # Runtime knob #1: VPS candidate budget
+        "vps.global_max_candidates": 20,
+        "vps.max_candidates": 5,
+        "vps.relocalization.max_centers": 6,
+    },
+    "E3": {
+        # Runtime knob #2: VPS cadence
+        "vps.min_update_interval": 0.9,
+    },
+    "E4": {
+        # Runtime knob #3: backend cadence
+        "backend.optimize_rate_hz": 0.5,
+        "backend.poll_interval_sec": 1.5,
+    },
+    "E5": {
+        # Runtime knob #4: log throttling
+        "logging.runtime_verbosity": "release",
+        "logging.runtime_log_interval_sec": 1.0,
+        "vps.runtime_verbosity": "release",
+        "vps.runtime_log_interval_sec": 1.0,
+    },
     # Backward-compatible aliases.
     "1": {},
     "2": {},
@@ -69,6 +120,7 @@ PHASE_ASSIGNMENTS["1"] = PHASE_ASSIGNMENTS["A1"]
 PHASE_ASSIGNMENTS["2"] = PHASE_ASSIGNMENTS["A2"]
 PHASE_ASSIGNMENTS["3"] = PHASE_ASSIGNMENTS["A3"]
 PHASE_ASSIGNMENTS["4"] = PHASE_ASSIGNMENTS["A4"]
+PHASE_ASSIGNMENTS["5"] = PHASE_ASSIGNMENTS["A5"]
 
 
 def list_run_dirs(repo_dir: Path) -> list[Path]:
@@ -115,13 +167,14 @@ def set_nested(cfg: dict[str, Any], key: str, value: Any) -> None:
 
 
 _MISSING = object()
+_NO_DEFAULT = object()
 
 
-def get_nested(cfg: dict[str, Any], key: str, default: Any = _MISSING) -> Any:
+def get_nested(cfg: dict[str, Any], key: str, default: Any = _NO_DEFAULT) -> Any:
     cur: Any = cfg
     for part in key.split("."):
         if not isinstance(cur, dict) or part not in cur:
-            if default is _MISSING:
+            if default is _NO_DEFAULT:
                 raise KeyError(key)
             return default
         cur = cur[part]
@@ -366,7 +419,7 @@ def evaluate_lock_profile(run_dir: Path | None, profile_name: str) -> tuple[bool
                 f"value={heading_final_abs:.3f}" if np.isfinite(heading_final_abs) else "value=nan",
             ),
         ])
-    elif profile == "backend":
+    elif profile in ("backend", "near_rt_backend"):
         checks.extend([
             (
                 "mag_cholfail_rate <= 0.08",
@@ -389,6 +442,15 @@ def evaluate_lock_profile(run_dir: Path | None, profile_name: str) -> tuple[bool
                 f"value={heading_final_abs:.3f}" if np.isfinite(heading_final_abs) else "value=nan",
             ),
         ])
+        if profile == "near_rt_backend":
+            rtf_proc_sim = _to_float(row, "rtf_proc_sim")
+            checks.append(
+                (
+                    "rtf_proc_sim <= 1.2",
+                    bool(np.isfinite(rtf_proc_sim) and rtf_proc_sim <= 1.2),
+                    f"value={rtf_proc_sim:.6f}" if np.isfinite(rtf_proc_sim) else "value=nan",
+                )
+            )
     else:
         checks.append(("lock profile recognized", False, f"profile={profile}"))
 
@@ -411,6 +473,19 @@ def evaluate_lock_profile(run_dir: Path | None, profile_name: str) -> tuple[bool
     return ok, detail
 
 
+def classify_rtf_pass_tier(rtf_proc_sim: float) -> str:
+    """Classify runtime tier for near-RT tracking dashboards."""
+    if not np.isfinite(rtf_proc_sim):
+        return "nan"
+    if rtf_proc_sim <= 1.2:
+        return "<=1.2"
+    if rtf_proc_sim <= 2.0:
+        return "<=2.0"
+    if rtf_proc_sim <= 3.0:
+        return "<=3.0"
+    return ">3.0"
+
+
 def save_phase_results(path: Path, rows: list[dict[str, Any]]) -> None:
     if not rows:
         return
@@ -426,14 +501,14 @@ def print_phase_table(rows: list[dict[str, Any]]) -> None:
         print("No phase results.")
         return
     print("\n=== Phase Tuning Summary ===")
-    print("phase  profile      status    err3d_mean(m)  delta_vs_baseline(%)  locks  run_dir")
+    print("phase  profile      status    err3d_mean(m)  delta_vs_baseline(%)  locks  rtf_tier  run_dir")
     for r in rows:
         d = r.get("err3d_delta_pct", np.nan)
         d_s = f"{d:+.2f}" if np.isfinite(d) else "n/a"
         print(
             f"{str(r['phase']):>5s}  {str(r.get('profile_name', '')):<11s}  {str(r['status']):<8s}  "
             f"{float(r.get('err3d_mean', np.nan)):>13.3f}  {d_s:>21s}  "
-            f"{str(r.get('locks_ok', np.nan)):<5s}  {r.get('run_dir', '')}"
+            f"{str(r.get('locks_ok', np.nan)):<5s}  {str(r.get('rtf_pass_tier', 'nan')):<8s}  {r.get('run_dir', '')}"
         )
 
 
@@ -441,7 +516,7 @@ def snapshot_path_for_profile(repo_dir: Path, profile_name: str) -> Path:
     profile = str(profile_name).lower()
     if profile == "pre_backend":
         return (repo_dir / "configs" / "config_bell412_dataset3_backend_stage1.yaml").resolve()
-    if profile == "backend":
+    if profile in ("backend", "near_rt_backend"):
         return (repo_dir / "configs" / "config_bell412_dataset3_backend_stage2.yaml").resolve()
     return (repo_dir / "configs" / "config_bell412_dataset3_accuracy_stage2.yaml").resolve()
 
@@ -454,10 +529,11 @@ def main() -> int:
     parser.add_argument("--save_debug_data", type=int, default=0, choices=[0, 1])
     parser.add_argument("--save_keyframe_images", type=int, default=0, choices=[0, 1])
     parser.add_argument("--baseline_run", default="")
-    parser.add_argument("--lock_profile", default="pre_backend", choices=["pre_backend", "backend"])
+    parser.add_argument("--lock_profile", default="pre_backend", choices=["pre_backend", "backend", "near_rt_backend"])
     parser.add_argument("--max_regress_pct", type=float, default=15.0)
     parser.add_argument("--apply_best_config", type=int, default=0, choices=[0, 1])
-    parser.add_argument("--phases", default=",".join(DEFAULT_PHASE_SEQUENCE))
+    parser.add_argument("--phase_set", default="stageA", choices=["stageA", "stageE", "custom"])
+    parser.add_argument("--phases", default="")
     parser.add_argument("--dry_run", action="store_true", help="Plan and emit phase table without running benchmarks")
     parser.add_argument("--force_run_noop", action="store_true", help="Run phase even when no keys would change")
     args = parser.parse_args()
@@ -479,12 +555,20 @@ def main() -> int:
     print(f"Baseline run: {baseline_run if baseline_run else 'None'}")
     print(f"Baseline err3d_mean: {baseline_err:.3f} m" if np.isfinite(baseline_err) else "Baseline err3d_mean: nan")
     print(f"Lock profile: {args.lock_profile}")
+    print(f"Phase set: {args.phase_set}")
     print(f"Phase base config: {base_cfg_path}")
 
     with base_cfg_path.open("r", encoding="utf-8") as f:
         base_cfg = yaml.safe_load(f) or {}
 
-    phases = [p.strip() for p in args.phases.split(",") if p.strip()]
+    if args.phase_set == "stageA":
+        default_phases = DEFAULT_PHASE_SEQUENCE_STAGE_A
+    elif args.phase_set == "stageE":
+        default_phases = DEFAULT_PHASE_SEQUENCE_STAGE_E
+    else:
+        default_phases = DEFAULT_PHASE_SEQUENCE
+    phases_raw = args.phases if str(args.phases).strip() else ",".join(default_phases)
+    phases = [p.strip() for p in phases_raw.split(",") if p.strip()]
     for p in phases:
         if p not in PHASE_ASSIGNMENTS:
             print(f"❌ Unknown phase: {p}")
@@ -496,7 +580,7 @@ def main() -> int:
     summary_csv = orchestration_dir / "phase_results.csv"
 
     current_cfg = copy.deepcopy(base_cfg)
-    accepted_cfg_by_run: dict[str, dict[str, Any]] = {}
+    cfg_by_run: dict[str, dict[str, Any]] = {}
     rows: list[dict[str, Any]] = []
 
     for phase in phases:
@@ -533,6 +617,7 @@ def main() -> int:
                     "pmax_max": np.nan,
                     "overflow_hits": np.nan,
                     "rtf_proc_sim": np.nan,
+                    "rtf_pass_tier": "nan",
                     "changed_key_count": 0,
                     "changed_keys": "",
                 }
@@ -562,6 +647,7 @@ def main() -> int:
                     "pmax_max": np.nan,
                     "overflow_hits": np.nan,
                     "rtf_proc_sim": np.nan,
+                    "rtf_pass_tier": "nan",
                     "changed_key_count": len(changed_keys),
                     "changed_keys": "|".join(changed_keys),
                 }
@@ -603,6 +689,7 @@ def main() -> int:
                     "pmax_max": np.nan,
                     "overflow_hits": np.nan,
                     "rtf_proc_sim": np.nan,
+                    "rtf_pass_tier": "nan",
                     "changed_key_count": len(changed_keys),
                     "changed_keys": "|".join(changed_keys),
                 }
@@ -612,6 +699,7 @@ def main() -> int:
 
         run_cfg_snapshot = run_dir / "phase_config_snapshot.yaml"
         write_yaml(run_cfg_snapshot, candidate_cfg)
+        cfg_by_run[str(run_dir.resolve())] = copy.deepcopy(candidate_cfg)
 
         err_cur = read_err3d_mean(run_dir)
         delta_pct = np.nan
@@ -652,6 +740,7 @@ def main() -> int:
             "pmax_max": lock_detail.get("pmax_max", np.nan),
             "overflow_hits": lock_detail.get("overflow_hits", np.nan),
             "rtf_proc_sim": lock_detail.get("rtf_proc_sim", np.nan),
+            "rtf_pass_tier": classify_rtf_pass_tier(float(lock_detail.get("rtf_proc_sim", np.nan))),
             "changed_key_count": len(changed_keys),
             "changed_keys": "|".join(changed_keys),
         }
@@ -661,7 +750,6 @@ def main() -> int:
             current_cfg = candidate_cfg
             baseline_run = run_dir
             baseline_err = err_cur
-            accepted_cfg_by_run[str(run_dir)] = copy.deepcopy(candidate_cfg)
             print(f"[Phase {phase}] PASS -> new baseline: {run_dir} (err3d_mean={err_cur:.3f} m)")
         else:
             print(f"[Phase {phase}] ROLLBACK ({reason_text})")
@@ -676,11 +764,10 @@ def main() -> int:
 
     accepted = [r for r in rows if r["status"] == "PASS" and np.isfinite(r["err3d_mean"])]
     best_run: Path | None = None
+    best_row: dict[str, Any] | None = None
     if accepted:
-        best = min(accepted, key=lambda r: float(r["err3d_mean"]))
-        best_run = Path(str(best["run_dir"])).resolve()
-    elif baseline_run is not None and baseline_run.is_dir():
-        best_run = baseline_run
+        best_row = min(accepted, key=lambda r: float(r["err3d_mean"]))
+        best_run = Path(str(best_row["run_dir"])).resolve()
 
     snapshot_path = snapshot_path_for_profile(repo_dir, args.lock_profile)
     if best_run is not None:
@@ -698,8 +785,30 @@ def main() -> int:
                 write_yaml(config_path, current_cfg)
                 print(f"Applied fallback best config to: {config_path}")
 
-        baseline_file.write_text(str(best_run) + "\n", encoding="utf-8")
-        print(f"Updated baseline pointer: {baseline_file} -> {best_run}")
+        should_update_baseline = True
+        if str(args.lock_profile).lower() == "near_rt_backend":
+            best_rtf = float(best_row.get("rtf_proc_sim", np.nan)) if isinstance(best_row, dict) else np.nan
+            should_update_baseline = bool(np.isfinite(best_rtf) and best_rtf <= 1.2)
+
+        if should_update_baseline:
+            baseline_file.write_text(str(best_run) + "\n", encoding="utf-8")
+            print(f"Updated baseline pointer: {baseline_file} -> {best_run}")
+        else:
+            candidate_cfg_path = (repo_dir / "configs" / "config_bell412_dataset3_backend_stage2_candidate.yaml").resolve()
+            cfg_candidate = cfg_by_run.get(str(best_run.resolve()), current_cfg)
+            write_yaml(candidate_cfg_path, cfg_candidate)
+            print(f"Near-RT candidate saved (baseline unchanged): {candidate_cfg_path}")
+    elif str(args.lock_profile).lower() == "near_rt_backend":
+        finite_rows = [r for r in rows if np.isfinite(float(r.get("err3d_mean", np.nan))) and str(r.get("run_dir", "")).strip()]
+        if finite_rows:
+            best_fail = min(finite_rows, key=lambda r: float(r["err3d_mean"]))
+            run_str = str(best_fail.get("run_dir", "")).strip()
+            cfg_candidate = current_cfg
+            if run_str:
+                cfg_candidate = cfg_by_run.get(str(Path(run_str).resolve()), current_cfg)
+            candidate_cfg_path = (repo_dir / "configs" / "config_bell412_dataset3_backend_stage2_candidate.yaml").resolve()
+            write_yaml(candidate_cfg_path, cfg_candidate)
+            print(f"Near-RT candidate saved from best finite run (baseline unchanged): {candidate_cfg_path}")
 
     save_phase_results(summary_csv, rows)
     print_phase_table(rows)

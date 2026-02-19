@@ -377,12 +377,16 @@ def run_imu_driven_loop(runner):
             lon_now=lon_now,
         )
         
-        # Log inference timing (every sample, like vio_vps.py)
+        # Log inference timing (every sample, like vio_vps.py).
+        # Use long-lived file handle to reduce per-sample I/O overhead.
         toc_iter = time.time()
-        with open(runner.inf_csv, "a", newline="") as f:
-            dt_proc = toc_iter - tic_iter
-            fps = (1.0 / dt_proc) if dt_proc > 0 else 0.0
-            f.write(f"{i},{dt_proc:.6f},{fps:.2f}\n")
+        dt_proc = toc_iter - tic_iter
+        fps = (1.0 / dt_proc) if dt_proc > 0 else 0.0
+        if runner._inf_fh is not None:
+            runner._inf_fh.write(f"{i},{dt_proc:.6f},{fps:.2f}\n")
+        else:
+            with open(runner.inf_csv, "a", newline="") as f:
+                f.write(f"{i},{dt_proc:.6f},{fps:.2f}\n")
         
         # Heavy state debug is optional (enabled by --save_debug_data).
         if runner.state_dbg_csv:

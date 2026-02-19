@@ -265,6 +265,12 @@ echo "  RUN_MODE: ${RUN_MODE}"
 echo "  SAVE_DEBUG_DATA: ${SAVE_DEBUG_DATA}"
 echo "  SAVE_KEYFRAME_IMAGES: ${SAVE_KEYFRAME_IMAGES}"
 echo "  LOCK_PROFILE: ${LOCK_PROFILE}"
+if [ "$SAVE_DEBUG_DATA" = "1" ]; then
+    export VIO_RUNTIME_VERBOSITY="${VIO_RUNTIME_VERBOSITY:-debug}"
+else
+    export VIO_RUNTIME_VERBOSITY="${VIO_RUNTIME_VERBOSITY:-release}"
+fi
+echo "  VIO_RUNTIME_VERBOSITY: ${VIO_RUNTIME_VERBOSITY}"
 echo "  Active sensors: ${RUN_MODE_LABEL}"
 [ -n "$BASELINE_RUN" ] && echo "  Baseline run: ${BASELINE_RUN}"
 [ "$USE_CAM" -eq 1 ] && echo "    - Camera: ${IMAGES_DIR}"
@@ -292,7 +298,7 @@ START_TIME=$(date +%s.%N)
 # v3.9.0: Add --timeref_csv for camera time_ref matching
 # v4.0.0: Add --vps_tiles for VPS real-time processing
 PYTHON_ARGS=(
-    python3 run_vio.py
+    python3 -u run_vio.py
     --config "$CONFIG"
     --imu "$IMU_PATH"
     --ground_truth "$GROUND_TRUTH"
@@ -333,7 +339,7 @@ elif [ "$HAS_VPS" -eq 1 ]; then
     echo "ℹ️  VPS disabled for RUN_MODE=${RUN_MODE} (camera/VPS policy)"
 fi
 
-if ! "${PYTHON_ARGS[@]}" 2>&1 | tee "$OUTPUT_DIR/run.log"; then
+if ! PYTHONUNBUFFERED=1 "${PYTHON_ARGS[@]}" 2>&1 | tee "$OUTPUT_DIR/run.log"; then
     fail_fast "VIO run failed (see $OUTPUT_DIR/run.log)"
 fi
 

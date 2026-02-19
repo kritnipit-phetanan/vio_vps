@@ -370,7 +370,7 @@ def evaluate_locks(
                 ),
             ]
         )
-    else:
+    elif profile in ("backend", "near_rt_backend"):
         checks.extend(
             [
                 (
@@ -395,6 +395,19 @@ def evaluate_locks(
                 ),
             ]
         )
+        if profile == "near_rt_backend":
+            rtf_proc_sim = _to_float(current_row.get("rtf_proc_sim"))
+            checks.append(
+                (
+                    "rtf_proc_sim <= 1.2",
+                    np.isfinite(rtf_proc_sim) and rtf_proc_sim <= 1.2,
+                    f"value={rtf_proc_sim:.6f}" if np.isfinite(rtf_proc_sim) else "value=nan",
+                )
+            )
+    else:
+        checks.append(
+            ("lock profile recognized", False, f"profile={profile}")
+        )
     all_ok = all(ok for _, ok, _ in checks)
     return all_ok, checks, overflow_hits, vps_used
 
@@ -403,7 +416,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Compare benchmark output with baseline and check locks.")
     parser.add_argument("--output_dir", required=True, help="Current run output directory")
     parser.add_argument("--baseline_run", default="", help="Optional baseline run directory")
-    parser.add_argument("--lock_profile", default="backend", choices=["pre_backend", "backend"])
+    parser.add_argument("--lock_profile", default="backend", choices=["pre_backend", "backend", "near_rt_backend"])
     parser.add_argument("--enforce_locks", action="store_true", help="Return non-zero when any hard lock fails")
     args = parser.parse_args()
 

@@ -171,6 +171,8 @@ def summarize_spectacular_style(out_dir: Path) -> dict:
         "yaw_align_deg": np.nan,
         "heading_mae_deg": np.nan,
         "heading_final_abs_deg": np.nan,
+        "aligned4dof_status": "not_computed",
+        "aligned4dof_skip_reason": "",
     }
 
     err_csv = out_dir / "error_log.csv"
@@ -234,35 +236,67 @@ def summarize_spectacular_style(out_dir: Path) -> dict:
                 g_xy = np.column_stack([g_e[mask], g_n[mask]])
                 v_z = v_u[mask]
                 g_z = g_u[mask]
+                max_abs_guard = 1.0e7
+                if (
+                    np.nanmax(np.abs(v_xy)) > max_abs_guard
+                    or np.nanmax(np.abs(g_xy)) > max_abs_guard
+                    or np.nanmax(np.abs(v_z)) > max_abs_guard
+                    or np.nanmax(np.abs(g_z)) > max_abs_guard
+                ):
+                    res["aligned4dof_status"] = "skipped"
+                    res["aligned4dof_skip_reason"] = "magnitude_guard"
+                else:
+                    try:
+                        with np.errstate(over="raise", invalid="raise", divide="raise"):
+                            v_xy_mu = np.mean(v_xy, axis=0)
+                            g_xy_mu = np.mean(g_xy, axis=0)
+                            v_xy_c = v_xy - v_xy_mu
+                            g_xy_c = g_xy - g_xy_mu
 
-                v_xy_mu = np.mean(v_xy, axis=0)
-                g_xy_mu = np.mean(g_xy, axis=0)
-                v_xy_c = v_xy - v_xy_mu
-                g_xy_c = g_xy - g_xy_mu
+                            c_val = float(np.sum(v_xy_c[:, 0] * g_xy_c[:, 0] + v_xy_c[:, 1] * g_xy_c[:, 1]))
+                            s_val = float(np.sum(v_xy_c[:, 0] * g_xy_c[:, 1] - v_xy_c[:, 1] * g_xy_c[:, 0]))
+                            yaw = float(np.arctan2(s_val, c_val))
+                            cy, sy = np.cos(yaw), np.sin(yaw)
+                            r2 = np.array([[cy, -sy], [sy, cy]], dtype=float)
 
-                c_val = float(np.sum(v_xy_c[:, 0] * g_xy_c[:, 0] + v_xy_c[:, 1] * g_xy_c[:, 1]))
-                s_val = float(np.sum(v_xy_c[:, 0] * g_xy_c[:, 1] - v_xy_c[:, 1] * g_xy_c[:, 0]))
-                yaw = float(np.arctan2(s_val, c_val))
-                cy, sy = np.cos(yaw), np.sin(yaw)
-                r2 = np.array([[cy, -sy], [sy, cy]], dtype=float)
+                            v_xy_aligned = (r2 @ v_xy.T).T
+                            t_xy = g_xy_mu - np.mean(v_xy_aligned, axis=0)
+                            v_xy_aligned = v_xy_aligned + t_xy
+                            t_z = float(np.mean(g_z - v_z))
+                            v_z_aligned = v_z + t_z
 
-                v_xy_aligned = (r2 @ v_xy.T).T
-                t_xy = g_xy_mu - np.mean(v_xy_aligned, axis=0)
-                v_xy_aligned = v_xy_aligned + t_xy
-                t_z = float(np.mean(g_z - v_z))
-                v_z_aligned = v_z + t_z
+                            err_xy = v_xy_aligned - g_xy
+                            err_z = v_z_aligned - g_z
+                            err_h = np.sqrt(np.sum(err_xy ** 2, axis=1))
+                            err_3d = np.sqrt(np.sum(err_xy ** 2, axis=1) + err_z ** 2)
 
-                err_xy = v_xy_aligned - g_xy
-                err_z = v_z_aligned - g_z
-                err_h = np.sqrt(np.sum(err_xy ** 2, axis=1))
-                err_3d = np.sqrt(np.sum(err_xy ** 2, axis=1) + err_z ** 2)
-
-                res["aligned4dof_h_cep50_m"] = float(np.percentile(err_h, 50))
-                res["aligned4dof_h_cep95_m"] = float(np.percentile(err_h, 95))
-                res["aligned4dof_h_rmse_m"] = float(np.sqrt(np.mean(err_h ** 2)))
-                res["aligned4dof_3d_rmse_m"] = float(np.sqrt(np.mean(err_3d ** 2)))
-                res["aligned4dof_final_3d_m"] = float(err_3d[-1])
-                res["yaw_align_deg"] = float(np.degrees(yaw))
+                        finite_mask = np.isfinite(err_h) & np.isfinite(err_3d)
+                        if finite_mask.sum() >= 5:
+                            err_h = err_h[finite_mask]
+                            err_3d = err_3d[finite_mask]
+                            res["aligned4dof_h_cep50_m"] = float(np.percentile(err_h, 50))
+                            res["aligned4dof_h_cep95_m"] = float(np.percentile(err_h, 95))
+                            res["aligned4dof_h_rmse_m"] = float(np.sqrt(np.mean(err_h ** 2)))
+                            res["aligned4dof_3d_rmse_m"] = float(np.sqrt(np.mean(err_3d ** 2)))
+                            res["aligned4dof_final_3d_m"] = float(err_3d[-1])
+                            res["yaw_align_deg"] = float(np.degrees(yaw))
+                            res["aligned4dof_status"] = "ok"
+                            res["aligned4dof_skip_reason"] = ""
+                        else:
+                            res["aligned4dof_status"] = "skipped"
+                            res["aligned4dof_skip_reason"] = "nonfinite_aligned_error"
+                    except FloatingPointError:
+                        res["aligned4dof_status"] = "skipped"
+                        res["aligned4dof_skip_reason"] = "numeric_guard_floating_point"
+                    except Exception:
+                        res["aligned4dof_status"] = "skipped"
+                        res["aligned4dof_skip_reason"] = "alignment_exception"
+            else:
+                res["aligned4dof_status"] = "skipped"
+                res["aligned4dof_skip_reason"] = "insufficient_valid_samples"
+        else:
+            res["aligned4dof_status"] = "skipped"
+            res["aligned4dof_skip_reason"] = "missing_vio_columns"
 
     out_csv = out_dir / "spectacular_style_metrics.csv"
     pd.DataFrame([res]).to_csv(out_csv, index=False)
@@ -278,6 +312,11 @@ def summarize_spectacular_style(out_dir: Path) -> dict:
     print(f"  ATE final 3D   : {res['aligned4dof_final_3d_m']:.3f} m")
     print(f"  CEP50/95 (2D)  : {res['aligned4dof_h_cep50_m']:.3f} / {res['aligned4dof_h_cep95_m']:.3f} m")
     print(f"  best yaw align : {res['yaw_align_deg']:.3f} deg")
+    if res.get("aligned4dof_status") != "ok":
+        print(
+            f"  aligned4dof status: {res.get('aligned4dof_status')} "
+            f"({res.get('aligned4dof_skip_reason', '')})"
+        )
     print("")
     print("Heading error:")
     print(f"  MAE            : {res['heading_mae_deg']:.3f} deg")

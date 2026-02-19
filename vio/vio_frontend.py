@@ -17,6 +17,8 @@ Author: VIO project
 
 import cv2
 import numpy as np
+import os
+import time
 from typing import Tuple, List, Optional, Dict
 
 from .camera import kannala_brandt_unproject
@@ -39,8 +41,10 @@ class VIOFrontEnd:
     Reference: OpenVINS (https://github.com/rpng/open_vins)
     """
     
-    def __init__(self, img_w: int, img_h: int, K: np.ndarray, D: np.ndarray, 
-                 use_fisheye: bool = True, fast_mode: bool = False):
+    def __init__(self, img_w: int, img_h: int, K: np.ndarray, D: np.ndarray,
+                 use_fisheye: bool = True, fast_mode: bool = False,
+                 runtime_verbosity: Optional[str] = None,
+                 runtime_log_interval_sec: float = 1.0):
         self.K = K
         self.D = D
         self.use_fisheye = use_fisheye
@@ -107,6 +111,24 @@ class VIOFrontEnd:
         
         # Debug counter
         self._undist_dbg_count = 0
+        if runtime_verbosity is None:
+            runtime_verbosity = os.environ.get("VIO_RUNTIME_VERBOSITY", "debug")
+        self.runtime_verbosity = str(runtime_verbosity).lower()
+        self.runtime_log_interval_sec = max(0.0, float(runtime_log_interval_sec))
+        self._runtime_quiet = self.runtime_verbosity in ("release", "quiet", "minimal")
+        self._last_runtime_log_ts: Dict[str, float] = {}
+
+    def _runtime_log(self, key: str, msg: str, force: bool = False):
+        """Rate-limited runtime logging for non-critical per-frame messages."""
+        if force or not self._runtime_quiet:
+            print(msg)
+            self._last_runtime_log_ts[key] = time.time()
+            return
+        now = time.time()
+        last = self._last_runtime_log_ts.get(key, -1e9)
+        if (now - last) >= self.runtime_log_interval_sec:
+            print(msg)
+            self._last_runtime_log_ts[key] = now
 
     def _extract_grid_features(self, img_gray: np.ndarray) -> np.ndarray:
         """
@@ -434,7 +456,10 @@ class VIOFrontEnd:
                         # Emergency reset breaks multi-view consistency for MSCKF
                         self.last_pts_for_klt = np.empty((0, 2), dtype=np.float32)
                         self.last_fids_for_klt = np.empty(0, dtype=np.int64)
-                        print(f"[VIO][TRACK] Frame {self.frame_idx}: All features lost, will replenish next cycle")
+                        self._runtime_log(
+                            "track_all_features_lost",
+                            f"[VIO][TRACK] Frame {self.frame_idx}: All features lost, will replenish next cycle",
+                        )
         except Exception as e:
             print(f"[VIO] KLT tracking exception: {e}")
         
@@ -592,7 +617,7 @@ class VIOFrontEnd:
         # Keyframe management
         should_keyframe, kf_reason = self._should_create_keyframe(img_gray)
         if should_keyframe:
-            print(f"[VIO] Creating new keyframe at frame {self.frame_idx}: {kf_reason}")
+            self._runtime_log("keyframe_create", f"[VIO] Creating new keyframe at frame {self.frame_idx}: {kf_reason}")
             self.keyframe_gray = img_gray.copy()
             self.keyframe_frame_idx = self.frame_idx
             self.keyframe_tracked_ratio = 1.0
@@ -604,7 +629,10 @@ class VIOFrontEnd:
 
     def _emergency_replenish(self, img_gray: np.ndarray):
         """Emergency feature replenishment when all tracking fails."""
-        print(f"[VIO][TRACK] WARNING: Frame {self.frame_idx} - All tracking failed! Replenishing...")
+        self._runtime_log(
+            "track_emergency_replenish",
+            f"[VIO][TRACK] WARNING: Frame {self.frame_idx} - All tracking failed! Replenishing...",
+        )
         
         try:
             new_features = self._extract_grid_features(img_gray)
@@ -620,7 +648,10 @@ class VIOFrontEnd:
                 self.last_pts_for_klt = new_features.astype(np.float32)
                 self.last_fids_for_klt = np.array(new_fids, dtype=np.int64)
                 self.last_gray_for_klt = img_gray.copy()
-                print(f"[VIO][EMERGENCY_REPLENISH] Added {len(new_features)} new features")
+                self._runtime_log(
+                    "track_emergency_replenish_added",
+                    f"[VIO][EMERGENCY_REPLENISH] Added {len(new_features)} new features",
+                )
             else:
                 self.last_pts_for_klt = np.empty((0, 2), dtype=np.float32)
                 self.last_fids_for_klt = np.empty(0, dtype=np.int64)
@@ -692,7 +723,10 @@ class VIOFrontEnd:
                         self.last_fids_for_klt = np.array(fids_all, dtype=np.int64)
                         self.last_gray_for_klt = img_gray.copy()
                         
-                    print(f"[VIO][REPLENISH] Added {len(new_features)} grid-based features")
+                    self._runtime_log(
+                        "track_replenish_added",
+                        f"[VIO][REPLENISH] Added {len(new_features)} grid-based features",
+                    )
         except Exception as e:
             print(f"[VIO][REPLENISH] Exception: {e}")
 
