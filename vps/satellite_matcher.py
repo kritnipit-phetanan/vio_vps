@@ -13,16 +13,53 @@ import numpy as np
 import cv2
 from typing import Optional, Tuple, Dict, Any, List
 from dataclasses import dataclass
+from pathlib import Path
+import os
+import sys
 
-# Try to import LightGlue (optional dependency)
-try:
-    import torch
-    from lightglue import LightGlue, SuperPoint
-    from lightglue.utils import numpy_image_to_torch, rbd
-    HAS_LIGHTGLUE = True
-except ImportError:
-    HAS_LIGHTGLUE = False
-    torch = None
+# Try to import LightGlue (optional dependency). If the package is not
+# installed globally, try local clone at <repo>/LightGlue.
+torch = None
+LightGlue = None
+SuperPoint = None
+numpy_image_to_torch = None
+rbd = None
+HAS_LIGHTGLUE = False
+LIGHTGLUE_IMPORT_ERROR = ""
+LIGHTGLUE_SOURCE = "unavailable"
+
+
+def _try_import_lightglue() -> bool:
+    global torch, LightGlue, SuperPoint, numpy_image_to_torch, rbd
+    global HAS_LIGHTGLUE, LIGHTGLUE_IMPORT_ERROR, LIGHTGLUE_SOURCE
+    try:
+        import torch as _torch
+        from lightglue import LightGlue as _LightGlue, SuperPoint as _SuperPoint
+        from lightglue.utils import numpy_image_to_torch as _numpy_image_to_torch, rbd as _rbd
+        torch = _torch
+        LightGlue = _LightGlue
+        SuperPoint = _SuperPoint
+        numpy_image_to_torch = _numpy_image_to_torch
+        rbd = _rbd
+        HAS_LIGHTGLUE = True
+        LIGHTGLUE_IMPORT_ERROR = ""
+        LIGHTGLUE_SOURCE = "python_env"
+        return True
+    except Exception as exc:
+        HAS_LIGHTGLUE = False
+        LIGHTGLUE_IMPORT_ERROR = str(exc)
+        return False
+
+
+if not _try_import_lightglue():
+    repo_root = Path(__file__).resolve().parents[1]
+    local_lightglue_root = repo_root / "LightGlue"
+    if local_lightglue_root.exists():
+        local_path = str(local_lightglue_root)
+        if local_path not in sys.path:
+            sys.path.insert(0, local_path)
+        if _try_import_lightglue():
+            LIGHTGLUE_SOURCE = f"local_clone:{local_lightglue_root}"
 
 
 @dataclass
@@ -51,7 +88,13 @@ class SatelliteMatcher:
                  device: str = 'cuda',
                  max_keypoints: int = 2048,
                  min_inliers: int = 20,
-                 reproj_threshold: float = 3.0):
+                 reproj_threshold: float = 3.0,
+                 match_mode: str = "auto",
+                 rescue_min_inliers: int = 8,
+                 rescue_min_confidence: float = 0.12,
+                 rescue_max_reproj_error: float = 2.5,
+                 max_image_side: int = 1024,
+                 mps_cache_clear_interval: int = 0):
         """
         Initialize matcher.
         
@@ -65,17 +108,94 @@ class SatelliteMatcher:
         self.max_keypoints = max_keypoints
         self.min_inliers = min_inliers
         self.reproj_threshold = reproj_threshold
-        
-        self.use_lightglue = HAS_LIGHTGLUE
-        
-        if self.use_lightglue:
-            self._init_lightglue()
-        else:
+        self.match_mode = str(match_mode).strip().lower()
+        if self.match_mode not in ("auto", "orb", "lightglue", "orb_lightglue_rescue"):
+            self.match_mode = "auto"
+        self.rescue_min_inliers = max(4, int(rescue_min_inliers))
+        self.rescue_min_confidence = float(np.clip(rescue_min_confidence, 0.0, 1.0))
+        self.rescue_max_reproj_error = max(0.1, float(rescue_max_reproj_error))
+        self.max_image_side = int(max(128, max_image_side))
+        self.mps_cache_clear_interval = int(max(0, mps_cache_clear_interval))
+        self._match_counter = 0
+
+        self._lightglue_ready = False
+        self._orb_ready = False
+        self.use_lightglue = False
+        self.lightglue_init_error = ""
+        self.stats = {
+            "rescue_attempts": 0,
+            "rescue_used": 0,
+            "rescue_lightglue_fail": 0,
+            "image_resized_count": 0,
+            "cache_clear_count": 0,
+        }
+
+        # Initialize matcher backends according to selected mode.
+        if self.match_mode == "orb":
             self._init_orb_fallback()
+        elif self.match_mode == "lightglue":
+            if HAS_LIGHTGLUE:
+                if not self._safe_init_lightglue():
+                    self._init_orb_fallback()
+            else:
+                print(
+                    "[SatelliteMatcher] LightGlue requested but unavailable; "
+                    f"falling back to ORB (reason: {LIGHTGLUE_IMPORT_ERROR})"
+                )
+                self._init_orb_fallback()
+        elif self.match_mode == "orb_lightglue_rescue":
+            self._init_orb_fallback()
+            if HAS_LIGHTGLUE:
+                self._safe_init_lightglue()
+            else:
+                print(
+                    "[SatelliteMatcher] Hybrid rescue requested but LightGlue unavailable; "
+                    f"using ORB only (reason: {LIGHTGLUE_IMPORT_ERROR})"
+                )
+        else:  # auto
+            if HAS_LIGHTGLUE:
+                if not self._safe_init_lightglue():
+                    self._init_orb_fallback()
+            else:
+                self._init_orb_fallback()
+
+    def _safe_init_lightglue(self) -> bool:
+        """Initialize LightGlue and fallback cleanly on runtime init failures."""
+        try:
+            self._init_lightglue()
+            return True
+        except Exception as exc:
+            self.lightglue_init_error = str(exc)
+            self._lightglue_ready = False
+            self.use_lightglue = False
+            print(
+                "[SatelliteMatcher] LightGlue init failed; fallback to ORB. "
+                f"reason={self.lightglue_init_error}"
+            )
+            return False
+
+    def _configure_torch_cache_dir(self):
+        """Force torch hub cache into project-local writable directory."""
+        if torch is None:
+            return
+        cache_dir = os.environ.get("TORCH_HOME", "").strip()
+        if not cache_dir:
+            repo_root = Path(__file__).resolve().parents[1]
+            cache_dir = str(repo_root / ".cache" / "torch")
+            os.environ["TORCH_HOME"] = cache_dir
+        os.makedirs(cache_dir, exist_ok=True)
+        try:
+            torch.hub.set_dir(cache_dir)
+        except Exception:
+            pass
     
     def _init_lightglue(self):
         """Initialize LightGlue + SuperPoint."""
-        print("[SatelliteMatcher] Initializing LightGlue + SuperPoint...")
+        print(
+            "[SatelliteMatcher] Initializing LightGlue + SuperPoint... "
+            f"(source={LIGHTGLUE_SOURCE})"
+        )
+        self._configure_torch_cache_dir()
         
         # Check CUDA availability
         if self.device == 'cuda' and not torch.cuda.is_available():
@@ -89,15 +209,17 @@ class SatelliteMatcher:
         # LightGlue matcher
         self.matcher = LightGlue(features='superpoint').eval()
         self.matcher = self.matcher.to(self.device)
-        
+        self._lightglue_ready = True
+        self.use_lightglue = True
         print(f"[SatelliteMatcher] LightGlue ready on {self.device}")
     
     def _init_orb_fallback(self):
-        """Initialize ORB fallback matcher."""
-        print("[SatelliteMatcher] Using ORB fallback (LightGlue not available)")
+        """Initialize ORB matcher backend."""
+        print("[SatelliteMatcher] Initializing ORB matcher backend")
         self.orb = cv2.ORB_create(nfeatures=4000)  # Increased from 2048
         self.bf_matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
         self.ratio_test_threshold = 0.78  # Balanced setting for VPS matching
+        self._orb_ready = True
     
     def extract_features_lightglue(self, img: np.ndarray) -> Dict[str, "torch.Tensor"]:
         """Extract SuperPoint features."""
@@ -108,10 +230,51 @@ class SatelliteMatcher:
         img_tensor = numpy_image_to_torch(img).to(self.device)
         
         # Extract features
-        with torch.no_grad():
+        with (torch.inference_mode() if hasattr(torch, "inference_mode") else torch.no_grad()):
             features = self.extractor.extract(img_tensor)
         
         return features
+
+    def _resize_for_match(self, img: np.ndarray) -> Tuple[np.ndarray, float, float]:
+        """
+        Resize image for matching if too large.
+
+        Returns:
+            resized_img, sx, sy where sx/sy = resized/original scale factors.
+        """
+        if img is None or img.size == 0:
+            return img, 1.0, 1.0
+        h, w = img.shape[:2]
+        max_side = int(max(h, w))
+        if max_side <= self.max_image_side:
+            return img, 1.0, 1.0
+        scale = float(self.max_image_side / max_side)
+        new_w = max(64, int(round(w * scale)))
+        new_h = max(64, int(round(h * scale)))
+        resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        self.stats["image_resized_count"] = int(self.stats.get("image_resized_count", 0)) + 1
+        return resized, (new_w / float(w)), (new_h / float(h))
+
+    def _maybe_clear_device_cache(self):
+        """Periodically clear device cache on MPS/CUDA to reduce memory spikes."""
+        self._match_counter += 1
+        if self.mps_cache_clear_interval <= 0:
+            return
+        if (self._match_counter % self.mps_cache_clear_interval) != 0:
+            return
+        if torch is None:
+            return
+        try:
+            dev = str(self.device).lower()
+            if dev == "mps" and hasattr(torch, "mps"):
+                if torch.backends.mps.is_available():
+                    torch.mps.empty_cache()
+                    self.stats["cache_clear_count"] = int(self.stats.get("cache_clear_count", 0)) + 1
+            elif dev == "cuda" and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                self.stats["cache_clear_count"] = int(self.stats.get("cache_clear_count", 0)) + 1
+        except Exception:
+            pass
     
     def match_lightglue(self, 
                         drone_img: np.ndarray, 
@@ -122,12 +285,18 @@ class SatelliteMatcher:
         Returns:
             (kp_drone, kp_sat, match_confidence) - matched keypoint pairs
         """
+        if not self._lightglue_ready:
+            return np.array([]), np.array([]), np.array([])
+
+        drone_img_in, sx0, sy0 = self._resize_for_match(drone_img)
+        sat_img_in, sx1, sy1 = self._resize_for_match(sat_img)
+
         # Extract features
-        feats0 = self.extract_features_lightglue(drone_img)
-        feats1 = self.extract_features_lightglue(sat_img)
+        feats0 = self.extract_features_lightglue(drone_img_in)
+        feats1 = self.extract_features_lightglue(sat_img_in)
         
         # Match
-        with torch.no_grad():
+        with (torch.inference_mode() if hasattr(torch, "inference_mode") else torch.no_grad()):
             matches_dict = self.matcher({'image0': feats0, 'image1': feats1})
         
         # Get matched keypoints
@@ -136,21 +305,46 @@ class SatelliteMatcher:
         matches = matches_dict['matches']
         kpts0 = feats0['keypoints']
         kpts1 = feats1['keypoints']
-        
-        # Convert to numpy
-        if len(matches) == 0:
+
+        if matches is None or int(getattr(matches, "numel", lambda: 0)()) == 0:
             return np.array([]), np.array([]), np.array([])
-        
-        # Get matched points
-        valid = matches > -1
-        mkpts0 = kpts0[valid].cpu().numpy()
-        mkpts1 = kpts1[matches[valid]].cpu().numpy()
+
+        # Support both LightGlue output variants:
+        # - old: matches is shape (N0,) with image1 index or -1
+        # - new: matches is shape (K, 2) explicit index pairs
+        if matches.ndim == 2 and matches.shape[1] == 2:
+            idx0 = matches[:, 0].long()
+            idx1 = matches[:, 1].long()
+            valid = (idx0 >= 0) & (idx1 >= 0)
+            if int(valid.sum().item()) == 0:
+                return np.array([]), np.array([]), np.array([])
+            mkpts0 = kpts0[idx0[valid]].cpu().numpy()
+            mkpts1 = kpts1[idx1[valid]].cpu().numpy()
+        else:
+            valid = matches > -1
+            if int(valid.sum().item()) == 0:
+                return np.array([]), np.array([]), np.array([])
+            mkpts0 = kpts0[valid].cpu().numpy()
+            mkpts1 = kpts1[matches[valid]].cpu().numpy()
+        if sx0 > 0.0 and sy0 > 0.0:
+            mkpts0[:, 0] /= float(sx0)
+            mkpts0[:, 1] /= float(sy0)
+        if sx1 > 0.0 and sy1 > 0.0:
+            mkpts1[:, 0] /= float(sx1)
+            mkpts1[:, 1] /= float(sy1)
         
         # Get confidence scores if available
         if 'scores' in matches_dict:
-            scores = matches_dict['scores'][valid].cpu().numpy()
+            score_src = matches_dict['scores']
+            if score_src.ndim == 2 and score_src.shape[1] > 0:
+                score_src = score_src[:, 0]
+            scores = score_src[valid].cpu().numpy()
         else:
             scores = np.ones(len(mkpts0))
+
+        # Drop references promptly to reduce peak memory.
+        del feats0, feats1, matches_dict, matches, kpts0, kpts1
+        self._maybe_clear_device_cache()
         
         return mkpts0, mkpts1, scores
     
@@ -171,8 +365,13 @@ class SatelliteMatcher:
         Returns:
             (kp_drone, kp_sat, match_scores) - matched keypoint pairs
         """
-        kp0, desc0 = self.extract_features_orb(drone_img)
-        kp1, desc1 = self.extract_features_orb(sat_img)
+        if not self._orb_ready:
+            return np.array([]), np.array([]), np.array([])
+
+        drone_img_in, sx0, sy0 = self._resize_for_match(drone_img)
+        sat_img_in, sx1, sy1 = self._resize_for_match(sat_img)
+        kp0, desc0 = self.extract_features_orb(drone_img_in)
+        kp1, desc1 = self.extract_features_orb(sat_img_in)
         
         if desc0 is None or desc1 is None or len(kp0) < 10 or len(kp1) < 10:
             return np.array([]), np.array([]), np.array([])
@@ -215,7 +414,14 @@ class SatelliteMatcher:
         # Extract matched points
         pts0 = np.array([kp0[m.queryIdx].pt for m in good_matches])
         pts1 = np.array([kp1[m.trainIdx].pt for m in good_matches])
+        if sx0 > 0.0 and sy0 > 0.0:
+            pts0[:, 0] /= float(sx0)
+            pts0[:, 1] /= float(sy0)
+        if sx1 > 0.0 and sy1 > 0.0:
+            pts1[:, 0] /= float(sx1)
+            pts1[:, 1] /= float(sy1)
         scores = np.array([1.0 - m.distance / 256.0 for m in good_matches])
+        self._maybe_clear_device_cache()
         
         return pts0, pts1, scores
     
@@ -232,10 +438,158 @@ class SatelliteMatcher:
         Returns:
             (kp_drone, kp_sat, scores) - Matched keypoint pairs and confidence scores
         """
-        if self.use_lightglue:
-            return self.match_lightglue(drone_img, sat_img)
-        else:
+        mode = str(self.match_mode).lower()
+        if mode == "orb":
             return self.match_orb(drone_img, sat_img)
+        if mode == "lightglue":
+            if self._lightglue_ready:
+                return self.match_lightglue(drone_img, sat_img)
+            return self.match_orb(drone_img, sat_img)
+        if mode == "orb_lightglue_rescue":
+            # Primary path for hybrid mode is ORB; rescue handled in match_with_homography().
+            return self.match_orb(drone_img, sat_img)
+        # auto
+        if self._lightglue_ready:
+            return self.match_lightglue(drone_img, sat_img)
+        return self.match_orb(drone_img, sat_img)
+
+    def _result_score(self, result: MatchResult) -> float:
+        """Monotonic quality score used to compare ORB vs LightGlue candidates."""
+        if result is None:
+            return float("-inf")
+        inl = max(0.0, float(result.num_inliers))
+        conf = float(np.clip(result.confidence if np.isfinite(result.confidence) else 0.0, 0.0, 1.0))
+        reproj = float(result.reproj_error if np.isfinite(result.reproj_error) else 1e6)
+        return float((1.0 + inl) * (0.2 + conf) / (1.0 + reproj))
+
+    def _needs_lightglue_rescue(self, result: MatchResult) -> bool:
+        """Decide if ORB outcome should trigger LightGlue rescue."""
+        if result is None:
+            return True
+        if result.success:
+            return False
+        if int(result.num_matches) < 4:
+            return True
+        if int(result.num_inliers) < int(self.rescue_min_inliers):
+            return True
+        if (not np.isfinite(float(result.reproj_error))) or float(result.reproj_error) > float(self.rescue_max_reproj_error):
+            return True
+        if float(result.confidence) < float(self.rescue_min_confidence):
+            return True
+        return False
+
+    def _build_result_from_points(self,
+                                  drone_img: np.ndarray,
+                                  sat_img: np.ndarray,
+                                  pts_drone: np.ndarray,
+                                  pts_sat: np.ndarray) -> MatchResult:
+        """Build MatchResult from matched points (shared by ORB and LightGlue paths)."""
+        num_matches = len(pts_drone)
+        if num_matches < 4:
+            return MatchResult(
+                success=False,
+                H=None,
+                num_matches=num_matches,
+                num_inliers=0,
+                reproj_error=float('inf'),
+                confidence=0.0,
+                offset_px=(0.0, 0.0),
+                keypoints_drone=pts_drone if len(pts_drone) > 0 else None,
+                keypoints_sat=pts_sat if len(pts_sat) > 0 else None
+            )
+
+        # Estimate homography
+        H, inlier_mask, reproj_error = self.estimate_homography(pts_drone, pts_sat)
+        num_inliers = int(np.sum(inlier_mask)) if len(inlier_mask) > 0 else 0
+
+        if H is None:
+            return MatchResult(
+                success=False,
+                H=None,
+                num_matches=num_matches,
+                num_inliers=num_inliers,
+                reproj_error=reproj_error,
+                confidence=0.0,
+                offset_px=(0.0, 0.0),
+                keypoints_drone=pts_drone,
+                keypoints_sat=pts_sat
+            )
+
+        # Compute confidence even if inlier count is below strict threshold.
+        # This supports fail-soft policies in the caller.
+        inlier_ratio = num_inliers / num_matches if num_matches > 0 else 0.0
+        reproj_score = max(0.0, 1.0 - float(reproj_error) / 10.0) if np.isfinite(reproj_error) else 0.0
+        confidence = float(inlier_ratio * reproj_score)
+
+        # Reject inlier sets that are too spatially concentrated.
+        inlier_pts_drone = pts_drone[inlier_mask] if len(inlier_mask) > 0 else np.empty((0, 2))
+        inlier_pts_sat = pts_sat[inlier_mask] if len(inlier_mask) > 0 else np.empty((0, 2))
+        if len(inlier_pts_drone) >= 4 and len(inlier_pts_sat) >= 4:
+            min_span_px = max(8.0, 0.02 * float(min(sat_img.shape[0], sat_img.shape[1])))
+            span_sat_x = float(np.ptp(inlier_pts_sat[:, 0]))
+            span_sat_y = float(np.ptp(inlier_pts_sat[:, 1]))
+            span_drone_x = float(np.ptp(inlier_pts_drone[:, 0]))
+            span_drone_y = float(np.ptp(inlier_pts_drone[:, 1]))
+            unique_sat = int(len(np.unique(np.round(inlier_pts_sat, 1), axis=0)))
+
+            sat_collapsed = (span_sat_x < min_span_px) and (span_sat_y < min_span_px)
+            drone_collapsed = (span_drone_x < min_span_px) and (span_drone_y < min_span_px)
+            low_uniqueness = unique_sat < max(4, int(0.35 * num_inliers))
+            if sat_collapsed or drone_collapsed or low_uniqueness:
+                return MatchResult(
+                    success=False,
+                    H=H,
+                    num_matches=num_matches,
+                    num_inliers=num_inliers,
+                    reproj_error=reproj_error,
+                    confidence=0.0,
+                    offset_px=(0.0, 0.0),
+                    keypoints_drone=inlier_pts_drone,
+                    keypoints_sat=inlier_pts_sat
+                )
+
+        # Compute center offset
+        drone_size = (drone_img.shape[1], drone_img.shape[0])
+        try:
+            offset_px = self.compute_center_offset(H, drone_size)
+        except ValueError:
+            return MatchResult(
+                success=False,
+                H=H,
+                num_matches=num_matches,
+                num_inliers=num_inliers,
+                reproj_error=float('inf'),
+                confidence=confidence,
+                offset_px=(0.0, 0.0),
+                keypoints_drone=pts_drone,
+                keypoints_sat=pts_sat
+            )
+
+        # Check minimum inliers after geometric sanity checks.
+        if num_inliers < self.min_inliers:
+            return MatchResult(
+                success=False,
+                H=H,
+                num_matches=num_matches,
+                num_inliers=num_inliers,
+                reproj_error=reproj_error,
+                confidence=confidence,
+                offset_px=offset_px,
+                keypoints_drone=inlier_pts_drone if len(inlier_pts_drone) > 0 else pts_drone,
+                keypoints_sat=inlier_pts_sat if len(inlier_pts_sat) > 0 else pts_sat
+            )
+
+        return MatchResult(
+            success=True,
+            H=H,
+            num_matches=num_matches,
+            num_inliers=num_inliers,
+            reproj_error=reproj_error,
+            confidence=confidence,
+            offset_px=offset_px,
+            keypoints_drone=pts_drone[inlier_mask] if len(inlier_mask) > 0 else None,
+            keypoints_sat=pts_sat[inlier_mask] if len(inlier_mask) > 0 else None
+        )
     
     def estimate_homography(self, 
                             pts_drone: np.ndarray, 
@@ -273,7 +627,8 @@ class SatelliteMatcher:
             # Project drone points to satellite space
             ones = np.ones((len(inlier_pts_drone), 1))
             pts_h = np.hstack([inlier_pts_drone, ones])
-            projected = (H @ pts_h.T).T
+            with np.errstate(all='ignore'):
+                projected = (H @ pts_h.T).T
             denom = projected[:, 2]
             valid_proj = np.isfinite(denom) & (np.abs(denom) > 1e-9)
             if not np.any(valid_proj):
@@ -339,119 +694,24 @@ class SatelliteMatcher:
         Returns:
             MatchResult with homography and offset
         """
-        # Match features
-        pts_drone, pts_sat, scores = self.match(drone_img, sat_img)
-        
-        num_matches = len(pts_drone)
-        
-        if num_matches < 4:
-            return MatchResult(
-                success=False,
-                H=None,
-                num_matches=num_matches,
-                num_inliers=0,
-                reproj_error=float('inf'),
-                confidence=0.0,
-                offset_px=(0.0, 0.0),
-                keypoints_drone=pts_drone if len(pts_drone) > 0 else None,
-                keypoints_sat=pts_sat if len(pts_sat) > 0 else None
-            )
-        
-        # Estimate homography
-        H, inlier_mask, reproj_error = self.estimate_homography(pts_drone, pts_sat)
-        
-        num_inliers = int(np.sum(inlier_mask)) if len(inlier_mask) > 0 else 0
+        # Hybrid mode: ORB primary, LightGlue rescue on weak ORB outcome.
+        if str(self.match_mode).lower() == "orb_lightglue_rescue":
+            pts_orb_drone, pts_orb_sat, _ = self.match_orb(drone_img, sat_img)
+            orb_result = self._build_result_from_points(drone_img, sat_img, pts_orb_drone, pts_orb_sat)
+            if self._lightglue_ready and self._needs_lightglue_rescue(orb_result):
+                self.stats["rescue_attempts"] = int(self.stats.get("rescue_attempts", 0)) + 1
+                pts_lg_drone, pts_lg_sat, _ = self.match_lightglue(drone_img, sat_img)
+                lg_result = self._build_result_from_points(drone_img, sat_img, pts_lg_drone, pts_lg_sat)
+                if self._result_score(lg_result) > self._result_score(orb_result):
+                    self.stats["rescue_used"] = int(self.stats.get("rescue_used", 0)) + 1
+                    return lg_result
+                self.stats["rescue_lightglue_fail"] = int(self.stats.get("rescue_lightglue_fail", 0)) + 1
+                return orb_result
+            return orb_result
 
-        if H is None:
-            return MatchResult(
-                success=False,
-                H=None,
-                num_matches=num_matches,
-                num_inliers=num_inliers,
-                reproj_error=reproj_error,
-                confidence=0.0,
-                offset_px=(0.0, 0.0),
-                keypoints_drone=pts_drone,
-                keypoints_sat=pts_sat
-            )
-
-        # Compute confidence even if inlier count is below strict threshold.
-        # This supports fail-soft policies in the caller.
-        inlier_ratio = num_inliers / num_matches if num_matches > 0 else 0.0
-        reproj_score = max(0.0, 1.0 - float(reproj_error) / 10.0) if np.isfinite(reproj_error) else 0.0
-        confidence = float(inlier_ratio * reproj_score)
-        
-        # Reject inlier sets that are too spatially concentrated.
-        # This avoids false "good" matches where many correspondences collapse
-        # to (almost) one map point.
-        inlier_pts_drone = pts_drone[inlier_mask] if len(inlier_mask) > 0 else np.empty((0, 2))
-        inlier_pts_sat = pts_sat[inlier_mask] if len(inlier_mask) > 0 else np.empty((0, 2))
-        if len(inlier_pts_drone) >= 4 and len(inlier_pts_sat) >= 4:
-            min_span_px = max(8.0, 0.02 * float(min(sat_img.shape[0], sat_img.shape[1])))
-            span_sat_x = float(np.ptp(inlier_pts_sat[:, 0]))
-            span_sat_y = float(np.ptp(inlier_pts_sat[:, 1]))
-            span_drone_x = float(np.ptp(inlier_pts_drone[:, 0]))
-            span_drone_y = float(np.ptp(inlier_pts_drone[:, 1]))
-            unique_sat = int(len(np.unique(np.round(inlier_pts_sat, 1), axis=0)))
-
-            sat_collapsed = (span_sat_x < min_span_px) and (span_sat_y < min_span_px)
-            drone_collapsed = (span_drone_x < min_span_px) and (span_drone_y < min_span_px)
-            low_uniqueness = unique_sat < max(4, int(0.35 * num_inliers))
-            if sat_collapsed or drone_collapsed or low_uniqueness:
-                return MatchResult(
-                    success=False,
-                    H=H,
-                    num_matches=num_matches,
-                    num_inliers=num_inliers,
-                    reproj_error=reproj_error,
-                    confidence=0.0,
-                    offset_px=(0.0, 0.0),
-                    keypoints_drone=inlier_pts_drone,
-                    keypoints_sat=inlier_pts_sat
-                )
-
-        # Compute center offset
-        drone_size = (drone_img.shape[1], drone_img.shape[0])
-        try:
-            offset_px = self.compute_center_offset(H, drone_size)
-        except ValueError:
-            return MatchResult(
-                success=False,
-                H=H,
-                num_matches=num_matches,
-                num_inliers=num_inliers,
-                reproj_error=float('inf'),
-                    confidence=confidence,
-                    offset_px=(0.0, 0.0),
-                    keypoints_drone=pts_drone,
-                    keypoints_sat=pts_sat
-            )
-
-        # Check minimum inliers after geometric sanity checks.
-        if num_inliers < self.min_inliers:
-            return MatchResult(
-                success=False,
-                H=H,
-                num_matches=num_matches,
-                num_inliers=num_inliers,
-                reproj_error=reproj_error,
-                confidence=confidence,
-                offset_px=offset_px,
-                keypoints_drone=inlier_pts_drone if len(inlier_pts_drone) > 0 else pts_drone,
-                keypoints_sat=inlier_pts_sat if len(inlier_pts_sat) > 0 else pts_sat
-            )
-        
-        return MatchResult(
-            success=True,
-            H=H,
-            num_matches=num_matches,
-            num_inliers=num_inliers,
-            reproj_error=reproj_error,
-            confidence=confidence,
-            offset_px=offset_px,
-            keypoints_drone=pts_drone[inlier_mask] if len(inlier_mask) > 0 else None,
-            keypoints_sat=pts_sat[inlier_mask] if len(inlier_mask) > 0 else None
-        )
+        # Standard single-backend mode.
+        pts_drone, pts_sat, _ = self.match(drone_img, sat_img)
+        return self._build_result_from_points(drone_img, sat_img, pts_drone, pts_sat)
     
     def visualize_matches(self, 
                           drone_img: np.ndarray, 

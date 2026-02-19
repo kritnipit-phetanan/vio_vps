@@ -1022,6 +1022,10 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
             max_delta_v_xy_base,
         )
     )
+    delta_v_soft_enable = bool(global_config.get("VIO_VEL_DELTA_V_SOFT_ENABLE", True))
+    delta_v_soft_factor = float(global_config.get("VIO_VEL_DELTA_V_SOFT_FACTOR", 2.0))
+    delta_v_hard_factor = float(global_config.get("VIO_VEL_DELTA_V_HARD_FACTOR", 3.0))
+    delta_v_soft_r_cap = float(global_config.get("VIO_VEL_DELTA_V_SOFT_MAX_R_MULT", 6.0))
     enforce_nadir_xy_guard = bool(camera_view == "nadir" and not bool(use_vz_only))
     
     # ESKF velocity update
@@ -1132,6 +1136,7 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
         # Compute innovation for gating with overflow protection
         predicted_vel = hx_fun(kf.x)
         innovation = vel_meas - predicted_vel
+        delta_v_soft_mult = 1.0
         if use_xy_only or enforce_nadir_xy_guard:
             max_delta_v_xy = float(max_delta_v_xy_base)
             if np.isfinite(speed_state_m_s) and speed_state_m_s > high_speed_flow_bp:
@@ -1140,35 +1145,55 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
                 )
             delta_v_xy = float(np.linalg.norm(np.asarray(innovation[:2]).reshape(-1)))
             if np.isfinite(max_delta_v_xy) and max_delta_v_xy > 0.0 and delta_v_xy > max_delta_v_xy:
-                _log_vio_vel_update(
-                    f"[VIO] Velocity REJECTED: delta-v cap (|Δv_xy|={delta_v_xy:.2f}m/s > "
-                    f"{max_delta_v_xy:.2f}m/s, guard={'xy_only' if use_xy_only else 'nadir_xy'})"
+                ratio_delta = float(delta_v_xy / max(max_delta_v_xy, 1e-9))
+                allow_delta_soft = (
+                    bool(delta_v_soft_enable)
+                    and bool(soft_fail_enable)
+                    and np.isfinite(ratio_delta)
+                    and ratio_delta <= max(1.0, float(delta_v_hard_factor))
+                    and float(avg_flow_px) >= (0.5 * max(0.1, min_flow_high_speed))
                 )
-                _set_adaptive_info(
-                    False,
-                    dof,
-                    None,
-                    None,
-                    extra_scale * max(1.0, speed_r_inflate),
-                    reason_code="soft_reject_delta_v_cap",
-                )
-                if save_debug and residual_csv:
-                    try:
-                        s_cap = h_vel @ kf.P @ h_vel.T + r_mat
-                        log_measurement_update(
-                            residual_csv, t, vio_frame, 'VIO_VEL',
-                            innovation=innovation.flatten(),
-                            mahalanobis_dist=np.nan,
-                            chi2_threshold=np.nan,
-                            accepted=False,
-                            s_matrix=s_cap,
-                            p_prior=getattr(kf, 'P_prior', kf.P),
-                            state_error=state_error,
-                            state_cov=state_cov,
-                        )
-                    except Exception:
-                        pass
-                return False
+                if allow_delta_soft:
+                    soft_pow = max(0.8, min(2.0, float(delta_v_soft_factor)))
+                    delta_v_soft_mult = float(
+                        np.clip(ratio_delta ** soft_pow, 1.0, max(1.0, float(delta_v_soft_r_cap)))
+                    )
+                    r_mat = r_mat * delta_v_soft_mult
+                    _log_vio_vel_update(
+                        f"[VIO] Velocity delta-v soft mode: |Δv_xy|={delta_v_xy:.2f}m/s, "
+                        f"cap={max_delta_v_xy:.2f}m/s, R*={delta_v_soft_mult:.2f}x "
+                        f"({('xy_only' if use_xy_only else 'nadir_xy')})"
+                    )
+                else:
+                    _log_vio_vel_update(
+                        f"[VIO] Velocity REJECTED: delta-v cap (|Δv_xy|={delta_v_xy:.2f}m/s > "
+                        f"{max_delta_v_xy:.2f}m/s, guard={'xy_only' if use_xy_only else 'nadir_xy'})"
+                    )
+                    _set_adaptive_info(
+                        False,
+                        dof,
+                        None,
+                        None,
+                        extra_scale * max(1.0, speed_r_inflate),
+                        reason_code="soft_reject_delta_v_cap",
+                    )
+                    if save_debug and residual_csv:
+                        try:
+                            s_cap = h_vel @ kf.P @ h_vel.T + r_mat
+                            log_measurement_update(
+                                residual_csv, t, vio_frame, 'VIO_VEL',
+                                innovation=innovation.flatten(),
+                                mahalanobis_dist=np.nan,
+                                chi2_threshold=np.nan,
+                                accepted=False,
+                                s_matrix=s_cap,
+                                p_prior=getattr(kf, 'P_prior', kf.P),
+                                state_error=state_error,
+                                state_cov=state_cov,
+                            )
+                        except Exception:
+                            pass
+                    return False
         
         # Suppress numpy warnings - we handle explicitly with tripwires
         with np.errstate(all='ignore'):
@@ -1239,6 +1264,7 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
         r_scale_used = extra_scale
         if use_xy_only:
             r_scale_used *= max(1.0, speed_r_inflate)
+        r_scale_used *= max(1.0, float(delta_v_soft_mult))
         chi2_used = chi2_value
         mahal_used = mahal_dist
 
@@ -1255,7 +1281,7 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
                 f"flow={avg_flow_px:.1f}px, R_scale={flow_quality_scale:.1f}x, mode={vo_mode}, chi2={chi2_value:.2f}"
             )
             accepted = True
-            reason_code = "normal_accept"
+            reason_code = "soft_accept_delta_v_cap" if float(delta_v_soft_mult) > 1.0 else "normal_accept"
         elif bool(soft_fail_enable):
             soft_ratio = max(1.0, float(chi2_value) / max(chi2_threshold, 1e-9))
             phase_cap_map = {

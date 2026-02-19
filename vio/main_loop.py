@@ -116,6 +116,8 @@ class VIORunner:
         self.error_csv = None
         self.inf_csv = None
         self._inf_fh = None
+        self._inf_flush_stride = 200
+        self._inf_since_flush = 0
         self.state_dbg_csv = None
         self.vo_dbg_csv = None
         self.msckf_dbg_csv = None
@@ -237,30 +239,32 @@ class VIORunner:
         self.adaptive_service.initialize_adaptive_controller()
 
         duration_sec = None
-        if self.config.estimator_mode == "event_queue_output_predictor":
-            print("\n[ARCH] Selected: Event-driven with output predictor (event_queue_output_predictor)")
-            print("[ARCH] Features:")
-            print("  - Priority queue orders all sensor events by timestamp")
-            print("  - Propagate-to-event ensures state_time == measurement_time")
-            print("  - Fast-propagate output layer for low-latency logging")
-            duration_sec = run_event_driven_loop(self)
-        elif self.config.estimator_mode == "imu_step_preint_cache":
-            print("\n[ARCH] Selected: IMU-driven with sub-sample timestamp precision (imu_step_preint_cache)")
-            duration_sec = run_imu_driven_loop(self)
-        else:
-            raise ValueError(f"Unknown estimator_mode: {self.config.estimator_mode}")
-
-        if self.backend_optimizer is not None:
-            try:
-                self.backend_optimizer.stop()
-            except Exception:
-                pass
-        if self._inf_fh is not None:
-            try:
-                self._inf_fh.close()
-            except Exception:
-                pass
-            self._inf_fh = None
+        try:
+            if self.config.estimator_mode == "event_queue_output_predictor":
+                print("\n[ARCH] Selected: Event-driven with output predictor (event_queue_output_predictor)")
+                print("[ARCH] Features:")
+                print("  - Priority queue orders all sensor events by timestamp")
+                print("  - Propagate-to-event ensures state_time == measurement_time")
+                print("  - Fast-propagate output layer for low-latency logging")
+                duration_sec = run_event_driven_loop(self)
+            elif self.config.estimator_mode == "imu_step_preint_cache":
+                print("\n[ARCH] Selected: IMU-driven with sub-sample timestamp precision (imu_step_preint_cache)")
+                duration_sec = run_imu_driven_loop(self)
+            else:
+                raise ValueError(f"Unknown estimator_mode: {self.config.estimator_mode}")
+        finally:
+            if self.backend_optimizer is not None:
+                try:
+                    self.backend_optimizer.stop()
+                except Exception:
+                    pass
+            if self._inf_fh is not None:
+                try:
+                    self._inf_fh.flush()
+                    self._inf_fh.close()
+                except Exception:
+                    pass
+                self._inf_fh = None
 
         # Finalize reporting in one place.
         self.output_reporting.print_summary()

@@ -124,11 +124,22 @@ PHASE_ASSIGNMENTS["5"] = PHASE_ASSIGNMENTS["A5"]
 
 
 def list_run_dirs(repo_dir: Path) -> list[Path]:
-    runs = sorted(
-        repo_dir.glob("benchmark_modular_*/preintegration"),
+    patterns = [
+        "outputs/benchmark_modular_*",
+        "benchmark_modular_*",
+        "benchmark_modular_*/preintegration",
+    ]
+    runs: list[Path] = []
+    for pat in patterns:
+        runs.extend(repo_dir.glob(pat))
+    uniq: dict[Path, Path] = {}
+    for p in runs:
+        if p.is_dir():
+            uniq[p.resolve()] = p.resolve()
+    return sorted(
+        uniq.values(),
         key=lambda p: p.stat().st_mtime if p.exists() else 0.0,
     )
-    return runs
 
 
 def resolve_path(repo_dir: Path, value: str) -> Path:
@@ -261,7 +272,7 @@ def run_benchmark(
     if created:
         return ret, created[-1]
 
-    m = re.search(r"Output directory:\s*([^\s]+/preintegration)", "".join(captured))
+    m = re.search(r"Output directory:\s*([^\s]+)", "".join(captured))
     if m:
         p = resolve_path(repo_dir, m.group(1))
         if p.is_dir():
@@ -575,7 +586,11 @@ def main() -> int:
             return 2
 
     ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-    orchestration_dir = repo_dir / f"benchmark_phase_tuning_{ts}"
+    output_root_raw = os.environ.get("OUTPUT_ROOT", "outputs")
+    output_root = Path(output_root_raw)
+    if not output_root.is_absolute():
+        output_root = (repo_dir / output_root).resolve()
+    orchestration_dir = output_root / f"benchmark_phase_tuning_{ts}"
     orchestration_dir.mkdir(parents=True, exist_ok=True)
     summary_csv = orchestration_dir / "phase_results.csv"
 

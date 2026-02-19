@@ -384,6 +384,14 @@ def run_imu_driven_loop(runner):
         fps = (1.0 / dt_proc) if dt_proc > 0 else 0.0
         if runner._inf_fh is not None:
             runner._inf_fh.write(f"{i},{dt_proc:.6f},{fps:.2f}\n")
+            runner._inf_since_flush = int(getattr(runner, "_inf_since_flush", 0)) + 1
+            flush_stride = int(max(1, getattr(runner, "_inf_flush_stride", 200)))
+            if runner._inf_since_flush >= flush_stride:
+                try:
+                    runner._inf_fh.flush()
+                except Exception:
+                    pass
+                runner._inf_since_flush = 0
         else:
             with open(runner.inf_csv, "a", newline="") as f:
                 f.write(f"{i},{dt_proc:.6f},{fps:.2f}\n")

@@ -100,7 +100,8 @@ SAVE_KEYFRAME_IMAGES="${SAVE_KEYFRAME_IMAGES:-1}"  # 1 => pass --save_keyframe_i
 LOCK_PROFILE="${LOCK_PROFILE:-backend}"
 
 # Output directory
-OUTPUT_DIR="benchmark_modular_${TEST_ID}/preintegration"
+OUTPUT_ROOT="${OUTPUT_ROOT:-outputs}"
+OUTPUT_DIR="${OUTPUT_ROOT}/benchmark_modular_${TEST_ID}"
 mkdir -p "$OUTPUT_DIR"
 
 # Baseline run for before/after diff.
@@ -119,7 +120,9 @@ import os
 
 exclude = os.path.normpath("$OUTPUT_DIR")
 cands = sorted(
-    glob.glob("benchmark_modular_*/preintegration"),
+    glob.glob("outputs/benchmark_modular_*")
+    + glob.glob("benchmark_modular_*")
+    + glob.glob("benchmark_modular_*/preintegration"),
     key=lambda p: os.path.getmtime(p) if os.path.exists(p) else 0.0,
     reverse=True,
 )

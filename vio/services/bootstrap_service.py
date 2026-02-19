@@ -498,6 +498,8 @@ class BootstrapService:
         runner.conditioning_events_csv = csv_paths.get("conditioning_events_csv")
         runner.benchmark_health_summary_csv = csv_paths.get("benchmark_health_summary_csv")
         runner.inf_csv = csv_paths["inf_csv"]
+        runner._inf_flush_stride = int(max(1, runner.global_config.get("INFERENCE_LOG_FLUSH_STRIDE", 200)))
+        runner._inf_since_flush = 0
         if runner._inf_fh is not None:
             try:
                 runner._inf_fh.close()
@@ -506,9 +508,10 @@ class BootstrapService:
             runner._inf_fh = None
         try:
             # Keep inference log file open for the whole run to avoid per-sample open/close overhead.
-            runner._inf_fh = open(runner.inf_csv, "a", newline="", buffering=1024 * 1024)
-        except Exception:
+            runner._inf_fh = open(runner.inf_csv, "a", newline="", buffering=256 * 1024)
+        except Exception as exc:
             runner._inf_fh = None
+            print(f"[WARN] Failed to open inference_log.csv for buffered writing: {exc}")
         runner.vo_dbg_csv = csv_paths.get("vo_dbg")
         runner.msckf_dbg_csv = csv_paths.get("msckf_dbg")
 

@@ -358,6 +358,7 @@ adaptive:
 backend:
   apply_cov_inflate: 1.05
   blend_steps: 3
+  correction_weight: 0.65
   enabled: true
   fixed_lag_window: 10
   max_abs_dp_xy_m: 60.0
@@ -499,22 +500,23 @@ imu_gnss_extrinsics:
     - 0.0
     - 1.0
 kinematic_guard:
+  abs_speed_sanity_m_s: 95.0
   enabled: true
-  hard_blend_alpha: 0.3
+  hard_blend_alpha: 0.22
   hard_hold_sec: 0.35
-  max_blend_speed_m_s: 62.0
+  max_blend_speed_m_s: 68.0
   max_inflate: 1.12
-  max_kin_speed_m_s: 65.0
-  max_state_speed_m_s: 65.0
+  max_kin_speed_m_s: 72.0
+  max_state_speed_m_s: 72.0
   min_action_dt_sec: 0.15
   release_hysteresis_ratio: 0.7
-  speed_blend_alpha: 0.35
+  speed_blend_alpha: 0.24
   speed_hard_hold_sec: 0.2
-  speed_hard_m_s: 52.0
-  speed_inflate: 1.18
+  speed_hard_m_s: 62.0
+  speed_inflate: 1.12
   speed_release_hysteresis_ratio: 0.9
-  vel_mismatch_hard: 10.0
-  vel_mismatch_warn: 6.0
+  vel_mismatch_hard: 12.0
+  vel_mismatch_warn: 7.0
   window_sec: 0.45
 loop_closure:
   fail_soft:
@@ -734,7 +736,7 @@ vio:
   msckf_max_reprojection_error: 12.0
   nadir_enforce_xy_motion: true
   nadir_prefer_flow_direction: true
-  nadir_xy_only_velocity: false
+  nadir_xy_only_velocity: true
   ratio_test: 0.8
   sigma_vo: 0.8
   use_vio_velocity: true
@@ -761,18 +763,22 @@ vio:
       sigma_scale_z: 1.2
       use_vz_only: false
 vio_vel:
-  high_speed_bp_m_s: 25.0
-  max_delta_v_xy_high_speed_m_s: 1.2
-  max_delta_v_xy_per_update_m_s: 2.0
-  min_flow_px_high_speed: 0.9
+  delta_v_hard_factor: 3.0
+  delta_v_soft_enable: true
+  delta_v_soft_factor: 1.4
+  delta_v_soft_max_r_mult: 5.0
+  high_speed_bp_m_s: 30.0
+  max_delta_v_xy_high_speed_m_s: 2.5
+  max_delta_v_xy_per_update_m_s: 3.5
+  min_flow_px_high_speed: 0.65
   speed_r_inflate_breakpoints_m_s:
-  - 25.0
-  - 35.0
+  - 30.0
   - 45.0
+  - 60.0
   speed_r_inflate_values:
+  - 1.3
   - 1.8
-  - 2.8
-  - 4.5
+  - 2.6
   xy_only_chi2_scale: 1.1
 vps:
   abs_hard_reject_dir_change_deg: 75.0
@@ -813,6 +819,9 @@ vps:
   max_clones: 3
   max_delay_sec: 0.5
   max_keypoints: 2048
+  matcher_mode: orb_lightglue_rescue
+  max_image_side: 1024
+  mps_cache_clear_interval: 20
   max_offset_px_failsoft: 900.0
   max_reproj_error: 5.0
   max_reproj_error_failsoft: 1.2
@@ -867,6 +876,9 @@ vps:
   - -90
   runtime_verbosity: release
   runtime_log_interval_sec: 1.0
+  rescue_max_reproj_error: 2.5
+  rescue_min_confidence: 0.12
+  rescue_min_inliers: 8
 zupt:
   accel_threshold: 0.5
   consecutive_required: 5
@@ -880,3 +892,4 @@ zupt:
 logging:
   runtime_verbosity: release
   runtime_log_interval_sec: 1.0
+  inference_log_flush_stride: 200

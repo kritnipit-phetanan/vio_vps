@@ -845,6 +845,10 @@ vps:
   failover_fail_streak: 6          # Failure streak before enlarged patch
   device: "cuda"                   # 'cuda' or 'cpu' for matcher
   max_keypoints: 2048              # Maximum keypoints to extract
+  matcher_mode: "orb_lightglue_rescue"  # auto|orb|lightglue|orb_lightglue_rescue
+  rescue_min_inliers: 8
+  rescue_min_confidence: 0.12
+  rescue_max_reproj_error: 2.5
   
   # Quality thresholds
   min_inliers: 12                  # Strict minimum inliers for valid match

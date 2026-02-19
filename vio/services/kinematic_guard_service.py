@@ -66,6 +66,22 @@ class KinematicGuardService:
         if not np.all(np.isfinite(v_kin)) or not np.all(np.isfinite(v_state)):
             return
 
+        # Absolute speed sanity clamp: catch one-shot spikes immediately
+        # before mismatch logic can get stuck behind dwell windows.
+        abs_speed_sanity = float(
+            runner.global_config.get(
+                "KIN_GUARD_ABS_SPEED_SANITY_M_S",
+                max(120.0, 1.8 * float(runner.global_config.get("KIN_GUARD_MAX_STATE_SPEED_M_S", 120.0))),
+            )
+        )
+        v_state_norm_raw = float(np.linalg.norm(v_state))
+        if np.isfinite(v_state_norm_raw) and abs_speed_sanity > 1e-3 and v_state_norm_raw > abs_speed_sanity:
+            kf.x[3:6, 0] = (v_state * (abs_speed_sanity / v_state_norm_raw)).reshape(3,)
+            v_state = np.array(kf.x[3:6, 0], dtype=float).reshape(3,)
+            runner._kin_guard_abs_speed_clamp_count = int(
+                getattr(runner, "_kin_guard_abs_speed_clamp_count", 0)
+            ) + 1
+
         mismatch = float(np.linalg.norm(v_state - v_kin))
         v_state_norm = float(np.linalg.norm(v_state))
         v_kin_norm = float(np.linalg.norm(v_kin))

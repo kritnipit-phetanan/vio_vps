@@ -805,6 +805,7 @@ vps:
   max_clones: 3
   max_delay_sec: 0.5
   max_keypoints: 2048
+  matcher_mode: orb_lightglue_rescue
   max_offset_px_failsoft: 900.0
   max_reproj_error: 5.0
   max_reproj_error_failsoft: 1.2
@@ -816,6 +817,9 @@ vps:
   min_inliers_failsoft: 5
   min_texture_std: 8.0
   min_update_interval: 0.5
+  rescue_max_reproj_error: 2.5
+  rescue_min_confidence: 0.12
+  rescue_min_inliers: 8
   output_size:
   - 512
   - 512

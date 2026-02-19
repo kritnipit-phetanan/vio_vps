@@ -1037,6 +1037,11 @@ class VIOService:
             dp[:2] *= float(max_dp / dp_xy_norm)
         max_dyaw_deg = float(runner.global_config.get("BACKEND_MAX_APPLY_DYAW_DEG", 2.5))
         dyaw_deg = float(np.clip(dyaw_deg, -max_dyaw_deg, max_dyaw_deg))
+        corr_weight = float(runner.global_config.get("BACKEND_CORRECTION_WEIGHT", 1.0))
+        corr_weight = float(np.clip(corr_weight, 0.0, 1.0))
+        if corr_weight < 1.0:
+            dp *= corr_weight
+            dyaw_deg *= corr_weight
 
         blend_steps = max(1, int(runner.global_config.get("BACKEND_BLEND_STEPS", 3)))
         runner._backend_pending_dp_enu = dp.copy()

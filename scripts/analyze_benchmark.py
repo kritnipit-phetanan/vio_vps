@@ -486,7 +486,7 @@ def summarize_sensor_phase(out_dir: Path, baseline_run: Path | None = None) -> N
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Analyze one benchmark output directory.")
-    parser.add_argument("--output_dir", required=True, help="Run output directory (usually .../preintegration)")
+    parser.add_argument("--output_dir", required=True, help="Run output directory (usually outputs/benchmark_modular_*)")
     parser.add_argument("--baseline_run", default="", help="Optional baseline run directory for sensor-phase delta")
     args = parser.parse_args()
 

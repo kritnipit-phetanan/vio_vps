@@ -244,6 +244,13 @@ def main():
         # Step 4: Create output directory and save CLI command
         # =================================================================
         os.makedirs(args.output, exist_ok=True)
+
+        # Create a minimal inference log early so the file exists even if
+        # initialization fails before bootstrap creates all CSVs.
+        inf_warm_path = os.path.join(args.output, "inference_log.csv")
+        if not os.path.exists(inf_warm_path):
+            with open(inf_warm_path, "w", newline="") as f:
+                f.write("Index,Inference Time (s),FPS\n")
         
         # Save CLI command for reproducibility
         cli_command = " ".join(sys.argv)

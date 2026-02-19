@@ -65,6 +65,12 @@ class VPSConfig:
     # Matcher
     device: str = 'cuda'
     max_keypoints: int = 2048
+    matcher_mode: str = "auto"  # auto|orb|lightglue|orb_lightglue_rescue
+    rescue_min_inliers: int = 8
+    rescue_min_confidence: float = 0.12
+    rescue_max_reproj_error: float = 2.5
+    max_image_side: int = 1024
+    mps_cache_clear_interval: int = 0
 
     # Accuracy-first controls
     accuracy_mode: bool = False
@@ -147,7 +153,13 @@ class VPSRunner:
         self.matcher = SatelliteMatcher(
             device=config.device,
             max_keypoints=config.max_keypoints,
-            min_inliers=config.min_inliers
+            min_inliers=config.min_inliers,
+            match_mode=config.matcher_mode,
+            rescue_min_inliers=config.rescue_min_inliers,
+            rescue_min_confidence=config.rescue_min_confidence,
+            rescue_max_reproj_error=config.rescue_max_reproj_error,
+            max_image_side=config.max_image_side,
+            mps_cache_clear_interval=config.mps_cache_clear_interval,
         )
         
         # 4. Pose estimator
@@ -349,6 +361,12 @@ class VPSRunner:
                 min_update_interval=float(vps_cfg.get("min_update_interval", 0.5)),
                 device=str(vps_cfg.get("device", device)),
                 max_keypoints=int(vps_cfg.get("max_keypoints", 2048)),
+                matcher_mode=str(vps_cfg.get("matcher_mode", "auto")),
+                rescue_min_inliers=int(vps_cfg.get("rescue_min_inliers", 8)),
+                rescue_min_confidence=float(vps_cfg.get("rescue_min_confidence", 0.12)),
+                rescue_max_reproj_error=float(vps_cfg.get("rescue_max_reproj_error", 2.5)),
+                max_image_side=int(vps_cfg.get("max_image_side", 1024)),
+                mps_cache_clear_interval=int(vps_cfg.get("mps_cache_clear_interval", 0)),
                 yaw_hypotheses_deg=yaw_hyp if len(yaw_hyp) > 0 else (0.0, 180.0, 90.0, -90.0),
                 scale_hypotheses=scale_hyp if len(scale_hyp) > 0 else (1.0, 0.90, 1.10),
                 max_candidates=int(vps_cfg.get("max_candidates", 6)),
@@ -383,7 +401,8 @@ class VPSRunner:
             print(
                 f"[VPSRunner] VPS cfg: patch={vps_config.patch_size_px}/{vps_config.patch_size_failover_px}, "
                 f"min_inliers={vps_config.min_inliers}, failsoft={vps_config.min_inliers_failsoft}, "
-                f"candidates<={vps_config.max_candidates}"
+                f"candidates<={vps_config.max_candidates}, matcher={vps_config.matcher_mode}, "
+                f"max_image_side={vps_config.max_image_side}"
             )
         
         # Create VPSRunner

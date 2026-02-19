@@ -502,6 +502,18 @@ def load_config(config_path: str) -> VIOConfig:
             vio_vel_cfg.get('max_delta_v_xy_per_update_m_s', 2.0),
         )
     )
+    result['VIO_VEL_DELTA_V_SOFT_ENABLE'] = bool(
+        vio_vel_cfg.get('delta_v_soft_enable', True)
+    )
+    result['VIO_VEL_DELTA_V_SOFT_FACTOR'] = float(
+        vio_vel_cfg.get('delta_v_soft_factor', 2.0)
+    )
+    result['VIO_VEL_DELTA_V_HARD_FACTOR'] = float(
+        vio_vel_cfg.get('delta_v_hard_factor', 3.0)
+    )
+    result['VIO_VEL_DELTA_V_SOFT_MAX_R_MULT'] = float(
+        vio_vel_cfg.get('delta_v_soft_max_r_mult', 6.0)
+    )
     result['VIO_VEL_HIGH_SPEED_BP_M_S'] = float(
         vio_vel_cfg.get('high_speed_bp_m_s', 25.0)
     )
@@ -570,6 +582,9 @@ def load_config(config_path: str) -> VIOConfig:
         runtime_logging.get("runtime_verbosity", runtime_verbosity_default)
     ).lower()
     result["LOG_RUNTIME_MIN_INTERVAL_SEC"] = float(runtime_logging.get("runtime_log_interval_sec", 1.0))
+    result["INFERENCE_LOG_FLUSH_STRIDE"] = int(
+        max(1, runtime_logging.get("inference_log_flush_stride", 200))
+    )
     
     # IMU-GNSS Lever Arm (optional - defaults to zero if not specified)
     if 'imu_gnss_extrinsics' in config:
@@ -675,6 +690,9 @@ def load_config(config_path: str) -> VIOConfig:
     result['KIN_GUARD_MAX_STATE_SPEED_M_S'] = float(kin_cfg.get('max_state_speed_m_s', 120.0))
     result['KIN_GUARD_MAX_BLEND_SPEED_M_S'] = float(kin_cfg.get('max_blend_speed_m_s', 60.0))
     result['KIN_GUARD_MAX_KIN_SPEED_M_S'] = float(kin_cfg.get('max_kin_speed_m_s', 80.0))
+    result['KIN_GUARD_ABS_SPEED_SANITY_M_S'] = float(
+        kin_cfg.get('abs_speed_sanity_m_s', max(120.0, 1.8 * float(kin_cfg.get('max_state_speed_m_s', 120.0))))
+    )
     result['KIN_GUARD_HARD_HOLD_SEC'] = float(kin_cfg.get('hard_hold_sec', 0.30))
     result['KIN_GUARD_SPEED_HARD_M_S'] = float(
         kin_cfg.get('speed_hard_m_s', kin_cfg.get('max_state_speed_m_s', 120.0))
@@ -843,6 +861,7 @@ def load_config(config_path: str) -> VIOConfig:
     result['BACKEND_BLEND_STEPS'] = int(backend_cfg.get('blend_steps', 3))
     result['BACKEND_MAX_APPLY_DYAW_DEG'] = float(backend_cfg.get('max_apply_dyaw_deg', 2.5))
     result['BACKEND_MAX_APPLY_DP_XY_M'] = float(backend_cfg.get('max_apply_dp_xy_m', 25.0))
+    result['BACKEND_CORRECTION_WEIGHT'] = float(backend_cfg.get('correction_weight', 1.0))
     result['BACKEND_APPLY_COV_INFLATE'] = float(backend_cfg.get('apply_cov_inflate', 1.05))
     result['BACKEND_MIN_QUALITY_SCORE'] = float(backend_cfg.get('min_quality_score', 0.20))
     result['BACKEND_MAX_ABS_DP_XY_M'] = float(backend_cfg.get('max_abs_dp_xy_m', 60.0))
