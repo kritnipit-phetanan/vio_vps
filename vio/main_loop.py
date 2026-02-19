@@ -27,7 +27,7 @@ Author: VIO project
 """
 
 import numpy as np
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 from .config import VIOConfig
 from .data_loaders import ProjectionCache
@@ -167,6 +167,11 @@ class VIORunner:
         self._vps_last_accepted_offset_vec: Optional[np.ndarray] = None
         self._vps_pending_large_offset_vec: Optional[np.ndarray] = None
         self._vps_pending_large_offset_hits: int = 0
+        # Async VPS worker state (single-flight guard to avoid thread/memory pile-up)
+        self._vps_inflight_thread = None
+        self._vps_inflight_result = None
+        self._vps_inflight_meta: Optional[Dict[str, Any]] = None
+        self._vps_thread_busy_skip_count: int = 0
         self._abs_corr_apply_count: int = 0
         self._abs_corr_soft_count: int = 0
 
@@ -253,6 +258,19 @@ class VIORunner:
             else:
                 raise ValueError(f"Unknown estimator_mode: {self.config.estimator_mode}")
         finally:
+            if self._vps_inflight_thread is not None:
+                try:
+                    self._vps_inflight_thread.join(timeout=0.2)
+                except Exception:
+                    pass
+                self._vps_inflight_thread = None
+                self._vps_inflight_result = None
+                self._vps_inflight_meta = None
+            if self.vps_runner is not None:
+                try:
+                    self.vps_runner.close()
+                except Exception:
+                    pass
             if self.backend_optimizer is not None:
                 try:
                     self.backend_optimizer.stop()

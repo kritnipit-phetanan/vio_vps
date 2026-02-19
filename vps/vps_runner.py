@@ -1093,6 +1093,17 @@ class VPSRunner:
     
     def close(self):
         """Release resources."""
+        try:
+            mstats = getattr(self.matcher, "stats", None)
+            if isinstance(mstats, dict):
+                print(
+                    "[VPSRunner] Matcher stats: "
+                    f"resized={int(mstats.get('image_resized_count', 0))}, "
+                    f"cache_clear={int(mstats.get('cache_clear_count', 0))}, "
+                    f"rescue_used={int(mstats.get('rescue_used', 0))}"
+                )
+        except Exception:
+            pass
         self.tile_cache.close()
     
     def __enter__(self):

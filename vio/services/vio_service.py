@@ -331,6 +331,25 @@ class VIOService:
         rotation_rate_deg_s = np.linalg.norm(rec.ang) * 180.0 / np.pi
         is_fast_rotation = rotation_rate_deg_s > 30.0
 
+        def _collect_finished_vps_result():
+            """
+            Collect async VPS result if the single in-flight worker has finished.
+
+            Returns:
+                (result, meta) where meta contains clone_id/frame/time info, or (None, None).
+            """
+            th = getattr(runner, "_vps_inflight_thread", None)
+            if th is None:
+                return None, None
+            if th.is_alive():
+                return None, None
+            result = getattr(runner, "_vps_inflight_result", None)
+            meta = getattr(runner, "_vps_inflight_meta", None)
+            runner._vps_inflight_thread = None
+            runner._vps_inflight_result = None
+            runner._vps_inflight_meta = None
+            return result, (meta if isinstance(meta, dict) else {})
+
         # Process images up to current time
         while runner.state.img_idx < len(runner.imgs) and runner.imgs[runner.state.img_idx].t <= t:
             # Get camera timestamp (CRITICAL: use this instead of IMU time t)
@@ -373,17 +392,30 @@ class VIOService:
             # ================================================================
             # VPS Real-time Processing (Parallel with Threading)
             # ================================================================
-            # VPS runs in background thread while VIO continues immediately
-            # This reduces total latency and utilizes multi-core CPUs
-            vps_thread = None
-            vps_result_container = [None]  # Thread-safe result storage
+            # VPS runs in background thread while VIO continues immediately.
+            # Single-flight guard: never allow more than one in-flight VPS worker.
+            # Without this, slow VPS frames can pile up threads and explode memory.
+            vps_result, vps_result_meta = _collect_finished_vps_result()
 
             if runner.vps_runner is not None:
+                inflight = getattr(runner, "_vps_inflight_thread", None)
+                worker_busy = bool(inflight is not None and inflight.is_alive())
                 if is_fast_rotation:
                     should_run_vps, skip_reason = False, "fast_rotation"
+                elif worker_busy:
+                    should_run_vps, skip_reason = False, "thread_busy"
                 else:
                     should_run_vps, skip_reason = self._should_run_vps(t_cam=t_cam, img=img)
                 if not should_run_vps:
+                    if skip_reason == "thread_busy":
+                        runner._vps_thread_busy_skip_count = int(
+                            getattr(runner, "_vps_thread_busy_skip_count", 0)
+                        ) + 1
+                        if (runner._vps_thread_busy_skip_count % 100) == 0:
+                            print(
+                                f"[VPS] worker busy; skipped {runner._vps_thread_busy_skip_count} frame(s) "
+                                "while previous VPS attempt is still running"
+                            )
                     if runner.vps_logger is not None and skip_reason != "interval_hold":
                         try:
                             runner.vps_logger.log_attempt(
@@ -430,6 +462,7 @@ class VIOService:
 
                     q_wxyz = runner.kf.x[6:10, 0].astype(float)
                     est_yaw = float(quaternion_to_yaw(q_wxyz))
+                    frame_idx_for_vps = int(runner.state.img_idx)
 
                     # Define VPS processing function for thread
                     def run_vps_in_thread():
@@ -442,24 +475,31 @@ class VIOService:
                                 est_lon=lon,
                                 est_yaw=est_yaw,
                                 est_alt=agl,  # Send AGL for 30m min_altitude check
-                                frame_idx=runner.state.img_idx,
+                                frame_idx=frame_idx_for_vps,
                                 est_cov_xy=est_cov_xy,
                                 phase=int(getattr(runner.state, "current_phase", 2)),
                                 objective=str(runner.global_config.get("OBJECTIVE_MODE", "stability")),
                             )
-                            vps_result_container[0] = result
+                            runner._vps_inflight_result = result
                         except Exception as e:
                             print(f"[VPS] Thread error: {e}")
-                            vps_result_container[0] = None
+                            runner._vps_inflight_result = None
 
-                    # Start VPS processing in background thread
-                    vps_thread = threading.Thread(target=run_vps_in_thread, daemon=True)
-                    vps_thread.start()
-
+                    clone_id = f"vps_{frame_idx_for_vps}"
                     # Clone EKF state for delayed update (stochastic cloning)
                     if hasattr(runner, "vps_clone_manager"):
-                        clone_id = f"vps_{runner.state.img_idx}"
                         runner.vps_clone_manager.clone_state(runner.kf, t_cam, clone_id)
+
+                    runner._vps_inflight_result = None
+                    runner._vps_inflight_meta = {
+                        "clone_id": clone_id,
+                        "frame_idx": frame_idx_for_vps,
+                        "t_cam": float(t_cam),
+                    }
+                    runner._vps_inflight_thread = threading.Thread(
+                        target=run_vps_in_thread, daemon=True
+                    )
+                    runner._vps_inflight_thread.start()
 
             # ================================================================
             # VIO Processing (continues immediately, parallel with VPS!)
@@ -770,16 +810,17 @@ class VIOService:
             # ================================================================
             # VPS Result Collection (after VIO completes)
             # ================================================================
-            if vps_thread is not None:
-                vps_thread.join(timeout=2.0)
-                vps_result = vps_result_container[0]
-                if vps_result is not None:
+            # Non-blocking poll: apply VPS only when worker has finished.
+            if vps_result is None:
+                vps_result, vps_result_meta = _collect_finished_vps_result()
+            if vps_result is not None:
                     from ..vps_integration import apply_vps_delayed_update
 
                     vps_policy_scales, vps_apply_scales = runner.adaptive_service.get_sensor_adaptive_scales("VPS")
                     vps_adaptive_info: Dict[str, Any] = {}
                     vps_sync_threshold = float(runner.global_config.get("VPS_TIME_SYNC_THRESHOLD_SEC", 0.25))
-                    vps_dt = abs(float(getattr(vps_result, "t_measurement", t_cam)) - float(t_cam))
+                    vps_t_ref = float(vps_result_meta.get("t_cam", getattr(vps_result, "t_measurement", t_cam)))
+                    vps_dt = abs(float(getattr(vps_result, "t_measurement", vps_t_ref)) - float(vps_t_ref))
                     runner.output_reporting.log_convention_check(
                         t=float(t_cam),
                         sensor="VPS",
@@ -787,7 +828,7 @@ class VIOService:
                         value=float(vps_dt),
                         threshold=float(vps_sync_threshold),
                         status="PASS" if vps_dt <= vps_sync_threshold else "WARN",
-                        note=f"vps_t={float(getattr(vps_result, 't_measurement', t_cam)):.6f}",
+                        note=f"vps_t={float(getattr(vps_result, 't_measurement', vps_t_ref)):.6f}",
                     )
 
                     # Create clone manager if not exists
@@ -799,7 +840,7 @@ class VIOService:
                             max_clones=3,
                         )
 
-                    clone_id = f"vps_{runner.state.img_idx}"
+                    clone_id = str(vps_result_meta.get("clone_id", f"vps_{runner.state.img_idx}"))
                     health_key = str(
                         getattr(getattr(runner, "current_adaptive_decision", None), "health_state", "HEALTHY")
                     ).upper()

@@ -196,11 +196,27 @@ class SatelliteMatcher:
             f"(source={LIGHTGLUE_SOURCE})"
         )
         self._configure_torch_cache_dir()
-        
-        # Check CUDA availability
-        if self.device == 'cuda' and not torch.cuda.is_available():
-            print("[SatelliteMatcher] CUDA not available, using CPU")
-            self.device = 'cpu'
+
+        # Resolve runtime device with safe fallback:
+        # requested cuda -> mps (Apple) -> cpu.
+        dev = str(self.device).lower().strip()
+        if dev in ("cuda", "gpu"):
+            if torch.cuda.is_available():
+                self.device = "cuda"
+            elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                print("[SatelliteMatcher] CUDA not available, using MPS")
+                self.device = "mps"
+            else:
+                print("[SatelliteMatcher] CUDA not available, using CPU")
+                self.device = "cpu"
+        elif dev == "mps":
+            if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                self.device = "mps"
+            else:
+                print("[SatelliteMatcher] MPS not available, using CPU")
+                self.device = "cpu"
+        else:
+            self.device = "cpu"
         
         # SuperPoint feature extractor
         self.extractor = SuperPoint(max_num_keypoints=self.max_keypoints).eval()
