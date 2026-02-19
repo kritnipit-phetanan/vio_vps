@@ -1012,6 +1012,17 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
             speed_r_inflate = float(max(speed_r_inflate, val))
     min_flow_high_speed = float(global_config.get("VIO_VEL_MIN_FLOW_PX_HIGH_SPEED", 0.8))
     high_speed_flow_bp = float(speed_pairs[0][0]) if len(speed_pairs) > 0 else 25.0
+    cfg_high_speed_bp = float(global_config.get("VIO_VEL_HIGH_SPEED_BP_M_S", high_speed_flow_bp))
+    if np.isfinite(cfg_high_speed_bp) and cfg_high_speed_bp > 0.0:
+        high_speed_flow_bp = cfg_high_speed_bp
+    max_delta_v_xy_base = float(global_config.get("VIO_VEL_MAX_DELTA_V_XY_PER_UPDATE_M_S", 2.0))
+    max_delta_v_xy_high_speed = float(
+        global_config.get(
+            "VIO_VEL_MAX_DELTA_V_XY_HIGH_SPEED_M_S",
+            max_delta_v_xy_base,
+        )
+    )
+    enforce_nadir_xy_guard = bool(camera_view == "nadir" and not bool(use_vz_only))
     
     # ESKF velocity update
     num_clones = (kf.x.shape[0] - 19) // 7  # v3.9.7: 19D nominal
@@ -1076,14 +1087,15 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
             _set_adaptive_info(False, dof, None, None, extra_scale, reason_code="hard_reject")
             return False
         if (
-            use_xy_only
+            enforce_nadir_xy_guard
             and np.isfinite(speed_state_m_s)
             and speed_state_m_s > high_speed_flow_bp
             and float(avg_flow_px) < min_flow_high_speed
         ):
             _log_vio_vel_update(
                 f"[VIO] Velocity REJECTED: low flow at high speed (flow={avg_flow_px:.2f}px, "
-                f"speed={speed_state_m_s:.2f}m/s, min_flow={min_flow_high_speed:.2f}px)"
+                f"speed={speed_state_m_s:.2f}m/s, min_flow={min_flow_high_speed:.2f}px, "
+                f"guard={'xy_only' if use_xy_only else 'nadir_xy'})"
             )
             _set_adaptive_info(
                 False, dof, None, None, extra_scale * max(1.0, speed_r_inflate),
@@ -1120,13 +1132,17 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
         # Compute innovation for gating with overflow protection
         predicted_vel = hx_fun(kf.x)
         innovation = vel_meas - predicted_vel
-        if use_xy_only:
-            max_delta_v_xy = float(global_config.get("VIO_VEL_MAX_DELTA_V_XY_PER_UPDATE_M_S", 2.0))
+        if use_xy_only or enforce_nadir_xy_guard:
+            max_delta_v_xy = float(max_delta_v_xy_base)
+            if np.isfinite(speed_state_m_s) and speed_state_m_s > high_speed_flow_bp:
+                max_delta_v_xy = float(
+                    min(max_delta_v_xy, max(1e-3, float(max_delta_v_xy_high_speed)))
+                )
             delta_v_xy = float(np.linalg.norm(np.asarray(innovation[:2]).reshape(-1)))
             if np.isfinite(max_delta_v_xy) and max_delta_v_xy > 0.0 and delta_v_xy > max_delta_v_xy:
                 _log_vio_vel_update(
                     f"[VIO] Velocity REJECTED: delta-v cap (|Δv_xy|={delta_v_xy:.2f}m/s > "
-                    f"{max_delta_v_xy:.2f}m/s)"
+                    f"{max_delta_v_xy:.2f}m/s, guard={'xy_only' if use_xy_only else 'nadir_xy'})"
                 )
                 _set_adaptive_info(
                     False,

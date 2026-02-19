@@ -496,6 +496,15 @@ def load_config(config_path: str) -> VIOConfig:
     result['VIO_VEL_MAX_DELTA_V_XY_PER_UPDATE_M_S'] = float(
         vio_vel_cfg.get('max_delta_v_xy_per_update_m_s', 2.0)
     )
+    result['VIO_VEL_MAX_DELTA_V_XY_HIGH_SPEED_M_S'] = float(
+        vio_vel_cfg.get(
+            'max_delta_v_xy_high_speed_m_s',
+            vio_vel_cfg.get('max_delta_v_xy_per_update_m_s', 2.0),
+        )
+    )
+    result['VIO_VEL_HIGH_SPEED_BP_M_S'] = float(
+        vio_vel_cfg.get('high_speed_bp_m_s', 25.0)
+    )
     result['VIO_VEL_MIN_FLOW_PX_HIGH_SPEED'] = float(
         vio_vel_cfg.get('min_flow_px_high_speed', 0.8)
     )
@@ -667,9 +676,25 @@ def load_config(config_path: str) -> VIOConfig:
     result['KIN_GUARD_MAX_BLEND_SPEED_M_S'] = float(kin_cfg.get('max_blend_speed_m_s', 60.0))
     result['KIN_GUARD_MAX_KIN_SPEED_M_S'] = float(kin_cfg.get('max_kin_speed_m_s', 80.0))
     result['KIN_GUARD_HARD_HOLD_SEC'] = float(kin_cfg.get('hard_hold_sec', 0.30))
+    result['KIN_GUARD_SPEED_HARD_M_S'] = float(
+        kin_cfg.get('speed_hard_m_s', kin_cfg.get('max_state_speed_m_s', 120.0))
+    )
+    result['KIN_GUARD_SPEED_HARD_HOLD_SEC'] = float(
+        kin_cfg.get('speed_hard_hold_sec', kin_cfg.get('hard_hold_sec', 0.30))
+    )
     result['KIN_GUARD_RELEASE_HYSTERESIS_RATIO'] = float(
         kin_cfg.get('release_hysteresis_ratio', 0.75)
     )
+    result['KIN_GUARD_SPEED_RELEASE_HYSTERESIS_RATIO'] = float(
+        kin_cfg.get(
+            'speed_release_hysteresis_ratio',
+            kin_cfg.get('release_hysteresis_ratio', 0.75),
+        )
+    )
+    result['KIN_GUARD_SPEED_BLEND_ALPHA'] = float(
+        kin_cfg.get('speed_blend_alpha', max(0.2, float(kin_cfg.get('hard_blend_alpha', 0.0))))
+    )
+    result['KIN_GUARD_SPEED_INFLATE'] = float(kin_cfg.get('speed_inflate', 1.12))
     
     # =========================================================================
     # NEW: Vibration Detection (v2.8.0)
