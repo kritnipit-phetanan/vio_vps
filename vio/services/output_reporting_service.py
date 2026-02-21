@@ -718,6 +718,21 @@ class OutputReportingService:
         backend_apply_count = float(int(getattr(self.runner, "_backend_apply_count", 0)))
         backend_stale_drop_count = float(int(getattr(self.runner, "_backend_stale_drop_count", 0)))
         backend_poll_count = float(int(getattr(self.runner, "_backend_poll_count", 0)))
+        vps_worker_busy_skips = float(int(getattr(self.runner, "_vps_thread_busy_skip_count", 0)))
+        vps_attempt_ms_p50 = float("nan")
+        vps_attempt_ms_p95 = float("nan")
+        vps_time_budget_stops = float("nan")
+        vps_evaluated_candidates_mean = float("nan")
+        policy_conflict_count = float(int(getattr(self.runner, "_policy_conflict_count", 0)))
+        if getattr(self.runner, "vps_runner", None) is not None and hasattr(self.runner.vps_runner, "get_runtime_metrics"):
+            try:
+                vps_rt = self.runner.vps_runner.get_runtime_metrics()
+                vps_attempt_ms_p50 = float(vps_rt.get("attempt_ms_p50", float("nan")))
+                vps_attempt_ms_p95 = float(vps_rt.get("attempt_ms_p95", float("nan")))
+                vps_time_budget_stops = float(vps_rt.get("time_budget_stops", float("nan")))
+                vps_evaluated_candidates_mean = float(vps_rt.get("evaluated_candidates_mean", float("nan")))
+            except Exception:
+                pass
         mag_accept_rate = float("nan")
         mag_total = int(getattr(self.runner.state, "mag_updates", 0)) + int(getattr(self.runner.state, "mag_rejects", 0))
         if mag_total > 0:
@@ -761,6 +776,12 @@ class OutputReportingService:
             backend_stale_drop_count=backend_stale_drop_count,
             backend_poll_count=backend_poll_count,
             vps_attempt_count=vps_attempt_count,
+            vps_worker_busy_skips=vps_worker_busy_skips,
+            vps_attempt_ms_p50=vps_attempt_ms_p50,
+            vps_attempt_ms_p95=vps_attempt_ms_p95,
+            vps_time_budget_stops=vps_time_budget_stops,
+            vps_evaluated_candidates_mean=vps_evaluated_candidates_mean,
+            policy_conflict_count=policy_conflict_count,
             rtf_proc_sim=rtf_proc_sim,
         )
         print(
@@ -772,6 +793,9 @@ class OutputReportingService:
             f"mag_cholfail_rate={mag_cholfail_rate:.3f}, "
             f"loop_applied_rate={loop_applied_rate:.3f}, "
             f"speed_p99={speed_p99_m_s:.2f}m/s, "
+            f"vps_busy_skips={vps_worker_busy_skips:.0f}, "
+            f"vps_p95={vps_attempt_ms_p95:.1f}ms, "
+            f"policy_conflicts={policy_conflict_count:.0f}, "
             f"rtf_proc_sim={rtf_proc_sim:.3f}"
         )
 

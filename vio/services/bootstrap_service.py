@@ -495,6 +495,16 @@ class BootstrapService:
         runner.mag_quality_csv = csv_paths.get("mag_quality_csv")
         runner.sensor_time_audit_csv = csv_paths.get("sensor_time_audit_csv")
         runner.vps_reloc_summary_csv = csv_paths.get("vps_reloc_summary_csv")
+        runner.policy_trace_csv = csv_paths.get("policy_trace_csv")
+        runner.policy_conflict_csv = csv_paths.get("policy_conflict_csv")
+        runner.policy_owner_map_csv = csv_paths.get("policy_owner_map_csv")
+        runner._policy_conflict_count = 0
+        runner.current_policy_snapshot = None
+        if getattr(runner, "policy_runtime_service", None) is not None:
+            try:
+                runner.policy_runtime_service._owner_map_written = False
+            except Exception:
+                pass
         runner.conditioning_events_csv = csv_paths.get("conditioning_events_csv")
         runner.benchmark_health_summary_csv = csv_paths.get("benchmark_health_summary_csv")
         runner.inf_csv = csv_paths["inf_csv"]

@@ -41,6 +41,12 @@ HEALTH_COLUMNS = [
     "backend_stale_drop_count",
     "backend_poll_count",
     "vps_attempt_count",
+    "vps_worker_busy_skips",
+    "vps_attempt_ms_p50",
+    "vps_attempt_ms_p95",
+    "vps_time_budget_stops",
+    "vps_evaluated_candidates_mean",
+    "policy_conflict_count",
     "rtf_proc_sim",
 ]
 
@@ -253,6 +259,12 @@ def _print_health_summary(current_row: pd.Series) -> None:
         "backend_stale_drop_count",
         "backend_poll_count",
         "vps_attempt_count",
+        "vps_worker_busy_skips",
+        "vps_attempt_ms_p50",
+        "vps_attempt_ms_p95",
+        "vps_time_budget_stops",
+        "vps_evaluated_candidates_mean",
+        "policy_conflict_count",
         "rtf_proc_sim",
     ]:
         if col in current_row.index:
@@ -300,6 +312,7 @@ def evaluate_locks(
     vps_attempt_count = _to_float(current_row.get("vps_attempt_count"))
     backend_stale_drop_count = _to_float(current_row.get("backend_stale_drop_count"))
     backend_poll_count = _to_float(current_row.get("backend_poll_count"))
+    policy_conflict_count = _to_float(current_row.get("policy_conflict_count"))
     heading_final_abs_deg = _load_heading_final_abs_deg(output_dir)
     vps_used = np.nan
     overflow_hits: list[str] = []
@@ -341,6 +354,11 @@ def evaluate_locks(
             "no overflow/non-finite flood in run.log",
             len(overflow_hits) == 0,
             f"hits={len(overflow_hits)}",
+        ),
+        (
+            "policy_conflict_count == 0",
+            np.isfinite(policy_conflict_count) and abs(policy_conflict_count) <= 1e-12,
+            f"value={policy_conflict_count:.0f}" if np.isfinite(policy_conflict_count) else "value=nan",
         ),
     ]
 

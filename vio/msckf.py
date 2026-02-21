@@ -888,11 +888,28 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
             avg_gate_factor = float(global_config.get("MSCKF_AVG_REPROJ_GATE_FACTOR", avg_gate_factor))
     except Exception:
         pass
+    phase_ray_soft = {"0": 1.12, "1": 1.06, "2": 1.00}
+    health_ray_soft = {"HEALTHY": 1.00, "WARNING": 1.10, "DEGRADED": 1.20, "RECOVERY": 1.04}
+    if isinstance(global_config, dict):
+        try:
+            phase_ray_soft = dict(global_config.get("MSCKF_PHASE_RAY_SOFT_SCALE", phase_ray_soft))
+        except Exception:
+            pass
+        try:
+            health_ray_soft = dict(global_config.get("MSCKF_HEALTH_RAY_SOFT_SCALE", health_ray_soft))
+        except Exception:
+            pass
     ray_soft_factor = float(np.clip(ray_soft_factor, 1.0, 6.0))
     pixel_soft_factor = float(np.clip(pixel_soft_factor, 1.0, 6.0))
     avg_gate_factor = float(np.clip(avg_gate_factor, 1.0, 6.0))
     phase_key = str(max(0, min(2, int(phase))))
     health_key = str(health_state).upper()
+    ray_soft_factor *= float(phase_ray_soft.get(phase_key, 1.0))
+    ray_soft_factor *= float(health_ray_soft.get(health_key, 1.0))
+    pixel_soft_factor *= float(phase_ray_soft.get(phase_key, 1.0))
+    pixel_soft_factor *= float(health_ray_soft.get(health_key, 1.0))
+    ray_soft_factor = float(np.clip(ray_soft_factor, 1.0, 8.0))
+    pixel_soft_factor = float(np.clip(pixel_soft_factor, 1.0, 8.0))
     phase_avg_gate = {"0": 1.15, "1": 1.05, "2": 1.00}
     health_avg_gate = {"HEALTHY": 1.00, "WARNING": 1.08, "DEGRADED": 1.15, "RECOVERY": 1.04}
     if isinstance(global_config, dict):
@@ -1004,33 +1021,79 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
         return None
 
     avg_error = total_error / len(valid_obs)
-    
-    if avg_error > (avg_gate_factor * norm_threshold):
-        MSCKF_STATS['fail_reproj_error'] += 1
-        MSCKF_STATS['fail_reproj_normalized'] += 1
-        if reproj_policy.get("quality_band", "mid") == "mid" or borderline_rejects > 0:
-            MSCKF_STATS['fail_geometry_borderline'] += 1
-        
-        # [DIAGNOSTIC] Log reprojection failures to identify root cause
-        # Causes: 1) intrinsic/extrinsic calibration error (especially fisheye KB params)
-        #         2) outlier feature / data association mismatch
-        #         3) high uncertainty / poor triangulation geometry
-        if MSCKF_STATS['fail_reproj_error'] % 500 == 1 and debug:
-            print(f"[MSCKF-DIAG] fail_reproj_error #{MSCKF_STATS['fail_reproj_error']}: fid={fid}, avg_norm_error={avg_error:.4f}, threshold={norm_threshold:.4f}")
-            print(f"  norm_scale_px={norm_scale_px:.2f}")
-        
-        return None
+    avg_reproj_gate = (avg_gate_factor * norm_threshold)
+    reproj_failsoft_applied = False
+    reproj_quality_scale = 1.0
+    if avg_error > avg_reproj_gate:
+        failsoft_enable = bool(
+            (global_config or {}).get("MSCKF_REPROJ_FAILSOFT_ENABLE", True)
+            if isinstance(global_config, dict) else True
+        )
+        failsoft_max_mult = float(
+            (global_config or {}).get("MSCKF_REPROJ_FAILSOFT_MAX_MULT", 1.35)
+            if isinstance(global_config, dict) else 1.35
+        )
+        failsoft_min_obs = int(
+            (global_config or {}).get("MSCKF_REPROJ_FAILSOFT_MIN_OBS", 3)
+            if isinstance(global_config, dict) else 3
+        )
+        failsoft_min_quality = float(
+            (global_config or {}).get("MSCKF_REPROJ_FAILSOFT_MIN_QUALITY", 0.35)
+            if isinstance(global_config, dict) else 0.35
+        )
+        failsoft_gate = avg_reproj_gate * max(1.0, failsoft_max_mult)
+        allow_failsoft = bool(
+            failsoft_enable
+            and np.isfinite(avg_error)
+            and avg_error <= failsoft_gate
+            and len(valid_obs) >= max(2, failsoft_min_obs)
+            and (
+                (not np.isfinite(feature_quality))
+                or (float(feature_quality) >= failsoft_min_quality)
+                or (reproj_policy.get("quality_band", "mid") != "low")
+            )
+            and not (
+                reproj_policy.get("quality_band", "mid") == "low"
+                and bool(reproj_policy.get("low_quality_reject", True))
+            )
+        )
+        if allow_failsoft:
+            reproj_failsoft_applied = True
+            reproj_quality_scale = float(np.clip(avg_reproj_gate / max(avg_error, 1e-9), 0.35, 0.92))
+            if borderline_rejects > 0 or reproj_policy.get("quality_band", "mid") != "high":
+                MSCKF_STATS['fail_geometry_borderline'] += 1
+            if debug:
+                _log_msckf_update(
+                    f"[MSCKF] reproj fail-soft: fid={fid}, avg={avg_error:.4f}, "
+                    f"gate={avg_reproj_gate:.4f}, soft_gate={failsoft_gate:.4f}, "
+                    f"q_scale={reproj_quality_scale:.2f}"
+                )
+        else:
+            MSCKF_STATS['fail_reproj_error'] += 1
+            MSCKF_STATS['fail_reproj_normalized'] += 1
+            if reproj_policy.get("quality_band", "mid") == "mid" or borderline_rejects > 0:
+                MSCKF_STATS['fail_geometry_borderline'] += 1
+
+            # [DIAGNOSTIC] Log reprojection failures to identify root cause
+            if MSCKF_STATS['fail_reproj_error'] % 500 == 1 and debug:
+                print(f"[MSCKF-DIAG] fail_reproj_error #{MSCKF_STATS['fail_reproj_error']}: fid={fid}, avg_norm_error={avg_error:.4f}, threshold={norm_threshold:.4f}")
+                print(f"  norm_scale_px={norm_scale_px:.2f}")
+
+            return None
     
     MSCKF_STATS['success'] += 1
+    quality_base = 1.0 / (1.0 + avg_error * 100.0)
     result = {
         'p_w': p_refined,
         'observations': valid_obs,
-        'quality': 1.0 / (1.0 + avg_error * 100.0),
+        'quality': float(quality_base * reproj_quality_scale),
         'avg_reproj_error': avg_error,
         'num_obs_used': len(valid_obs),
         'num_obs_total': len(obs_list),
         'quality_band': str(reproj_policy.get("quality_band", "mid")),
         'feature_quality': float(feature_quality) if np.isfinite(feature_quality) else np.nan,
+        'reproj_failsoft_applied': bool(reproj_failsoft_applied),
+        'reproj_quality_scale': float(reproj_quality_scale),
     }
     
     # Add pixel-level error if available
@@ -2089,7 +2152,8 @@ def trigger_msckf_update(kf, cam_states: list, cam_observations: list,
                          reproj_scale: float = 1.0,
                          phase: int = 2,
                          health_state: str = "HEALTHY",
-                         adaptive_info: Optional[Dict[str, Any]] = None) -> int:
+                         adaptive_info: Optional[Dict[str, Any]] = None,
+                         policy_decision: Optional[Any] = None) -> int:
     """
     Trigger MSCKF multi-view geometric update.
     
@@ -2111,6 +2175,32 @@ def trigger_msckf_update(kf, cam_states: list, cam_observations: list,
     Returns:
         Number of successful MSCKF updates
     """
+    if policy_decision is not None:
+        mode = str(getattr(policy_decision, "mode", "APPLY")).upper()
+        if mode in ("HOLD", "SKIP"):
+            if adaptive_info is not None:
+                adaptive_info.clear()
+                adaptive_info.update({
+                    "sensor": "MSCKF",
+                    "accepted": False,
+                    "dof": 1,
+                    "nis_norm": np.nan,
+                    "chi2": np.nan,
+                    "threshold": np.nan,
+                    "r_scale_used": 1.0,
+                    "attempted": 0,
+                    "reason_code": f"policy_mode_{mode.lower()}",
+                })
+            return 0
+        try:
+            chi2_scale = float(getattr(policy_decision, "chi2_scale", chi2_scale))
+        except Exception:
+            pass
+        try:
+            reproj_scale = float(getattr(policy_decision, "reproj_scale", reproj_scale))
+        except Exception:
+            pass
+
     if vio_fe is None or len(cam_states) < 2:
         if adaptive_info is not None:
             adaptive_info.clear()

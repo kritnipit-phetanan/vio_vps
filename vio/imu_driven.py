@@ -193,6 +193,11 @@ def run_imu_driven_loop(runner):
         )
         runner.state.current_phase = phase_num
         runner.adaptive_service.update_adaptive_policy(t=t, phase=phase_num)
+        if getattr(runner, "policy_runtime_service", None) is not None:
+            try:
+                runner.policy_runtime_service.build_snapshot(float(t))
+            except Exception:
+                pass
         imu_params_step, sigma_accel_step = runner.adaptive_service.build_step_imu_params(
             imu_params_base, sigma_accel_base
         )

@@ -704,7 +704,8 @@ def check_loop_closure(loop_detector, img_gray: np.ndarray, t: float, kf,
 
 def apply_loop_closure_correction(kf, loop_info: Dict[str, Any], t: float,
                                    cam_states: list, loop_detector,
-                                   global_config: Optional[Dict[str, Any]] = None) -> bool:
+                                   global_config: Optional[Dict[str, Any]] = None,
+                                   policy_decision: Optional[Any] = None) -> bool:
     """
     Apply yaw correction from loop closure detection.
     
@@ -729,14 +730,41 @@ def apply_loop_closure_correction(kf, loop_info: Dict[str, Any], t: float,
         phase = int(loop_info.get("phase", 2))
         health = str(loop_info.get("health_state", "HEALTHY")).upper()
         fail_soft = bool(loop_info.get("fail_soft", False))
+        if policy_decision is not None:
+            mode = str(getattr(policy_decision, "mode", "APPLY")).upper()
+            if mode in ("HOLD", "SKIP"):
+                return False
 
         # Rejection/clamp bounds
         min_abs_deg = float(global_config.get("LOOP_MIN_ABS_YAW_CORR_DEG", 1.5))
         max_abs_deg = float(global_config.get("LOOP_MAX_ABS_YAW_CORR_DEG", 4.0))
         reject_abs_deg = float(global_config.get("LOOP_YAW_RESIDUAL_BOUND_DEG", 25.0))
-        speed_skip_m_s = float(global_config.get("LOOP_SPEED_SKIP_M_S", 35.0))
-        speed_sigma_inflate_m_s = float(global_config.get("LOOP_SPEED_SIGMA_INFLATE_M_S", 25.0))
-        speed_sigma_mult = float(global_config.get("LOOP_SPEED_SIGMA_MULT", 1.5))
+        if policy_decision is not None:
+            try:
+                max_abs_deg = float(policy_decision.extra("max_abs_yaw_corr_deg", max_abs_deg))
+            except Exception:
+                pass
+        if fail_soft:
+            speed_skip_m_s = float(global_config.get("LOOP_SPEED_SKIP_M_S_FAILSOFT", global_config.get("LOOP_SPEED_SKIP_M_S", 35.0)))
+            speed_sigma_inflate_m_s = float(
+                global_config.get("LOOP_SPEED_SIGMA_INFLATE_M_S_FAILSOFT", global_config.get("LOOP_SPEED_SIGMA_INFLATE_M_S", 25.0))
+            )
+            speed_sigma_mult = float(global_config.get("LOOP_SPEED_SIGMA_MULT_FAILSOFT", global_config.get("LOOP_SPEED_SIGMA_MULT", 1.5)))
+        else:
+            speed_skip_m_s = float(global_config.get("LOOP_SPEED_SKIP_M_S_NORMAL", global_config.get("LOOP_SPEED_SKIP_M_S", 35.0)))
+            speed_sigma_inflate_m_s = float(
+                global_config.get("LOOP_SPEED_SIGMA_INFLATE_M_S_NORMAL", global_config.get("LOOP_SPEED_SIGMA_INFLATE_M_S", 25.0))
+            )
+            speed_sigma_mult = float(global_config.get("LOOP_SPEED_SIGMA_MULT_NORMAL", global_config.get("LOOP_SPEED_SIGMA_MULT", 1.5)))
+        if policy_decision is not None:
+            if fail_soft:
+                speed_skip_m_s = float(policy_decision.extra("speed_skip_m_s_failsoft", speed_skip_m_s))
+                speed_sigma_inflate_m_s = float(policy_decision.extra("speed_sigma_inflate_m_s_failsoft", speed_sigma_inflate_m_s))
+                speed_sigma_mult = float(policy_decision.extra("speed_sigma_mult_failsoft", speed_sigma_mult))
+            else:
+                speed_skip_m_s = float(policy_decision.extra("speed_skip_m_s_normal", speed_skip_m_s))
+                speed_sigma_inflate_m_s = float(policy_decision.extra("speed_sigma_inflate_m_s_normal", speed_sigma_inflate_m_s))
+                speed_sigma_mult = float(policy_decision.extra("speed_sigma_mult_normal", speed_sigma_mult))
         speed_now = float(np.linalg.norm(np.asarray(kf.x[3:6, 0], dtype=float)))
 
         if abs(np.degrees(yaw_error)) < min_abs_deg:

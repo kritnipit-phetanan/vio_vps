@@ -49,6 +49,7 @@ from .services.vps_service import VPSService
 from .services.vio_service import VIOService
 from .services.imu_update_service import IMUUpdateService
 from .services.kinematic_guard_service import KinematicGuardService
+from .services.policy_runtime_service import PolicyRuntimeService
 
 
 class VIORunner:
@@ -129,6 +130,9 @@ class VIORunner:
         self.mag_quality_csv = None
         self.sensor_time_audit_csv = None
         self.vps_reloc_summary_csv = None
+        self.policy_trace_csv = None
+        self.policy_conflict_csv = None
+        self.policy_owner_map_csv = None
         self.conditioning_events_csv = None
         self.benchmark_health_summary_csv = None
         
@@ -172,6 +176,8 @@ class VIORunner:
         self._vps_inflight_result = None
         self._vps_inflight_meta: Optional[Dict[str, Any]] = None
         self._vps_thread_busy_skip_count: int = 0
+        self._vps_thread_busy_streak: int = 0
+        self._vps_force_local_until_t: float = -1e9
         self._abs_corr_apply_count: int = 0
         self._abs_corr_soft_count: int = 0
 
@@ -196,6 +202,7 @@ class VIORunner:
         # Adaptive controller runtime
         self.adaptive_controller: Optional[AdaptiveController] = None
         self.current_adaptive_decision: Optional[AdaptiveDecision] = None
+        self.current_policy_snapshot = None
         self._adaptive_last_aiding_time: Optional[float] = None
         self._adaptive_prev_pmax: Optional[float] = None
         self._adaptive_log_enabled: bool = True
@@ -216,6 +223,7 @@ class VIORunner:
         self._cam_frames_inlier_nonzero: int = 0
         self._vio_vel_attempt_count: int = 0
         self._vio_vel_accept_count: int = 0
+        self._policy_conflict_count: int = 0
         self._kin_guard_samples: int = 0
         self._kin_guard_trigger_count: int = 0
         self._kin_guard_hard_count: int = 0
@@ -230,6 +238,7 @@ class VIORunner:
         self.vio_service = VIOService(self)
         self.imu_update_service = IMUUpdateService(self)
         self.kinematic_guard_service = KinematicGuardService(self)
+        self.policy_runtime_service = PolicyRuntimeService(self)
     
     def run(self):
         """
@@ -258,19 +267,23 @@ class VIORunner:
             else:
                 raise ValueError(f"Unknown estimator_mode: {self.config.estimator_mode}")
         finally:
+            vps_thread_alive_after_join = False
             if self._vps_inflight_thread is not None:
                 try:
-                    self._vps_inflight_thread.join(timeout=0.2)
+                    self._vps_inflight_thread.join(timeout=5.0)
+                    vps_thread_alive_after_join = bool(self._vps_inflight_thread.is_alive())
                 except Exception:
                     pass
                 self._vps_inflight_thread = None
                 self._vps_inflight_result = None
                 self._vps_inflight_meta = None
-            if self.vps_runner is not None:
+            if self.vps_runner is not None and not vps_thread_alive_after_join:
                 try:
                     self.vps_runner.close()
                 except Exception:
                     pass
+            elif self.vps_runner is not None and vps_thread_alive_after_join:
+                print("[VPS] Skip close() because inflight thread is still alive (avoid DB-close race).")
             if self.backend_optimizer is not None:
                 try:
                     self.backend_optimizer.stop()

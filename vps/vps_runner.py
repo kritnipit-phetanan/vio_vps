@@ -26,6 +26,15 @@ from .relocalization_policy import (
 )
 
 
+def _resolve_total_candidate_budget(raw_num_candidates: int, max_total_candidates: int) -> int:
+    """Return effective per-frame candidate budget (0 means no candidates)."""
+    raw = max(0, int(raw_num_candidates))
+    cap = int(max_total_candidates)
+    if cap <= 0:
+        return raw
+    return min(raw, cap)
+
+
 @dataclass
 class VPSConfig:
     """Configuration for VPS system."""
@@ -65,7 +74,7 @@ class VPSConfig:
     # Matcher
     device: str = 'cuda'
     max_keypoints: int = 2048
-    matcher_mode: str = "auto"  # auto|orb|lightglue|orb_lightglue_rescue
+    matcher_mode: str = "orb"  # auto|orb|lightglue|orb_lightglue_rescue
     rescue_min_inliers: int = 8
     rescue_min_confidence: float = 0.12
     rescue_max_reproj_error: float = 2.5
@@ -75,6 +84,19 @@ class VPSConfig:
     # Accuracy-first controls
     accuracy_mode: bool = False
     global_max_candidates: int = 12
+    max_total_candidates: int = 0  # 0 => unlimited (bounded by generated candidates)
+    max_frame_time_ms_local: float = 0.0  # 0 => disabled
+    max_frame_time_ms_global: float = 0.0  # 0 => disabled
+
+    # AGL gate fail-soft / hysteresis
+    agl_gate_failsoft_enabled: bool = True
+    min_altitude_floor: float = 8.0
+    min_altitude_phase_early: float = 12.0
+    min_altitude_low_speed: float = 10.0
+    low_speed_threshold_m_s: float = 12.0
+    min_altitude_high_speed: float = 20.0
+    high_speed_threshold_m_s: float = 25.0
+    altitude_gate_hysteresis_m: float = 4.0
 
     # Relocalization (local/global search)
     reloc_enabled: bool = True
@@ -88,6 +110,20 @@ class VPSConfig:
     reloc_global_yaw_hypotheses_deg: tuple = (0.0, 45.0, 90.0, 135.0, 180.0, -45.0, -90.0, -135.0)
     reloc_global_scale_hypotheses: tuple = (0.80, 0.90, 1.00, 1.10, 1.20)
     reloc_force_global_on_warning_phase: bool = False
+    reloc_global_backoff_fail_streak: int = 10
+    reloc_global_backoff_sec: float = 8.0
+    reloc_busy_backoff_force_local_streak: int = 6
+    reloc_busy_backoff_sec: float = 6.0
+    reloc_global_backoff_probe_every_attempts: int = 12
+    reloc_global_backoff_probe_min_interval_sec: float = 2.0
+    reloc_global_probe_on_no_coverage: bool = True
+    reloc_global_probe_no_coverage_streak: int = 3
+    reloc_no_coverage_recovery_streak: int = 3
+    reloc_no_coverage_use_last_success: bool = True
+    reloc_no_coverage_use_last_coverage: bool = True
+    reloc_no_coverage_radius_m: tuple = (25.0, 60.0)
+    reloc_no_coverage_samples: int = 6
+    reloc_no_coverage_max_centers: int = 6
     runtime_verbosity: str = "debug"
     runtime_log_interval_sec: float = 1.0
 
@@ -176,7 +212,19 @@ class VPSRunner:
         self.last_result: Optional[VPSMeasurement] = None
         self._fail_streak = 0
         self._last_success_time = -1e9
+        self._last_success_center_lat = float("nan")
+        self._last_success_center_lon = float("nan")
+        self._last_coverage_center_lat = float("nan")
+        self._last_coverage_center_lon = float("nan")
         self._last_global_search_time = -1e9
+        self._last_backoff_probe_attempt = -1
+        self._last_backoff_probe_time = -1e9
+        self._global_backoff_until_t = -1e9
+        self._global_backoff_trigger_count = 0
+        self._global_backoff_probe_count = 0
+        self._force_local_streak = 0
+        self._no_coverage_streak = 0
+        self._altitude_gate_open = True
         self.reloc_summary_csv: Optional[str] = None
         
         # Debug logger (set via set_logger)
@@ -201,6 +249,14 @@ class VPSRunner:
             'fail_quality': 0,
             'global_search': 0,
             'local_search': 0,
+            'attempt_wall_ms': [],
+            'time_budget_stops': 0,
+            'candidate_budget_stops': 0,
+            'evaluated_candidates_total': 0,
+            'evaluated_candidates_samples': 0,
+            'global_backoff_triggers': 0,
+            'global_backoff_probes': 0,
+            'coverage_recovery_used': 0,
         }
         
         print("[VPSRunner] Ready")
@@ -329,6 +385,9 @@ class VPSRunner:
             scale_hyp = tuple(float(v) for v in vps_cfg.get("scale_hypotheses", [1.0, 0.90, 1.10]))
             reloc_cfg = vps_cfg.get("relocalization", {}) if isinstance(vps_cfg.get("relocalization", {}), dict) else {}
             reloc_ring_radius = tuple(float(v) for v in reloc_cfg.get("ring_radius_m", [35.0, 80.0]))
+            reloc_no_cov_radius = tuple(
+                float(v) for v in reloc_cfg.get("no_coverage_recovery_radius_m", [25.0, 60.0])
+            )
             reloc_global_yaw = tuple(float(v) for v in reloc_cfg.get(
                 "global_yaw_hypotheses_deg", [0.0, 45.0, 90.0, 135.0, 180.0, -45.0, -90.0, -135.0]
             ))
@@ -361,7 +420,7 @@ class VPSRunner:
                 min_update_interval=float(vps_cfg.get("min_update_interval", 0.5)),
                 device=str(vps_cfg.get("device", device)),
                 max_keypoints=int(vps_cfg.get("max_keypoints", 2048)),
-                matcher_mode=str(vps_cfg.get("matcher_mode", "auto")),
+                matcher_mode=str(vps_cfg.get("matcher_mode", "orb")),
                 rescue_min_inliers=int(vps_cfg.get("rescue_min_inliers", 8)),
                 rescue_min_confidence=float(vps_cfg.get("rescue_min_confidence", 0.12)),
                 rescue_max_reproj_error=float(vps_cfg.get("rescue_max_reproj_error", 2.5)),
@@ -371,6 +430,17 @@ class VPSRunner:
                 scale_hypotheses=scale_hyp if len(scale_hyp) > 0 else (1.0, 0.90, 1.10),
                 max_candidates=int(vps_cfg.get("max_candidates", 6)),
                 global_max_candidates=int(vps_cfg.get("global_max_candidates", 12)),
+                max_total_candidates=int(vps_cfg.get("max_total_candidates", 0)),
+                max_frame_time_ms_local=float(vps_cfg.get("max_frame_time_ms_local", 0.0)),
+                max_frame_time_ms_global=float(vps_cfg.get("max_frame_time_ms_global", 0.0)),
+                agl_gate_failsoft_enabled=bool(vps_cfg.get("agl_gate_failsoft_enabled", True)),
+                min_altitude_floor=float(vps_cfg.get("min_altitude_floor", 8.0)),
+                min_altitude_phase_early=float(vps_cfg.get("min_altitude_phase_early", 12.0)),
+                min_altitude_low_speed=float(vps_cfg.get("min_altitude_low_speed", 10.0)),
+                low_speed_threshold_m_s=float(vps_cfg.get("low_speed_threshold_m_s", 12.0)),
+                min_altitude_high_speed=float(vps_cfg.get("min_altitude_high_speed", 20.0)),
+                high_speed_threshold_m_s=float(vps_cfg.get("high_speed_threshold_m_s", 25.0)),
+                altitude_gate_hysteresis_m=float(vps_cfg.get("altitude_gate_hysteresis_m", 4.0)),
                 min_content_ratio=float(vps_cfg.get("min_content_ratio", 0.20)),
                 min_texture_std=float(vps_cfg.get("min_texture_std", 8.0)),
                 accuracy_mode=bool(vps_cfg.get("accuracy_mode", False)),
@@ -385,6 +455,40 @@ class VPSRunner:
                 reloc_global_yaw_hypotheses_deg=reloc_global_yaw if len(reloc_global_yaw) > 0 else (0.0, 45.0, 90.0, 135.0, 180.0, -45.0, -90.0, -135.0),
                 reloc_global_scale_hypotheses=reloc_global_scale if len(reloc_global_scale) > 0 else (0.80, 0.90, 1.00, 1.10, 1.20),
                 reloc_force_global_on_warning_phase=bool(reloc_cfg.get("force_global_on_warning_phase", False)),
+                reloc_global_backoff_fail_streak=int(reloc_cfg.get("global_backoff_fail_streak", 10)),
+                reloc_global_backoff_sec=float(reloc_cfg.get("global_backoff_sec", 8.0)),
+                reloc_busy_backoff_force_local_streak=int(
+                    reloc_cfg.get("busy_backoff_force_local_streak", 6)
+                ),
+                reloc_busy_backoff_sec=float(reloc_cfg.get("busy_backoff_sec", 6.0)),
+                reloc_global_backoff_probe_every_attempts=int(
+                    reloc_cfg.get("global_backoff_probe_every_attempts", 12)
+                ),
+                reloc_global_backoff_probe_min_interval_sec=float(
+                    reloc_cfg.get("global_backoff_probe_min_interval_sec", 2.0)
+                ),
+                reloc_global_probe_on_no_coverage=bool(
+                    reloc_cfg.get("global_probe_on_no_coverage", True)
+                ),
+                reloc_global_probe_no_coverage_streak=int(
+                    reloc_cfg.get("global_probe_no_coverage_streak", 3)
+                ),
+                reloc_no_coverage_recovery_streak=int(
+                    reloc_cfg.get("no_coverage_recovery_streak", 3)
+                ),
+                reloc_no_coverage_use_last_success=bool(
+                    reloc_cfg.get("no_coverage_use_last_success", True)
+                ),
+                reloc_no_coverage_use_last_coverage=bool(
+                    reloc_cfg.get("no_coverage_use_last_coverage", True)
+                ),
+                reloc_no_coverage_radius_m=(
+                    reloc_no_cov_radius if len(reloc_no_cov_radius) > 0 else (25.0, 60.0)
+                ),
+                reloc_no_coverage_samples=int(reloc_cfg.get("no_coverage_recovery_samples", 6)),
+                reloc_no_coverage_max_centers=int(
+                    reloc_cfg.get("no_coverage_recovery_max_centers", 6)
+                ),
                 runtime_verbosity=str(
                     vps_cfg.get(
                         "runtime_verbosity",
@@ -402,7 +506,11 @@ class VPSRunner:
                 f"[VPSRunner] VPS cfg: patch={vps_config.patch_size_px}/{vps_config.patch_size_failover_px}, "
                 f"min_inliers={vps_config.min_inliers}, failsoft={vps_config.min_inliers_failsoft}, "
                 f"candidates<={vps_config.max_candidates}, matcher={vps_config.matcher_mode}, "
-                f"max_image_side={vps_config.max_image_side}"
+                f"max_image_side={vps_config.max_image_side}, "
+                f"max_total_candidates={vps_config.max_total_candidates}, "
+                f"budget_ms(local/global)={vps_config.max_frame_time_ms_local:.0f}/{vps_config.max_frame_time_ms_global:.0f}, "
+                f"gbackoff_fail={vps_config.reloc_global_backoff_fail_streak},"
+                f"{vps_config.reloc_global_backoff_sec:.1f}s"
             )
         
         # Create VPSRunner
@@ -507,6 +615,10 @@ class VPSRunner:
                            trigger_reason: str,
                            est_lat: float,
                            est_lon: float,
+                           est_alt_agl: float,
+                           min_alt_agl: float,
+                           max_alt_agl: float,
+                           altitude_ok: bool,
                            best_center_lat: float,
                            best_center_lon: float,
                            best_score: float,
@@ -515,6 +627,28 @@ class VPSRunner:
                            best_conf: float,
                            selected_yaw_deg: float,
                            selected_scale_mult: float,
+                           centers_total: int,
+                           centers_in_cache: int,
+                           centers_with_patch: int,
+                           coverage_found: bool,
+                           raw_num_candidates: int,
+                           budget_num_candidates: int,
+                           evaluated_candidates: int,
+                           stopped_by_time_budget: bool,
+                           stopped_by_candidate_budget: bool,
+                           fail_streak: int,
+                           global_backoff_active: bool,
+                           global_backoff_until_t: float,
+                           global_probe_allowed: bool,
+                           no_coverage_streak: int,
+                           coverage_recovery_active: bool,
+                           state_speed_m_s: float,
+                           since_success_sec: float,
+                           agl_gate_open: bool,
+                           agl_hysteresis_m: float,
+                           agl_gate_min_thresh: float,
+                           agl_gate_max_thresh: float,
+                           attempt_wall_ms: float,
                            success: bool,
                            reason: str):
         """Append one VPS relocalization summary row."""
@@ -526,10 +660,20 @@ class VPSRunner:
             with open(self.reloc_summary_csv, "a", newline="") as f:
                 f.write(
                     f"{float(t_cam):.6f},{int(frame_idx)},{mode},{int(force_global)},{trig_txt},"
-                    f"{float(est_lat):.8f},{float(est_lon):.8f},"
+                    f"{float(est_lat):.8f},{float(est_lon):.8f},{float(est_alt_agl):.3f},"
+                    f"{float(min_alt_agl):.3f},{float(max_alt_agl):.3f},{int(altitude_ok)},"
                     f"{float(best_center_lat):.8f},{float(best_center_lon):.8f},"
                     f"{float(best_score):.6f},{int(best_inliers)},{float(best_reproj):.6f},"
                     f"{float(best_conf):.6f},{float(selected_yaw_deg):.3f},{float(selected_scale_mult):.4f},"
+                    f"{int(centers_total)},{int(centers_in_cache)},{int(centers_with_patch)},{int(coverage_found)},"
+                    f"{int(raw_num_candidates)},{int(budget_num_candidates)},{int(evaluated_candidates)},"
+                    f"{int(stopped_by_time_budget)},{int(stopped_by_candidate_budget)},"
+                    f"{int(fail_streak)},{int(global_backoff_active)},{float(global_backoff_until_t):.6f},"
+                    f"{int(global_probe_allowed)},{int(no_coverage_streak)},{int(coverage_recovery_active)},"
+                    f"{float(state_speed_m_s):.3f},{float(since_success_sec):.3f},"
+                    f"{int(agl_gate_open)},{float(agl_hysteresis_m):.3f},"
+                    f"{float(agl_gate_min_thresh):.3f},{float(agl_gate_max_thresh):.3f},"
+                    f"{float(attempt_wall_ms):.3f},"
                     f"{int(success)},{reason_txt}\n"
                 )
         except Exception:
@@ -545,7 +689,9 @@ class VPSRunner:
                       frame_idx: int = -1,
                       est_cov_xy: Optional[np.ndarray] = None,
                       phase: Optional[int] = None,
+                      state_speed_m_s: Optional[float] = None,
                       force_global: bool = False,
+                      force_local: bool = False,
                       objective: str = "accuracy") -> Optional[VPSMeasurement]:
         """
         Process single camera frame for VPS position.
@@ -590,13 +736,139 @@ class VPSRunner:
         selected_center_lat = float(est_lat)
         selected_center_lon = float(est_lon)
         selected_map_patch: Optional[MapPatch] = None
+        stop_search = False
+        stopped_by_time_budget = False
+        stopped_by_candidate_budget = False
+        evaluated_candidates = 0
+        raw_num_candidates = 0
+        num_candidates = 0
+        frame_budget_ms = 0.0
+        centers_total = 0
+        centers_in_cache = 0
+        centers_with_patch = 0
+        coverage_found = False
+        state_speed_val = float(state_speed_m_s) if state_speed_m_s is not None else float("nan")
+        if not np.isfinite(state_speed_val):
+            state_speed_val = float("nan")
+        alt_min_dynamic = float(self.config.min_altitude)
+        alt_max_dynamic = float(self.config.max_altitude)
+        agl_hyst = max(0.0, float(self.config.altitude_gate_hysteresis_m))
+        if bool(self.config.agl_gate_failsoft_enabled):
+            alt_min_dynamic = max(float(self.config.min_altitude_floor), alt_min_dynamic)
+            if phase is not None and int(phase) <= 1:
+                alt_min_dynamic = min(alt_min_dynamic, float(self.config.min_altitude_phase_early))
+            if np.isfinite(state_speed_val) and state_speed_val <= float(self.config.low_speed_threshold_m_s):
+                alt_min_dynamic = min(alt_min_dynamic, float(self.config.min_altitude_low_speed))
+            if np.isfinite(state_speed_val) and state_speed_val >= float(self.config.high_speed_threshold_m_s):
+                alt_min_dynamic = min(alt_min_dynamic, float(self.config.min_altitude_high_speed))
+            if int(getattr(self, "_no_coverage_streak", 0)) >= int(self.config.reloc_no_coverage_recovery_streak):
+                alt_min_dynamic = min(alt_min_dynamic, float(self.config.min_altitude_high_speed))
+            alt_min_dynamic = max(float(self.config.min_altitude_floor), alt_min_dynamic)
+
+        agl_gate_open = bool(getattr(self, "_altitude_gate_open", True))
+        max_high_thresh = float(alt_max_dynamic + agl_hyst)
+        if agl_gate_open:
+            agl_gate_min_thresh = float(alt_min_dynamic - agl_hyst)
+            agl_gate_max_thresh = max_high_thresh
+        else:
+            # Re-open with softer threshold to avoid hard lockout near min altitude.
+            agl_gate_min_thresh = float(alt_min_dynamic - 0.25 * agl_hyst)
+            agl_gate_max_thresh = max_high_thresh
+        if agl_gate_max_thresh < agl_gate_min_thresh:
+            agl_gate_max_thresh = agl_gate_min_thresh
+        altitude_ok = bool(agl_gate_min_thresh <= float(est_alt) <= agl_gate_max_thresh)
+        self._altitude_gate_open = bool(altitude_ok)
+        coverage_recovery_active = False
+        global_probe_allowed = False
+        since_success_sec = float(t_cam - self._last_success_time) if np.isfinite(self._last_success_time) else float("inf")
+        runtime_recorded = False
+
+        def _record_runtime_stats_once():
+            nonlocal runtime_recorded
+            if runtime_recorded:
+                return
+            runtime_recorded = True
+            wall_ms = float((time.time() - t_start) * 1000.0)
+            vals = self.stats.setdefault("attempt_wall_ms", [])
+            vals.append(wall_ms)
+            if len(vals) > 4000:
+                del vals[: len(vals) - 4000]
+            self.stats["evaluated_candidates_total"] = int(
+                self.stats.get("evaluated_candidates_total", 0)
+            ) + int(evaluated_candidates)
+            self.stats["evaluated_candidates_samples"] = int(
+                self.stats.get("evaluated_candidates_samples", 0)
+            ) + 1
+            if stopped_by_time_budget:
+                self.stats["time_budget_stops"] = int(self.stats.get("time_budget_stops", 0)) + 1
+            if stopped_by_candidate_budget:
+                self.stats["candidate_budget_stops"] = int(
+                    self.stats.get("candidate_budget_stops", 0)
+                ) + 1
+
+        def _attempt_wall_ms() -> float:
+            return float((time.time() - t_start) * 1000.0)
+
+        def _activate_global_backoff(backoff_sec: float, reason_tag: str):
+            if backoff_sec <= 0.0:
+                return
+            now_t = float(t_cam)
+            new_until = now_t + float(backoff_sec)
+            if new_until > float(self._global_backoff_until_t):
+                self._global_backoff_until_t = float(new_until)
+                self._global_backoff_trigger_count = int(self._global_backoff_trigger_count) + 1
+                self.stats["global_backoff_triggers"] = int(self._global_backoff_trigger_count)
+                self._runtime_log(
+                    "vps_global_backoff",
+                    "[VPS] global-search backoff "
+                    f"reason={reason_tag}, duration={backoff_sec:.1f}s, "
+                    f"fail_streak={int(self._fail_streak)}, until={self._global_backoff_until_t:.2f}",
+                )
+
+        def _maybe_backoff_after_failure(reason_tag: str):
+            threshold = int(self.config.reloc_global_backoff_fail_streak)
+            if reason_tag == "no_coverage":
+                threshold = max(threshold + 2, int(self.config.reloc_no_coverage_recovery_streak) + 2)
+            elif reason_tag in ("time_budget_stop", "candidate_budget_stop"):
+                threshold = max(threshold + 2, 8)
+            if threshold <= 0:
+                return
+            if int(self._fail_streak) < threshold:
+                return
+            if reason_tag in {
+                "no_coverage",
+                "match_failed",
+                "time_budget_stop",
+                "candidate_budget_stop",
+                "quality_inliers",
+                "quality_reproj",
+                "quality_confidence",
+                "pose_estimation_failed",
+                "pose_estimation_exception",
+            }:
+                _activate_global_backoff(
+                    float(self.config.reloc_global_backoff_sec),
+                    reason_tag=f"fail_streak_{reason_tag}",
+                )
+
+        if force_local:
+            self._force_local_streak = int(self._force_local_streak) + 1
+        else:
+            self._force_local_streak = 0
+        if (
+            int(self.config.reloc_busy_backoff_force_local_streak) > 0
+            and int(self._force_local_streak) >= int(self.config.reloc_busy_backoff_force_local_streak)
+        ):
+            _activate_global_backoff(
+                float(self.config.reloc_busy_backoff_sec),
+                reason_tag="busy_force_local_streak",
+            )
 
         force_global_requested = bool(force_global)
         objective_mode = str(objective).lower()
         if objective_mode == "":
             objective_mode = "accuracy" if bool(self.config.accuracy_mode) else "stability"
 
-        since_success_sec = float(t_cam - self._last_success_time) if np.isfinite(self._last_success_time) else float("inf")
         since_global_sec = float(t_cam - self._last_global_search_time) if np.isfinite(self._last_global_search_time) else float("inf")
         global_mode, trigger_reason = should_force_global_relocalization(
             force_global=bool(force_global),
@@ -614,17 +886,114 @@ class VPSRunner:
             phase=phase,
             force_global_on_warning_phase=bool(self.config.reloc_force_global_on_warning_phase),
         )
-        search_centers = (
-            build_relocalization_centers(
-                est_lat=float(est_lat),
-                est_lon=float(est_lon),
+        global_backoff_active = bool(float(t_cam) < float(self._global_backoff_until_t))
+        allow_probe_from_no_coverage = bool(
+            bool(self.config.reloc_global_probe_on_no_coverage)
+            and int(self._no_coverage_streak) >= int(self.config.reloc_global_probe_no_coverage_streak)
+        )
+        if global_backoff_active and (global_mode or allow_probe_from_no_coverage):
+            probe_every = int(self.config.reloc_global_backoff_probe_every_attempts)
+            probe_min_interval = float(self.config.reloc_global_backoff_probe_min_interval_sec)
+            attempts_since_probe = int(self.stats.get("total_attempts", 0)) - int(self._last_backoff_probe_attempt)
+            time_since_probe = float(t_cam - self._last_backoff_probe_time)
+            if (
+                probe_every > 0
+                and attempts_since_probe >= probe_every
+                and time_since_probe >= max(0.0, probe_min_interval)
+            ):
+                global_probe_allowed = True
+                if global_mode:
+                    trigger_reason = "global_backoff_probe"
+                else:
+                    trigger_reason = "global_backoff_probe_recovery"
+                    global_mode = True
+                self._last_backoff_probe_attempt = int(self.stats.get("total_attempts", 0))
+                self._last_backoff_probe_time = float(t_cam)
+                self._global_backoff_probe_count = int(self._global_backoff_probe_count) + 1
+                self.stats["global_backoff_probes"] = int(self._global_backoff_probe_count)
+                self._runtime_log(
+                    "vps_global_probe",
+                    "[VPS] global-search probe allowed during backoff "
+                    f"(attempts_since_probe={attempts_since_probe}, fail_streak={int(self._fail_streak)})",
+                )
+            elif global_mode:
+                global_mode = False
+                trigger_reason = "global_backoff_active"
+        if force_local and global_mode:
+            global_mode = False
+            trigger_reason = "force_local_busy_guard"
+
+        has_last_success_center = bool(
+            np.isfinite(self._last_success_center_lat) and np.isfinite(self._last_success_center_lon)
+        )
+        has_last_coverage_center = bool(
+            np.isfinite(self._last_coverage_center_lat) and np.isfinite(self._last_coverage_center_lon)
+        )
+        use_coverage_recovery = bool(
+            int(self._no_coverage_streak) >= int(self.config.reloc_no_coverage_recovery_streak)
+            and (
+                (bool(self.config.reloc_no_coverage_use_last_success) and has_last_success_center)
+                or (bool(self.config.reloc_no_coverage_use_last_coverage) and has_last_coverage_center)
+            )
+        )
+        recovery_source = "none"
+        if use_coverage_recovery and bool(self.config.reloc_no_coverage_use_last_success) and has_last_success_center:
+            search_base_lat = float(self._last_success_center_lat)
+            search_base_lon = float(self._last_success_center_lon)
+            recovery_source = "last_success"
+        elif use_coverage_recovery and bool(self.config.reloc_no_coverage_use_last_coverage) and has_last_coverage_center:
+            search_base_lat = float(self._last_coverage_center_lat)
+            search_base_lon = float(self._last_coverage_center_lon)
+            recovery_source = "last_coverage"
+        else:
+            search_base_lat = float(est_lat)
+            search_base_lon = float(est_lon)
+
+        if global_mode:
+            search_centers = build_relocalization_centers(
+                est_lat=search_base_lat,
+                est_lon=search_base_lon,
                 max_centers=int(self.config.reloc_max_centers),
                 ring_radius_m=list(self.config.reloc_ring_radius_m),
                 ring_samples=int(self.config.reloc_ring_samples),
             )
-            if global_mode
-            else [(float(est_lat), float(est_lon))]
-        )
+            if use_coverage_recovery:
+                coverage_recovery_active = True
+                trigger_reason = (
+                    f"coverage_recovery_{recovery_source}_global"
+                    if trigger_reason in ("", "global_interval", "global_fail_streak")
+                    else f"{trigger_reason}+coverage_recovery"
+                )
+                self.stats["coverage_recovery_used"] = int(self.stats.get("coverage_recovery_used", 0)) + 1
+        else:
+            if use_coverage_recovery:
+                coverage_recovery_active = True
+                self.stats["coverage_recovery_used"] = int(self.stats.get("coverage_recovery_used", 0)) + 1
+                rec_centers = build_relocalization_centers(
+                    est_lat=search_base_lat,
+                    est_lon=search_base_lon,
+                    max_centers=max(1, int(self.config.reloc_no_coverage_max_centers)),
+                    ring_radius_m=list(self.config.reloc_no_coverage_radius_m),
+                    ring_samples=max(1, int(self.config.reloc_no_coverage_samples)),
+                )
+                search_centers = []
+                seen = set()
+                for lat_c, lon_c in rec_centers:
+                    key = (round(float(lat_c), 7), round(float(lon_c), 7))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    search_centers.append((float(lat_c), float(lon_c)))
+                est_key = (round(float(est_lat), 7), round(float(est_lon), 7))
+                if est_key not in seen:
+                    search_centers.append((float(est_lat), float(est_lon)))
+                trigger_reason = (
+                    f"coverage_recovery_{recovery_source}"
+                    if trigger_reason in ("", "local_default", "none")
+                    else f"{trigger_reason}+coverage_recovery"
+                )
+            else:
+                search_centers = [(float(est_lat), float(est_lon))]
         if global_mode:
             self.stats['global_search'] += 1
             self._last_global_search_time = float(t_cam)
@@ -633,6 +1002,7 @@ class VPSRunner:
 
         def _log_attempt_and_profile(success: bool, reason: str):
             processing_time_ms = (time.time() - t_start) * 1000.0
+            _record_runtime_stats_once()
             if self.logger:
                 import math
                 self.logger.log_attempt(
@@ -710,6 +1080,10 @@ class VPSRunner:
                 trigger_reason=trigger_reason,
                 est_lat=est_lat,
                 est_lon=est_lon,
+                est_alt_agl=est_alt,
+                min_alt_agl=float(alt_min_dynamic),
+                max_alt_agl=float(alt_max_dynamic),
+                altitude_ok=bool(altitude_ok),
                 best_center_lat=selected_center_lat,
                 best_center_lon=selected_center_lon,
                 best_score=best_score,
@@ -718,17 +1092,41 @@ class VPSRunner:
                 best_conf=best_conf,
                 selected_yaw_deg=selected_yaw_deg,
                 selected_scale_mult=selected_scale_mult,
+                centers_total=int(centers_total),
+                centers_in_cache=int(centers_in_cache),
+                centers_with_patch=int(centers_with_patch),
+                coverage_found=bool(coverage_found),
+                raw_num_candidates=int(raw_num_candidates),
+                budget_num_candidates=int(num_candidates),
+                evaluated_candidates=int(evaluated_candidates),
+                stopped_by_time_budget=bool(stopped_by_time_budget),
+                stopped_by_candidate_budget=bool(stopped_by_candidate_budget),
+                fail_streak=int(self._fail_streak),
+                global_backoff_active=bool(float(t_cam) < float(self._global_backoff_until_t)),
+                global_backoff_until_t=float(self._global_backoff_until_t),
+                global_probe_allowed=bool(global_probe_allowed),
+                no_coverage_streak=int(self._no_coverage_streak),
+                coverage_recovery_active=bool(coverage_recovery_active),
+                state_speed_m_s=float(state_speed_val),
+                since_success_sec=float(since_success_sec),
+                agl_gate_open=bool(getattr(self, "_altitude_gate_open", True)),
+                agl_hysteresis_m=float(agl_hyst),
+                agl_gate_min_thresh=float(agl_gate_min_thresh),
+                agl_gate_max_thresh=float(agl_gate_max_thresh),
+                attempt_wall_ms=_attempt_wall_ms(),
                 success=success,
                 reason=reason,
             )
         
         # 1. Check update interval
         if t_cam - self.last_update_time < self.config.min_update_interval:
+            _record_runtime_stats_once()
             return None
         
-        # 2. Check altitude limits
-        if est_alt < self.config.min_altitude or est_alt > self.config.max_altitude:
+        # 2. Check altitude limits (AGL fail-soft + hysteresis).
+        if not altitude_ok:
             _log_reloc(False, "altitude_out_of_range")
+            _record_runtime_stats_once()
             return None
 
         if img is None or getattr(img, "size", 0) == 0:
@@ -741,13 +1139,19 @@ class VPSRunner:
         # 3/4/5/6. Search centers + preprocess hypotheses + matching
         camera_yaw_base = est_yaw + self.camera_yaw_offset_rad
         candidates = self._build_preprocess_candidates(global_mode=global_mode, objective=objective_mode)
-        num_candidates = len(candidates) * max(1, len(search_centers))
-        stop_search = False
-        coverage_found = False
+        centers_total = int(len(search_centers))
+        raw_num_candidates = len(candidates) * max(1, centers_total)
+        num_candidates = _resolve_total_candidate_budget(
+            raw_num_candidates, int(self.config.max_total_candidates)
+        )
+        frame_budget_ms = float(
+            self.config.max_frame_time_ms_global if global_mode else self.config.max_frame_time_ms_local
+        )
 
         for center_idx, (center_lat, center_lon) in enumerate(search_centers):
             if not self.tile_cache.is_position_in_cache(center_lat, center_lon):
                 continue
+            centers_in_cache += 1
 
             t_tile_start = time.time()
             map_patch = self.tile_cache.get_map_patch(
@@ -763,11 +1167,26 @@ class VPSRunner:
                 continue
             if not np.isfinite(float(map_patch.meters_per_pixel)) or float(map_patch.meters_per_pixel) <= 0.0:
                 continue
+            centers_with_patch += 1
             coverage_found = True
+            self._last_coverage_center_lat = float(map_patch.center_lat)
+            self._last_coverage_center_lon = float(map_patch.center_lon)
 
             sat_img = map_patch.image if len(map_patch.image.shape) == 2 else map_patch.image[:, :, 0]
             for cand_idx, (yaw_delta_deg, scale_mult) in enumerate(candidates):
-                candidate_idx = center_idx * max(1, len(candidates)) + cand_idx
+                if num_candidates > 0 and evaluated_candidates >= int(num_candidates):
+                    stopped_by_candidate_budget = True
+                    stop_search = True
+                    break
+                if frame_budget_ms > 0.0:
+                    elapsed_ms = float((time.time() - t_start) * 1000.0)
+                    if elapsed_ms >= frame_budget_ms:
+                        stopped_by_time_budget = True
+                        stop_search = True
+                        break
+
+                candidate_idx = int(evaluated_candidates)
+                evaluated_candidates += 1
                 yaw_used_rad = float(camera_yaw_base + np.deg2rad(float(yaw_delta_deg)))
 
                 t_preprocess_start = time.time()
@@ -934,10 +1353,18 @@ class VPSRunner:
         if selected_match is None:
             if coverage_found:
                 self.stats['fail_match'] += 1
+                self._no_coverage_streak = 0
             else:
                 self.stats['fail_no_coverage'] += 1
+                self._no_coverage_streak = int(self._no_coverage_streak) + 1
             self._fail_streak += 1
-            fail_reason = "match_failed" if coverage_found else "no_coverage"
+            if stopped_by_time_budget:
+                fail_reason = "time_budget_stop"
+            elif stopped_by_candidate_budget:
+                fail_reason = "candidate_budget_stop"
+            else:
+                fail_reason = "match_failed" if coverage_found else "no_coverage"
+            _maybe_backoff_after_failure(fail_reason)
             _log_attempt_and_profile(False, fail_reason)
             _log_reloc(False, fail_reason)
             return None
@@ -947,7 +1374,9 @@ class VPSRunner:
         map_patch = selected_map_patch
         if selected_reason == "match_failed":
             self.stats['fail_match'] += 1
+            self._no_coverage_streak = 0
             self._fail_streak += 1
+            _maybe_backoff_after_failure("match_failed")
             _save_match_visualization("match_failed", preprocess_result, map_patch, match_result)
             _log_attempt_and_profile(False, "match_failed")
             _log_reloc(False, "match_failed")
@@ -956,7 +1385,9 @@ class VPSRunner:
         # 7. Quality check
         if selected_reason != "matched_failsoft" and match_result.num_inliers < self.config.min_inliers:
             self.stats['fail_quality'] += 1
+            self._no_coverage_streak = 0
             self._fail_streak += 1
+            _maybe_backoff_after_failure("quality_inliers")
             _save_match_visualization("quality_inliers", preprocess_result, map_patch, match_result)
             _log_attempt_and_profile(False, "quality_inliers")
             _log_reloc(False, "quality_inliers")
@@ -964,7 +1395,9 @@ class VPSRunner:
         
         if selected_reason != "matched_failsoft" and match_result.reproj_error > self.config.max_reproj_error:
             self.stats['fail_quality'] += 1
+            self._no_coverage_streak = 0
             self._fail_streak += 1
+            _maybe_backoff_after_failure("quality_reproj")
             _save_match_visualization("quality_reproj", preprocess_result, map_patch, match_result)
             _log_attempt_and_profile(False, "quality_reproj")
             _log_reloc(False, "quality_reproj")
@@ -972,7 +1405,9 @@ class VPSRunner:
         
         if selected_reason != "matched_failsoft" and match_result.confidence < self.config.min_confidence:
             self.stats['fail_quality'] += 1
+            self._no_coverage_streak = 0
             self._fail_streak += 1
+            _maybe_backoff_after_failure("quality_confidence")
             _save_match_visualization("quality_confidence", preprocess_result, map_patch, match_result)
             _log_attempt_and_profile(False, "quality_confidence")
             _log_reloc(False, "quality_confidence")
@@ -990,7 +1425,9 @@ class VPSRunner:
             )
         except Exception:
             self.stats['fail_match'] += 1
+            self._no_coverage_streak = 0
             self._fail_streak += 1
+            _maybe_backoff_after_failure("pose_estimation_exception")
             _log_attempt_and_profile(False, "pose_estimation_exception")
             _log_reloc(False, "pose_estimation_exception")
             return None
@@ -998,7 +1435,9 @@ class VPSRunner:
         
         if vps_measurement is None:
             self.stats['fail_match'] += 1
+            self._no_coverage_streak = 0
             self._fail_streak += 1
+            _maybe_backoff_after_failure("pose_estimation_failed")
             _save_match_visualization("pose_failed", preprocess_result, map_patch, match_result)
             _log_attempt_and_profile(False, "pose_estimation_failed")
             _log_reloc(False, "pose_estimation_failed")
@@ -1012,8 +1451,11 @@ class VPSRunner:
         # Success!
         self.stats['success'] += 1
         self._fail_streak = 0
+        self._no_coverage_streak = 0
         self.last_update_time = t_cam
         self._last_success_time = float(t_cam)
+        self._last_success_center_lat = float(selected_center_lat)
+        self._last_success_center_lon = float(selected_center_lon)
         self.last_result = vps_measurement
         
         # Log processing time
@@ -1071,16 +1513,41 @@ class VPSRunner:
             **self.stats,
             'success_rate': self.stats['success'] / total if total > 0 else 0,
         }
+
+    def get_runtime_metrics(self) -> Dict[str, float]:
+        """Return compact runtime metrics for summary reporting."""
+        wall_vals = np.asarray(self.stats.get("attempt_wall_ms", []), dtype=float)
+        wall_vals = wall_vals[np.isfinite(wall_vals)]
+        eval_samples = int(self.stats.get("evaluated_candidates_samples", 0))
+        eval_total = int(self.stats.get("evaluated_candidates_total", 0))
+        return {
+            "attempt_ms_p50": float(np.percentile(wall_vals, 50.0)) if wall_vals.size > 0 else float("nan"),
+            "attempt_ms_p95": float(np.percentile(wall_vals, 95.0)) if wall_vals.size > 0 else float("nan"),
+            "attempt_ms_mean": float(np.mean(wall_vals)) if wall_vals.size > 0 else float("nan"),
+            "time_budget_stops": float(int(self.stats.get("time_budget_stops", 0))),
+            "candidate_budget_stops": float(int(self.stats.get("candidate_budget_stops", 0))),
+            "evaluated_candidates_mean": (
+                float(eval_total / max(1, eval_samples)) if eval_samples > 0 else float("nan")
+            ),
+        }
     
     def print_statistics(self):
         """Print statistics summary."""
         stats = self.get_statistics()
+        runtime = self.get_runtime_metrics()
         print(f"\n[VPS] Statistics:")
         print(f"  Total attempts: {stats['total_attempts']}")
         print(f"  Success: {stats['success']} ({stats['success_rate']*100:.1f}%)")
         print(f"  No coverage: {stats['fail_no_coverage']}")
         print(f"  Match failed: {stats['fail_match']}")
         print(f"  Quality reject: {stats['fail_quality']}")
+        print(
+            "  Runtime:"
+            f" p50={runtime['attempt_ms_p50']:.1f}ms,"
+            f" p95={runtime['attempt_ms_p95']:.1f}ms,"
+            f" budget_stops={int(runtime['time_budget_stops'])},"
+            f" cand_mean={runtime['evaluated_candidates_mean']:.2f}"
+        )
     
     def set_logger(self, logger):
         """
@@ -1102,6 +1569,15 @@ class VPSRunner:
                     f"cache_clear={int(mstats.get('cache_clear_count', 0))}, "
                     f"rescue_used={int(mstats.get('rescue_used', 0))}"
                 )
+            runtime = self.get_runtime_metrics()
+            print(
+                "[VPSRunner] Runtime stats: "
+                f"attempt_p50={runtime['attempt_ms_p50']:.1f}ms, "
+                f"attempt_p95={runtime['attempt_ms_p95']:.1f}ms, "
+                f"time_budget_stops={int(runtime['time_budget_stops'])}, "
+                f"candidate_budget_stops={int(runtime['candidate_budget_stops'])}, "
+                f"eval_cand_mean={runtime['evaluated_candidates_mean']:.2f}"
+            )
         except Exception:
             pass
         self.tile_cache.close()

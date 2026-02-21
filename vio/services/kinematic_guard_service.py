@@ -43,6 +43,15 @@ class KinematicGuardService:
         if not bool(runner.global_config.get("KIN_GUARD_ENABLED", True)):
             return
 
+        policy_decision = None
+        if getattr(runner, "policy_runtime_service", None) is not None:
+            try:
+                policy_decision = runner.policy_runtime_service.get_sensor_decision("KIN_GUARD", float(t))
+            except Exception:
+                policy_decision = None
+        if policy_decision is not None and str(getattr(policy_decision, "mode", "APPLY")).upper() in ("HOLD", "SKIP"):
+            return
+
         p_now = np.array(kf.x[0:3, 0], dtype=float).reshape(3,)
         t_now = float(t)
         if not np.all(np.isfinite(p_now)) or not np.isfinite(t_now):
@@ -96,6 +105,10 @@ class KinematicGuardService:
         alpha_hard = float(runner.global_config.get("KIN_GUARD_HARD_BLEND_ALPHA", 0.08))
         min_action_dt = float(runner.global_config.get("KIN_GUARD_MIN_ACTION_DT_SEC", 0.25))
         max_state_speed = float(runner.global_config.get("KIN_GUARD_MAX_STATE_SPEED_M_S", 120.0))
+        if policy_decision is not None:
+            warn_th = float(policy_decision.extra("vel_mismatch_warn", warn_th))
+            hard_th = float(policy_decision.extra("vel_mismatch_hard", hard_th))
+            max_state_speed = float(policy_decision.extra("max_state_speed_m_s", max_state_speed))
         max_blend_speed = float(runner.global_config.get("KIN_GUARD_MAX_BLEND_SPEED_M_S", 60.0))
         max_kin_speed = float(runner.global_config.get("KIN_GUARD_MAX_KIN_SPEED_M_S", 80.0))
         speed_hard_th = float(

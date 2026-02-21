@@ -2,7 +2,7 @@
 """Phase-by-phase accuracy tuning orchestrator with stage-aware lock profiles.
 
 Implements one-knob-at-a-time protocol:
-- fixed order phases (default: A1 -> A2 -> A3 -> A4)
+- fixed order phases per stage-set (stageA/stageE/stageF)
 - each phase mutates only that phase keys
 - rollback immediately when lock profile fails or err3d_mean regresses beyond threshold
 - persist best run + baseline pointer automatically
@@ -32,6 +32,7 @@ except Exception as exc:  # pragma: no cover
 
 DEFAULT_PHASE_SEQUENCE_STAGE_A = ["A1", "A2", "A3", "A4", "A5"]
 DEFAULT_PHASE_SEQUENCE_STAGE_E = ["E1", "E2", "E3", "E4", "E5"]
+DEFAULT_PHASE_SEQUENCE_STAGE_F = ["F1", "F2", "F3", "F4", "F5"]
 DEFAULT_PHASE_SEQUENCE = list(DEFAULT_PHASE_SEQUENCE_STAGE_A)
 
 # One-knob assignments for Stage-A pre-backend tuning (Phase4-base roadmap).
@@ -109,6 +110,31 @@ PHASE_ASSIGNMENTS: dict[str, dict[str, Any]] = {
         "logging.runtime_log_interval_sec": 1.0,
         "vps.runtime_verbosity": "release",
         "vps.runtime_log_interval_sec": 1.0,
+    },
+    "F1": {
+        # LightGlue containment for near-RT recovery: force ORB-only matcher.
+        "vps.matcher_mode": "orb",
+    },
+    "F2": {
+        # VPS hard runtime budget: cap total candidates and wall-time per frame.
+        "vps.max_total_candidates": 16,
+        "vps.max_frame_time_ms_local": 250.0,
+        "vps.max_frame_time_ms_global": 700.0,
+    },
+    "F3": {
+        # Recover VIO_VEL aiding coverage (relax over-tight high-speed guard).
+        "vio_vel.max_delta_v_xy_per_update_m_s": 5.0,
+        "vio_vel.min_flow_px_high_speed": 0.50,
+        "vio_vel.speed_r_inflate_values": [1.0, 1.5, 2.0],
+    },
+    "F4": {
+        # MAG usefulness recovery: postpone hard conditioning skip to extreme cases.
+        "magnetometer.warning_weak_yaw.conditioning_guard_hard_pcond": 2.0e12,
+        "magnetometer.warning_weak_yaw.conditioning_guard_hard_pmax": 2.0e7,
+    },
+    "F5": {
+        # Optional bounded LightGlue rescue re-enable after F1-F4 stability.
+        "vps.matcher_mode": "orb_lightglue_rescue",
     },
     # Backward-compatible aliases.
     "1": {},
@@ -543,7 +569,7 @@ def main() -> int:
     parser.add_argument("--lock_profile", default="pre_backend", choices=["pre_backend", "backend", "near_rt_backend"])
     parser.add_argument("--max_regress_pct", type=float, default=15.0)
     parser.add_argument("--apply_best_config", type=int, default=0, choices=[0, 1])
-    parser.add_argument("--phase_set", default="stageA", choices=["stageA", "stageE", "custom"])
+    parser.add_argument("--phase_set", default="stageA", choices=["stageA", "stageE", "stageF", "custom"])
     parser.add_argument("--phases", default="")
     parser.add_argument("--dry_run", action="store_true", help="Plan and emit phase table without running benchmarks")
     parser.add_argument("--force_run_noop", action="store_true", help="Run phase even when no keys would change")
@@ -576,6 +602,8 @@ def main() -> int:
         default_phases = DEFAULT_PHASE_SEQUENCE_STAGE_A
     elif args.phase_set == "stageE":
         default_phases = DEFAULT_PHASE_SEQUENCE_STAGE_E
+    elif args.phase_set == "stageF":
+        default_phases = DEFAULT_PHASE_SEQUENCE_STAGE_F
     else:
         default_phases = DEFAULT_PHASE_SEQUENCE
     phases_raw = args.phases if str(args.phases).strip() else ",".join(default_phases)

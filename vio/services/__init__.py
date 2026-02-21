@@ -7,6 +7,7 @@ from .imu_update_service import IMUUpdateService
 from .magnetometer_service import MagnetometerService
 from .output_reporting_service import OutputReportingService
 from .phase_service import PhaseService
+from .policy_runtime_service import PolicyRuntimeService
 from .vio_service import VIOService
 from .vps_service import VPSService
 
@@ -18,6 +19,7 @@ __all__ = [
     "MagnetometerService",
     "OutputReportingService",
     "PhaseService",
+    "PolicyRuntimeService",
     "VIOService",
     "VPSService",
 ]

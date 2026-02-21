@@ -75,7 +75,43 @@ class DEMService:
 
         time_since_correction = t - getattr(self.runner.kf, "last_absolute_correction_time", t)
         speed = float(np.linalg.norm(self.runner.kf.x[3:6, 0]))
-        dem_policy_scales, dem_apply_scales = self.runner.adaptive_service.get_sensor_adaptive_scales("DEM")
+        dem_decision = None
+        dem_policy_scales = {
+            "r_scale": 1.0,
+            "chi2_scale": 1.0,
+            "threshold_scale": 1.0,
+            "reproj_scale": 1.0,
+        }
+        if getattr(self.runner, "policy_runtime_service", None) is not None:
+            try:
+                dem_decision = self.runner.policy_runtime_service.get_sensor_decision("DEM", float(t))
+                dem_policy_scales = {
+                    "r_scale": float(dem_decision.r_scale),
+                    "chi2_scale": float(dem_decision.chi2_scale),
+                    "threshold_scale": float(dem_decision.threshold_scale),
+                    "reproj_scale": float(dem_decision.reproj_scale),
+                }
+            except Exception:
+                dem_decision = None
+        if dem_decision is not None and str(dem_decision.mode).upper() in ("HOLD", "SKIP"):
+            dem_adaptive_info: Dict[str, Any] = {
+                "sensor": "DEM",
+                "accepted": False,
+                "attempted": 0,
+                "dof": 1,
+                "nis_norm": np.nan,
+                "chi2": np.nan,
+                "threshold": np.nan,
+                "r_scale_used": float(dem_policy_scales.get("r_scale", 1.0)),
+                "reason_code": f"policy_mode_{str(dem_decision.mode).lower()}",
+            }
+            self.runner.adaptive_service.record_adaptive_measurement(
+                "DEM",
+                adaptive_info=dem_adaptive_info,
+                timestamp=t,
+                policy_scales=dem_policy_scales,
+            )
+            return
         dem_adaptive_info: Dict[str, Any] = {}
 
         # Get residual_csv path if debug data is enabled
@@ -97,8 +133,8 @@ class DEMService:
             timestamp=t,
             residual_csv=residual_path,
             frame=self.runner.state.vio_frame,
-            threshold_scale=float(dem_apply_scales.get("threshold_scale", 1.0)),
-            r_scale_extra=float(dem_apply_scales.get("r_scale", 1.0)),
+            threshold_scale=float(dem_policy_scales.get("threshold_scale", 1.0)),
+            r_scale_extra=float(dem_policy_scales.get("r_scale", 1.0)),
             adaptive_info=dem_adaptive_info,
         )
         self.runner.adaptive_service.record_adaptive_measurement(

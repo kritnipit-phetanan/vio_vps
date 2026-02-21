@@ -272,6 +272,68 @@ def log_sensor_health(sensor_csv: Optional[str],
         pass
 
 
+def log_policy_trace(policy_trace_csv: Optional[str],
+                     t: float,
+                     sensor: str,
+                     mode: str,
+                     phase: int,
+                     health_state: str,
+                     speed_m_s: float,
+                     r_scale: float,
+                     chi2_scale: float,
+                     threshold_scale: float,
+                     reproj_scale: float,
+                     reason: str = ""):
+    """Log one policy decision row (single-authority snapshot trace)."""
+    if policy_trace_csv is None:
+        return
+    try:
+        reason_txt = str(reason).replace(",", ";")
+        with open(policy_trace_csv, "a", newline="") as f:
+            f.write(
+                f"{float(t):.6f},{sensor},{mode},{int(phase)},{health_state},"
+                f"{float(speed_m_s):.6f},{float(r_scale):.6f},{float(chi2_scale):.6f},"
+                f"{float(threshold_scale):.6f},{float(reproj_scale):.6f},{reason_txt}\n"
+            )
+    except Exception:
+        pass
+
+
+def log_policy_conflict(policy_conflict_csv: Optional[str],
+                        t: float,
+                        sensor: str,
+                        expected_mode: str,
+                        actual_mode: str,
+                        note: str = ""):
+    """Log one policy conflict row when runtime behavior diverges from snapshot."""
+    if policy_conflict_csv is None:
+        return
+    try:
+        note_txt = str(note).replace(",", ";")
+        with open(policy_conflict_csv, "a", newline="") as f:
+            f.write(
+                f"{float(t):.6f},{sensor},{expected_mode},{actual_mode},{note_txt}\n"
+            )
+    except Exception:
+        pass
+
+
+def write_policy_owner_map_rows(policy_owner_map_csv: Optional[str],
+                                rows: List[Dict[str, Any]]):
+    """Append policy owner-map rows once (policy key -> authority owner)."""
+    if policy_owner_map_csv is None or rows is None:
+        return
+    try:
+        with open(policy_owner_map_csv, "a", newline="") as f:
+            for row in rows:
+                key = str(row.get("key", ""))
+                owner = str(row.get("owner", ""))
+                note = str(row.get("note", "")).replace(",", ";")
+                f.write(f"{key},{owner},{note}\n")
+    except Exception:
+        pass
+
+
 def log_mag_quality(mag_quality_csv: Optional[str],
                     t: float,
                     raw_norm: float,
@@ -349,6 +411,12 @@ def append_benchmark_health_summary(summary_csv: Optional[str],
                                     backend_stale_drop_count: float = float("nan"),
                                     backend_poll_count: float = float("nan"),
                                     vps_attempt_count: float = float("nan"),
+                                    vps_worker_busy_skips: float = float("nan"),
+                                    vps_attempt_ms_p50: float = float("nan"),
+                                    vps_attempt_ms_p95: float = float("nan"),
+                                    vps_time_budget_stops: float = float("nan"),
+                                    vps_evaluated_candidates_mean: float = float("nan"),
+                                    policy_conflict_count: float = float("nan"),
                                     rtf_proc_sim: float = float("nan")):
     """Append one benchmark-health summary row."""
     if summary_csv is None:
@@ -367,7 +435,11 @@ def append_benchmark_health_summary(summary_csv: Optional[str],
                 f"{vps_jump_reject_count:.6f},{vps_temporal_confirm_count:.6f},"
                 f"{abs_corr_apply_count:.6f},{abs_corr_soft_count:.6f},"
                 f"{backend_apply_count:.6f},{backend_stale_drop_count:.6f},"
-                f"{backend_poll_count:.6f},{vps_attempt_count:.6f},{rtf_proc_sim:.6f}\n"
+                f"{backend_poll_count:.6f},{vps_attempt_count:.6f},"
+                f"{vps_worker_busy_skips:.6f},{vps_attempt_ms_p50:.6f},"
+                f"{vps_attempt_ms_p95:.6f},{vps_time_budget_stops:.6f},"
+                f"{vps_evaluated_candidates_mean:.6f},{policy_conflict_count:.6f},"
+                f"{rtf_proc_sim:.6f}\n"
             )
     except Exception:
         pass
@@ -1315,9 +1387,34 @@ def init_output_csvs(output_dir: str, save_debug_data: bool = False) -> Dict[str
     with open(paths['vps_reloc_summary_csv'], "w", newline="") as f:
         f.write(
             "t,frame,mode,force_global,trigger_reason,est_lat,est_lon,"
+            "est_alt_agl,min_alt_agl,max_alt_agl,altitude_ok,"
             "best_center_lat,best_center_lon,best_score,best_inliers,best_reproj_error,"
-            "best_confidence,selected_yaw_deg,selected_scale,success,reason\n"
+            "best_confidence,selected_yaw_deg,selected_scale,"
+            "centers_total,centers_in_cache,centers_with_patch,coverage_found,"
+            "raw_num_candidates,budget_num_candidates,evaluated_candidates,"
+            "stopped_by_time_budget,stopped_by_candidate_budget,fail_streak,"
+            "global_backoff_active,global_backoff_until_t,global_probe_allowed,"
+            "no_coverage_streak,coverage_recovery_active,state_speed_m_s,since_success_sec,"
+            "agl_gate_open,agl_hysteresis_m,agl_gate_min_thresh,agl_gate_max_thresh,"
+            "attempt_wall_ms,"
+            "success,reason\n"
         )
+
+    # Single-authority policy traces
+    paths['policy_trace_csv'] = os.path.join(output_dir, "policy_trace.csv")
+    with open(paths['policy_trace_csv'], "w", newline="") as f:
+        f.write(
+            "t,sensor,mode,phase,health_state,speed_m_s,r_scale,chi2_scale,"
+            "threshold_scale,reproj_scale,reason\n"
+        )
+
+    paths['policy_conflict_csv'] = os.path.join(output_dir, "policy_conflict.csv")
+    with open(paths['policy_conflict_csv'], "w", newline="") as f:
+        f.write("t,sensor,expected_mode,actual_mode,note\n")
+
+    paths['policy_owner_map_csv'] = os.path.join(output_dir, "policy_owner_map.csv")
+    with open(paths['policy_owner_map_csv'], "w", newline="") as f:
+        f.write("key,owner,note\n")
 
     # Conditioning events (trigger-only log for covariance repairs)
     paths['conditioning_events_csv'] = os.path.join(output_dir, "conditioning_events.csv")
@@ -1337,7 +1434,9 @@ def init_output_csvs(output_dir: str, save_debug_data: bool = False) -> Dict[str
             "vps_jump_reject_count,vps_temporal_confirm_count,"
             "abs_corr_apply_count,abs_corr_soft_count,"
             "backend_apply_count,backend_stale_drop_count,backend_poll_count,"
-            "vps_attempt_count,rtf_proc_sim\n"
+            "vps_attempt_count,vps_worker_busy_skips,vps_attempt_ms_p50,vps_attempt_ms_p95,"
+            "vps_time_budget_stops,vps_evaluated_candidates_mean,policy_conflict_count,"
+            "rtf_proc_sim\n"
         )
 
     # Heavy per-frame/per-feature debug logs are opt-in via --save_debug_data.

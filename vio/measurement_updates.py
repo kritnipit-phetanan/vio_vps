@@ -15,12 +15,15 @@ Author: VIO project
 import os
 import numpy as np
 from scipy.spatial.transform import Rotation as R_scipy
-from typing import Optional, Tuple, Callable, Dict, Any
+from typing import Optional, Tuple, Callable, Dict, Any, TYPE_CHECKING
 import math
 
 # Import shared math utilities (avoid duplication)
 from .math_utils import quaternion_to_yaw, mahalanobis_squared, safe_matrix_inverse
 from .output_utils import log_measurement_update
+
+if TYPE_CHECKING:
+    from .policy.types import SensorPolicyDecision
 
 
 def _mahalanobis2(y: np.ndarray, S: np.ndarray) -> float:
@@ -89,7 +92,8 @@ def apply_magnetometer_update(kf,
                               filter_info: Optional[dict] = None,
                               use_estimated_bias: bool = True,
                               r_scale_extra: float = 1.0,
-                              adaptive_info: Optional[Dict[str, Any]] = None) -> Tuple[bool, str]:
+                              adaptive_info: Optional[Dict[str, Any]] = None,
+                              policy_decision: Optional["SensorPolicyDecision"] = None) -> Tuple[bool, str]:
     """
     Apply magnetometer heading update.
     
@@ -124,12 +128,29 @@ def apply_magnetometer_update(kf,
     """
     global _MAG_STATE
     extra_scale = max(1e-3, float(r_scale_extra))
+    if policy_decision is not None:
+        mode = str(getattr(policy_decision, "mode", "APPLY")).upper()
+        if mode in ("HOLD", "SKIP"):
+            if adaptive_info is not None:
+                adaptive_info.clear()
+                adaptive_info.update({
+                    "sensor": "MAG",
+                    "accepted": False,
+                    "dof": 1,
+                    "nis_norm": np.nan,
+                    "chi2": np.nan,
+                    "threshold": np.nan,
+                    "r_scale_used": float(extra_scale),
+                    "reason_code": f"policy_mode_{mode.lower()}",
+                })
+            return False, f"policy_mode_{mode.lower()}"
 
     def _set_adaptive_info(accepted: bool,
                            nis_norm: Optional[float],
                            chi2: Optional[float],
                            threshold: Optional[float],
-                           r_scale_used: float):
+                           r_scale_used: float,
+                           reason_code: str = ""):
         if adaptive_info is None:
             return
         adaptive_info.clear()
@@ -141,6 +162,7 @@ def apply_magnetometer_update(kf,
             "chi2": float(chi2) if chi2 is not None and np.isfinite(chi2) else np.nan,
             "threshold": float(threshold) if threshold is not None and np.isfinite(threshold) else np.nan,
             "r_scale_used": float(r_scale_used),
+            "reason_code": str(reason_code) if reason_code else ("normal_accept" if accepted else "hard_reject"),
         })
     from .magnetometer import compute_yaw_from_mag
     global_config = global_config or {}
@@ -706,7 +728,8 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
                                soft_fail_power: float = 1.0,
                                phase: int = 2,
                                health_state: str = "HEALTHY",
-                               adaptive_info: Optional[Dict[str, Any]] = None) -> bool:
+                               adaptive_info: Optional[Dict[str, Any]] = None,
+                               policy_decision: Optional["SensorPolicyDecision"] = None) -> bool:
     """
     Apply VIO velocity update with scale recovery and chi-square gating.
     
@@ -765,6 +788,20 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
             "reason_code": str(reason_code),
             "hard_threshold": float(hard_threshold) if hard_threshold is not None and np.isfinite(hard_threshold) else np.nan,
         })
+
+    if policy_decision is not None:
+        mode = str(getattr(policy_decision, "mode", "APPLY")).upper()
+        if mode in ("HOLD", "SKIP"):
+            _set_adaptive_info(
+                False,
+                2,
+                None,
+                None,
+                max(1e-3, float(r_scale_extra)),
+                reason_code=f"policy_mode_{mode.lower()}",
+                attempted=0,
+            )
+            return False
 
     from scipy.spatial.transform import Rotation as R_scipy
     from .config import CAMERA_VIEW_CONFIGS
@@ -975,6 +1012,11 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
     vio_config = global_config.get('vio', {})
     use_vz_only = vio_config.get('use_vz_only', use_vz_only_default)
     xy_only_nadir = bool(global_config.get('VIO_NADIR_XY_ONLY_VELOCITY', False))
+    if policy_decision is not None:
+        try:
+            xy_only_nadir = bool(float(policy_decision.extra("xy_only_nadir", float(xy_only_nadir))) >= 0.5)
+        except Exception:
+            pass
     use_xy_only = bool(camera_view == "nadir" and xy_only_nadir and not bool(use_vz_only))
     speed_state_m_s = float(np.linalg.norm(np.asarray(kf.x[3:6, 0], dtype=float)))
 
@@ -1011,11 +1053,15 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
         if np.isfinite(speed_state_m_s) and speed_state_m_s > bp:
             speed_r_inflate = float(max(speed_r_inflate, val))
     min_flow_high_speed = float(global_config.get("VIO_VEL_MIN_FLOW_PX_HIGH_SPEED", 0.8))
+    if policy_decision is not None:
+        min_flow_high_speed = float(policy_decision.extra("min_flow_px_high_speed", min_flow_high_speed))
     high_speed_flow_bp = float(speed_pairs[0][0]) if len(speed_pairs) > 0 else 25.0
     cfg_high_speed_bp = float(global_config.get("VIO_VEL_HIGH_SPEED_BP_M_S", high_speed_flow_bp))
     if np.isfinite(cfg_high_speed_bp) and cfg_high_speed_bp > 0.0:
         high_speed_flow_bp = cfg_high_speed_bp
     max_delta_v_xy_base = float(global_config.get("VIO_VEL_MAX_DELTA_V_XY_PER_UPDATE_M_S", 2.0))
+    if policy_decision is not None:
+        max_delta_v_xy_base = float(policy_decision.extra("max_delta_v_xy_m_s", max_delta_v_xy_base))
     max_delta_v_xy_high_speed = float(
         global_config.get(
             "VIO_VEL_MAX_DELTA_V_XY_HIGH_SPEED_M_S",
@@ -1026,6 +1072,12 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
     delta_v_soft_factor = float(global_config.get("VIO_VEL_DELTA_V_SOFT_FACTOR", 2.0))
     delta_v_hard_factor = float(global_config.get("VIO_VEL_DELTA_V_HARD_FACTOR", 3.0))
     delta_v_soft_r_cap = float(global_config.get("VIO_VEL_DELTA_V_SOFT_MAX_R_MULT", 6.0))
+    delta_v_clamp_enable = bool(global_config.get("VIO_VEL_DELTA_V_CLAMP_ENABLE", True))
+    delta_v_clamp_max_ratio = float(global_config.get("VIO_VEL_DELTA_V_CLAMP_MAX_RATIO", 6.0))
+    delta_v_clamp_r_mult = float(global_config.get("VIO_VEL_DELTA_V_CLAMP_R_MULT", 3.5))
+    if policy_decision is not None:
+        delta_v_clamp_max_ratio = float(policy_decision.extra("delta_v_clamp_max_ratio", delta_v_clamp_max_ratio))
+        delta_v_clamp_r_mult = float(policy_decision.extra("delta_v_clamp_r_mult", delta_v_clamp_r_mult))
     enforce_nadir_xy_guard = bool(camera_view == "nadir" and not bool(use_vz_only))
     
     # ESKF velocity update
@@ -1137,6 +1189,7 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
         predicted_vel = hx_fun(kf.x)
         innovation = vel_meas - predicted_vel
         delta_v_soft_mult = 1.0
+        delta_v_clamped = False
         if use_xy_only or enforce_nadir_xy_guard:
             max_delta_v_xy = float(max_delta_v_xy_base)
             if np.isfinite(speed_state_m_s) and speed_state_m_s > high_speed_flow_bp:
@@ -1165,35 +1218,61 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
                         f"({('xy_only' if use_xy_only else 'nadir_xy')})"
                     )
                 else:
-                    _log_vio_vel_update(
-                        f"[VIO] Velocity REJECTED: delta-v cap (|Δv_xy|={delta_v_xy:.2f}m/s > "
-                        f"{max_delta_v_xy:.2f}m/s, guard={'xy_only' if use_xy_only else 'nadir_xy'})"
+                    allow_delta_clamp = (
+                        bool(delta_v_clamp_enable)
+                        and np.isfinite(ratio_delta)
+                        and ratio_delta <= max(1.0, float(delta_v_clamp_max_ratio))
+                        and float(avg_flow_px) >= (0.4 * max(0.1, min_flow_high_speed))
                     )
-                    _set_adaptive_info(
-                        False,
-                        dof,
-                        None,
-                        None,
-                        extra_scale * max(1.0, speed_r_inflate),
-                        reason_code="soft_reject_delta_v_cap",
-                    )
-                    if save_debug and residual_csv:
-                        try:
-                            s_cap = h_vel @ kf.P @ h_vel.T + r_mat
-                            log_measurement_update(
-                                residual_csv, t, vio_frame, 'VIO_VEL',
-                                innovation=innovation.flatten(),
-                                mahalanobis_dist=np.nan,
-                                chi2_threshold=np.nan,
-                                accepted=False,
-                                s_matrix=s_cap,
-                                p_prior=getattr(kf, 'P_prior', kf.P),
-                                state_error=state_error,
-                                state_cov=state_cov,
+                    if allow_delta_clamp:
+                        clamp_scale = float(max_delta_v_xy / max(delta_v_xy, 1e-9))
+                        innovation[:2] *= clamp_scale
+                        vel_meas[:2, 0] = predicted_vel[:2, 0] + innovation[:2, 0]
+                        clamp_mult = float(
+                            np.clip(
+                                max(1.0, float(delta_v_clamp_r_mult)) * max(1.0, ratio_delta),
+                                1.0,
+                                max(1.0, float(delta_v_soft_r_cap) * 1.8),
                             )
-                        except Exception:
-                            pass
-                    return False
+                        )
+                        r_mat = r_mat * clamp_mult
+                        delta_v_soft_mult = max(float(delta_v_soft_mult), clamp_mult)
+                        delta_v_clamped = True
+                        _log_vio_vel_update(
+                            f"[VIO] Velocity delta-v CLAMP: |Δv_xy|={delta_v_xy:.2f}m/s -> "
+                            f"{max_delta_v_xy:.2f}m/s, clamp={clamp_scale:.3f}, R*={clamp_mult:.2f}x "
+                            f"({('xy_only' if use_xy_only else 'nadir_xy')})"
+                        )
+                    else:
+                        _log_vio_vel_update(
+                            f"[VIO] Velocity REJECTED: delta-v cap (|Δv_xy|={delta_v_xy:.2f}m/s > "
+                            f"{max_delta_v_xy:.2f}m/s, guard={'xy_only' if use_xy_only else 'nadir_xy'})"
+                        )
+                        _set_adaptive_info(
+                            False,
+                            dof,
+                            None,
+                            None,
+                            extra_scale * max(1.0, speed_r_inflate),
+                            reason_code="soft_reject_delta_v_cap",
+                        )
+                        if save_debug and residual_csv:
+                            try:
+                                s_cap = h_vel @ kf.P @ h_vel.T + r_mat
+                                log_measurement_update(
+                                    residual_csv, t, vio_frame, 'VIO_VEL',
+                                    innovation=innovation.flatten(),
+                                    mahalanobis_dist=np.nan,
+                                    chi2_threshold=np.nan,
+                                    accepted=False,
+                                    s_matrix=s_cap,
+                                    p_prior=getattr(kf, 'P_prior', kf.P),
+                                    state_error=state_error,
+                                    state_cov=state_cov,
+                                )
+                            except Exception:
+                                pass
+                        return False
         
         # Suppress numpy warnings - we handle explicitly with tripwires
         with np.errstate(all='ignore'):
@@ -1281,7 +1360,12 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
                 f"flow={avg_flow_px:.1f}px, R_scale={flow_quality_scale:.1f}x, mode={vo_mode}, chi2={chi2_value:.2f}"
             )
             accepted = True
-            reason_code = "soft_accept_delta_v_cap" if float(delta_v_soft_mult) > 1.0 else "normal_accept"
+            if bool(delta_v_clamped):
+                reason_code = "soft_accept_clamped_delta_v_cap"
+            elif float(delta_v_soft_mult) > 1.0:
+                reason_code = "soft_accept_delta_v_cap"
+            else:
+                reason_code = "normal_accept"
         elif bool(soft_fail_enable):
             soft_ratio = max(1.0, float(chi2_value) / max(chi2_threshold, 1e-9))
             phase_cap_map = {
@@ -1358,6 +1442,9 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
                 f"[VIO] Velocity REJECTED: chi2={chi2_value:.2f} > {chi2_threshold:.1f}, "
                 f"flow={avg_flow_px:.1f}px, speed={speed_final:.2f}m/s"
             )
+
+        if accepted and bool(delta_v_clamped) and reason_code in ("soft_accept", "soft_accept_tail"):
+            reason_code = f"{reason_code}_clamped"
 
         _set_adaptive_info(
             accepted,

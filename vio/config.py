@@ -385,6 +385,33 @@ def load_config(config_path: str) -> VIOConfig:
     result['MAG_CONDITIONING_GUARD_HARD_PMAX'] = float(
         warning_weak_yaw.get('conditioning_guard_hard_pmax', 1e7)
     )
+    result['MAG_CONDITIONING_GUARD_EXTREME_PCOND'] = float(
+        warning_weak_yaw.get(
+            'conditioning_guard_extreme_pcond',
+            8.0 * float(warning_weak_yaw.get('conditioning_guard_hard_pcond', 1e12)),
+        )
+    )
+    result['MAG_CONDITIONING_GUARD_EXTREME_PMAX'] = float(
+        warning_weak_yaw.get(
+            'conditioning_guard_extreme_pmax',
+            4.0 * float(warning_weak_yaw.get('conditioning_guard_hard_pmax', 1e7)),
+        )
+    )
+    result['MAG_CONDITIONING_GUARD_SOFT_ENABLE'] = bool(
+        warning_weak_yaw.get('conditioning_guard_soft_enable', True)
+    )
+    result['MAG_CONDITIONING_GUARD_SOFT_R_MULT'] = float(
+        warning_weak_yaw.get('conditioning_guard_soft_r_mult', 4.0)
+    )
+    result['MAG_CONDITIONING_GUARD_SOFT_R_MULT_WARNING'] = float(
+        warning_weak_yaw.get('conditioning_guard_soft_r_mult_warning', 1.0)
+    )
+    result['MAG_CONDITIONING_GUARD_SOFT_R_MULT_DEGRADED'] = float(
+        warning_weak_yaw.get('conditioning_guard_soft_r_mult_degraded', 1.3)
+    )
+    result['MAG_CONDITIONING_GUARD_SOFT_R_MULT_RECOVERY'] = float(
+        warning_weak_yaw.get('conditioning_guard_soft_r_mult_recovery', 1.0)
+    )
     result['MAG_BIAS_FREEZE_WARN_PCOND'] = float(
         warning_weak_yaw.get('bias_freeze_warn_pcond', 1e10)
     )
@@ -479,6 +506,20 @@ def load_config(config_path: str) -> VIOConfig:
     result['MSCKF_REPROJ_QUALITY_LOW_REJECT'] = bool(reproj_state_aware.get('low_quality_reject', True))
     result['MSCKF_REPROJ_WARNING_SCALE'] = float(reproj_state_aware.get('warning_scale', 1.20))
     result['MSCKF_REPROJ_DEGRADED_SCALE'] = float(reproj_state_aware.get('degraded_scale', 1.35))
+    result['MSCKF_REPROJ_FAILSOFT_ENABLE'] = bool(reproj_state_aware.get('failsoft_enable', True))
+    result['MSCKF_REPROJ_FAILSOFT_MAX_MULT'] = float(reproj_state_aware.get('failsoft_max_mult', 1.35))
+    result['MSCKF_REPROJ_FAILSOFT_MIN_OBS'] = int(reproj_state_aware.get('failsoft_min_obs', 3))
+    result['MSCKF_REPROJ_FAILSOFT_MIN_QUALITY'] = float(
+        reproj_state_aware.get('failsoft_min_quality', 0.35)
+    )
+    result['MSCKF_PHASE_RAY_SOFT_SCALE'] = msckf_cfg.get(
+        'phase_ray_soft_scale',
+        {'0': 1.12, '1': 1.06, '2': 1.00}
+    )
+    result['MSCKF_HEALTH_RAY_SOFT_SCALE'] = msckf_cfg.get(
+        'health_ray_soft_scale',
+        {'HEALTHY': 1.0, 'WARNING': 1.10, 'DEGRADED': 1.20, 'RECOVERY': 1.04}
+    )
     result['VO_NADIR_ALIGN_DEG'] = vio['views']['nadir']['nadir_threshold_deg']
     result['VO_FRONT_ALIGN_DEG'] = vio['views']['front']['nadir_threshold_deg']
     
@@ -513,6 +554,15 @@ def load_config(config_path: str) -> VIOConfig:
     )
     result['VIO_VEL_DELTA_V_SOFT_MAX_R_MULT'] = float(
         vio_vel_cfg.get('delta_v_soft_max_r_mult', 6.0)
+    )
+    result['VIO_VEL_DELTA_V_CLAMP_ENABLE'] = bool(
+        vio_vel_cfg.get('delta_v_clamp_enable', True)
+    )
+    result['VIO_VEL_DELTA_V_CLAMP_MAX_RATIO'] = float(
+        vio_vel_cfg.get('delta_v_clamp_max_ratio', 6.0)
+    )
+    result['VIO_VEL_DELTA_V_CLAMP_R_MULT'] = float(
+        vio_vel_cfg.get('delta_v_clamp_r_mult', 3.5)
     )
     result['VIO_VEL_HIGH_SPEED_BP_M_S'] = float(
         vio_vel_cfg.get('high_speed_bp_m_s', 25.0)
@@ -811,6 +861,12 @@ def load_config(config_path: str) -> VIOConfig:
     )
     result['VPS_ABS_MAX_APPLY_DP_XY_M'] = float(
         vps_cfg.get('abs_max_apply_dp_xy_m', 25.0)
+    )
+    result['VPS_WORKER_BUSY_FORCE_LOCAL_STREAK'] = int(
+        vps_cfg.get('worker_busy_force_local_streak', 120)
+    )
+    result['VPS_WORKER_BUSY_FORCE_LOCAL_SEC'] = float(
+        vps_cfg.get('worker_busy_force_local_sec', 8.0)
     )
 
     vps_reloc_defaults = {

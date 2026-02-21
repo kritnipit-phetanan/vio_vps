@@ -350,6 +350,37 @@ class VIOService:
             runner._vps_inflight_meta = None
             return result, (meta if isinstance(meta, dict) else {})
 
+        def _get_policy(sensor: str, ts: float):
+            decision = None
+            scales = {
+                "r_scale": 1.0,
+                "chi2_scale": 1.0,
+                "threshold_scale": 1.0,
+                "reproj_scale": 1.0,
+            }
+            policy_runtime = getattr(runner, "policy_runtime_service", None)
+            if policy_runtime is not None:
+                try:
+                    decision = policy_runtime.get_sensor_decision(str(sensor), float(ts))
+                    scales = {
+                        "r_scale": float(decision.r_scale),
+                        "chi2_scale": float(decision.chi2_scale),
+                        "threshold_scale": float(decision.threshold_scale),
+                        "reproj_scale": float(decision.reproj_scale),
+                    }
+                    return decision, scales
+                except Exception:
+                    decision = None
+            # Backward-compatible fallback.
+            try:
+                _, apply_scales = runner.adaptive_service.get_sensor_adaptive_scales(str(sensor))
+                for k in scales.keys():
+                    if k in apply_scales:
+                        scales[k] = float(apply_scales[k])
+            except Exception:
+                pass
+            return decision, scales
+
         # Process images up to current time
         while runner.state.img_idx < len(runner.imgs) and runner.imgs[runner.state.img_idx].t <= t:
             # Get camera timestamp (CRITICAL: use this instead of IMU time t)
@@ -400,6 +431,12 @@ class VIOService:
             if runner.vps_runner is not None:
                 inflight = getattr(runner, "_vps_inflight_thread", None)
                 worker_busy = bool(inflight is not None and inflight.is_alive())
+                busy_force_streak = int(
+                    runner.global_config.get("VPS_WORKER_BUSY_FORCE_LOCAL_STREAK", 120)
+                )
+                busy_force_sec = float(
+                    runner.global_config.get("VPS_WORKER_BUSY_FORCE_LOCAL_SEC", 8.0)
+                )
                 if is_fast_rotation:
                     should_run_vps, skip_reason = False, "fast_rotation"
                 elif worker_busy:
@@ -411,11 +448,25 @@ class VIOService:
                         runner._vps_thread_busy_skip_count = int(
                             getattr(runner, "_vps_thread_busy_skip_count", 0)
                         ) + 1
+                        runner._vps_thread_busy_streak = int(
+                            getattr(runner, "_vps_thread_busy_streak", 0)
+                        ) + 1
+                        if busy_force_streak > 0 and runner._vps_thread_busy_streak >= busy_force_streak:
+                            prev_until = float(getattr(runner, "_vps_force_local_until_t", -1e9))
+                            new_until = float(t_cam + max(0.0, busy_force_sec))
+                            runner._vps_force_local_until_t = max(prev_until, new_until)
+                            if prev_until < float(t_cam):
+                                print(
+                                    f"[VPS] busy guard: force_local enabled for {busy_force_sec:.1f}s "
+                                    f"(streak={runner._vps_thread_busy_streak})"
+                                )
                         if (runner._vps_thread_busy_skip_count % 100) == 0:
                             print(
                                 f"[VPS] worker busy; skipped {runner._vps_thread_busy_skip_count} frame(s) "
                                 "while previous VPS attempt is still running"
                             )
+                    else:
+                        runner._vps_thread_busy_streak = 0
                     if runner.vps_logger is not None and skip_reason != "interval_hold":
                         try:
                             runner.vps_logger.log_attempt(
@@ -432,10 +483,12 @@ class VIOService:
                         except Exception:
                             pass
                 else:
+                    runner._vps_thread_busy_streak = 0
                     runner._vps_attempt_count = int(getattr(runner, "_vps_attempt_count", 0)) + 1
                     # Get current EKF estimates for VPS processing
                     # Extract IMU position from EKF state
                     p_imu_enu = runner.kf.x[:3].flatten()  # Position in ENU
+                    v_imu_enu = runner.kf.x[3:6].flatten()  # Velocity in ENU
 
                     # Extract rotation matrix from quaternion
                     q = runner.kf.x[6:10].flatten()  # Quaternion [w, x, y, z]
@@ -453,6 +506,7 @@ class VIOService:
                         p_gnss_enu[0], p_gnss_enu[1], runner.lat0, runner.lon0
                     )
                     alt = p_gnss_enu[2]  # MSL altitude
+                    state_speed_m_s = float(np.linalg.norm(v_imu_enu))
 
                     # Get terrain height (DEM) to compute AGL for VPS filtering
                     dem_height = runner.dem.sample_m(lat, lon)
@@ -463,6 +517,12 @@ class VIOService:
                     q_wxyz = runner.kf.x[6:10, 0].astype(float)
                     est_yaw = float(quaternion_to_yaw(q_wxyz))
                     frame_idx_for_vps = int(runner.state.img_idx)
+                    force_local_busy_guard = bool(
+                        float(t_cam) < float(getattr(runner, "_vps_force_local_until_t", -1e9))
+                    )
+                    if force_local_busy_guard and (runner._vps_attempt_count % 20) == 0:
+                        rem = float(getattr(runner, "_vps_force_local_until_t", -1e9)) - float(t_cam)
+                        print(f"[VPS] force_local active (remaining={max(0.0, rem):.1f}s)")
 
                     # Define VPS processing function for thread
                     def run_vps_in_thread():
@@ -478,6 +538,8 @@ class VIOService:
                                 frame_idx=frame_idx_for_vps,
                                 est_cov_xy=est_cov_xy,
                                 phase=int(getattr(runner.state, "current_phase", 2)),
+                                state_speed_m_s=state_speed_m_s,
+                                force_local=force_local_busy_guard,
                                 objective=str(runner.global_config.get("OBJECTIVE_MODE", "stability")),
                             )
                             runner._vps_inflight_result = result
@@ -529,14 +591,29 @@ class VIOService:
                 health_state=current_health,
             )
             if match_result is not None:
-                apply_loop_closure_correction(
+                loop_decision, _ = _get_policy("LOOP_CLOSURE", t_cam)
+                loop_applied = apply_loop_closure_correction(
                     kf=runner.kf,
                     loop_info=match_result,
                     t=t_cam,
                     cam_states=runner.state.cam_states,
                     loop_detector=runner.loop_detector,
                     global_config=runner.global_config,
+                    policy_decision=loop_decision,
                 )
+                if (
+                    loop_decision is not None
+                    and str(getattr(loop_decision, "mode", "APPLY")).upper() in ("HOLD", "SKIP")
+                    and bool(loop_applied)
+                    and getattr(runner, "policy_runtime_service", None) is not None
+                ):
+                    runner.policy_runtime_service.record_conflict(
+                        sensor="LOOP_CLOSURE",
+                        t=float(t_cam),
+                        expected_mode=str(loop_decision.mode),
+                        actual_mode="APPLY",
+                        note="applied_despite_hold_skip",
+                    )
 
             # Compute average optical flow (parallax) - use the new attributes
             # mean_parallax is now computed in step() EVERY frame, even if ok=False
@@ -627,7 +704,7 @@ class VIOService:
 
                     # Trigger MSCKF update if enough clones
                     if len(runner.state.cam_states) >= 3:
-                        msckf_policy_scales, msckf_apply_scales = runner.adaptive_service.get_sensor_adaptive_scales("MSCKF")
+                        msckf_decision, msckf_policy_scales = _get_policy("MSCKF", t_cam)
                         msckf_adaptive_info: Dict[str, Any] = {}
                         phase_key = str(int(getattr(runner.state, "current_phase", 2)))
                         phase_chi2 = float(
@@ -649,14 +726,28 @@ class VIOService:
                             plane_detector=runner.plane_detector,
                             plane_config=runner.global_config if runner.plane_detector else None,
                             global_config=runner.global_config,
-                            chi2_scale=float(msckf_apply_scales.get("chi2_scale", 1.0)) * phase_chi2,
-                            reproj_scale=float(msckf_apply_scales.get("reproj_scale", 1.0)) * phase_reproj,
+                            chi2_scale=float(msckf_policy_scales.get("chi2_scale", 1.0)) * phase_chi2,
+                            reproj_scale=float(msckf_policy_scales.get("reproj_scale", 1.0)) * phase_reproj,
                             phase=int(getattr(runner.state, "current_phase", 2)),
                             health_state=str(
                                 getattr(getattr(runner, "current_adaptive_decision", None), "health_state", "HEALTHY")
                             ),
                             adaptive_info=msckf_adaptive_info,
+                            policy_decision=msckf_decision,
                         )
+                        if (
+                            msckf_decision is not None
+                            and str(getattr(msckf_decision, "mode", "APPLY")).upper() in ("HOLD", "SKIP")
+                            and int(num_updates) > 0
+                            and getattr(runner, "policy_runtime_service", None) is not None
+                        ):
+                            runner.policy_runtime_service.record_conflict(
+                                sensor="MSCKF",
+                                t=float(t_cam),
+                                expected_mode=str(msckf_decision.mode),
+                                actual_mode="APPLY",
+                                note=f"num_updates={int(num_updates)}",
+                            )
                         runner.adaptive_service.record_adaptive_measurement(
                             "MSCKF",
                             adaptive_info=msckf_adaptive_info,
@@ -686,7 +777,7 @@ class VIOService:
                 vel_error, vel_cov = get_ground_truth_error(
                     t_cam, runner.kf, runner.ppk_trajectory, runner.lat0, runner.lon0, runner.proj_cache, "velocity"
                 )
-                vio_policy_scales, vio_apply_scales = runner.adaptive_service.get_sensor_adaptive_scales("VIO_VEL")
+                vio_decision, vio_policy_scales = _get_policy("VIO_VEL", t_cam)
                 vio_adaptive_info: Dict[str, Any] = {}
                 runner._vio_vel_attempt_count += 1
                 vio_vel_accepted = apply_vio_velocity_update(
@@ -710,20 +801,34 @@ class VIOService:
                     vio_fe=runner.vio_fe,
                     state_error=vel_error,
                     state_cov=vel_cov,
-                    chi2_scale=float(vio_apply_scales.get("chi2_scale", 1.0)),
-                    r_scale_extra=float(vio_apply_scales.get("r_scale", 1.0)),
-                    soft_fail_enable=bool(float(vio_apply_scales.get("fail_soft_enable", 0.0)) >= 0.5),
-                    soft_fail_r_cap=float(vio_apply_scales.get("soft_r_cap", 8.0)),
-                    soft_fail_hard_reject_factor=float(vio_apply_scales.get("hard_reject_factor", 3.0)),
-                    soft_fail_power=float(vio_apply_scales.get("soft_r_power", 1.0)),
+                    chi2_scale=float(vio_policy_scales.get("chi2_scale", 1.0)),
+                    r_scale_extra=float(vio_policy_scales.get("r_scale", 1.0)),
+                    soft_fail_enable=bool(runner.global_config.get("VIO_VEL_SOFT_FAIL_ENABLE", True)),
+                    soft_fail_r_cap=float(runner.global_config.get("VIO_VEL_SOFT_FAIL_MAX_R_MULT", 8.0)),
+                    soft_fail_hard_reject_factor=float(runner.global_config.get("VIO_VEL_SOFT_FAIL_HARD_REJECT_FACTOR", 3.0)),
+                    soft_fail_power=float(runner.global_config.get("VIO_VEL_SOFT_FAIL_POWER", 1.0)),
                     phase=int(getattr(runner.state, "current_phase", 2)),
                     health_state=str(
                         getattr(getattr(runner, "current_adaptive_decision", None), "health_state", "HEALTHY")
                     ),
                     adaptive_info=vio_adaptive_info,
+                    policy_decision=vio_decision,
                 )
                 if bool(vio_vel_accepted):
                     runner._vio_vel_accept_count += 1
+                if (
+                    vio_decision is not None
+                    and str(getattr(vio_decision, "mode", "APPLY")).upper() in ("HOLD", "SKIP")
+                    and bool(vio_vel_accepted)
+                    and getattr(runner, "policy_runtime_service", None) is not None
+                ):
+                    runner.policy_runtime_service.record_conflict(
+                        sensor="VIO_VEL",
+                        t=float(t_cam),
+                        expected_mode=str(vio_decision.mode),
+                        actual_mode="APPLY",
+                        note="accepted_despite_hold_skip",
+                    )
                 runner.adaptive_service.record_adaptive_measurement(
                     "VIO_VEL",
                     adaptive_info=vio_adaptive_info,
@@ -816,7 +921,7 @@ class VIOService:
             if vps_result is not None:
                     from ..vps_integration import apply_vps_delayed_update
 
-                    vps_policy_scales, vps_apply_scales = runner.adaptive_service.get_sensor_adaptive_scales("VPS")
+                    vps_decision, vps_policy_scales = _get_policy("VPS", t_cam)
                     vps_adaptive_info: Dict[str, Any] = {}
                     vps_sync_threshold = float(runner.global_config.get("VPS_TIME_SYNC_THRESHOLD_SEC", 0.25))
                     vps_t_ref = float(vps_result_meta.get("t_cam", getattr(vps_result, "t_measurement", t_cam)))
@@ -902,7 +1007,11 @@ class VIOService:
                         and vps_offset_m <= fs_max_offset_m
                     )
                     quality_mode = "strict" if strict_quality_ok else ("failsoft" if failsoft_quality_ok else "reject")
-                    r_scale_apply = float(vps_apply_scales.get("r_scale", 1.0))
+                    r_scale_apply = float(vps_policy_scales.get("r_scale", 1.0))
+                    policy_reject_note = ""
+                    if vps_decision is not None and str(getattr(vps_decision, "mode", "APPLY")).upper() in ("HOLD", "SKIP"):
+                        quality_mode = "reject"
+                        policy_reject_note = f"policy_mode_{str(getattr(vps_decision, 'mode', 'skip')).lower()}"
                     temporal_reject_note = ""
                     hard_reject_note = ""
                     hard_ok, hard_note = self._check_vps_hard_reject(abs_offset_vec, abs_offset_m)
@@ -934,6 +1043,8 @@ class VIOService:
                             vps_status = f"{hard_reject_note} | {vps_status}"
                         if temporal_reject_note:
                             vps_status = f"{temporal_reject_note} | {vps_status}"
+                        if policy_reject_note:
+                            vps_status = f"{policy_reject_note} | {vps_status}"
                     else:
                         if quality_mode == "failsoft":
                             r_scale_apply *= float(runner.global_config.get("VPS_APPLY_FAILSOFT_R_MULT", 1.5))
@@ -979,6 +1090,8 @@ class VIOService:
                                 reason_code = "soft_reject"
                         elif "hard_reject" in status_lower:
                             reason_code = "abs_corr_hard_reject"
+                        elif "policy_mode_" in status_lower:
+                            reason_code = "policy_hold"
                         elif "large_offset_pending" in status_lower:
                             reason_code = "abs_corr_temporal_wait"
                         elif quality_mode == "failsoft" and "gated" in status_lower:
@@ -1041,6 +1154,19 @@ class VIOService:
                                 )
                             except Exception:
                                 pass
+                    if (
+                        vps_decision is not None
+                        and str(getattr(vps_decision, "mode", "APPLY")).upper() in ("HOLD", "SKIP")
+                        and bool(vps_applied)
+                        and getattr(runner, "policy_runtime_service", None) is not None
+                    ):
+                        runner.policy_runtime_service.record_conflict(
+                            sensor="VPS",
+                            t=float(t_cam),
+                            expected_mode=str(vps_decision.mode),
+                            actual_mode="APPLY",
+                            note="applied_despite_hold_skip",
+                        )
 
             # Save keyframe image with visualization overlay
             if runner.config.save_keyframe_images and hasattr(runner, "keyframe_dir"):

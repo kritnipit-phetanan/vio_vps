@@ -277,21 +277,43 @@ class MagnetometerService:
             p_cond = float("inf")
         return p_max, p_cond
 
-    def _check_conditioning_guard(self, health_key: str, p_max: float, p_cond: float) -> tuple[bool, str]:
+    def _check_conditioning_guard(self, health_key: str, p_max: float, p_cond: float) -> tuple[bool, str, float]:
         """
-        Skip MAG updates only on hard conditioning violations.
+        Conditioning guard for MAG path.
 
-        WARNING/DEGRADED moderate stress is handled by R inflation (fail-soft),
-        not hard skip, to keep heading aid continuity.
+        Default behavior is fail-soft:
+        - WARNING/DEGRADED/RECOVERY in hard region -> inflate R, don't hard skip.
+        - EXTREME region -> hard skip to protect numerical stability.
         """
         cfg = self.runner.global_config
         if not bool(cfg.get("MAG_CONDITIONING_GUARD_ENABLE", True)):
-            return False, ""
+            return False, "", 1.0
         pcond_hard = float(cfg.get("MAG_CONDITIONING_GUARD_HARD_PCOND", 1e12))
         pmax_hard = float(cfg.get("MAG_CONDITIONING_GUARD_HARD_PMAX", 1e7))
+        if not np.isfinite(p_cond):
+            p_cond = float("inf")
+        if not np.isfinite(p_max):
+            p_max = float("inf")
+
+        extreme_pcond = float(cfg.get("MAG_CONDITIONING_GUARD_EXTREME_PCOND", 8.0 * pcond_hard))
+        extreme_pmax = float(cfg.get("MAG_CONDITIONING_GUARD_EXTREME_PMAX", 4.0 * pmax_hard))
+        if p_cond > extreme_pcond or p_max > extreme_pmax:
+            return True, "skip_conditioning_hard_extreme", 1.0
+
         if p_cond > pcond_hard or p_max > pmax_hard:
-            return True, "skip_conditioning_hard"
-        return False, ""
+            soft_enable = bool(cfg.get("MAG_CONDITIONING_GUARD_SOFT_ENABLE", True))
+            if soft_enable and health_key in ("WARNING", "DEGRADED", "RECOVERY"):
+                soft_mult = float(cfg.get("MAG_CONDITIONING_GUARD_SOFT_R_MULT", 4.0))
+                soft_mult *= float(
+                    cfg.get(
+                        f"MAG_CONDITIONING_GUARD_SOFT_R_MULT_{health_key}",
+                        1.0,
+                    )
+                )
+                return False, "conditioning_soft_inflate", max(1.0, soft_mult)
+            return True, "skip_conditioning_hard", 1.0
+
+        return False, "", 1.0
 
     def _should_use_estimated_bias(self, health_key: str, p_cond: float) -> bool:
         """Freeze online mag-bias updates when observability/conditioning is poor."""
@@ -323,8 +345,50 @@ class MagnetometerService:
             mag_rec = self.runner.mag_list[self.runner.state.mag_idx]
             self.runner.state.mag_idx += 1
 
+            policy_decision = None
+            mag_policy_scales = {
+                "r_scale": 1.0,
+                "chi2_scale": 1.0,
+                "threshold_scale": 1.0,
+                "reproj_scale": 1.0,
+            }
+            if getattr(self.runner, "policy_runtime_service", None) is not None:
+                try:
+                    policy_decision = self.runner.policy_runtime_service.get_sensor_decision(
+                        "MAG", float(mag_rec.t)
+                    )
+                    mag_policy_scales = {
+                        "r_scale": float(policy_decision.r_scale),
+                        "chi2_scale": float(policy_decision.chi2_scale),
+                        "threshold_scale": float(policy_decision.threshold_scale),
+                        "reproj_scale": float(policy_decision.reproj_scale),
+                    }
+                except Exception:
+                    policy_decision = None
+
             # Rate limiting
             if (self.runner.state.mag_idx - 1) % rate_limit != 0:
+                continue
+
+            if policy_decision is not None and str(policy_decision.mode).upper() in ("HOLD", "SKIP"):
+                mag_adaptive_info = {
+                    "sensor": "MAG",
+                    "accepted": False,
+                    "attempted": 1,
+                    "dof": 1,
+                    "nis_norm": np.nan,
+                    "chi2": np.nan,
+                    "threshold": np.nan,
+                    "r_scale_used": float(mag_policy_scales.get("r_scale", 1.0)),
+                    "reason_code": f"policy_mode_{str(policy_decision.mode).lower()}",
+                }
+                self.runner.adaptive_service.record_adaptive_measurement(
+                    "MAG",
+                    adaptive_info=mag_adaptive_info,
+                    timestamp=float(mag_rec.t),
+                    policy_scales=mag_policy_scales,
+                )
+                self.runner.state.mag_rejects += 1
                 continue
 
             sync_threshold = float(self.runner.global_config.get("MAG_TIME_SYNC_THRESHOLD_SEC", 0.05))
@@ -399,7 +463,6 @@ class MagnetometerService:
 
             # Scale measurement noise based on filter confidence
             sigma_mag_scaled = sigma_mag * r_scale
-            mag_policy_scales, mag_apply_scales = self.runner.adaptive_service.get_sensor_adaptive_scales("MAG")
             mag_adaptive_info: Dict[str, Any] = {}
             health_state = "HEALTHY"
             if getattr(self.runner, "current_adaptive_decision", None) is not None:
@@ -427,7 +490,15 @@ class MagnetometerService:
                 sigma_mag_scaled=sigma_mag_scaled,
                 timestamp=float(mag_rec.t),
             )
-            cond_skip, cond_reason = self._check_conditioning_guard(health_key=health_key, p_max=p_max, p_cond=p_cond)
+            cond_skip, cond_reason, cond_r_mult = self._check_conditioning_guard(
+                health_key=health_key, p_max=p_max, p_cond=p_cond
+            )
+            if np.isfinite(cond_r_mult) and cond_r_mult > 1.0:
+                sigma_mag_scaled *= float(cond_r_mult)
+                if not consistency_reason:
+                    consistency_reason = cond_reason
+                elif cond_reason:
+                    consistency_reason = f"{consistency_reason}|{cond_reason}"
             if cond_skip:
                 skip_mag = True
                 consistency_reason = cond_reason if consistency_reason == "" else f"{consistency_reason}|{cond_reason}"
@@ -500,7 +571,8 @@ class MagnetometerService:
                 yaw_override=yaw_mag_filtered,  # NEW: pass filtered yaw directly
                 filter_info=filter_info,  # v2.9.2: track filter rejection reasons
                 use_estimated_bias=use_estimated_bias,
-                r_scale_extra=float(mag_apply_scales.get("r_scale", 1.0)),
+                r_scale_extra=float(mag_policy_scales.get("r_scale", 1.0)),
+                policy_decision=policy_decision,
                 adaptive_info=mag_adaptive_info,
             )
             if consistency_reason:
@@ -542,6 +614,22 @@ class MagnetometerService:
             mag_rec: Magnetometer record with hardware-synchronized timestamp
             t: Current IMU timestamp (after propagation)
         """
+        policy_decision = None
+        policy_r_scale = 1.0
+        if getattr(self.runner, "policy_runtime_service", None) is not None:
+            try:
+                policy_decision = self.runner.policy_runtime_service.get_sensor_decision(
+                    "MAG", float(mag_rec.t)
+                )
+                policy_r_scale = float(policy_decision.r_scale)
+            except Exception:
+                policy_decision = None
+                policy_r_scale = 1.0
+
+        if policy_decision is not None and str(policy_decision.mode).upper() in ("HOLD", "SKIP"):
+            self.runner.state.mag_rejects += 1
+            return
+
         # Check time synchronization (should be very close if time_ref works)
         if abs(t - mag_rec.t) > 0.05:  # 50ms threshold
             print(f"[Mag] WARNING: Large time difference {t - mag_rec.t:.3f}s - may indicate clock sync issue")
@@ -613,7 +701,11 @@ class MagnetometerService:
         )
         if str(mag_quality.get("decision", "")) == "bad_skip":
             skip_mag = True
-        cond_skip, _ = self._check_conditioning_guard(health_key=health_key, p_max=p_max, p_cond=p_cond)
+        cond_skip, cond_reason, cond_r_mult = self._check_conditioning_guard(
+            health_key=health_key, p_max=p_max, p_cond=p_cond
+        )
+        if np.isfinite(cond_r_mult) and cond_r_mult > 1.0:
+            sigma_mag_scaled *= float(cond_r_mult)
         if cond_skip:
             skip_mag = True
         log_mag_quality(
@@ -662,6 +754,8 @@ class MagnetometerService:
             yaw_override=yaw_mag_filtered,
             filter_info=filter_info,
             use_estimated_bias=use_estimated_bias,
+            r_scale_extra=float(policy_r_scale),
+            policy_decision=policy_decision,
         )
 
         if applied:
