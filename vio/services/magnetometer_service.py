@@ -26,6 +26,15 @@ class MagnetometerService:
     def _wrap_angle(rad: float) -> float:
         return float(np.arctan2(np.sin(float(rad)), np.cos(float(rad))))
 
+    @staticmethod
+    def _policy_health_key(policy_decision: Any) -> str:
+        if policy_decision is None:
+            return "HEALTHY"
+        try:
+            return str(policy_decision.extra_str("health_state", "HEALTHY")).upper()
+        except Exception:
+            return "HEALTHY"
+
     def _score_linear(self, value: float, good: float, bad: float) -> float:
         if not np.isfinite(value):
             return float("nan")
@@ -166,7 +175,8 @@ class MagnetometerService:
     def _apply_visual_heading_consistency(self,
                                           yaw_mag_filtered: float,
                                           sigma_mag_scaled: float,
-                                          timestamp: float) -> tuple[bool, float, str]:
+                                          timestamp: float,
+                                          health_key: str = "HEALTHY") -> tuple[bool, float, str]:
         """
         Fail-soft MAG heading consistency with VO-derived heading reference.
 
@@ -205,18 +215,14 @@ class MagnetometerService:
         soft_deg = float(cfg.get("MAG_VISION_HEADING_PHASE_SOFT_DEG", {}).get(phase_key, soft_deg))
         hard_deg = float(cfg.get("MAG_VISION_HEADING_PHASE_HARD_DEG", {}).get(phase_key, hard_deg))
 
-        health_state = "HEALTHY"
-        decision = getattr(runner, "current_adaptive_decision", None)
-        if decision is not None and hasattr(decision, "health_state"):
-            health_state = str(getattr(decision, "health_state", "HEALTHY")).upper()
         th_mult = float(
-            cfg.get("MAG_VISION_HEADING_HEALTH_THRESHOLD_MULT", {}).get(health_state, 1.0)
+            cfg.get("MAG_VISION_HEADING_HEALTH_THRESHOLD_MULT", {}).get(health_key, 1.0)
         )
         soft_deg = max(5.0, float(soft_deg) * max(0.3, th_mult))
         hard_deg = max(soft_deg + 1.0, float(hard_deg) * max(0.3, th_mult))
 
         max_r = max(1.0, float(cfg.get("MAG_VISION_HEADING_R_INFLATE_MAX", 6.0)))
-        max_r *= float(cfg.get("MAG_VISION_HEADING_HEALTH_R_MULT", {}).get(health_state, 1.0))
+        max_r *= float(cfg.get("MAG_VISION_HEADING_HEALTH_R_MULT", {}).get(health_key, 1.0))
 
         # At high speed, trust transient MAG heading less; tighten mismatch thresholds
         # and increase fail-soft inflation ceiling.
@@ -239,7 +245,7 @@ class MagnetometerService:
             value=float(yaw_diff_deg),
             threshold=float(hard_deg),
             status="PASS" if yaw_diff_deg <= hard_deg else "WARN",
-            note=f"vision_quality={vis_q:.3f};phase={phase};health={health_state};speed={speed_m_s:.1f}",
+            note=f"vision_quality={vis_q:.3f};phase={phase};health={health_key};speed={speed_m_s:.1f}",
         )
 
         if yaw_diff_deg >= hard_deg:
@@ -247,7 +253,7 @@ class MagnetometerService:
             # Otherwise keep MAG update alive with aggressive R inflation.
             if (
                 bool(cfg.get("MAG_WARNING_SKIP_VISION_HARD_MISMATCH", True))
-                and health_state in ("WARNING", "DEGRADED")
+                and health_key in ("WARNING", "DEGRADED")
             ):
                 return True, float(sigma_mag_scaled), "skip_vision_heading_mismatch"
             if vis_q >= strong_quality:
@@ -464,12 +470,7 @@ class MagnetometerService:
             # Scale measurement noise based on filter confidence
             sigma_mag_scaled = sigma_mag * r_scale
             mag_adaptive_info: Dict[str, Any] = {}
-            health_state = "HEALTHY"
-            if getattr(self.runner, "current_adaptive_decision", None) is not None:
-                health_state = str(
-                    getattr(self.runner.current_adaptive_decision, "health_state", "HEALTHY")
-                )
-            health_key = str(health_state).upper()
+            health_key = self._policy_health_key(policy_decision)
             p_max, p_cond = self._get_cov_health()
             mag_quality = self._evaluate_accuracy_policy(
                 yaw_mag_filtered=yaw_mag_filtered,
@@ -478,17 +479,18 @@ class MagnetometerService:
             )
             sigma_mag_scaled *= float(mag_quality.get("r_scale", 1.0))
             if health_key == "WARNING":
-                warn_soft = float(self.runner.global_config.get("MAG_CONDITIONING_GUARD_WARN_PCOND", 8e11))
+                warn_soft = float(policy_decision.extra("conditioning_warn_pcond", self.runner.global_config.get("MAG_CONDITIONING_GUARD_WARN_PCOND", 8e11))) if policy_decision is not None else float(self.runner.global_config.get("MAG_CONDITIONING_GUARD_WARN_PCOND", 8e11))
                 if p_cond > warn_soft:
-                    sigma_mag_scaled *= float(self.runner.global_config.get("MAG_WARNING_EXTRA_R_MULT", 2.0))
+                    sigma_mag_scaled *= float(policy_decision.extra("warning_extra_r_mult", self.runner.global_config.get("MAG_WARNING_EXTRA_R_MULT", 2.0))) if policy_decision is not None else float(self.runner.global_config.get("MAG_WARNING_EXTRA_R_MULT", 2.0))
             elif health_key == "DEGRADED":
-                deg_soft = float(self.runner.global_config.get("MAG_CONDITIONING_GUARD_DEGRADED_PCOND", 1e11))
+                deg_soft = float(policy_decision.extra("conditioning_degraded_pcond", self.runner.global_config.get("MAG_CONDITIONING_GUARD_DEGRADED_PCOND", 1e11))) if policy_decision is not None else float(self.runner.global_config.get("MAG_CONDITIONING_GUARD_DEGRADED_PCOND", 1e11))
                 if p_cond > deg_soft:
-                    sigma_mag_scaled *= float(self.runner.global_config.get("MAG_DEGRADED_EXTRA_R_MULT", 2.8))
+                    sigma_mag_scaled *= float(policy_decision.extra("degraded_extra_r_mult", self.runner.global_config.get("MAG_DEGRADED_EXTRA_R_MULT", 2.8))) if policy_decision is not None else float(self.runner.global_config.get("MAG_DEGRADED_EXTRA_R_MULT", 2.8))
             skip_mag, sigma_mag_scaled, consistency_reason = self._apply_visual_heading_consistency(
                 yaw_mag_filtered=yaw_mag_filtered,
                 sigma_mag_scaled=sigma_mag_scaled,
                 timestamp=float(mag_rec.t),
+                health_key=health_key,
             )
             cond_skip, cond_reason, cond_r_mult = self._check_conditioning_guard(
                 health_key=health_key, p_max=p_max, p_cond=p_cond
@@ -562,7 +564,7 @@ class MagnetometerService:
                 sigma_mag_yaw=sigma_mag_scaled,  # Use scaled sigma
                 global_config=self.runner.global_config,
                 current_phase=self.runner.state.current_phase,  # v3.4.0: state-based phase
-                health_state=health_state,
+                health_state=health_key,
                 in_convergence=in_convergence,
                 has_ppk_yaw=has_ppk,
                 timestamp=mag_rec.t,
@@ -673,21 +675,16 @@ class MagnetometerService:
 
         # Scale measurement noise based on filter confidence
         sigma_mag_scaled = sigma_mag * r_scale
-        health_state = "HEALTHY"
-        if getattr(self.runner, "current_adaptive_decision", None) is not None:
-            health_state = str(
-                getattr(self.runner.current_adaptive_decision, "health_state", "HEALTHY")
-            )
-        health_key = str(health_state).upper()
+        health_key = self._policy_health_key(policy_decision)
         p_max, p_cond = self._get_cov_health()
         if health_key == "WARNING":
-            warn_soft = float(self.runner.global_config.get("MAG_CONDITIONING_GUARD_WARN_PCOND", 8e11))
+            warn_soft = float(policy_decision.extra("conditioning_warn_pcond", self.runner.global_config.get("MAG_CONDITIONING_GUARD_WARN_PCOND", 8e11))) if policy_decision is not None else float(self.runner.global_config.get("MAG_CONDITIONING_GUARD_WARN_PCOND", 8e11))
             if p_cond > warn_soft:
-                sigma_mag_scaled *= float(self.runner.global_config.get("MAG_WARNING_EXTRA_R_MULT", 2.0))
+                sigma_mag_scaled *= float(policy_decision.extra("warning_extra_r_mult", self.runner.global_config.get("MAG_WARNING_EXTRA_R_MULT", 2.0))) if policy_decision is not None else float(self.runner.global_config.get("MAG_WARNING_EXTRA_R_MULT", 2.0))
         elif health_key == "DEGRADED":
-            deg_soft = float(self.runner.global_config.get("MAG_CONDITIONING_GUARD_DEGRADED_PCOND", 1e11))
+            deg_soft = float(policy_decision.extra("conditioning_degraded_pcond", self.runner.global_config.get("MAG_CONDITIONING_GUARD_DEGRADED_PCOND", 1e11))) if policy_decision is not None else float(self.runner.global_config.get("MAG_CONDITIONING_GUARD_DEGRADED_PCOND", 1e11))
             if p_cond > deg_soft:
-                sigma_mag_scaled *= float(self.runner.global_config.get("MAG_DEGRADED_EXTRA_R_MULT", 2.8))
+                sigma_mag_scaled *= float(policy_decision.extra("degraded_extra_r_mult", self.runner.global_config.get("MAG_DEGRADED_EXTRA_R_MULT", 2.8))) if policy_decision is not None else float(self.runner.global_config.get("MAG_DEGRADED_EXTRA_R_MULT", 2.8))
         mag_quality = self._evaluate_accuracy_policy(
             yaw_mag_filtered=yaw_mag_filtered,
             mag_norm=float(np.linalg.norm(mag_cal)),
@@ -698,6 +695,7 @@ class MagnetometerService:
             yaw_mag_filtered=yaw_mag_filtered,
             sigma_mag_scaled=sigma_mag_scaled,
             timestamp=float(mag_rec.t),
+            health_key=health_key,
         )
         if str(mag_quality.get("decision", "")) == "bad_skip":
             skip_mag = True
@@ -745,7 +743,7 @@ class MagnetometerService:
             sigma_mag_yaw=sigma_mag_scaled,
             global_config=self.runner.global_config,
             current_phase=self.runner.state.current_phase,
-            health_state=health_state,
+            health_state=health_key,
             in_convergence=in_convergence,
             has_ppk_yaw=has_ppk,
             timestamp=mag_rec.t,

@@ -23,6 +23,7 @@ from ..output_utils import (
 )
 from ..propagation import apply_preintegration_at_camera, clone_camera_for_msckf
 from ..state_manager import imu_to_gnss_position
+from ..policy.types import SensorPolicyDecision
 
 
 class VIOService:
@@ -351,7 +352,7 @@ class VIOService:
             return result, (meta if isinstance(meta, dict) else {})
 
         def _get_policy(sensor: str, ts: float):
-            decision = None
+            decision: SensorPolicyDecision = SensorPolicyDecision(sensor=str(sensor))
             scales = {
                 "r_scale": 1.0,
                 "chi2_scale": 1.0,
@@ -368,18 +369,22 @@ class VIOService:
                         "threshold_scale": float(decision.threshold_scale),
                         "reproj_scale": float(decision.reproj_scale),
                     }
-                    return decision, scales
                 except Exception:
-                    decision = None
-            # Backward-compatible fallback.
-            try:
-                _, apply_scales = runner.adaptive_service.get_sensor_adaptive_scales(str(sensor))
-                for k in scales.keys():
-                    if k in apply_scales:
-                        scales[k] = float(apply_scales[k])
-            except Exception:
-                pass
+                    decision = SensorPolicyDecision(sensor=str(sensor))
+            # Consume-only contract: no adaptive/local fallback policy here.
             return decision, scales
+
+        def _decision_phase(decision: SensorPolicyDecision, default_phase: int = 2) -> int:
+            try:
+                return int(round(float(decision.extra("phase", float(default_phase)))))
+            except Exception:
+                return int(default_phase)
+
+        def _decision_health(decision: SensorPolicyDecision, default_health: str = "HEALTHY") -> str:
+            try:
+                return str(decision.extra_str("health_state", default_health)).upper()
+            except Exception:
+                return str(default_health).upper()
 
         # Process images up to current time
         while runner.state.img_idx < len(runner.imgs) and runner.imgs[runner.state.img_idx].t <= t:
@@ -576,10 +581,9 @@ class VIOService:
             ok, ninl, r_vo_mat, t_unit, dt_img = runner.vio_fe.step(img_for_tracking, t_cam)
 
             # Loop closure detection - check when we have sufficient position estimate
-            current_phase = int(getattr(runner.state, "current_phase", 2))
-            current_health = str(
-                getattr(getattr(runner, "current_adaptive_decision", None), "health_state", "HEALTHY")
-            )
+            loop_decision, _ = _get_policy("LOOP_CLOSURE", t_cam)
+            current_phase = _decision_phase(loop_decision, int(getattr(runner.state, "current_phase", 2)))
+            current_health = _decision_health(loop_decision, "HEALTHY")
             match_result = check_loop_closure(
                 loop_detector=runner.loop_detector,
                 img_gray=img,
@@ -591,7 +595,6 @@ class VIOService:
                 health_state=current_health,
             )
             if match_result is not None:
-                loop_decision, _ = _get_policy("LOOP_CLOSURE", t_cam)
                 loop_applied = apply_loop_closure_correction(
                     kf=runner.kf,
                     loop_info=match_result,
@@ -706,13 +709,10 @@ class VIOService:
                     if len(runner.state.cam_states) >= 3:
                         msckf_decision, msckf_policy_scales = _get_policy("MSCKF", t_cam)
                         msckf_adaptive_info: Dict[str, Any] = {}
-                        phase_key = str(int(getattr(runner.state, "current_phase", 2)))
-                        phase_chi2 = float(
-                            runner.global_config.get("MSCKF_PHASE_CHI2_SCALE", {}).get(phase_key, 1.0)
-                        )
-                        phase_reproj = float(
-                            runner.global_config.get("MSCKF_PHASE_REPROJ_SCALE", {}).get(phase_key, 1.0)
-                        )
+                        msckf_phase = _decision_phase(msckf_decision, int(getattr(runner.state, "current_phase", 2)))
+                        msckf_health = _decision_health(msckf_decision, "HEALTHY")
+                        phase_chi2 = float(msckf_decision.extra("phase_chi2_scale", 1.0))
+                        phase_reproj = float(msckf_decision.extra("phase_reproj_scale", 1.0))
                         num_updates = trigger_msckf_update(
                             kf=runner.kf,
                             cam_states=runner.state.cam_states,
@@ -728,10 +728,8 @@ class VIOService:
                             global_config=runner.global_config,
                             chi2_scale=float(msckf_policy_scales.get("chi2_scale", 1.0)) * phase_chi2,
                             reproj_scale=float(msckf_policy_scales.get("reproj_scale", 1.0)) * phase_reproj,
-                            phase=int(getattr(runner.state, "current_phase", 2)),
-                            health_state=str(
-                                getattr(getattr(runner, "current_adaptive_decision", None), "health_state", "HEALTHY")
-                            ),
+                            phase=int(msckf_phase),
+                            health_state=str(msckf_health),
                             adaptive_info=msckf_adaptive_info,
                             policy_decision=msckf_decision,
                         )
@@ -780,6 +778,8 @@ class VIOService:
                 vio_decision, vio_policy_scales = _get_policy("VIO_VEL", t_cam)
                 vio_adaptive_info: Dict[str, Any] = {}
                 runner._vio_vel_attempt_count += 1
+                vio_phase = _decision_phase(vio_decision, int(getattr(runner.state, "current_phase", 2)))
+                vio_health = _decision_health(vio_decision, "HEALTHY")
                 vio_vel_accepted = apply_vio_velocity_update(
                     kf=runner.kf,
                     r_vo_mat=r_vo_mat if ok else None,
@@ -807,10 +807,8 @@ class VIOService:
                     soft_fail_r_cap=float(runner.global_config.get("VIO_VEL_SOFT_FAIL_MAX_R_MULT", 8.0)),
                     soft_fail_hard_reject_factor=float(runner.global_config.get("VIO_VEL_SOFT_FAIL_HARD_REJECT_FACTOR", 3.0)),
                     soft_fail_power=float(runner.global_config.get("VIO_VEL_SOFT_FAIL_POWER", 1.0)),
-                    phase=int(getattr(runner.state, "current_phase", 2)),
-                    health_state=str(
-                        getattr(getattr(runner, "current_adaptive_decision", None), "health_state", "HEALTHY")
-                    ),
+                    phase=int(vio_phase),
+                    health_state=str(vio_health),
                     adaptive_info=vio_adaptive_info,
                     policy_decision=vio_decision,
                 )
@@ -946,22 +944,20 @@ class VIOService:
                         )
 
                     clone_id = str(vps_result_meta.get("clone_id", f"vps_{runner.state.img_idx}"))
-                    health_key = str(
-                        getattr(getattr(runner, "current_adaptive_decision", None), "health_state", "HEALTHY")
-                    ).upper()
+                    health_key = _decision_health(vps_decision, "HEALTHY")
                     speed_now = float(np.linalg.norm(np.array(runner.kf.x[3:6, 0], dtype=float)))
-                    min_inliers_apply = int(runner.global_config.get("VPS_APPLY_MIN_INLIERS", 8))
-                    min_conf_apply = float(runner.global_config.get("VPS_APPLY_MIN_CONFIDENCE", 0.18))
-                    max_reproj_apply = float(runner.global_config.get("VPS_APPLY_MAX_REPROJ_ERROR", 1.2))
-                    max_speed_apply = float(runner.global_config.get("VPS_APPLY_MAX_SPEED_M_S", 80.0))
+                    min_inliers_apply = int(round(float(vps_decision.extra("strict_min_inliers", 8.0))))
+                    min_conf_apply = float(vps_decision.extra("strict_min_conf", 0.18))
+                    max_reproj_apply = float(vps_decision.extra("strict_max_reproj", 1.2))
+                    max_speed_apply = float(vps_decision.extra("strict_max_speed", 80.0))
                     if health_key == "WARNING":
-                        min_inliers_apply += int(runner.global_config.get("VPS_APPLY_WARNING_INLIER_BONUS", 2))
-                        min_conf_apply *= float(runner.global_config.get("VPS_APPLY_WARNING_CONF_MULT", 1.15))
-                        max_reproj_apply *= float(runner.global_config.get("VPS_APPLY_WARNING_REPROJ_MULT", 0.90))
+                        min_inliers_apply += int(round(float(vps_decision.extra("warning_inlier_bonus", 2.0))))
+                        min_conf_apply *= float(vps_decision.extra("warning_conf_mult", 1.15))
+                        max_reproj_apply *= float(vps_decision.extra("warning_reproj_mult", 0.90))
                     elif health_key == "DEGRADED":
-                        min_inliers_apply += int(runner.global_config.get("VPS_APPLY_DEGRADED_INLIER_BONUS", 4))
-                        min_conf_apply *= float(runner.global_config.get("VPS_APPLY_DEGRADED_CONF_MULT", 1.30))
-                        max_reproj_apply *= float(runner.global_config.get("VPS_APPLY_DEGRADED_REPROJ_MULT", 0.80))
+                        min_inliers_apply += int(round(float(vps_decision.extra("degraded_inlier_bonus", 4.0))))
+                        min_conf_apply *= float(vps_decision.extra("degraded_conf_mult", 1.30))
+                        max_reproj_apply *= float(vps_decision.extra("degraded_reproj_mult", 0.80))
 
                     vps_num_inliers = int(getattr(vps_result, "num_inliers", 0))
                     vps_conf = float(getattr(vps_result, "confidence", 0.0))
@@ -983,17 +979,17 @@ class VIOService:
                     )
                     vps_offset = np.asarray(getattr(vps_result, "offset_m", (np.nan, np.nan)), dtype=float).reshape(-1)
                     vps_offset_m = float(np.linalg.norm(vps_offset[:2])) if vps_offset.size >= 2 else float("nan")
-                    failsoft_enabled = bool(runner.global_config.get("VPS_APPLY_FAILSOFT_ENABLE", True))
+                    failsoft_enabled = bool(float(vps_decision.extra("failsoft_enabled", 1.0)) >= 0.5)
                     failsoft_allowed_state = (
                         (health_key == "HEALTHY")
-                        or (health_key == "WARNING" and bool(runner.global_config.get("VPS_APPLY_FAILSOFT_ALLOW_WARNING", True)))
-                        or (health_key == "DEGRADED" and bool(runner.global_config.get("VPS_APPLY_FAILSOFT_ALLOW_DEGRADED", False)))
+                        or (health_key == "WARNING" and bool(float(vps_decision.extra("failsoft_allow_warning", 1.0)) >= 0.5))
+                        or (health_key == "DEGRADED" and bool(float(vps_decision.extra("failsoft_allow_degraded", 0.0)) >= 0.5))
                     )
-                    fs_min_inliers = int(runner.global_config.get("VPS_APPLY_FAILSOFT_MIN_INLIERS", 5))
-                    fs_min_conf = float(runner.global_config.get("VPS_APPLY_FAILSOFT_MIN_CONFIDENCE", 0.12))
-                    fs_max_reproj = float(runner.global_config.get("VPS_APPLY_FAILSOFT_MAX_REPROJ_ERROR", 1.2))
-                    fs_max_speed = float(runner.global_config.get("VPS_APPLY_FAILSOFT_MAX_SPEED_M_S", max_speed_apply))
-                    fs_max_offset_m = float(runner.global_config.get("VPS_APPLY_FAILSOFT_MAX_OFFSET_M", 180.0))
+                    fs_min_inliers = int(round(float(vps_decision.extra("failsoft_min_inliers", 5.0))))
+                    fs_min_conf = float(vps_decision.extra("failsoft_min_conf", 0.12))
+                    fs_max_reproj = float(vps_decision.extra("failsoft_max_reproj", 1.2))
+                    fs_max_speed = float(vps_decision.extra("failsoft_max_speed", max_speed_apply))
+                    fs_max_offset_m = float(vps_decision.extra("failsoft_max_offset_m", 180.0))
                     failsoft_quality_ok = (
                         failsoft_enabled
                         and failsoft_allowed_state
@@ -1047,7 +1043,7 @@ class VIOService:
                             vps_status = f"{policy_reject_note} | {vps_status}"
                     else:
                         if quality_mode == "failsoft":
-                            r_scale_apply *= float(runner.global_config.get("VPS_APPLY_FAILSOFT_R_MULT", 1.5))
+                            r_scale_apply *= float(vps_decision.extra("failsoft_r_mult", 1.5))
                             if health_key == "WARNING":
                                 r_scale_apply *= 1.25
                             elif health_key == "DEGRADED":

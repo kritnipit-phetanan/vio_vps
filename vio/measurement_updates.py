@@ -144,6 +144,10 @@ def apply_magnetometer_update(kf,
                     "reason_code": f"policy_mode_{mode.lower()}",
                 })
             return False, f"policy_mode_{mode.lower()}"
+        try:
+            health_state = str(policy_decision.extra_str("health_state", str(health_state))).upper()
+        except Exception:
+            pass
 
     def _set_adaptive_info(accepted: bool,
                            nis_norm: Optional[float],
@@ -289,10 +293,19 @@ def apply_magnetometer_update(kf,
     # Apply oscillation R-scaling to measurement noise (v2.9.5)
     sigma_mag_yaw_scaled = sigma_mag_yaw * oscillation_r_scale * extra_scale
     health_key = str(health_state).upper()
+    warning_r_mult = float(global_config.get("MAG_WARNING_R_MULT", 4.0))
+    degraded_r_mult = float(global_config.get("MAG_DEGRADED_R_MULT", 8.0))
+    warning_max_dyaw_deg = float(global_config.get("MAG_WARNING_MAX_DYAW_DEG", 1.5))
+    degraded_max_dyaw_deg = float(global_config.get("MAG_DEGRADED_MAX_DYAW_DEG", 1.0))
+    if policy_decision is not None:
+        warning_r_mult = float(policy_decision.extra("warning_r_mult", warning_r_mult))
+        degraded_r_mult = float(policy_decision.extra("degraded_r_mult", degraded_r_mult))
+        warning_max_dyaw_deg = float(policy_decision.extra("warning_max_dyaw_deg", warning_max_dyaw_deg))
+        degraded_max_dyaw_deg = float(policy_decision.extra("degraded_max_dyaw_deg", degraded_max_dyaw_deg))
     if health_key == "WARNING":
-        sigma_mag_yaw_scaled *= float(global_config.get("MAG_WARNING_R_MULT", 4.0))
+        sigma_mag_yaw_scaled *= float(warning_r_mult)
     elif health_key == "DEGRADED":
-        sigma_mag_yaw_scaled *= float(global_config.get("MAG_DEGRADED_R_MULT", 8.0))
+        sigma_mag_yaw_scaled *= float(degraded_r_mult)
     
     # Build measurement model
     _MAG_STATE['total_accepted'] += 1
@@ -393,12 +406,12 @@ def apply_magnetometer_update(kf,
     if health_key == "WARNING":
         MAX_YAW_CORRECTION = min(
             MAX_YAW_CORRECTION,
-            np.radians(float(global_config.get("MAG_WARNING_MAX_DYAW_DEG", 1.5)))
+            np.radians(float(warning_max_dyaw_deg))
         )
     elif health_key == "DEGRADED":
         MAX_YAW_CORRECTION = min(
             MAX_YAW_CORRECTION,
-            np.radians(float(global_config.get("MAG_DEGRADED_MAX_DYAW_DEG", 1.0)))
+            np.radians(float(degraded_max_dyaw_deg))
         )
     
     # Compute current Kalman gain
@@ -802,6 +815,14 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
                 attempted=0,
             )
             return False
+        try:
+            phase = int(round(float(policy_decision.extra("phase", float(phase)))))
+        except Exception:
+            pass
+        try:
+            health_state = str(policy_decision.extra_str("health_state", str(health_state))).upper()
+        except Exception:
+            pass
 
     from scipy.spatial.transform import Rotation as R_scipy
     from .config import CAMERA_VIEW_CONFIGS

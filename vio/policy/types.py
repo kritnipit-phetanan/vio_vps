@@ -8,7 +8,7 @@ same decision.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, Mapping, Tuple
+from typing import Any, Dict, Mapping, Tuple
 
 
 @dataclass(frozen=True)
@@ -22,7 +22,7 @@ class SensorPolicyDecision:
     threshold_scale: float = 1.0
     reproj_scale: float = 1.0
     reason_codes: Tuple[str, ...] = field(default_factory=tuple)
-    extras: Mapping[str, float] = field(default_factory=dict)
+    extras: Mapping[str, Any] = field(default_factory=dict)
     valid_from_t: float = 0.0
     valid_to_t: float = float("inf")
 
@@ -32,6 +32,13 @@ class SensorPolicyDecision:
             return float(val)
         except Exception:
             return float(default)
+
+    def extra_str(self, key: str, default: str) -> str:
+        val = self.extras.get(key, default)
+        try:
+            return str(val)
+        except Exception:
+            return str(default)
 
     def as_trace_dict(self) -> Dict[str, float]:
         return {
@@ -62,4 +69,3 @@ class PolicySnapshot:
             str(sensor),
             SensorPolicyDecision(sensor=str(sensor)),
         )
-

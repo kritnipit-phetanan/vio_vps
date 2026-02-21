@@ -2200,6 +2200,14 @@ def trigger_msckf_update(kf, cam_states: list, cam_observations: list,
             reproj_scale = float(getattr(policy_decision, "reproj_scale", reproj_scale))
         except Exception:
             pass
+        try:
+            phase = int(round(float(policy_decision.extra("phase", float(phase)))))
+        except Exception:
+            pass
+        try:
+            health_state = str(policy_decision.extra_str("health_state", str(health_state))).upper()
+        except Exception:
+            pass
 
     if vio_fe is None or len(cam_states) < 2:
         if adaptive_info is not None:

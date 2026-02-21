@@ -739,9 +739,21 @@ def apply_loop_closure_correction(kf, loop_info: Dict[str, Any], t: float,
         min_abs_deg = float(global_config.get("LOOP_MIN_ABS_YAW_CORR_DEG", 1.5))
         max_abs_deg = float(global_config.get("LOOP_MAX_ABS_YAW_CORR_DEG", 4.0))
         reject_abs_deg = float(global_config.get("LOOP_YAW_RESIDUAL_BOUND_DEG", 25.0))
+        base_sigma_deg = float(global_config.get("LOOP_BASE_SIGMA_YAW_DEG", 5.0))
+        fail_soft_sigma_deg = float(global_config.get("LOOP_FAIL_SOFT_SIGMA_YAW_DEG", 18.0))
+        dynamic_phase_sigma_mult = float(global_config.get("LOOP_DYNAMIC_PHASE_SIGMA_MULT", 1.15))
+        warning_sigma_mult = float(global_config.get("LOOP_WARNING_SIGMA_MULT", 1.20))
+        degraded_sigma_mult = float(global_config.get("LOOP_DEGRADED_SIGMA_MULT", 1.40))
         if policy_decision is not None:
             try:
+                min_abs_deg = float(policy_decision.extra("min_abs_yaw_corr_deg", min_abs_deg))
                 max_abs_deg = float(policy_decision.extra("max_abs_yaw_corr_deg", max_abs_deg))
+                reject_abs_deg = float(policy_decision.extra("reject_abs_yaw_corr_deg", reject_abs_deg))
+                base_sigma_deg = float(policy_decision.extra("base_sigma_yaw_deg", base_sigma_deg))
+                fail_soft_sigma_deg = float(policy_decision.extra("fail_soft_sigma_yaw_deg", fail_soft_sigma_deg))
+                dynamic_phase_sigma_mult = float(policy_decision.extra("dynamic_phase_sigma_mult", dynamic_phase_sigma_mult))
+                warning_sigma_mult = float(policy_decision.extra("warning_sigma_mult", warning_sigma_mult))
+                degraded_sigma_mult = float(policy_decision.extra("degraded_sigma_mult", degraded_sigma_mult))
             except Exception:
                 pass
         if fail_soft:
@@ -795,8 +807,6 @@ def apply_loop_closure_correction(kf, loop_info: Dict[str, Any], t: float,
         z_loop = np.array([[yaw_error]])
         
         # Measurement noise (inversely proportional to inliers), with fail-soft profile.
-        base_sigma_deg = float(global_config.get("LOOP_BASE_SIGMA_YAW_DEG", 5.0))
-        fail_soft_sigma_deg = float(global_config.get("LOOP_FAIL_SOFT_SIGMA_YAW_DEG", 18.0))
         sigma_loop = np.deg2rad(base_sigma_deg) / np.sqrt(max(num_inliers, 1) / 15.0)
         if fail_soft:
             sigma_loop = max(sigma_loop, np.deg2rad(fail_soft_sigma_deg))
@@ -809,11 +819,11 @@ def apply_loop_closure_correction(kf, loop_info: Dict[str, Any], t: float,
 
         # Dynamic phase/health inflation (conservative during dynamic phases)
         if phase <= 1:
-            sigma_loop *= float(global_config.get("LOOP_DYNAMIC_PHASE_SIGMA_MULT", 1.15))
+            sigma_loop *= float(dynamic_phase_sigma_mult)
         if health == "WARNING":
-            sigma_loop *= float(global_config.get("LOOP_WARNING_SIGMA_MULT", 1.20))
+            sigma_loop *= float(warning_sigma_mult)
         elif health == "DEGRADED":
-            sigma_loop *= float(global_config.get("LOOP_DEGRADED_SIGMA_MULT", 1.40))
+            sigma_loop *= float(degraded_sigma_mult)
         R_loop = np.array([[sigma_loop**2]])
         
         # Apply EKF update
