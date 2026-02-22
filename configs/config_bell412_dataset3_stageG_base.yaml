@@ -1,25 +1,25 @@
 adaptive:
   conditioning:
     caps:
-      DEGRADED: 1.0e6
-      HEALTHY: 1.0e8
-      RECOVERY: 1.0e7
-      WARNING: 1.0e7
+      DEGRADED: 5.0e5
+      HEALTHY: 9.0e5
+      RECOVERY: 8.0e5
+      WARNING: 7.0e5
     cond_hard:
-      DEGRADED: 1.1e12
-      HEALTHY: 1.2e12
-      RECOVERY: 1.2e12
-      WARNING: 1.2e12
+      DEGRADED: 2.0e10
+      HEALTHY: 4.0e10
+      RECOVERY: 3.0e10
+      WARNING: 2.5e10
     cond_hard_window:
-      DEGRADED: 16
-      HEALTHY: 16
-      RECOVERY: 16
-      WARNING: 16
+      DEGRADED: 4
+      HEALTHY: 6
+      RECOVERY: 5
+      WARNING: 4
     projection_min_interval_steps:
-      DEGRADED: 64
-      HEALTHY: 64
-      RECOVERY: 64
-      WARNING: 64
+      DEGRADED: 8
+      HEALTHY: 12
+      RECOVERY: 10
+      WARNING: 8
   health:
     aiding_age:
       full_sec: 0.25
@@ -461,12 +461,12 @@ imu:
   - -0.0038
   - -0.0077
   phase_detection:
-    allow_normal_to_early: true
-    down_hold_sec: 6.0
+    allow_normal_to_early: false
+    down_hold_sec: 10.0
     early_velocity_sigma_thresh: 3.0
     hysteresis_enabled: true
-    revert_max_alt_change: 60.0
-    revert_max_speed: 18.0
+    revert_max_alt_change: 35.0
+    revert_max_speed: 14.0
     spinup_altitude_change_thresh: 5.0
     spinup_velocity_thresh: 1.0
     spinup_vibration_thresh: 0.3
@@ -500,14 +500,28 @@ imu_gnss_extrinsics:
     - 1.0
 kinematic_guard:
   enabled: true
-  hard_blend_alpha: 0.2
-  hard_hold_sec: 0.5
-  max_blend_speed_m_s: 70.0
-  max_inflate: 1.08
-  max_kin_speed_m_s: 80.0
-  max_state_speed_m_s: 85.0
-  min_action_dt_sec: 0.25
-  release_hysteresis_ratio: 0.65
+  hard_blend_alpha: 0.5
+  hard_hold_sec: 0.08
+  max_blend_speed_m_s: 30.0
+  max_inflate: 1.02
+  max_kin_speed_m_s: 35.0
+  max_state_speed_m_s: 25.5
+  min_action_dt_sec: 0.03
+  release_hysteresis_ratio: 0.45
+  abs_speed_sanity_m_s: 40.0
+  speed_hard_m_s: 24.0
+  speed_hard_hold_sec: 0.05
+  speed_release_hysteresis_ratio: 0.45
+  speed_blend_alpha: 0.55
+  speed_inflate: 1.02
+  certainty_enable: true
+  certainty_mismatch_mult: 1.35
+  certainty_speed_mult: 1.02
+  certainty_inflate: 1.04
+  certainty_blend_alpha: 0.6
+  certainty_speed_cap_m_s: 22.0
+  certainty_min_action_dt_sec: 0.01
+  certainty_require_both: false
   vel_mismatch_hard: 15.0
   vel_mismatch_warn: 8.0
   window_sec: 0.5
@@ -518,12 +532,41 @@ loop_closure:
     dynamic_phase_sigma_mult: 1.15
     enable: true
     fail_soft_sigma_yaw_deg: 18.0
-    max_abs_yaw_corr_deg: 4.0
-    min_abs_yaw_corr_deg: 1.5
+    max_abs_yaw_corr_deg: 3.0
+    min_abs_yaw_corr_deg: 1.0
     speed_sigma_inflate_m_s: 25.0
     speed_sigma_mult: 1.5
     speed_skip_m_s: 35.0
     warning_sigma_mult: 1.2
+  speed_gate:
+    normal:
+      speed_skip_m_s: 42.0
+      speed_sigma_inflate_m_s: 30.0
+      speed_sigma_mult: 1.25
+    fail_soft:
+      speed_skip_m_s: 44.0
+      speed_sigma_inflate_m_s: 32.0
+      speed_sigma_mult: 1.20
+  speed_yaw_cap:
+    breakpoints_m_s: [15.0, 25.0, 35.0]
+    normal_cap_deg: [3.0, 2.6, 2.2]
+    fail_soft_cap_deg: [2.8, 2.3, 1.8]
+  temporal_apply:
+    enable: true
+    confirm_window_sec: 2.8
+    confirm_yaw_deg: 6.0
+    confirm_hits_normal: 1
+    confirm_hits_failsoft: 2
+    confirm_speed_m_s: 18.0
+    confirm_extra_hits_high_speed: 3
+    phase_dynamic_min_hits: 1
+    cooldown_sec_normal: 1.9
+    cooldown_sec_failsoft: 2.3
+    cooldown_speed_m_s: 22.0
+    cooldown_speed_mult: 1.6
+    burst_window_sec: 10.0
+    burst_max_corrections: 2
+    burst_cooldown_sec: 5.5
   min_frame_gap: 50
   min_inliers: 15
   min_keyframe_dist: 15.0
@@ -535,7 +578,7 @@ loop_closure:
     degraded_inlier_mult: 1.2
     double_confirm_enable: true
     double_confirm_window_sec: 2.0
-    double_confirm_yaw_deg: 8.0
+    double_confirm_yaw_deg: 6.0
     max_reproj_px: 2.5
     min_inliers_failsoft: 20
     min_inliers_hard: 35
@@ -592,7 +635,7 @@ magnetometer:
   use_estimated_bias: true
   use_raw_heading: true
   vision_heading_consistency_enable: true
-  vision_heading_hard_deg: 85.0
+  vision_heading_hard_deg: 110.0
   vision_heading_health_r_mult:
     DEGRADED: 1.4
     HEALTHY: 1.0
@@ -612,9 +655,9 @@ magnetometer:
   vision_heading_min_parallax_px: 1.0
   vision_heading_min_quality: 0.3
   vision_heading_phase_hard_deg:
-    '0': 95.0
-    '1': 78.0
-    '2': 62.0
+    '0': 120.0
+    '1': 95.0
+    '2': 85.0
   vision_heading_phase_soft_deg:
     '0': 36.0
     '1': 28.0
@@ -626,20 +669,31 @@ magnetometer:
   warning_weak_yaw:
     bias_freeze_degraded_pcond: 5.0e9
     bias_freeze_warn_pcond: 1.0e10
-    conditioning_guard_degraded_pcond: 1.0e11
-    conditioning_guard_degraded_pmax: 2.0e6
+    chol_cooldown_max_sec: 2.5
+    chol_cooldown_sec: 0.35
+    chol_cooldown_streak_mult: 0.35
+    conditioning_guard_degraded_pcond: 7.0e9
+    conditioning_guard_degraded_pmax: 9.0e5
     conditioning_guard_enable: true
-    conditioning_guard_hard_pcond: 1000000000000.0
-    conditioning_guard_hard_pmax: 10000000.0
-    conditioning_guard_warn_pcond: 800000000000.0
-    conditioning_guard_warn_pmax: 8000000.0
-    degraded_extra_r_mult: 2.8
-    degraded_max_dyaw_deg: 1.0
-    degraded_r_mult: 8.0
-    skip_vision_hard_mismatch: true
-    warning_extra_r_mult: 2.0
-    warning_max_dyaw_deg: 1.5
-    warning_r_mult: 4.0
+    conditioning_guard_hard_pcond: 7.0e10
+    conditioning_guard_hard_pmax: 2.2e6
+    conditioning_guard_warn_pcond: 1.0e10
+    conditioning_guard_warn_pmax: 1.1e6
+    conditioning_guard_extreme_pcond: 1.3e11
+    conditioning_guard_extreme_pmax: 2.5e6
+    conditioning_guard_soft_enable: true
+    conditioning_guard_soft_r_mult: 8.5
+    conditioning_guard_soft_r_mult_healthy: 2.0
+    conditioning_guard_soft_r_mult_warning: 1.8
+    conditioning_guard_soft_r_mult_degraded: 2.2
+    conditioning_guard_soft_r_mult_recovery: 1.2
+    degraded_extra_r_mult: 5.5
+    degraded_max_dyaw_deg: 0.6
+    degraded_r_mult: 9.0
+    skip_vision_hard_mismatch: false
+    warning_extra_r_mult: 3.5
+    warning_max_dyaw_deg: 0.8
+    warning_r_mult: 6.0
 optimization:
   compute_budget: medium
   objective: accuracy

@@ -313,15 +313,15 @@ def evaluate_locks(
     backend_stale_drop_count = _to_float(current_row.get("backend_stale_drop_count"))
     backend_poll_count = _to_float(current_row.get("backend_poll_count"))
     policy_conflict_count = _to_float(current_row.get("policy_conflict_count"))
+    vps_used = _to_float(current_row.get("vps_used"))
     heading_final_abs_deg = _load_heading_final_abs_deg(output_dir)
-    vps_used = np.nan
     overflow_hits: list[str] = []
 
     if run_log.is_file():
         lines = run_log.read_text(errors="ignore").splitlines()
         for line in lines:
             m = re.search(r"VPS used:\s*(\d+)", line)
-            if m:
+            if m and not np.isfinite(vps_used):
                 vps_used = float(m.group(1))
 
         warn_patterns = ("overflow", "non-finite", "contains inf/nan", "runtimewarning")

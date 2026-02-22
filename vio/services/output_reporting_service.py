@@ -694,6 +694,7 @@ class OutputReportingService:
         loop_applied_rate = float("nan")
         loop_corr_count = float("nan")
         loop_abs_yaw_corr_sum_deg = float("nan")
+        vps_used = float(int(getattr(self.runner.state, "vps_idx", 0)))
         if getattr(self.runner, "loop_detector", None) is not None and hasattr(self.runner.loop_detector, "stats"):
             try:
                 l_stats = self.runner.loop_detector.stats
@@ -760,6 +761,7 @@ class OutputReportingService:
             frames_inlier_nonzero_ratio=frames_inlier_nonzero_ratio,
             vio_vel_accept_ratio_vs_cam=vio_vel_accept_ratio_vs_cam,
             mag_cholfail_rate=mag_cholfail_rate,
+            vps_used=vps_used,
             loop_applied_rate=loop_applied_rate,
             speed_max_m_s=speed_max_m_s,
             speed_p99_m_s=speed_p99_m_s,

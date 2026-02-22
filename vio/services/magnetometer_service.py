@@ -21,6 +21,8 @@ class MagnetometerService:
         self._mag_norm_ewma: float = float("nan")
         self._last_mag_yaw: float | None = None
         self._last_mag_t: float | None = None
+        self._mag_chol_cooldown_until: float = -1e9
+        self._mag_chol_fail_streak: int = 0
 
     @staticmethod
     def _wrap_angle(rad: float) -> float:
@@ -270,20 +272,75 @@ class MagnetometerService:
 
     def _get_cov_health(self) -> tuple[float, float]:
         """Return lightweight covariance health metrics for MAG safety gating."""
-        p_core = np.array(self.runner.kf.P[:18, :18], dtype=float, copy=True)
-        if p_core.size == 0:
+        p_full = np.array(self.runner.kf.P, dtype=float, copy=True)
+        if p_full.size == 0:
             return float("nan"), float("inf")
-        p_core = 0.5 * (p_core + p_core.T)
-        p_max = float(np.nanmax(np.abs(p_core)))
+
+        p_full = 0.5 * (p_full + p_full.T)
+        p_max = float(np.nanmax(np.abs(p_full)))
+        if not np.isfinite(p_max):
+            return float("inf"), float("inf")
+
+        # Use full covariance when dimension is moderate; otherwise a capped
+        # principal block keeps runtime predictable in long runs.
+        dim = int(p_full.shape[0])
+        cond_block_dim = min(dim, 96)
+        p_cond_block = p_full[:cond_block_dim, :cond_block_dim]
         try:
-            p_cond = float(np.linalg.cond(p_core))
+            p_cond = float(np.linalg.cond(p_cond_block))
         except Exception:
             p_cond = float("inf")
         if not np.isfinite(p_cond):
             p_cond = float("inf")
         return p_max, p_cond
 
-    def _check_conditioning_guard(self, health_key: str, p_max: float, p_cond: float) -> tuple[bool, str, float]:
+    def _conditioning_counters(self) -> tuple[int, int]:
+        """Return (chol_fail_count, projection_count) from EKF conditioning stats."""
+        kf = getattr(self.runner, "kf", None)
+        if kf is None or not hasattr(kf, "get_conditioning_stats"):
+            return 0, 0
+        try:
+            stats = kf.get_conditioning_stats()
+            return int(stats.get("chol_fail_count", 0)), int(stats.get("projection_count", 0))
+        except Exception:
+            return 0, 0
+
+    def _update_mag_chol_cooldown(self,
+                                  timestamp: float,
+                                  applied: bool,
+                                  reason: str,
+                                  chol_before: int,
+                                  proj_before: int):
+        """
+        Apply short MAG cooldown when this update triggers numerical conditioning.
+
+        This suppresses CHOLESKY_FAIL bursts while preserving occasional updates.
+        """
+        chol_after, proj_after = self._conditioning_counters()
+        reason_l = str(reason).lower()
+        chol_triggered = (chol_after > chol_before) or ("chol" in reason_l and "failed" in reason_l)
+        projected = proj_after > proj_before
+
+        if chol_triggered:
+            self._mag_chol_fail_streak += 1
+            base_sec = float(self.runner.global_config.get("MAG_CHOL_COOLDOWN_SEC", 0.30))
+            streak_mult = float(self.runner.global_config.get("MAG_CHOL_COOLDOWN_STREAK_MULT", 0.25))
+            max_sec = float(self.runner.global_config.get("MAG_CHOL_COOLDOWN_MAX_SEC", 2.00))
+            cooldown = base_sec * (1.0 + streak_mult * max(0, self._mag_chol_fail_streak - 1))
+            if projected:
+                cooldown *= 1.5
+            cooldown = float(np.clip(cooldown, 0.0, max_sec))
+            self._mag_chol_cooldown_until = max(self._mag_chol_cooldown_until, float(timestamp) + cooldown)
+            return
+
+        if applied:
+            self._mag_chol_fail_streak = max(0, self._mag_chol_fail_streak - 1)
+
+    def _check_conditioning_guard(self,
+                                  health_key: str,
+                                  p_max: float,
+                                  p_cond: float,
+                                  policy_decision: Optional[Any] = None) -> tuple[bool, str, float]:
         """
         Conditioning guard for MAG path.
 
@@ -296,6 +353,13 @@ class MagnetometerService:
             return False, "", 1.0
         pcond_hard = float(cfg.get("MAG_CONDITIONING_GUARD_HARD_PCOND", 1e12))
         pmax_hard = float(cfg.get("MAG_CONDITIONING_GUARD_HARD_PMAX", 1e7))
+        pcond_warn = float(cfg.get("MAG_CONDITIONING_GUARD_WARN_PCOND", 8e11))
+        pmax_warn = float(cfg.get("MAG_CONDITIONING_GUARD_WARN_PMAX", 8e6))
+        if policy_decision is not None:
+            pcond_hard = float(policy_decision.extra("conditioning_hard_pcond", pcond_hard))
+            pmax_hard = float(policy_decision.extra("conditioning_hard_pmax", pmax_hard))
+            pcond_warn = float(policy_decision.extra("conditioning_warn_pcond", pcond_warn))
+            pmax_warn = float(policy_decision.extra("conditioning_warn_pmax", pmax_warn))
         if not np.isfinite(p_cond):
             p_cond = float("inf")
         if not np.isfinite(p_max):
@@ -303,21 +367,38 @@ class MagnetometerService:
 
         extreme_pcond = float(cfg.get("MAG_CONDITIONING_GUARD_EXTREME_PCOND", 8.0 * pcond_hard))
         extreme_pmax = float(cfg.get("MAG_CONDITIONING_GUARD_EXTREME_PMAX", 4.0 * pmax_hard))
+        if policy_decision is not None:
+            extreme_pcond = float(policy_decision.extra("conditioning_extreme_pcond", extreme_pcond))
+            extreme_pmax = float(policy_decision.extra("conditioning_extreme_pmax", extreme_pmax))
         if p_cond > extreme_pcond or p_max > extreme_pmax:
             return True, "skip_conditioning_hard_extreme", 1.0
 
         if p_cond > pcond_hard or p_max > pmax_hard:
             soft_enable = bool(cfg.get("MAG_CONDITIONING_GUARD_SOFT_ENABLE", True))
-            if soft_enable and health_key in ("WARNING", "DEGRADED", "RECOVERY"):
+            if policy_decision is not None:
+                soft_enable = bool(policy_decision.extra("conditioning_soft_enable", 1.0) > 0.5)
+            if soft_enable:
                 soft_mult = float(cfg.get("MAG_CONDITIONING_GUARD_SOFT_R_MULT", 4.0))
-                soft_mult *= float(
-                    cfg.get(
-                        f"MAG_CONDITIONING_GUARD_SOFT_R_MULT_{health_key}",
-                        1.0,
+                health_soft_key = f"MAG_CONDITIONING_GUARD_SOFT_R_MULT_{health_key}"
+                health_soft_default = float(cfg.get("MAG_CONDITIONING_GUARD_SOFT_R_MULT_HEALTHY", 1.0))
+                health_soft_mult = float(cfg.get(health_soft_key, health_soft_default))
+                if policy_decision is not None:
+                    soft_mult = float(policy_decision.extra("conditioning_soft_r_mult", soft_mult))
+                    health_soft_mult = float(
+                        policy_decision.extra(
+                            f"conditioning_soft_r_mult_{str(health_key).lower()}",
+                            health_soft_mult,
+                        )
                     )
-                )
-                return False, "conditioning_soft_inflate", max(1.0, soft_mult)
+                soft_mult *= health_soft_mult
+                if np.isfinite(soft_mult) and soft_mult > 1.0:
+                    return False, "conditioning_hard_soft_inflate", max(1.0, soft_mult)
             return True, "skip_conditioning_hard", 1.0
+
+        # Healthy-state fail-soft to prevent low-level MAG conditioning churn.
+        if health_key == "HEALTHY" and (p_cond > pcond_warn or p_max > pmax_warn):
+            healthy_soft = float(cfg.get("MAG_CONDITIONING_GUARD_SOFT_R_MULT_HEALTHY", 1.6))
+            return False, "conditioning_warn_soft_inflate", max(1.0, healthy_soft)
 
         return False, "", 1.0
 
@@ -387,6 +468,28 @@ class MagnetometerService:
                     "threshold": np.nan,
                     "r_scale_used": float(mag_policy_scales.get("r_scale", 1.0)),
                     "reason_code": f"policy_mode_{str(policy_decision.mode).lower()}",
+                }
+                self.runner.adaptive_service.record_adaptive_measurement(
+                    "MAG",
+                    adaptive_info=mag_adaptive_info,
+                    timestamp=float(mag_rec.t),
+                    policy_scales=mag_policy_scales,
+                )
+                self.runner.state.mag_rejects += 1
+                continue
+
+            # Temporary cooldown after MAG-triggered conditioning failures.
+            if float(mag_rec.t) < float(self._mag_chol_cooldown_until):
+                mag_adaptive_info = {
+                    "sensor": "MAG",
+                    "accepted": False,
+                    "attempted": 1,
+                    "dof": 1,
+                    "nis_norm": np.nan,
+                    "chi2": np.nan,
+                    "threshold": np.nan,
+                    "r_scale_used": float(max(1e-6, mag_policy_scales.get("r_scale", 1.0))),
+                    "reason_code": "skip_chol_cooldown",
                 }
                 self.runner.adaptive_service.record_adaptive_measurement(
                     "MAG",
@@ -493,7 +596,10 @@ class MagnetometerService:
                 health_key=health_key,
             )
             cond_skip, cond_reason, cond_r_mult = self._check_conditioning_guard(
-                health_key=health_key, p_max=p_max, p_cond=p_cond
+                health_key=health_key,
+                p_max=p_max,
+                p_cond=p_cond,
+                policy_decision=policy_decision,
             )
             if np.isfinite(cond_r_mult) and cond_r_mult > 1.0:
                 sigma_mag_scaled *= float(cond_r_mult)
@@ -556,6 +662,7 @@ class MagnetometerService:
             # Apply magnetometer update using FILTERED yaw
             # CRITICAL: Pass filtered yaw directly instead of raw mag
             use_estimated_bias = self._should_use_estimated_bias(health_key=health_key, p_cond=p_cond)
+            chol_before, proj_before = self._conditioning_counters()
             applied, reason = apply_magnetometer_update(
                 self.runner.kf,
                 mag_calibrated=mag_cal,  # Still needed for compute_yaw_from_mag inside
@@ -576,6 +683,13 @@ class MagnetometerService:
                 r_scale_extra=float(mag_policy_scales.get("r_scale", 1.0)),
                 policy_decision=policy_decision,
                 adaptive_info=mag_adaptive_info,
+            )
+            self._update_mag_chol_cooldown(
+                timestamp=float(mag_rec.t),
+                applied=bool(applied),
+                reason=str(reason),
+                chol_before=chol_before,
+                proj_before=proj_before,
             )
             if consistency_reason:
                 mag_adaptive_info["reason_code"] = consistency_reason
@@ -629,6 +743,10 @@ class MagnetometerService:
                 policy_r_scale = 1.0
 
         if policy_decision is not None and str(policy_decision.mode).upper() in ("HOLD", "SKIP"):
+            self.runner.state.mag_rejects += 1
+            return
+
+        if float(mag_rec.t) < float(self._mag_chol_cooldown_until):
             self.runner.state.mag_rejects += 1
             return
 
@@ -700,7 +818,10 @@ class MagnetometerService:
         if str(mag_quality.get("decision", "")) == "bad_skip":
             skip_mag = True
         cond_skip, cond_reason, cond_r_mult = self._check_conditioning_guard(
-            health_key=health_key, p_max=p_max, p_cond=p_cond
+            health_key=health_key,
+            p_max=p_max,
+            p_cond=p_cond,
+            policy_decision=policy_decision,
         )
         if np.isfinite(cond_r_mult) and cond_r_mult > 1.0:
             sigma_mag_scaled *= float(cond_r_mult)
@@ -735,6 +856,7 @@ class MagnetometerService:
 
         # Apply magnetometer update using FILTERED yaw
         use_estimated_bias = self._should_use_estimated_bias(health_key=health_key, p_cond=p_cond)
+        chol_before, proj_before = self._conditioning_counters()
         applied, reason = apply_magnetometer_update(
             self.runner.kf,
             mag_calibrated=mag_cal,
@@ -754,6 +876,13 @@ class MagnetometerService:
             use_estimated_bias=use_estimated_bias,
             r_scale_extra=float(policy_r_scale),
             policy_decision=policy_decision,
+        )
+        self._update_mag_chol_cooldown(
+            timestamp=float(mag_rec.t),
+            applied=bool(applied),
+            reason=str(reason),
+            chol_before=chol_before,
+            proj_before=proj_before,
         )
 
         if applied:

@@ -79,6 +79,20 @@ def _validate_yaml_config(cfg: Dict[str, Any], config_path: str) -> None:
         )
 
 
+def _as_float_list(value: Any, default: Tuple[float, ...]) -> list:
+    """Best-effort parse list/tuple into list[float] with safe fallback."""
+    if isinstance(value, (list, tuple)):
+        out = []
+        for v in value:
+            try:
+                out.append(float(v))
+            except Exception:
+                continue
+        if len(out) > 0:
+            return out
+    return [float(v) for v in default]
+
+
 # =============================================================================
 # VIOConfig Dataclass - Single source of truth for VIO runtime settings
 # =============================================================================
@@ -412,6 +426,9 @@ def load_config(config_path: str) -> VIOConfig:
     result['MAG_CONDITIONING_GUARD_SOFT_R_MULT_RECOVERY'] = float(
         warning_weak_yaw.get('conditioning_guard_soft_r_mult_recovery', 1.0)
     )
+    result['MAG_CONDITIONING_GUARD_SOFT_R_MULT_HEALTHY'] = float(
+        warning_weak_yaw.get('conditioning_guard_soft_r_mult_healthy', 1.6)
+    )
     result['MAG_BIAS_FREEZE_WARN_PCOND'] = float(
         warning_weak_yaw.get('bias_freeze_warn_pcond', 1e10)
     )
@@ -423,6 +440,15 @@ def load_config(config_path: str) -> VIOConfig:
     )
     result['MAG_DEGRADED_EXTRA_R_MULT'] = float(
         warning_weak_yaw.get('degraded_extra_r_mult', 2.8)
+    )
+    result['MAG_CHOL_COOLDOWN_SEC'] = float(
+        warning_weak_yaw.get('chol_cooldown_sec', 0.30)
+    )
+    result['MAG_CHOL_COOLDOWN_STREAK_MULT'] = float(
+        warning_weak_yaw.get('chol_cooldown_streak_mult', 0.25)
+    )
+    result['MAG_CHOL_COOLDOWN_MAX_SEC'] = float(
+        warning_weak_yaw.get('chol_cooldown_max_sec', 2.0)
     )
     result['VISION_HEADING_MIN_INLIERS'] = int(
         mag.get('vision_heading_min_inliers', 25)
@@ -694,6 +720,78 @@ def load_config(config_path: str) -> VIOConfig:
         result['LOOP_SPEED_SKIP_M_S'] = float(fs.get('speed_skip_m_s', 35.0))
         result['LOOP_SPEED_SIGMA_INFLATE_M_S'] = float(fs.get('speed_sigma_inflate_m_s', 25.0))
         result['LOOP_SPEED_SIGMA_MULT'] = float(fs.get('speed_sigma_mult', 1.5))
+        speed_gate = lc.get('speed_gate', {})
+        speed_gate_normal = speed_gate.get('normal', {})
+        speed_gate_failsoft = speed_gate.get('fail_soft', speed_gate.get('failsoft', {}))
+        result['LOOP_SPEED_SKIP_M_S_NORMAL'] = float(
+            speed_gate_normal.get('speed_skip_m_s', fs.get('speed_skip_m_s_normal', fs.get('speed_skip_m_s', 35.0)))
+        )
+        result['LOOP_SPEED_SIGMA_INFLATE_M_S_NORMAL'] = float(
+            speed_gate_normal.get(
+                'speed_sigma_inflate_m_s',
+                fs.get('speed_sigma_inflate_m_s_normal', fs.get('speed_sigma_inflate_m_s', 25.0)),
+            )
+        )
+        result['LOOP_SPEED_SIGMA_MULT_NORMAL'] = float(
+            speed_gate_normal.get('speed_sigma_mult', fs.get('speed_sigma_mult_normal', fs.get('speed_sigma_mult', 1.5)))
+        )
+        result['LOOP_SPEED_SKIP_M_S_FAILSOFT'] = float(
+            speed_gate_failsoft.get('speed_skip_m_s', fs.get('speed_skip_m_s_failsoft', fs.get('speed_skip_m_s', 35.0)))
+        )
+        result['LOOP_SPEED_SIGMA_INFLATE_M_S_FAILSOFT'] = float(
+            speed_gate_failsoft.get(
+                'speed_sigma_inflate_m_s',
+                fs.get('speed_sigma_inflate_m_s_failsoft', fs.get('speed_sigma_inflate_m_s', 25.0)),
+            )
+        )
+        result['LOOP_SPEED_SIGMA_MULT_FAILSOFT'] = float(
+            speed_gate_failsoft.get('speed_sigma_mult', fs.get('speed_sigma_mult_failsoft', fs.get('speed_sigma_mult', 1.5)))
+        )
+        speed_yaw_cap = lc.get('speed_yaw_cap', {})
+        result['LOOP_SPEED_YAW_CAP_BREAKPOINTS_M_S'] = _as_float_list(
+            speed_yaw_cap.get('breakpoints_m_s', [20.0, 35.0, 50.0]),
+            (20.0, 35.0, 50.0),
+        )
+        result['LOOP_SPEED_YAW_CAP_NORMAL_DEG'] = _as_float_list(
+            speed_yaw_cap.get('normal_cap_deg', [3.0, 2.2, 1.5]),
+            (3.0, 2.2, 1.5),
+        )
+        result['LOOP_SPEED_YAW_CAP_FAILSOFT_DEG'] = _as_float_list(
+            speed_yaw_cap.get('fail_soft_cap_deg', speed_yaw_cap.get('failsoft_cap_deg', [2.5, 1.8, 1.2])),
+            (2.5, 1.8, 1.2),
+        )
+        temporal_apply = lc.get('temporal_apply', {})
+        result['LOOP_APPLY_CONFIRM_ENABLE'] = bool(temporal_apply.get('enable', True))
+        result['LOOP_APPLY_CONFIRM_WINDOW_SEC'] = float(temporal_apply.get('confirm_window_sec', 3.0))
+        result['LOOP_APPLY_CONFIRM_YAW_DEG'] = float(temporal_apply.get('confirm_yaw_deg', 6.0))
+        result['LOOP_APPLY_CONFIRM_HITS_NORMAL'] = int(temporal_apply.get('confirm_hits_normal', 1))
+        result['LOOP_APPLY_CONFIRM_HITS_FAILSOFT'] = int(temporal_apply.get('confirm_hits_failsoft', 2))
+        result['LOOP_APPLY_CONFIRM_SPEED_M_S'] = float(temporal_apply.get('confirm_speed_m_s', 25.0))
+        result['LOOP_APPLY_CONFIRM_EXTRA_HITS_HIGH_SPEED'] = int(
+            temporal_apply.get('confirm_extra_hits_high_speed', 1)
+        )
+        result['LOOP_APPLY_CONFIRM_PHASE_DYNAMIC_MIN_HITS'] = int(
+            temporal_apply.get('phase_dynamic_min_hits', 2)
+        )
+        result['LOOP_COOLDOWN_SEC_NORMAL'] = float(
+            temporal_apply.get('cooldown_sec_normal', qg.get('cooldown_sec', 2.0))
+        )
+        result['LOOP_COOLDOWN_SEC_FAILSOFT'] = float(
+            temporal_apply.get('cooldown_sec_failsoft', max(qg.get('cooldown_sec', 2.0), 3.0))
+        )
+        result['LOOP_COOLDOWN_SPEED_M_S'] = float(
+            temporal_apply.get(
+                'cooldown_speed_m_s',
+                max(
+                    fs.get('speed_sigma_inflate_m_s', 25.0),
+                    speed_gate_normal.get('speed_sigma_inflate_m_s', fs.get('speed_sigma_inflate_m_s', 25.0)),
+                ),
+            )
+        )
+        result['LOOP_COOLDOWN_SPEED_MULT'] = float(temporal_apply.get('cooldown_speed_mult', 1.35))
+        result['LOOP_BURST_WINDOW_SEC'] = float(temporal_apply.get('burst_window_sec', 12.0))
+        result['LOOP_BURST_MAX_CORRECTIONS'] = int(temporal_apply.get('burst_max_corrections', 2))
+        result['LOOP_BURST_COOLDOWN_SEC'] = float(temporal_apply.get('burst_cooldown_sec', 6.0))
     else:
         result['USE_LOOP_CLOSURE'] = True
         result['LOOP_POSITION_THRESHOLD'] = 30.0
@@ -725,6 +823,30 @@ def load_config(config_path: str) -> VIOConfig:
         result['LOOP_SPEED_SKIP_M_S'] = 35.0
         result['LOOP_SPEED_SIGMA_INFLATE_M_S'] = 25.0
         result['LOOP_SPEED_SIGMA_MULT'] = 1.5
+        result['LOOP_SPEED_SKIP_M_S_NORMAL'] = 35.0
+        result['LOOP_SPEED_SIGMA_INFLATE_M_S_NORMAL'] = 25.0
+        result['LOOP_SPEED_SIGMA_MULT_NORMAL'] = 1.5
+        result['LOOP_SPEED_SKIP_M_S_FAILSOFT'] = 35.0
+        result['LOOP_SPEED_SIGMA_INFLATE_M_S_FAILSOFT'] = 25.0
+        result['LOOP_SPEED_SIGMA_MULT_FAILSOFT'] = 1.5
+        result['LOOP_SPEED_YAW_CAP_BREAKPOINTS_M_S'] = [20.0, 35.0, 50.0]
+        result['LOOP_SPEED_YAW_CAP_NORMAL_DEG'] = [3.0, 2.2, 1.5]
+        result['LOOP_SPEED_YAW_CAP_FAILSOFT_DEG'] = [2.5, 1.8, 1.2]
+        result['LOOP_APPLY_CONFIRM_ENABLE'] = True
+        result['LOOP_APPLY_CONFIRM_WINDOW_SEC'] = 3.0
+        result['LOOP_APPLY_CONFIRM_YAW_DEG'] = 6.0
+        result['LOOP_APPLY_CONFIRM_HITS_NORMAL'] = 1
+        result['LOOP_APPLY_CONFIRM_HITS_FAILSOFT'] = 2
+        result['LOOP_APPLY_CONFIRM_SPEED_M_S'] = 25.0
+        result['LOOP_APPLY_CONFIRM_EXTRA_HITS_HIGH_SPEED'] = 1
+        result['LOOP_APPLY_CONFIRM_PHASE_DYNAMIC_MIN_HITS'] = 2
+        result['LOOP_COOLDOWN_SEC_NORMAL'] = 2.0
+        result['LOOP_COOLDOWN_SEC_FAILSOFT'] = 3.0
+        result['LOOP_COOLDOWN_SPEED_M_S'] = 25.0
+        result['LOOP_COOLDOWN_SPEED_MULT'] = 1.35
+        result['LOOP_BURST_WINDOW_SEC'] = 12.0
+        result['LOOP_BURST_MAX_CORRECTIONS'] = 2
+        result['LOOP_BURST_COOLDOWN_SEC'] = 6.0
 
     # =========================================================================
     # Kinematic consistency guard
@@ -763,6 +885,18 @@ def load_config(config_path: str) -> VIOConfig:
         kin_cfg.get('speed_blend_alpha', max(0.2, float(kin_cfg.get('hard_blend_alpha', 0.0))))
     )
     result['KIN_GUARD_SPEED_INFLATE'] = float(kin_cfg.get('speed_inflate', 1.12))
+    result['KIN_GUARD_CERTAINTY_ENABLE'] = bool(kin_cfg.get('certainty_enable', False))
+    result['KIN_GUARD_CERTAINTY_MISMATCH_MULT'] = float(kin_cfg.get('certainty_mismatch_mult', 1.6))
+    result['KIN_GUARD_CERTAINTY_SPEED_MULT'] = float(kin_cfg.get('certainty_speed_mult', 1.15))
+    result['KIN_GUARD_CERTAINTY_INFLATE'] = float(kin_cfg.get('certainty_inflate', 1.35))
+    result['KIN_GUARD_CERTAINTY_BLEND_ALPHA'] = float(kin_cfg.get('certainty_blend_alpha', 0.35))
+    result['KIN_GUARD_CERTAINTY_SPEED_CAP_M_S'] = float(
+        kin_cfg.get('certainty_speed_cap_m_s', kin_cfg.get('max_state_speed_m_s', 120.0))
+    )
+    result['KIN_GUARD_CERTAINTY_MIN_ACTION_DT_SEC'] = float(
+        kin_cfg.get('certainty_min_action_dt_sec', kin_cfg.get('min_action_dt_sec', 0.25))
+    )
+    result['KIN_GUARD_CERTAINTY_REQUIRE_BOTH'] = bool(kin_cfg.get('certainty_require_both', False))
     
     # =========================================================================
     # NEW: Vibration Detection (v2.8.0)
@@ -809,6 +943,11 @@ def load_config(config_path: str) -> VIOConfig:
     # =========================================================================
     vps_cfg = config.get('vps', {})
     result['VPS_ACCURACY_MODE'] = bool(vps_cfg.get('accuracy_mode', False))
+    result['VPS_MATCHER_MODE'] = str(vps_cfg.get('matcher_mode', 'orb')).lower()
+    result['VPS_MIN_UPDATE_INTERVAL'] = float(vps_cfg.get('min_update_interval', 0.5))
+    result['VPS_MAX_TOTAL_CANDIDATES'] = int(vps_cfg.get('max_total_candidates', 0))
+    result['VPS_MAX_FRAME_TIME_MS_LOCAL'] = float(vps_cfg.get('max_frame_time_ms_local', 0.0))
+    result['VPS_MAX_FRAME_TIME_MS_GLOBAL'] = float(vps_cfg.get('max_frame_time_ms_global', 0.0))
     result['VPS_APPLY_MIN_INLIERS'] = int(vps_cfg.get('apply_min_inliers', 8))
     result['VPS_APPLY_MIN_CONFIDENCE'] = float(vps_cfg.get('apply_min_confidence', 0.18))
     result['VPS_APPLY_MAX_REPROJ_ERROR'] = float(vps_cfg.get('apply_max_reproj_error', 1.2))

@@ -58,13 +58,15 @@ class PhaseService:
         speed_xy = float(np.linalg.norm(velocity[:2])) if velocity is not None and len(velocity) >= 2 else 0.0
         alt_abs = abs(float(altitude_change)) if altitude_change is not None and np.isfinite(altitude_change) else 0.0
 
-        # One-way protection: keep NORMAL unless we have sustained landing-like motion.
+        # One-way protection: keep NORMAL unless we explicitly allow safe revert.
         if current_phase == 2 and raw_phase < 2:
-            allow_revert = bool(self.runner.PHASE_ALLOW_NORMAL_TO_EARLY)
-            allow_revert = allow_revert and speed_xy <= max(0.1, float(self.runner.PHASE_REVERT_MAX_SPEED))
-            allow_revert = allow_revert and alt_abs <= max(0.1, float(self.runner.PHASE_REVERT_MAX_ALT_CHANGE))
-            if not allow_revert:
+            if not bool(self.runner.PHASE_ALLOW_NORMAL_TO_EARLY):
                 target_phase = 2
+            else:
+                allow_revert = speed_xy <= max(0.1, float(self.runner.PHASE_REVERT_MAX_SPEED))
+                allow_revert = allow_revert and alt_abs <= max(0.1, float(self.runner.PHASE_REVERT_MAX_ALT_CHANGE))
+                if not allow_revert:
+                    target_phase = 2
 
         # Avoid jumping SPINUP->NORMAL directly.
         if current_phase == 0 and target_phase == 2:

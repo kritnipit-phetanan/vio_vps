@@ -33,6 +33,9 @@ except Exception as exc:  # pragma: no cover
 DEFAULT_PHASE_SEQUENCE_STAGE_A = ["A1", "A2", "A3", "A4", "A5"]
 DEFAULT_PHASE_SEQUENCE_STAGE_E = ["E1", "E2", "E3", "E4", "E5"]
 DEFAULT_PHASE_SEQUENCE_STAGE_F = ["F1", "F2", "F3", "F4", "F5"]
+DEFAULT_PHASE_SEQUENCE_STAGE_G = ["G5_1", "G5_2", "G6_1", "G7_1", "G7_2"]
+DEFAULT_PHASE_SEQUENCE_STAGE_G_CONT = ["G7_1_HALF", "G5_3"]
+DEFAULT_PHASE_SEQUENCE_STAGE_G_MAG = ["G5_MAG_SAFE", "G5_MAG_COND"]
 DEFAULT_PHASE_SEQUENCE = list(DEFAULT_PHASE_SEQUENCE_STAGE_A)
 
 # One-knob assignments for Stage-A pre-backend tuning (Phase4-base roadmap).
@@ -72,19 +75,6 @@ PHASE_ASSIGNMENTS: dict[str, dict[str, Any]] = {
         "vps.relocalization.fail_streak_trigger": 4,
         "vps.relocalization.xy_sigma_trigger_m": 25.0,
         "vps.relocalization.max_centers": 8,
-    },
-    "D1": {
-        # Near-RT budget knob 1: reduce async backend cadence.
-        "backend.optimize_rate_hz": 1.0,
-        "backend.poll_interval_sec": 1.0,
-    },
-    "D2": {
-        # Near-RT budget knob 2: reduce VPS invocation/candidate load.
-        "vps.min_update_interval": 0.8,
-        "vps.max_candidates": 4,
-        "vps.global_max_candidates": 8,
-        "vps.relocalization.max_centers": 6,
-        "vps.relocalization.ring_samples": 6,
     },
     "E1": {
         # Phase-E base marker (no knob change by design).
@@ -136,17 +126,79 @@ PHASE_ASSIGNMENTS: dict[str, dict[str, Any]] = {
         # Optional bounded LightGlue rescue re-enable after F1-F4 stability.
         "vps.matcher_mode": "orb_lightglue_rescue",
     },
-    # Backward-compatible aliases.
-    "1": {},
-    "2": {},
-    "3": {},
-    "4": {},
+    "G5_1": {
+        # Loop temporal tighten for heading stability (normal path + stricter cap).
+        "loop_closure.temporal_apply.confirm_hits_normal": 2,
+        "loop_closure.temporal_apply.cooldown_sec_normal": 2.4,
+        "loop_closure.fail_soft.max_abs_yaw_corr_deg": 2.2,
+        "loop_closure.quality_gate.yaw_residual_bound_deg": 18.0,
+    },
+    "G5_2": {
+        # MAG soft-inflate stabilization: delay hard-skip, tighten per-update dyaw.
+        "magnetometer.warning_weak_yaw.conditioning_guard_hard_pcond": 7.0e10,
+        "magnetometer.warning_weak_yaw.conditioning_guard_hard_pmax": 2.2e6,
+        "magnetometer.warning_weak_yaw.warning_max_dyaw_deg": 0.8,
+        "magnetometer.warning_weak_yaw.warning_extra_r_mult": 3.5,
+    },
+    "G6_1": {
+        # MSCKF reprojection retune after heading is stable.
+        "vio.msckf.avg_reproj_gate_factor": 2.4,
+        "vio.msckf.reproj_state_aware.mid_gate_mult": 1.20,
+    },
+    "G7_1": {
+        # VPS coverage/backoff duty-cycle and bounded candidate budget.
+        "vps.matcher_mode": "orb",
+        "vps.max_total_candidates": 16,
+        "vps.max_frame_time_ms_local": 250.0,
+        "vps.max_frame_time_ms_global": 700.0,
+        "vps.relocalization.global_backoff_probe_every_attempts": 8,
+        "vps.relocalization.global_backoff_probe_min_interval_sec": 1.5,
+        "vps.relocalization.global_probe_on_no_coverage": True,
+        "vps.relocalization.global_probe_no_coverage_streak": 2,
+        "vps.relocalization.no_coverage_recovery_streak": 2,
+        "vps.relocalization.no_coverage_use_last_success": True,
+        "vps.relocalization.no_coverage_use_last_coverage": True,
+        "vps.relocalization.no_coverage_recovery_radius_m": [20.0, 50.0],
+        "vps.relocalization.no_coverage_recovery_samples": 5,
+        "vps.relocalization.no_coverage_recovery_max_centers": 4,
+    },
+    "G7_2": {
+        # Near-RT refinement once coverage is recovered.
+        "vps.min_update_interval": 0.6,
+        "backend.optimize_rate_hz": 0.8,
+        "backend.poll_interval_sec": 1.2,
+    },
+    "G7_1_HALF": {
+        # Half-step runtime/backoff from G7_1: keep runtime gains without over-pruning coverage.
+        "vps.matcher_mode": "orb",
+        "vps.max_total_candidates": 24,
+        "vps.max_frame_time_ms_local": 320.0,
+        "vps.max_frame_time_ms_global": 900.0,
+        "vps.relocalization.global_backoff_probe_every_attempts": 10,
+        "vps.relocalization.global_backoff_probe_min_interval_sec": 1.8,
+    },
+    "G5_3": {
+        # MAG-only follow-up: reduce hard-extreme skips while keeping yaw clamp conservative.
+        "magnetometer.warning_weak_yaw.conditioning_guard_hard_pcond": 9.0e10,
+        "magnetometer.warning_weak_yaw.conditioning_guard_hard_pmax": 2.8e6,
+        "magnetometer.warning_weak_yaw.conditioning_guard_extreme_pcond": 1.2e12,
+        "magnetometer.warning_weak_yaw.conditioning_guard_extreme_pmax": 1.4e7,
+    },
+    "G5_MAG_SAFE": {
+        # G5 follow-up (MAG safety only, conservative):
+        # keep fail-soft style but reduce yaw injection per update.
+        "magnetometer.warning_weak_yaw.warning_extra_r_mult": 3.8,
+        "magnetometer.warning_weak_yaw.warning_max_dyaw_deg": 0.7,
+    },
+    "G5_MAG_COND": {
+        # G5 follow-up (MAG conditioning only, micro-step):
+        # slight relaxation from G5_2 to avoid hard-extreme flood but keep guard tight.
+        "magnetometer.warning_weak_yaw.conditioning_guard_hard_pcond": 7.4e10,
+        "magnetometer.warning_weak_yaw.conditioning_guard_hard_pmax": 2.3e6,
+        "magnetometer.warning_weak_yaw.conditioning_guard_extreme_pcond": 1.45e11,
+        "magnetometer.warning_weak_yaw.conditioning_guard_extreme_pmax": 2.7e6,
+    },
 }
-PHASE_ASSIGNMENTS["1"] = PHASE_ASSIGNMENTS["A1"]
-PHASE_ASSIGNMENTS["2"] = PHASE_ASSIGNMENTS["A2"]
-PHASE_ASSIGNMENTS["3"] = PHASE_ASSIGNMENTS["A3"]
-PHASE_ASSIGNMENTS["4"] = PHASE_ASSIGNMENTS["A4"]
-PHASE_ASSIGNMENTS["5"] = PHASE_ASSIGNMENTS["A5"]
 
 
 def list_run_dirs(repo_dir: Path) -> list[Path]:
@@ -569,7 +621,11 @@ def main() -> int:
     parser.add_argument("--lock_profile", default="pre_backend", choices=["pre_backend", "backend", "near_rt_backend"])
     parser.add_argument("--max_regress_pct", type=float, default=15.0)
     parser.add_argument("--apply_best_config", type=int, default=0, choices=[0, 1])
-    parser.add_argument("--phase_set", default="stageA", choices=["stageA", "stageE", "stageF", "custom"])
+    parser.add_argument(
+        "--phase_set",
+        default="stageA",
+        choices=["stageA", "stageE", "stageF", "stageG", "stageG_cont", "stageG_mag", "custom"],
+    )
     parser.add_argument("--phases", default="")
     parser.add_argument("--dry_run", action="store_true", help="Plan and emit phase table without running benchmarks")
     parser.add_argument("--force_run_noop", action="store_true", help="Run phase even when no keys would change")
@@ -604,6 +660,12 @@ def main() -> int:
         default_phases = DEFAULT_PHASE_SEQUENCE_STAGE_E
     elif args.phase_set == "stageF":
         default_phases = DEFAULT_PHASE_SEQUENCE_STAGE_F
+    elif args.phase_set == "stageG":
+        default_phases = DEFAULT_PHASE_SEQUENCE_STAGE_G
+    elif args.phase_set == "stageG_cont":
+        default_phases = DEFAULT_PHASE_SEQUENCE_STAGE_G_CONT
+    elif args.phase_set == "stageG_mag":
+        default_phases = DEFAULT_PHASE_SEQUENCE_STAGE_G_MAG
     else:
         default_phases = DEFAULT_PHASE_SEQUENCE
     phases_raw = args.phases if str(args.phases).strip() else ",".join(default_phases)

@@ -52,6 +52,7 @@ class BootstrapService:
             self.runner.global_config = self.runner.config._raw_config
         elif self.runner.config.config_yaml:
             self.load_config()
+        self._apply_phase_detection_thresholds(self.runner.global_config)
 
         print(f"\n[CONFIG] Algorithm settings (from YAML):")
         print(f"  config_yaml: {self.runner.config.config_yaml}")
@@ -63,23 +64,32 @@ class BootstrapService:
         print(f"  fast_mode: {self.runner.config.fast_mode}")
         print(f"  frame_skip: {self.runner.config.frame_skip}")
 
+    def _apply_phase_detection_thresholds(self, cfg: dict):
+        """
+        Apply phase-detection thresholds from compiled runtime config.
+
+        Important: these values must be applied even when config comes from
+        `VIOConfig._raw_config` (not only from load_config()).
+        """
+        self.runner.PHASE_SPINUP_VELOCITY_THRESH = float(cfg.get("PHASE_SPINUP_VELOCITY_THRESH", 1.0))
+        self.runner.PHASE_SPINUP_VIBRATION_THRESH = float(cfg.get("PHASE_SPINUP_VIBRATION_THRESH", 0.3))
+        self.runner.PHASE_SPINUP_ALT_CHANGE_THRESH = float(cfg.get("PHASE_SPINUP_ALT_CHANGE_THRESH", 5.0))
+        self.runner.PHASE_EARLY_VELOCITY_SIGMA_THRESH = float(cfg.get("PHASE_EARLY_VELOCITY_SIGMA_THRESH", 3.0))
+        self.runner.PHASE_HYSTERESIS_ENABLED = bool(cfg.get("PHASE_HYSTERESIS_ENABLED", True))
+        self.runner.PHASE_UP_HOLD_SEC = float(cfg.get("PHASE_UP_HOLD_SEC", 0.75))
+        self.runner.PHASE_DOWN_HOLD_SEC = float(cfg.get("PHASE_DOWN_HOLD_SEC", 6.0))
+        self.runner.PHASE_ALLOW_NORMAL_TO_EARLY = bool(cfg.get("PHASE_ALLOW_NORMAL_TO_EARLY", True))
+        self.runner.PHASE_REVERT_MAX_SPEED = float(cfg.get("PHASE_REVERT_MAX_SPEED", 18.0))
+        self.runner.PHASE_REVERT_MAX_ALT_CHANGE = float(cfg.get("PHASE_REVERT_MAX_ALT_CHANGE", 60.0))
+
     def load_config(self) -> dict:
         """Load YAML configuration file."""
         if self.runner.config.config_yaml:
             cfg = load_config(self.runner.config.config_yaml)
             self.runner.global_config = cfg
 
-            # Load flight phase detection thresholds from YAML (v3.4.0)
-            self.runner.PHASE_SPINUP_VELOCITY_THRESH = cfg.get("PHASE_SPINUP_VELOCITY_THRESH", 1.0)
-            self.runner.PHASE_SPINUP_VIBRATION_THRESH = cfg.get("PHASE_SPINUP_VIBRATION_THRESH", 0.3)
-            self.runner.PHASE_SPINUP_ALT_CHANGE_THRESH = cfg.get("PHASE_SPINUP_ALT_CHANGE_THRESH", 5.0)
-            self.runner.PHASE_EARLY_VELOCITY_SIGMA_THRESH = cfg.get("PHASE_EARLY_VELOCITY_SIGMA_THRESH", 3.0)
-            self.runner.PHASE_HYSTERESIS_ENABLED = bool(cfg.get("PHASE_HYSTERESIS_ENABLED", True))
-            self.runner.PHASE_UP_HOLD_SEC = float(cfg.get("PHASE_UP_HOLD_SEC", 0.75))
-            self.runner.PHASE_DOWN_HOLD_SEC = float(cfg.get("PHASE_DOWN_HOLD_SEC", 6.0))
-            self.runner.PHASE_ALLOW_NORMAL_TO_EARLY = bool(cfg.get("PHASE_ALLOW_NORMAL_TO_EARLY", True))
-            self.runner.PHASE_REVERT_MAX_SPEED = float(cfg.get("PHASE_REVERT_MAX_SPEED", 18.0))
-            self.runner.PHASE_REVERT_MAX_ALT_CHANGE = float(cfg.get("PHASE_REVERT_MAX_ALT_CHANGE", 60.0))
+            # Load flight phase detection thresholds from YAML (v3.4.0).
+            self._apply_phase_detection_thresholds(cfg)
 
             return cfg
         return {}

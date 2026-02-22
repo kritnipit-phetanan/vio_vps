@@ -51,9 +51,58 @@ class PolicyRuntimeService:
         "LOOP_SPEED_SKIP_M_S": "yaml.loop_closure.fail_soft",
         "LOOP_SPEED_SIGMA_INFLATE_M_S": "yaml.loop_closure.fail_soft",
         "LOOP_SPEED_SIGMA_MULT": "yaml.loop_closure.fail_soft",
+        "LOOP_SPEED_SKIP_M_S_NORMAL": "yaml.loop_closure.speed_gate.normal",
+        "LOOP_SPEED_SKIP_M_S_FAILSOFT": "yaml.loop_closure.speed_gate.fail_soft",
+        "LOOP_SPEED_YAW_CAP_BREAKPOINTS_M_S": "yaml.loop_closure.speed_yaw_cap",
+        "LOOP_SPEED_YAW_CAP_NORMAL_DEG": "yaml.loop_closure.speed_yaw_cap",
+        "LOOP_SPEED_YAW_CAP_FAILSOFT_DEG": "yaml.loop_closure.speed_yaw_cap",
+        "LOOP_APPLY_CONFIRM_ENABLE": "yaml.loop_closure.temporal_apply",
+        "LOOP_APPLY_CONFIRM_HITS_NORMAL": "yaml.loop_closure.temporal_apply",
+        "LOOP_APPLY_CONFIRM_HITS_FAILSOFT": "yaml.loop_closure.temporal_apply",
+        "LOOP_APPLY_CONFIRM_WINDOW_SEC": "yaml.loop_closure.temporal_apply",
+        "LOOP_APPLY_CONFIRM_YAW_DEG": "yaml.loop_closure.temporal_apply",
+        "LOOP_COOLDOWN_SEC_NORMAL": "yaml.loop_closure.temporal_apply",
+        "LOOP_COOLDOWN_SEC_FAILSOFT": "yaml.loop_closure.temporal_apply",
+        "LOOP_BURST_WINDOW_SEC": "yaml.loop_closure.temporal_apply",
+        "LOOP_BURST_MAX_CORRECTIONS": "yaml.loop_closure.temporal_apply",
+        "LOOP_BURST_COOLDOWN_SEC": "yaml.loop_closure.temporal_apply",
+        "MAG_CONDITIONING_GUARD_HARD_PCOND": "yaml.magnetometer.warning_weak_yaw",
+        "MAG_CONDITIONING_GUARD_HARD_PMAX": "yaml.magnetometer.warning_weak_yaw",
+        "MAG_CONDITIONING_GUARD_EXTREME_PCOND": "yaml.magnetometer.warning_weak_yaw",
+        "MAG_CONDITIONING_GUARD_EXTREME_PMAX": "yaml.magnetometer.warning_weak_yaw",
+        "MAG_WARNING_EXTRA_R_MULT": "yaml.magnetometer.warning_weak_yaw",
+        "MAG_WARNING_MAX_DYAW_DEG": "yaml.magnetometer.warning_weak_yaw",
+        "MAG_DEGRADED_EXTRA_R_MULT": "yaml.magnetometer.warning_weak_yaw",
+        "MAG_DEGRADED_MAX_DYAW_DEG": "yaml.magnetometer.warning_weak_yaw",
+        "VPS_MATCHER_MODE": "yaml.vps",
+        "VPS_MIN_UPDATE_INTERVAL": "yaml.vps",
+        "VPS_MAX_TOTAL_CANDIDATES": "yaml.vps",
+        "VPS_MAX_FRAME_TIME_MS_LOCAL": "yaml.vps",
+        "VPS_MAX_FRAME_TIME_MS_GLOBAL": "yaml.vps",
         "KIN_GUARD_VEL_MISMATCH_WARN": "yaml.kinematic_guard",
         "KIN_GUARD_VEL_MISMATCH_HARD": "yaml.kinematic_guard",
         "KIN_GUARD_MAX_STATE_SPEED_M_S": "yaml.kinematic_guard",
+        "KIN_GUARD_MAX_INFLATE": "yaml.kinematic_guard",
+        "KIN_GUARD_HARD_BLEND_ALPHA": "yaml.kinematic_guard",
+        "KIN_GUARD_HARD_HOLD_SEC": "yaml.kinematic_guard",
+        "KIN_GUARD_RELEASE_HYSTERESIS_RATIO": "yaml.kinematic_guard",
+        "KIN_GUARD_MIN_ACTION_DT_SEC": "yaml.kinematic_guard",
+        "KIN_GUARD_MAX_BLEND_SPEED_M_S": "yaml.kinematic_guard",
+        "KIN_GUARD_MAX_KIN_SPEED_M_S": "yaml.kinematic_guard",
+        "KIN_GUARD_SPEED_HARD_M_S": "yaml.kinematic_guard",
+        "KIN_GUARD_SPEED_HARD_HOLD_SEC": "yaml.kinematic_guard",
+        "KIN_GUARD_SPEED_RELEASE_HYSTERESIS_RATIO": "yaml.kinematic_guard",
+        "KIN_GUARD_SPEED_BLEND_ALPHA": "yaml.kinematic_guard",
+        "KIN_GUARD_SPEED_INFLATE": "yaml.kinematic_guard",
+        "KIN_GUARD_ABS_SPEED_SANITY_M_S": "yaml.kinematic_guard",
+        "KIN_GUARD_CERTAINTY_ENABLE": "yaml.kinematic_guard",
+        "KIN_GUARD_CERTAINTY_MISMATCH_MULT": "yaml.kinematic_guard",
+        "KIN_GUARD_CERTAINTY_SPEED_MULT": "yaml.kinematic_guard",
+        "KIN_GUARD_CERTAINTY_INFLATE": "yaml.kinematic_guard",
+        "KIN_GUARD_CERTAINTY_BLEND_ALPHA": "yaml.kinematic_guard",
+        "KIN_GUARD_CERTAINTY_SPEED_CAP_M_S": "yaml.kinematic_guard",
+        "KIN_GUARD_CERTAINTY_MIN_ACTION_DT_SEC": "yaml.kinematic_guard",
+        "KIN_GUARD_CERTAINTY_REQUIRE_BOTH": "yaml.kinematic_guard",
         "IMU_HELPER_PERIODS": "adaptive.controller",
         "ADAPTIVE_SENSOR_R_SCALE": "adaptive.controller",
         "ADAPTIVE_SENSOR_CHI2_SCALE": "adaptive.controller",
@@ -141,17 +190,70 @@ class PolicyRuntimeService:
             )
             extras["max_abs_yaw_corr_deg"] = float(cfg.get("LOOP_MAX_ABS_YAW_CORR_DEG", 4.0))
             extras["reject_abs_yaw_corr_deg"] = float(cfg.get("LOOP_YAW_RESIDUAL_BOUND_DEG", 25.0))
+            extras["speed_yaw_cap_breakpoints_m_s"] = list(
+                cfg.get("LOOP_SPEED_YAW_CAP_BREAKPOINTS_M_S", [20.0, 35.0, 50.0])
+            )
+            extras["speed_yaw_cap_normal_deg"] = list(
+                cfg.get("LOOP_SPEED_YAW_CAP_NORMAL_DEG", [3.0, 2.2, 1.5])
+            )
+            extras["speed_yaw_cap_failsoft_deg"] = list(
+                cfg.get("LOOP_SPEED_YAW_CAP_FAILSOFT_DEG", [2.5, 1.8, 1.2])
+            )
             extras["base_sigma_yaw_deg"] = float(cfg.get("LOOP_BASE_SIGMA_YAW_DEG", 5.0))
             extras["fail_soft_sigma_yaw_deg"] = float(cfg.get("LOOP_FAIL_SOFT_SIGMA_YAW_DEG", 18.0))
             extras["dynamic_phase_sigma_mult"] = float(cfg.get("LOOP_DYNAMIC_PHASE_SIGMA_MULT", 1.15))
             extras["warning_sigma_mult"] = float(cfg.get("LOOP_WARNING_SIGMA_MULT", 1.20))
             extras["degraded_sigma_mult"] = float(cfg.get("LOOP_DEGRADED_SIGMA_MULT", 1.40))
+            extras["apply_confirm_enable"] = 1.0 if bool(cfg.get("LOOP_APPLY_CONFIRM_ENABLE", True)) else 0.0
+            extras["apply_confirm_window_sec"] = float(cfg.get("LOOP_APPLY_CONFIRM_WINDOW_SEC", 3.0))
+            extras["apply_confirm_yaw_deg"] = float(cfg.get("LOOP_APPLY_CONFIRM_YAW_DEG", 6.0))
+            extras["apply_confirm_hits_normal"] = float(cfg.get("LOOP_APPLY_CONFIRM_HITS_NORMAL", 1))
+            extras["apply_confirm_hits_failsoft"] = float(cfg.get("LOOP_APPLY_CONFIRM_HITS_FAILSOFT", 2))
+            extras["apply_confirm_speed_m_s"] = float(cfg.get("LOOP_APPLY_CONFIRM_SPEED_M_S", 25.0))
+            extras["apply_confirm_extra_hits_high_speed"] = float(
+                cfg.get("LOOP_APPLY_CONFIRM_EXTRA_HITS_HIGH_SPEED", 1)
+            )
+            extras["apply_confirm_phase_dynamic_min_hits"] = float(
+                cfg.get("LOOP_APPLY_CONFIRM_PHASE_DYNAMIC_MIN_HITS", 2)
+            )
+            extras["cooldown_sec_normal"] = float(cfg.get("LOOP_COOLDOWN_SEC_NORMAL", cfg.get("LOOP_COOLDOWN_SEC", 2.0)))
+            extras["cooldown_sec_failsoft"] = float(
+                cfg.get("LOOP_COOLDOWN_SEC_FAILSOFT", max(cfg.get("LOOP_COOLDOWN_SEC", 2.0), 3.0))
+            )
+            extras["cooldown_speed_m_s"] = float(cfg.get("LOOP_COOLDOWN_SPEED_M_S", 25.0))
+            extras["cooldown_speed_mult"] = float(cfg.get("LOOP_COOLDOWN_SPEED_MULT", 1.35))
+            extras["burst_window_sec"] = float(cfg.get("LOOP_BURST_WINDOW_SEC", 12.0))
+            extras["burst_max_corrections"] = float(cfg.get("LOOP_BURST_MAX_CORRECTIONS", 2))
+            extras["burst_cooldown_sec"] = float(cfg.get("LOOP_BURST_COOLDOWN_SEC", 6.0))
         elif sensor == "KIN_GUARD":
             extras["vel_mismatch_warn"] = float(cfg.get("KIN_GUARD_VEL_MISMATCH_WARN", 8.0))
             extras["vel_mismatch_hard"] = float(cfg.get("KIN_GUARD_VEL_MISMATCH_HARD", 15.0))
             extras["max_state_speed_m_s"] = float(cfg.get("KIN_GUARD_MAX_STATE_SPEED_M_S", 120.0))
+            extras["max_inflate"] = float(cfg.get("KIN_GUARD_MAX_INFLATE", 1.25))
+            extras["hard_blend_alpha"] = float(cfg.get("KIN_GUARD_HARD_BLEND_ALPHA", 0.08))
             extras["hard_hold_sec"] = float(cfg.get("KIN_GUARD_HARD_HOLD_SEC", 0.30))
+            extras["min_action_dt_sec"] = float(cfg.get("KIN_GUARD_MIN_ACTION_DT_SEC", 0.25))
             extras["release_hysteresis_ratio"] = float(cfg.get("KIN_GUARD_RELEASE_HYSTERESIS_RATIO", 0.75))
+            extras["max_blend_speed_m_s"] = float(cfg.get("KIN_GUARD_MAX_BLEND_SPEED_M_S", 60.0))
+            extras["max_kin_speed_m_s"] = float(cfg.get("KIN_GUARD_MAX_KIN_SPEED_M_S", 80.0))
+            extras["speed_hard_m_s"] = float(cfg.get("KIN_GUARD_SPEED_HARD_M_S", extras["max_state_speed_m_s"]))
+            extras["speed_hard_hold_sec"] = float(cfg.get("KIN_GUARD_SPEED_HARD_HOLD_SEC", extras["hard_hold_sec"]))
+            extras["speed_release_hysteresis_ratio"] = float(
+                cfg.get("KIN_GUARD_SPEED_RELEASE_HYSTERESIS_RATIO", extras["release_hysteresis_ratio"])
+            )
+            extras["speed_blend_alpha"] = float(cfg.get("KIN_GUARD_SPEED_BLEND_ALPHA", max(0.2, extras["hard_blend_alpha"])))
+            extras["speed_inflate"] = float(cfg.get("KIN_GUARD_SPEED_INFLATE", 1.12))
+            extras["abs_speed_sanity_m_s"] = float(cfg.get("KIN_GUARD_ABS_SPEED_SANITY_M_S", max(120.0, 1.8 * extras["max_state_speed_m_s"])))
+            extras["certainty_enable"] = 1.0 if bool(cfg.get("KIN_GUARD_CERTAINTY_ENABLE", False)) else 0.0
+            extras["certainty_mismatch_mult"] = float(cfg.get("KIN_GUARD_CERTAINTY_MISMATCH_MULT", 1.6))
+            extras["certainty_speed_mult"] = float(cfg.get("KIN_GUARD_CERTAINTY_SPEED_MULT", 1.15))
+            extras["certainty_inflate"] = float(cfg.get("KIN_GUARD_CERTAINTY_INFLATE", 1.35))
+            extras["certainty_blend_alpha"] = float(cfg.get("KIN_GUARD_CERTAINTY_BLEND_ALPHA", 0.35))
+            extras["certainty_speed_cap_m_s"] = float(cfg.get("KIN_GUARD_CERTAINTY_SPEED_CAP_M_S", extras["max_state_speed_m_s"]))
+            extras["certainty_min_action_dt_sec"] = float(
+                cfg.get("KIN_GUARD_CERTAINTY_MIN_ACTION_DT_SEC", extras["min_action_dt_sec"])
+            )
+            extras["certainty_require_both"] = 1.0 if bool(cfg.get("KIN_GUARD_CERTAINTY_REQUIRE_BOTH", False)) else 0.0
         elif sensor == "ZUPT":
             extras["acc_threshold_scale"] = float(scales.get("acc_threshold_scale", 1.0))
             extras["gyro_threshold_scale"] = float(scales.get("gyro_threshold_scale", 1.0))
@@ -210,7 +312,13 @@ class PolicyRuntimeService:
             if health_state == "DEGRADED" and not allow_degraded:
                 mode = "HOLD"
                 reasons.append("degraded_hold")
-            extras["matcher_mode_orb"] = 1.0 if str(cfg.get("VPS_MATCHER_MODE", "orb")).lower() == "orb" else 0.0
+            matcher_mode = str(cfg.get("VPS_MATCHER_MODE", "orb")).lower()
+            extras["matcher_mode_orb"] = 1.0 if matcher_mode == "orb" else 0.0
+            extras["matcher_mode"] = matcher_mode
+            extras["min_update_interval"] = float(cfg.get("VPS_MIN_UPDATE_INTERVAL", 0.5))
+            extras["max_total_candidates"] = float(cfg.get("VPS_MAX_TOTAL_CANDIDATES", 0))
+            extras["max_frame_time_ms_local"] = float(cfg.get("VPS_MAX_FRAME_TIME_MS_LOCAL", 0.0))
+            extras["max_frame_time_ms_global"] = float(cfg.get("VPS_MAX_FRAME_TIME_MS_GLOBAL", 0.0))
             extras["strict_min_inliers"] = float(cfg.get("VPS_APPLY_MIN_INLIERS", 8))
             extras["strict_min_conf"] = float(cfg.get("VPS_APPLY_MIN_CONFIDENCE", 0.18))
             extras["strict_max_reproj"] = float(cfg.get("VPS_APPLY_MAX_REPROJ_ERROR", 1.2))
@@ -236,7 +344,31 @@ class PolicyRuntimeService:
             extras["warning_max_dyaw_deg"] = float(cfg.get("MAG_WARNING_MAX_DYAW_DEG", 1.5))
             extras["degraded_max_dyaw_deg"] = float(cfg.get("MAG_DEGRADED_MAX_DYAW_DEG", 1.0))
             extras["conditioning_warn_pcond"] = float(cfg.get("MAG_CONDITIONING_GUARD_WARN_PCOND", 8e11))
+            extras["conditioning_warn_pmax"] = float(cfg.get("MAG_CONDITIONING_GUARD_WARN_PMAX", 8e6))
             extras["conditioning_degraded_pcond"] = float(cfg.get("MAG_CONDITIONING_GUARD_DEGRADED_PCOND", 1e11))
+            extras["conditioning_degraded_pmax"] = float(cfg.get("MAG_CONDITIONING_GUARD_DEGRADED_PMAX", 1e7))
+            extras["conditioning_hard_pcond"] = float(cfg.get("MAG_CONDITIONING_GUARD_HARD_PCOND", 1e12))
+            extras["conditioning_hard_pmax"] = float(cfg.get("MAG_CONDITIONING_GUARD_HARD_PMAX", 1e7))
+            extras["conditioning_extreme_pcond"] = float(
+                cfg.get("MAG_CONDITIONING_GUARD_EXTREME_PCOND", 8e12)
+            )
+            extras["conditioning_extreme_pmax"] = float(
+                cfg.get("MAG_CONDITIONING_GUARD_EXTREME_PMAX", 4e7)
+            )
+            extras["conditioning_soft_enable"] = 1.0 if bool(cfg.get("MAG_CONDITIONING_GUARD_SOFT_ENABLE", True)) else 0.0
+            extras["conditioning_soft_r_mult"] = float(cfg.get("MAG_CONDITIONING_GUARD_SOFT_R_MULT", 4.0))
+            extras["conditioning_soft_r_mult_healthy"] = float(
+                cfg.get("MAG_CONDITIONING_GUARD_SOFT_R_MULT_HEALTHY", 1.0)
+            )
+            extras["conditioning_soft_r_mult_warning"] = float(
+                cfg.get("MAG_CONDITIONING_GUARD_SOFT_R_MULT_WARNING", 1.0)
+            )
+            extras["conditioning_soft_r_mult_degraded"] = float(
+                cfg.get("MAG_CONDITIONING_GUARD_SOFT_R_MULT_DEGRADED", 1.0)
+            )
+            extras["conditioning_soft_r_mult_recovery"] = float(
+                cfg.get("MAG_CONDITIONING_GUARD_SOFT_R_MULT_RECOVERY", 1.0)
+            )
             extras["warning_extra_r_mult"] = float(cfg.get("MAG_WARNING_EXTRA_R_MULT", 2.0))
             extras["degraded_extra_r_mult"] = float(cfg.get("MAG_DEGRADED_EXTRA_R_MULT", 2.8))
 

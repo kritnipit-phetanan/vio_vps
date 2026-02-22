@@ -27,6 +27,37 @@ from typing import Optional, Tuple, List, Dict, Any
 from .math_utils import quaternion_to_yaw
 
 
+def _parse_float_list(value: Any, default: Tuple[float, ...]) -> List[float]:
+    """Parse a list-like config value into float list with fallback."""
+    if isinstance(value, (list, tuple)):
+        out: List[float] = []
+        for v in value:
+            try:
+                out.append(float(v))
+            except Exception:
+                continue
+        if len(out) > 0:
+            return out
+    return [float(v) for v in default]
+
+
+def _speed_tier_value(speed_m_s: float, breakpoints: List[float], values: List[float], default: float) -> float:
+    """Piecewise-constant lookup: use the last tier whose breakpoint is exceeded."""
+    try:
+        if (not np.isfinite(float(speed_m_s))) or len(breakpoints) == 0 or len(values) == 0:
+            return float(default)
+        out = float(default)
+        n = min(len(breakpoints), len(values))
+        for i in range(n):
+            bp = float(breakpoints[i])
+            val = float(values[i])
+            if speed_m_s >= bp:
+                out = val
+        return float(out)
+    except Exception:
+        return float(default)
+
+
 class LoopClosureDetector:
     """
     Lightweight loop closure detector for yaw drift correction.
@@ -98,6 +129,8 @@ class LoopClosureDetector:
             'loop_rejected_few_matches': 0,
             'loop_rejected_geometry': 0,
             'loop_speed_skipped': 0,
+            'loop_apply_pending_confirm': 0,
+            'loop_apply_burst_suppressed': 0,
             'yaw_corrections_applied': 0,
             'total_yaw_correction': 0.0,
         }
@@ -108,6 +141,8 @@ class LoopClosureDetector:
         self.last_kf_frame: int = -1000
         self._pending_match: Optional[Dict[str, Any]] = None
         self._last_apply_t: float = -1e9
+        self._apply_pending_confirm: Dict[str, Dict[str, float]] = {}
+        self._recent_apply_times: List[float] = []
         
     def should_add_keyframe(self, position: np.ndarray, yaw: float, frame_idx: int) -> bool:
         """
@@ -576,6 +611,8 @@ class LoopClosureDetector:
         self.last_kf_position = None
         self.last_kf_yaw = None
         self.last_kf_frame = -1000
+        self._apply_pending_confirm = {}
+        self._recent_apply_times = []
         for key in self.stats:
             if isinstance(self.stats[key], (int, float)):
                 self.stats[key] = 0 if isinstance(self.stats[key], int) else 0.0
@@ -779,6 +816,125 @@ def apply_loop_closure_correction(kf, loop_info: Dict[str, Any], t: float,
                 speed_sigma_mult = float(policy_decision.extra("speed_sigma_mult_normal", speed_sigma_mult))
         speed_now = float(np.linalg.norm(np.asarray(kf.x[3:6, 0], dtype=float)))
 
+        # Temporal anti-burst gates (additional apply-side safety beyond detection-side confirm/cooldown).
+        apply_confirm_enable = bool(global_config.get("LOOP_APPLY_CONFIRM_ENABLE", True))
+        apply_confirm_window_sec = float(global_config.get("LOOP_APPLY_CONFIRM_WINDOW_SEC", 3.0))
+        apply_confirm_yaw_deg = float(global_config.get("LOOP_APPLY_CONFIRM_YAW_DEG", 6.0))
+        apply_confirm_hits_normal = int(global_config.get("LOOP_APPLY_CONFIRM_HITS_NORMAL", 1))
+        apply_confirm_hits_failsoft = int(global_config.get("LOOP_APPLY_CONFIRM_HITS_FAILSOFT", 2))
+        apply_confirm_speed_m_s = float(global_config.get("LOOP_APPLY_CONFIRM_SPEED_M_S", 25.0))
+        apply_confirm_extra_hits_high_speed = int(
+            global_config.get("LOOP_APPLY_CONFIRM_EXTRA_HITS_HIGH_SPEED", 1)
+        )
+        apply_confirm_phase_dynamic_min_hits = int(
+            global_config.get("LOOP_APPLY_CONFIRM_PHASE_DYNAMIC_MIN_HITS", 2)
+        )
+        cooldown_sec_normal = float(global_config.get("LOOP_COOLDOWN_SEC_NORMAL", global_config.get("LOOP_COOLDOWN_SEC", 2.0)))
+        cooldown_sec_failsoft = float(
+            global_config.get("LOOP_COOLDOWN_SEC_FAILSOFT", max(global_config.get("LOOP_COOLDOWN_SEC", 2.0), 3.0))
+        )
+        cooldown_speed_m_s = float(global_config.get("LOOP_COOLDOWN_SPEED_M_S", 25.0))
+        cooldown_speed_mult = float(global_config.get("LOOP_COOLDOWN_SPEED_MULT", 1.35))
+        burst_window_sec = float(global_config.get("LOOP_BURST_WINDOW_SEC", 12.0))
+        burst_max_corrections = int(global_config.get("LOOP_BURST_MAX_CORRECTIONS", 2))
+        burst_cooldown_sec = float(global_config.get("LOOP_BURST_COOLDOWN_SEC", 6.0))
+        if policy_decision is not None:
+            apply_confirm_enable = bool(policy_decision.extra("apply_confirm_enable", 1.0) > 0.5)
+            apply_confirm_window_sec = float(policy_decision.extra("apply_confirm_window_sec", apply_confirm_window_sec))
+            apply_confirm_yaw_deg = float(policy_decision.extra("apply_confirm_yaw_deg", apply_confirm_yaw_deg))
+            apply_confirm_hits_normal = int(round(policy_decision.extra("apply_confirm_hits_normal", apply_confirm_hits_normal)))
+            apply_confirm_hits_failsoft = int(round(policy_decision.extra("apply_confirm_hits_failsoft", apply_confirm_hits_failsoft)))
+            apply_confirm_speed_m_s = float(policy_decision.extra("apply_confirm_speed_m_s", apply_confirm_speed_m_s))
+            apply_confirm_extra_hits_high_speed = int(
+                round(policy_decision.extra("apply_confirm_extra_hits_high_speed", apply_confirm_extra_hits_high_speed))
+            )
+            apply_confirm_phase_dynamic_min_hits = int(
+                round(policy_decision.extra("apply_confirm_phase_dynamic_min_hits", apply_confirm_phase_dynamic_min_hits))
+            )
+            cooldown_sec_normal = float(policy_decision.extra("cooldown_sec_normal", cooldown_sec_normal))
+            cooldown_sec_failsoft = float(policy_decision.extra("cooldown_sec_failsoft", cooldown_sec_failsoft))
+            cooldown_speed_m_s = float(policy_decision.extra("cooldown_speed_m_s", cooldown_speed_m_s))
+            cooldown_speed_mult = float(policy_decision.extra("cooldown_speed_mult", cooldown_speed_mult))
+            burst_window_sec = float(policy_decision.extra("burst_window_sec", burst_window_sec))
+            burst_max_corrections = int(round(policy_decision.extra("burst_max_corrections", burst_max_corrections)))
+            burst_cooldown_sec = float(policy_decision.extra("burst_cooldown_sec", burst_cooldown_sec))
+
+        required_hits = apply_confirm_hits_failsoft if fail_soft else apply_confirm_hits_normal
+        if np.isfinite(speed_now) and speed_now >= apply_confirm_speed_m_s:
+            required_hits += max(0, int(apply_confirm_extra_hits_high_speed))
+        if int(phase) <= 1:
+            required_hits = max(required_hits, max(1, int(apply_confirm_phase_dynamic_min_hits)))
+        required_hits = max(1, int(required_hits))
+
+        # Adaptive cooldown: stronger at high speed and after correction bursts.
+        effective_cooldown_sec = cooldown_sec_failsoft if fail_soft else cooldown_sec_normal
+        if np.isfinite(speed_now) and speed_now >= cooldown_speed_m_s:
+            effective_cooldown_sec *= max(1.0, float(cooldown_speed_mult))
+        if (
+            loop_detector is not None
+            and hasattr(loop_detector, "_recent_apply_times")
+            and isinstance(getattr(loop_detector, "_recent_apply_times"), list)
+        ):
+            recent_ts = [float(ts) for ts in loop_detector._recent_apply_times if float(t) - float(ts) <= max(0.0, burst_window_sec)]
+            loop_detector._recent_apply_times = recent_ts
+            if len(recent_ts) >= max(1, int(burst_max_corrections)):
+                effective_cooldown_sec = max(float(effective_cooldown_sec), float(burst_cooldown_sec))
+                if hasattr(loop_detector, "stats") and isinstance(loop_detector.stats, dict):
+                    loop_detector.stats["loop_apply_burst_suppressed"] = int(
+                        loop_detector.stats.get("loop_apply_burst_suppressed", 0)
+                    ) + 1
+
+        if float(t) - float(getattr(loop_detector, "_last_apply_t", -1e9)) < float(effective_cooldown_sec):
+            if loop_detector is not None and hasattr(loop_detector, "stats"):
+                loop_detector.stats["loop_cooldown_skipped"] = int(loop_detector.stats.get("loop_cooldown_skipped", 0)) + 1
+            return False
+
+        # Apply-side temporal confirmation: require repeated consistent candidates before correction.
+        if apply_confirm_enable and required_hits > 1:
+            if not hasattr(loop_detector, "_apply_pending_confirm") or not isinstance(
+                getattr(loop_detector, "_apply_pending_confirm"), dict
+            ):
+                loop_detector._apply_pending_confirm = {}
+            pending_map: Dict[str, Dict[str, float]] = loop_detector._apply_pending_confirm
+            # prune stale pending entries
+            pending_map = {
+                str(k): v
+                for k, v in pending_map.items()
+                if float(t) - float(v.get("last_t", -1e9)) <= max(0.0, apply_confirm_window_sec)
+            }
+            loop_detector._apply_pending_confirm = pending_map
+            key = f"{int(kf_idx)}:{'FS' if fail_soft else 'NM'}"
+            pending = pending_map.get(key)
+            if pending is None:
+                pending = {
+                    "hits": 1.0,
+                    "first_t": float(t),
+                    "last_t": float(t),
+                    "yaw_deg": float(np.degrees(yaw_error)),
+                }
+            else:
+                dt_ok = float(t) - float(pending.get("first_t", -1e9)) <= max(0.0, apply_confirm_window_sec)
+                yaw_ok = abs(float(np.degrees(yaw_error)) - float(pending.get("yaw_deg", 0.0))) <= float(apply_confirm_yaw_deg)
+                if dt_ok and yaw_ok:
+                    pending["hits"] = float(pending.get("hits", 1.0)) + 1.0
+                else:
+                    pending = {
+                        "hits": 1.0,
+                        "first_t": float(t),
+                        "last_t": float(t),
+                        "yaw_deg": float(np.degrees(yaw_error)),
+                    }
+                pending["last_t"] = float(t)
+                pending["yaw_deg"] = float(np.degrees(yaw_error))
+            pending_map[key] = pending
+            if int(round(float(pending.get("hits", 1.0)))) < required_hits:
+                if loop_detector is not None and hasattr(loop_detector, "stats"):
+                    loop_detector.stats["loop_apply_pending_confirm"] = int(
+                        loop_detector.stats.get("loop_apply_pending_confirm", 0)
+                    ) + 1
+                return False
+            pending_map.pop(key, None)
+
         if abs(np.degrees(yaw_error)) < min_abs_deg:
             return False
         if abs(np.degrees(yaw_error)) > reject_abs_deg:
@@ -791,6 +947,32 @@ def apply_loop_closure_correction(kf, loop_info: Dict[str, Any], t: float,
                 f"[LOOP] SKIP apply at t={t:.2f}s: speed={speed_now:.2f}m/s > {speed_skip_m_s:.2f}m/s"
             )
             return False
+
+        speed_caps_bp_raw = global_config.get(
+            "LOOP_SPEED_YAW_CAP_BREAKPOINTS_M_S", [20.0, 35.0, 50.0]
+        )
+        speed_caps_deg_raw = (
+            global_config.get("LOOP_SPEED_YAW_CAP_FAILSOFT_DEG", [2.5, 1.8, 1.2])
+            if fail_soft
+            else global_config.get("LOOP_SPEED_YAW_CAP_NORMAL_DEG", [3.0, 2.2, 1.5])
+        )
+        if policy_decision is not None:
+            extras_map = getattr(policy_decision, "extras", {}) or {}
+            speed_caps_bp_raw = extras_map.get("speed_yaw_cap_breakpoints_m_s", speed_caps_bp_raw)
+            if fail_soft:
+                speed_caps_deg_raw = extras_map.get("speed_yaw_cap_failsoft_deg", speed_caps_deg_raw)
+            else:
+                speed_caps_deg_raw = extras_map.get("speed_yaw_cap_normal_deg", speed_caps_deg_raw)
+        speed_caps_bp = _parse_float_list(speed_caps_bp_raw, (20.0, 35.0, 50.0))
+        speed_caps_deg = _parse_float_list(
+            speed_caps_deg_raw,
+            (2.5, 1.8, 1.2) if fail_soft else (3.0, 2.2, 1.5),
+        )
+        speed_dependent_cap_deg = _speed_tier_value(
+            speed_now, speed_caps_bp, speed_caps_deg, float(max_abs_deg)
+        )
+        if np.isfinite(float(speed_dependent_cap_deg)):
+            max_abs_deg = max(float(min_abs_deg), min(float(max_abs_deg), float(speed_dependent_cap_deg)))
 
         # Clamp correction magnitude (fail-soft by design)
         yaw_abs = abs(yaw_error)
@@ -852,6 +1034,8 @@ def apply_loop_closure_correction(kf, loop_info: Dict[str, Any], t: float,
             ) + abs(float(yaw_error))
         
         loop_detector._last_apply_t = float(t)
+        if hasattr(loop_detector, "_recent_apply_times") and isinstance(loop_detector._recent_apply_times, list):
+            loop_detector._recent_apply_times.append(float(t))
         tag = "FAILSOFT" if fail_soft else "NORMAL"
         print(f"[LOOP] {tag} correction at t={t:.2f}s: Δyaw={np.degrees(yaw_error):.2f}° "
               f"(kf={kf_idx}, inliers={num_inliers}, sigma={np.degrees(sigma_loop):.2f}°)")
