@@ -411,6 +411,12 @@ def load_config(config_path: str) -> VIOConfig:
             4.0 * float(warning_weak_yaw.get('conditioning_guard_hard_pmax', 1e7)),
         )
     )
+    result['MAG_CONDITIONING_GUARD_EXTREME_SOFT_ENABLE'] = bool(
+        warning_weak_yaw.get('conditioning_guard_extreme_soft_enable', True)
+    )
+    result['MAG_CONDITIONING_GUARD_EXTREME_SOFT_R_MULT'] = float(
+        warning_weak_yaw.get('conditioning_guard_extreme_soft_r_mult', 2.0)
+    )
     result['MAG_CONDITIONING_GUARD_SOFT_ENABLE'] = bool(
         warning_weak_yaw.get('conditioning_guard_soft_enable', True)
     )
@@ -450,6 +456,109 @@ def load_config(config_path: str) -> VIOConfig:
     result['MAG_CHOL_COOLDOWN_MAX_SEC'] = float(
         warning_weak_yaw.get('chol_cooldown_max_sec', 2.0)
     )
+    mag_ablation = mag.get('ablation', {})
+    result['MAG_MODE'] = str(mag_ablation.get('mode', 'normal')).lower()
+    result['MAG_ABLATION_R_MULT'] = float(mag_ablation.get('r_mult', 1.0))
+    result['MAG_ABLATION_MAX_DYAW_DEG'] = float(
+        mag_ablation.get('max_dyaw_deg', 180.0)
+    )
+    result['MAG_ABLATION_MAX_UPDATE_DYAW_DEG'] = float(
+        mag_ablation.get('max_update_dyaw_deg', 180.0)
+    )
+    result['MAG_ABLATION_WEAK_SKIP_HARD_MISMATCH'] = bool(
+        mag_ablation.get('weak_skip_hard_mismatch', False)
+    )
+    heading_arb = mag.get('heading_arbitration', {})
+    result['MAG_HEADING_ARB_ENABLE'] = bool(heading_arb.get('enable', False))
+    result['MAG_HEADING_ARB_HARD_MISMATCH_DEG'] = float(
+        heading_arb.get('hard_mismatch_deg', 95.0)
+    )
+    result['MAG_HEADING_ARB_MIN_VISION_QUALITY'] = float(
+        heading_arb.get('min_vision_quality', 0.55)
+    )
+    result['MAG_HEADING_ARB_STREAK_TO_HOLD'] = int(
+        heading_arb.get('streak_to_hold', 3)
+    )
+    result['MAG_HEADING_ARB_HOLD_SEC'] = float(
+        heading_arb.get('hold_sec', 1.8)
+    )
+    result['MAG_HEADING_ARB_SOFT_R_MULT'] = float(
+        heading_arb.get('soft_r_mult', 2.0)
+    )
+    result['MAG_HEADING_ARB_MAX_VISION_AGE_SEC'] = float(
+        heading_arb.get('max_vision_age_sec', 1.0)
+    )
+    result['MAG_HEADING_ARB_SCORE_EMA_ALPHA'] = float(
+        heading_arb.get('score_ema_alpha', 0.20)
+    )
+    result['MAG_HEADING_ARB_SCORE_SOFT_THRESHOLD'] = float(
+        heading_arb.get('score_soft_threshold', 0.55)
+    )
+    result['MAG_HEADING_ARB_SCORE_HOLD_THRESHOLD'] = float(
+        heading_arb.get('score_hold_threshold', 0.30)
+    )
+    result['MAG_HEADING_ARB_SCORE_VIS_GOOD_DEG'] = float(
+        heading_arb.get('score_vis_good_deg', 18.0)
+    )
+    result['MAG_HEADING_ARB_SCORE_GYRO_GOOD_DEG'] = float(
+        heading_arb.get('score_gyro_good_deg', 10.0)
+    )
+    result['MAG_HEADING_ARB_SCORE_GYRO_BAD_DEG'] = float(
+        heading_arb.get('score_gyro_bad_deg', 50.0)
+    )
+    result['MAG_HEADING_ARB_SCORE_STATE_GOOD_DEG'] = float(
+        heading_arb.get('score_state_good_deg', 25.0)
+    )
+    result['MAG_HEADING_ARB_SCORE_STATE_BAD_DEG'] = float(
+        heading_arb.get('score_state_bad_deg', 110.0)
+    )
+    result['MAG_HEADING_ARB_SCORE_VIS_WEIGHT'] = float(
+        heading_arb.get('score_vis_weight', 0.50)
+    )
+    result['MAG_HEADING_ARB_SCORE_GYRO_WEIGHT'] = float(
+        heading_arb.get('score_gyro_weight', 0.30)
+    )
+    result['MAG_HEADING_ARB_SCORE_STATE_WEIGHT'] = float(
+        heading_arb.get('score_state_weight', 0.20)
+    )
+    result['MAG_HEADING_ARB_YAW_BUDGET_WINDOW_SEC'] = float(
+        heading_arb.get('yaw_budget_window_sec', 6.0)
+    )
+    result['MAG_HEADING_ARB_YAW_BUDGET_ABS_DEG'] = float(
+        heading_arb.get('yaw_budget_abs_deg', 8.0)
+    )
+    result['MAG_HEADING_ARB_YAW_BUDGET_MIN_REMAINING_DEG'] = float(
+        heading_arb.get('yaw_budget_min_remaining_deg', 0.6)
+    )
+    result['MAG_HEADING_ARB_RECOVER_CONFIRM_HITS'] = int(
+        heading_arb.get('recover_confirm_hits', 3)
+    )
+    result['MAG_HEADING_ARB_RECOVER_MIN_SCORE'] = float(
+        heading_arb.get('recover_min_score', 0.60)
+    )
+    result['MAG_HEADING_ARB_RECOVER_SOFT_R_MULT'] = float(
+        heading_arb.get('recover_soft_r_mult', 1.6)
+    )
+    result['MAG_HEADING_ARB_RECOVER_MAX_UPDATE_DYAW_DEG'] = float(
+        heading_arb.get('recover_max_update_dyaw_deg', 0.30)
+    )
+    mag_preproc = mag.get('preprocessing', {})
+    result['MAG_PREPROC_ENABLE'] = bool(mag_preproc.get('enable', True))
+    result['MAG_PREPROC_NORM_RANGE_ENABLE'] = bool(
+        mag_preproc.get('norm_range_enable', True)
+    )
+    result['MAG_PREPROC_NORM_DEV_MAX'] = float(
+        mag_preproc.get('rolling_norm_dev_max', 0.45)
+    )
+    result['MAG_PREPROC_GYRO_DELTA_MAX_DEG'] = float(
+        mag_preproc.get('gyro_delta_max_deg', 95.0)
+    )
+    result['MAG_PREPROC_VISION_DELTA_MAX_DEG'] = float(
+        mag_preproc.get('vision_delta_max_deg', 120.0)
+    )
+    result['MAG_PREPROC_EWMA_ALPHA'] = float(
+        mag_preproc.get('ewma_alpha', 0.08)
+    )
     result['VISION_HEADING_MIN_INLIERS'] = int(
         mag.get('vision_heading_min_inliers', 25)
     )
@@ -461,6 +570,87 @@ def load_config(config_path: str) -> VIOConfig:
     )
     result['VISION_HEADING_QUALITY_DECAY'] = float(
         mag.get('vision_heading_quality_decay', 0.92)
+    )
+
+    # =========================================================================
+    # Global Yaw Authority (single-owner yaw governance)
+    # =========================================================================
+    yaw_auth = config.get('yaw_authority', {})
+    result['YAW_AUTH_ENABLE'] = bool(yaw_auth.get('enable', False))
+    result['YAW_AUTH_STAGE'] = int(yaw_auth.get('activation_stage', 0))
+    result['YAW_AUTH_SCORE_EMA_ALPHA'] = float(yaw_auth.get('score_ema_alpha', 0.22))
+    result['YAW_AUTH_MIN_SOURCE_SCORE'] = float(yaw_auth.get('min_source_score', 0.35))
+    result['YAW_AUTH_SWITCH_MARGIN'] = float(yaw_auth.get('switch_margin', 0.12))
+    result['YAW_AUTH_SWITCH_MIN_INTERVAL_SEC'] = float(
+        yaw_auth.get('switch_min_interval_sec', 0.75)
+    )
+    result['YAW_AUTH_HOLD_SCORE_THRESHOLD'] = float(
+        yaw_auth.get('hold_score_threshold', 0.18)
+    )
+    result['YAW_AUTH_HOLD_SEC'] = float(yaw_auth.get('hold_sec', 0.8))
+    result['YAW_AUTH_YAW_BUDGET_WINDOW_SEC'] = float(
+        yaw_auth.get('yaw_budget_window_sec', 8.0)
+    )
+    result['YAW_AUTH_YAW_BUDGET_ABS_DEG'] = float(
+        yaw_auth.get('yaw_budget_abs_deg', 10.0)
+    )
+    result['YAW_AUTH_YAW_RATE_MAX_DEG_S'] = float(
+        yaw_auth.get('yaw_rate_max_deg_s', 4.0)
+    )
+    result['YAW_AUTH_BUDGET_SOFT_R_MULT'] = float(
+        yaw_auth.get('budget_soft_r_mult', 1.6)
+    )
+    result['YAW_AUTH_SOFT_ONLY_HIGH_SPEED_M_S'] = float(
+        yaw_auth.get('soft_only_high_speed_m_s', 22.0)
+    )
+    result['YAW_AUTH_SOFT_ONLY_UNSTABLE_PMAX'] = float(
+        yaw_auth.get('soft_only_unstable_pmax', 1.0e6)
+    )
+    result['YAW_AUTH_SOFT_ONLY_UNSTABLE_PCOND'] = float(
+        yaw_auth.get('soft_only_unstable_pcond', 1.0e12)
+    )
+    result['YAW_AUTH_SOFT_ONLY_UNSTABLE_HEALTH'] = yaw_auth.get(
+        'soft_only_unstable_health',
+        ['WARNING', 'DEGRADED'],
+    )
+    result['YAW_AUTH_SOFT_ONLY_MAX_DYAW_DEG'] = float(
+        yaw_auth.get('soft_only_max_dyaw_deg', 1.2)
+    )
+    result['YAW_AUTH_SOFT_ONLY_R_MULT'] = float(
+        yaw_auth.get('soft_only_r_mult', 1.5)
+    )
+    result['YAW_AUTH_SOURCE_PRIORITY'] = yaw_auth.get(
+        'source_priority',
+        {'MAG': 1.0, 'LOOP': 1.0, 'BACKEND': 0.9},
+    )
+    # Stage-1/2 controlled owner handoff (pre-stage3 confidence switching)
+    result['YAW_AUTH_STAGE12_CLAIM_ENABLE'] = bool(
+        yaw_auth.get('stage12_claim_enable', True)
+    )
+    result['YAW_AUTH_STAGE12_MIN_SWITCH_INTERVAL_SEC'] = float(
+        yaw_auth.get('stage12_min_switch_interval_sec', yaw_auth.get('switch_min_interval_sec', 0.75))
+    )
+    result['YAW_AUTH_STAGE12_OWNER_TIMEOUT_SEC'] = float(
+        yaw_auth.get('stage12_owner_timeout_sec', 1.2)
+    )
+    result['YAW_AUTH_STAGE12_CLAIM_MIN_SCORE'] = float(
+        yaw_auth.get('stage12_claim_min_score', 0.45)
+    )
+    result['YAW_AUTH_STAGE12_CLAIM_MARGIN'] = float(
+        yaw_auth.get('stage12_claim_margin', 0.05)
+    )
+    result['YAW_AUTH_STAGE12_LOOP_FORCE_CLAIM_MIN_SCORE'] = float(
+        yaw_auth.get('stage12_loop_force_claim_min_score', 0.62)
+    )
+    result['YAW_AUTH_STAGE12_LOOP_FORCE_CLAIM_MAX_SPEED_M_S'] = float(
+        yaw_auth.get('stage12_loop_force_claim_max_speed_m_s', 35.0)
+    )
+    result['YAW_AUTH_STAGE12_ALLOW_STALE_RECLAIM_ANY'] = bool(
+        yaw_auth.get('stage12_allow_stale_reclaim_any', True)
+    )
+    result['YAW_AUTH_STAGE12_CLAIM_SOURCES'] = yaw_auth.get(
+        'stage12_claim_sources',
+        ['LOOP', 'BACKEND'],
     )
     
     # Process noise

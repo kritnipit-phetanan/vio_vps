@@ -70,10 +70,69 @@ class PolicyRuntimeService:
         "MAG_CONDITIONING_GUARD_HARD_PMAX": "yaml.magnetometer.warning_weak_yaw",
         "MAG_CONDITIONING_GUARD_EXTREME_PCOND": "yaml.magnetometer.warning_weak_yaw",
         "MAG_CONDITIONING_GUARD_EXTREME_PMAX": "yaml.magnetometer.warning_weak_yaw",
+        "MAG_CONDITIONING_GUARD_EXTREME_SOFT_ENABLE": "yaml.magnetometer.warning_weak_yaw",
+        "MAG_CONDITIONING_GUARD_EXTREME_SOFT_R_MULT": "yaml.magnetometer.warning_weak_yaw",
         "MAG_WARNING_EXTRA_R_MULT": "yaml.magnetometer.warning_weak_yaw",
         "MAG_WARNING_MAX_DYAW_DEG": "yaml.magnetometer.warning_weak_yaw",
         "MAG_DEGRADED_EXTRA_R_MULT": "yaml.magnetometer.warning_weak_yaw",
         "MAG_DEGRADED_MAX_DYAW_DEG": "yaml.magnetometer.warning_weak_yaw",
+        "MAG_MODE": "yaml.magnetometer.ablation",
+        "MAG_ABLATION_R_MULT": "yaml.magnetometer.ablation",
+        "MAG_ABLATION_MAX_DYAW_DEG": "yaml.magnetometer.ablation",
+        "MAG_ABLATION_MAX_UPDATE_DYAW_DEG": "yaml.magnetometer.ablation",
+        "MAG_ABLATION_WEAK_SKIP_HARD_MISMATCH": "yaml.magnetometer.ablation",
+        "MAG_HEADING_ARB_ENABLE": "yaml.magnetometer.heading_arbitration",
+        "MAG_HEADING_ARB_HARD_MISMATCH_DEG": "yaml.magnetometer.heading_arbitration",
+        "MAG_HEADING_ARB_MIN_VISION_QUALITY": "yaml.magnetometer.heading_arbitration",
+        "MAG_HEADING_ARB_STREAK_TO_HOLD": "yaml.magnetometer.heading_arbitration",
+        "MAG_HEADING_ARB_HOLD_SEC": "yaml.magnetometer.heading_arbitration",
+        "MAG_HEADING_ARB_SOFT_R_MULT": "yaml.magnetometer.heading_arbitration",
+        "MAG_HEADING_ARB_MAX_VISION_AGE_SEC": "yaml.magnetometer.heading_arbitration",
+        "MAG_HEADING_ARB_SCORE_EMA_ALPHA": "yaml.magnetometer.heading_arbitration",
+        "MAG_HEADING_ARB_SCORE_SOFT_THRESHOLD": "yaml.magnetometer.heading_arbitration",
+        "MAG_HEADING_ARB_SCORE_HOLD_THRESHOLD": "yaml.magnetometer.heading_arbitration",
+        "MAG_HEADING_ARB_SCORE_VIS_GOOD_DEG": "yaml.magnetometer.heading_arbitration",
+        "MAG_HEADING_ARB_SCORE_GYRO_GOOD_DEG": "yaml.magnetometer.heading_arbitration",
+        "MAG_HEADING_ARB_SCORE_GYRO_BAD_DEG": "yaml.magnetometer.heading_arbitration",
+        "MAG_HEADING_ARB_SCORE_STATE_GOOD_DEG": "yaml.magnetometer.heading_arbitration",
+        "MAG_HEADING_ARB_SCORE_STATE_BAD_DEG": "yaml.magnetometer.heading_arbitration",
+        "MAG_HEADING_ARB_SCORE_VIS_WEIGHT": "yaml.magnetometer.heading_arbitration",
+        "MAG_HEADING_ARB_SCORE_GYRO_WEIGHT": "yaml.magnetometer.heading_arbitration",
+        "MAG_HEADING_ARB_SCORE_STATE_WEIGHT": "yaml.magnetometer.heading_arbitration",
+        "MAG_HEADING_ARB_YAW_BUDGET_WINDOW_SEC": "yaml.magnetometer.heading_arbitration",
+        "MAG_HEADING_ARB_YAW_BUDGET_ABS_DEG": "yaml.magnetometer.heading_arbitration",
+        "MAG_HEADING_ARB_YAW_BUDGET_MIN_REMAINING_DEG": "yaml.magnetometer.heading_arbitration",
+        "MAG_HEADING_ARB_RECOVER_CONFIRM_HITS": "yaml.magnetometer.heading_arbitration",
+        "MAG_HEADING_ARB_RECOVER_MIN_SCORE": "yaml.magnetometer.heading_arbitration",
+        "MAG_HEADING_ARB_RECOVER_SOFT_R_MULT": "yaml.magnetometer.heading_arbitration",
+        "MAG_HEADING_ARB_RECOVER_MAX_UPDATE_DYAW_DEG": "yaml.magnetometer.heading_arbitration",
+        "MAG_PREPROC_ENABLE": "yaml.magnetometer.preprocessing",
+        "MAG_PREPROC_NORM_RANGE_ENABLE": "yaml.magnetometer.preprocessing",
+        "MAG_PREPROC_NORM_DEV_MAX": "yaml.magnetometer.preprocessing",
+        "MAG_PREPROC_GYRO_DELTA_MAX_DEG": "yaml.magnetometer.preprocessing",
+        "MAG_PREPROC_VISION_DELTA_MAX_DEG": "yaml.magnetometer.preprocessing",
+        "MAG_PREPROC_EWMA_ALPHA": "yaml.magnetometer.preprocessing",
+        "YAW_AUTH_ENABLE": "yaml.yaw_authority",
+        "YAW_AUTH_STAGE": "yaml.yaw_authority",
+        "YAW_AUTH_MIN_SOURCE_SCORE": "yaml.yaw_authority",
+        "YAW_AUTH_SWITCH_MARGIN": "yaml.yaw_authority",
+        "YAW_AUTH_SWITCH_MIN_INTERVAL_SEC": "yaml.yaw_authority",
+        "YAW_AUTH_STAGE12_CLAIM_ENABLE": "yaml.yaw_authority",
+        "YAW_AUTH_STAGE12_MIN_SWITCH_INTERVAL_SEC": "yaml.yaw_authority",
+        "YAW_AUTH_STAGE12_OWNER_TIMEOUT_SEC": "yaml.yaw_authority",
+        "YAW_AUTH_STAGE12_CLAIM_MIN_SCORE": "yaml.yaw_authority",
+        "YAW_AUTH_STAGE12_CLAIM_MARGIN": "yaml.yaw_authority",
+        "YAW_AUTH_STAGE12_LOOP_FORCE_CLAIM_MIN_SCORE": "yaml.yaw_authority",
+        "YAW_AUTH_STAGE12_LOOP_FORCE_CLAIM_MAX_SPEED_M_S": "yaml.yaw_authority",
+        "YAW_AUTH_STAGE12_ALLOW_STALE_RECLAIM_ANY": "yaml.yaw_authority",
+        "YAW_AUTH_YAW_BUDGET_WINDOW_SEC": "yaml.yaw_authority",
+        "YAW_AUTH_YAW_BUDGET_ABS_DEG": "yaml.yaw_authority",
+        "YAW_AUTH_YAW_RATE_MAX_DEG_S": "yaml.yaw_authority",
+        "YAW_AUTH_SOFT_ONLY_HIGH_SPEED_M_S": "yaml.yaw_authority",
+        "YAW_AUTH_SOFT_ONLY_UNSTABLE_PMAX": "yaml.yaw_authority",
+        "YAW_AUTH_SOFT_ONLY_UNSTABLE_PCOND": "yaml.yaw_authority",
+        "YAW_AUTH_SOFT_ONLY_MAX_DYAW_DEG": "yaml.yaw_authority",
+        "YAW_AUTH_SOFT_ONLY_R_MULT": "yaml.yaw_authority",
         "VPS_MATCHER_MODE": "yaml.vps",
         "VPS_MIN_UPDATE_INTERVAL": "yaml.vps",
         "VPS_MAX_TOTAL_CANDIDATES": "yaml.vps",
@@ -343,6 +402,90 @@ class PolicyRuntimeService:
             extras["degraded_r_mult"] = float(cfg.get("MAG_DEGRADED_R_MULT", 8.0))
             extras["warning_max_dyaw_deg"] = float(cfg.get("MAG_WARNING_MAX_DYAW_DEG", 1.5))
             extras["degraded_max_dyaw_deg"] = float(cfg.get("MAG_DEGRADED_MAX_DYAW_DEG", 1.0))
+            extras["mag_mode"] = str(cfg.get("MAG_MODE", "normal")).lower()
+            extras["ablation_r_mult"] = float(cfg.get("MAG_ABLATION_R_MULT", 1.0))
+            extras["ablation_max_dyaw_deg"] = float(cfg.get("MAG_ABLATION_MAX_DYAW_DEG", 180.0))
+            extras["ablation_max_update_dyaw_deg"] = float(
+                cfg.get("MAG_ABLATION_MAX_UPDATE_DYAW_DEG", 180.0)
+            )
+            extras["ablation_weak_skip_hard_mismatch"] = (
+                1.0 if bool(cfg.get("MAG_ABLATION_WEAK_SKIP_HARD_MISMATCH", False)) else 0.0
+            )
+            extras["heading_arb_enable"] = 1.0 if bool(cfg.get("MAG_HEADING_ARB_ENABLE", False)) else 0.0
+            extras["heading_arb_hard_mismatch_deg"] = float(
+                cfg.get("MAG_HEADING_ARB_HARD_MISMATCH_DEG", 95.0)
+            )
+            extras["heading_arb_min_vision_quality"] = float(
+                cfg.get("MAG_HEADING_ARB_MIN_VISION_QUALITY", 0.55)
+            )
+            extras["heading_arb_streak_to_hold"] = float(
+                cfg.get("MAG_HEADING_ARB_STREAK_TO_HOLD", 3)
+            )
+            extras["heading_arb_hold_sec"] = float(cfg.get("MAG_HEADING_ARB_HOLD_SEC", 1.8))
+            extras["heading_arb_soft_r_mult"] = float(
+                cfg.get("MAG_HEADING_ARB_SOFT_R_MULT", 2.0)
+            )
+            extras["heading_arb_max_vision_age_sec"] = float(
+                cfg.get("MAG_HEADING_ARB_MAX_VISION_AGE_SEC", 1.0)
+            )
+            extras["heading_arb_score_ema_alpha"] = float(
+                cfg.get("MAG_HEADING_ARB_SCORE_EMA_ALPHA", 0.20)
+            )
+            extras["heading_arb_score_soft_threshold"] = float(
+                cfg.get("MAG_HEADING_ARB_SCORE_SOFT_THRESHOLD", 0.55)
+            )
+            extras["heading_arb_score_hold_threshold"] = float(
+                cfg.get("MAG_HEADING_ARB_SCORE_HOLD_THRESHOLD", 0.30)
+            )
+            extras["heading_arb_score_vis_good_deg"] = float(
+                cfg.get("MAG_HEADING_ARB_SCORE_VIS_GOOD_DEG", 18.0)
+            )
+            extras["heading_arb_score_gyro_good_deg"] = float(
+                cfg.get("MAG_HEADING_ARB_SCORE_GYRO_GOOD_DEG", 10.0)
+            )
+            extras["heading_arb_score_gyro_bad_deg"] = float(
+                cfg.get("MAG_HEADING_ARB_SCORE_GYRO_BAD_DEG", 50.0)
+            )
+            extras["heading_arb_score_state_good_deg"] = float(
+                cfg.get("MAG_HEADING_ARB_SCORE_STATE_GOOD_DEG", 25.0)
+            )
+            extras["heading_arb_score_state_bad_deg"] = float(
+                cfg.get("MAG_HEADING_ARB_SCORE_STATE_BAD_DEG", 110.0)
+            )
+            extras["heading_arb_score_vis_weight"] = float(
+                cfg.get("MAG_HEADING_ARB_SCORE_VIS_WEIGHT", 0.50)
+            )
+            extras["heading_arb_score_gyro_weight"] = float(
+                cfg.get("MAG_HEADING_ARB_SCORE_GYRO_WEIGHT", 0.30)
+            )
+            extras["heading_arb_score_state_weight"] = float(
+                cfg.get("MAG_HEADING_ARB_SCORE_STATE_WEIGHT", 0.20)
+            )
+            extras["heading_arb_yaw_budget_window_sec"] = float(
+                cfg.get("MAG_HEADING_ARB_YAW_BUDGET_WINDOW_SEC", 6.0)
+            )
+            extras["heading_arb_yaw_budget_abs_deg"] = float(
+                cfg.get("MAG_HEADING_ARB_YAW_BUDGET_ABS_DEG", 8.0)
+            )
+            extras["heading_arb_yaw_budget_min_remaining_deg"] = float(
+                cfg.get("MAG_HEADING_ARB_YAW_BUDGET_MIN_REMAINING_DEG", 0.6)
+            )
+            extras["heading_arb_recover_confirm_hits"] = float(
+                cfg.get("MAG_HEADING_ARB_RECOVER_CONFIRM_HITS", 3)
+            )
+            extras["heading_arb_recover_min_score"] = float(
+                cfg.get("MAG_HEADING_ARB_RECOVER_MIN_SCORE", 0.60)
+            )
+            extras["heading_arb_recover_soft_r_mult"] = float(
+                cfg.get("MAG_HEADING_ARB_RECOVER_SOFT_R_MULT", 1.6)
+            )
+            extras["heading_arb_recover_max_update_dyaw_deg"] = float(
+                cfg.get("MAG_HEADING_ARB_RECOVER_MAX_UPDATE_DYAW_DEG", 0.30)
+            )
+            extras["preproc_norm_dev_max"] = float(cfg.get("MAG_PREPROC_NORM_DEV_MAX", 0.45))
+            extras["preproc_gyro_delta_max_deg"] = float(cfg.get("MAG_PREPROC_GYRO_DELTA_MAX_DEG", 95.0))
+            extras["preproc_vision_delta_max_deg"] = float(cfg.get("MAG_PREPROC_VISION_DELTA_MAX_DEG", 120.0))
+            extras["preproc_ewma_alpha"] = float(cfg.get("MAG_PREPROC_EWMA_ALPHA", 0.08))
             extras["conditioning_warn_pcond"] = float(cfg.get("MAG_CONDITIONING_GUARD_WARN_PCOND", 8e11))
             extras["conditioning_warn_pmax"] = float(cfg.get("MAG_CONDITIONING_GUARD_WARN_PMAX", 8e6))
             extras["conditioning_degraded_pcond"] = float(cfg.get("MAG_CONDITIONING_GUARD_DEGRADED_PCOND", 1e11))
@@ -354,6 +497,12 @@ class PolicyRuntimeService:
             )
             extras["conditioning_extreme_pmax"] = float(
                 cfg.get("MAG_CONDITIONING_GUARD_EXTREME_PMAX", 4e7)
+            )
+            extras["conditioning_extreme_soft_enable"] = 1.0 if bool(
+                cfg.get("MAG_CONDITIONING_GUARD_EXTREME_SOFT_ENABLE", True)
+            ) else 0.0
+            extras["conditioning_extreme_soft_r_mult"] = float(
+                cfg.get("MAG_CONDITIONING_GUARD_EXTREME_SOFT_R_MULT", 2.0)
             )
             extras["conditioning_soft_enable"] = 1.0 if bool(cfg.get("MAG_CONDITIONING_GUARD_SOFT_ENABLE", True)) else 0.0
             extras["conditioning_soft_r_mult"] = float(cfg.get("MAG_CONDITIONING_GUARD_SOFT_R_MULT", 4.0))

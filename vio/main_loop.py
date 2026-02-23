@@ -50,6 +50,7 @@ from .services.vio_service import VIOService
 from .services.imu_update_service import IMUUpdateService
 from .services.kinematic_guard_service import KinematicGuardService
 from .services.policy_runtime_service import PolicyRuntimeService
+from .services.yaw_authority_service import YawAuthorityService
 
 
 class VIORunner:
@@ -224,6 +225,7 @@ class VIORunner:
         self._vio_vel_attempt_count: int = 0
         self._vio_vel_accept_count: int = 0
         self._policy_conflict_count: int = 0
+        self._yaw_auth_skip_count: int = 0
         self._kin_guard_samples: int = 0
         self._kin_guard_trigger_count: int = 0
         self._kin_guard_hard_count: int = 0
@@ -239,6 +241,7 @@ class VIORunner:
         self.imu_update_service = IMUUpdateService(self)
         self.kinematic_guard_service = KinematicGuardService(self)
         self.policy_runtime_service = PolicyRuntimeService(self)
+        self.yaw_authority_service = YawAuthorityService(self)
     
     def run(self):
         """

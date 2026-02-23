@@ -36,6 +36,7 @@ DEFAULT_PHASE_SEQUENCE_STAGE_F = ["F1", "F2", "F3", "F4", "F5"]
 DEFAULT_PHASE_SEQUENCE_STAGE_G = ["G5_1", "G5_2", "G6_1", "G7_1", "G7_2"]
 DEFAULT_PHASE_SEQUENCE_STAGE_G_CONT = ["G7_1_HALF", "G5_3"]
 DEFAULT_PHASE_SEQUENCE_STAGE_G_MAG = ["G5_MAG_SAFE", "G5_MAG_COND"]
+DEFAULT_PHASE_SEQUENCE_STAGE_YAW_AUTH = ["S1", "S2", "S3", "S4"]
 DEFAULT_PHASE_SEQUENCE = list(DEFAULT_PHASE_SEQUENCE_STAGE_A)
 
 # One-knob assignments for Stage-A pre-backend tuning (Phase4-base roadmap).
@@ -197,6 +198,22 @@ PHASE_ASSIGNMENTS: dict[str, dict[str, Any]] = {
         "magnetometer.warning_weak_yaw.conditioning_guard_hard_pmax": 2.3e6,
         "magnetometer.warning_weak_yaw.conditioning_guard_extreme_pcond": 1.45e11,
         "magnetometer.warning_weak_yaw.conditioning_guard_extreme_pmax": 2.7e6,
+    },
+    "S1": {
+        # Yaw authority stage-1: single-owner gate only.
+        "yaw_authority.activation_stage": 1,
+    },
+    "S2": {
+        # Yaw authority stage-2: enable cumulative/rate guards.
+        "yaw_authority.activation_stage": 2,
+    },
+    "S3": {
+        # Yaw authority stage-3: confidence + hysteresis switching.
+        "yaw_authority.activation_stage": 3,
+    },
+    "S4": {
+        # Yaw authority stage-4: soft-only gating under high-speed/unstable state.
+        "yaw_authority.activation_stage": 4,
     },
 }
 
@@ -624,7 +641,7 @@ def main() -> int:
     parser.add_argument(
         "--phase_set",
         default="stageA",
-        choices=["stageA", "stageE", "stageF", "stageG", "stageG_cont", "stageG_mag", "custom"],
+        choices=["stageA", "stageE", "stageF", "stageG", "stageG_cont", "stageG_mag", "stageYawAuth", "custom"],
     )
     parser.add_argument("--phases", default="")
     parser.add_argument("--dry_run", action="store_true", help="Plan and emit phase table without running benchmarks")
@@ -666,6 +683,8 @@ def main() -> int:
         default_phases = DEFAULT_PHASE_SEQUENCE_STAGE_G_CONT
     elif args.phase_set == "stageG_mag":
         default_phases = DEFAULT_PHASE_SEQUENCE_STAGE_G_MAG
+    elif args.phase_set == "stageYawAuth":
+        default_phases = DEFAULT_PHASE_SEQUENCE_STAGE_YAW_AUTH
     else:
         default_phases = DEFAULT_PHASE_SEQUENCE
     phases_raw = args.phases if str(args.phases).strip() else ",".join(default_phases)

@@ -742,7 +742,8 @@ def check_loop_closure(loop_detector, img_gray: np.ndarray, t: float, kf,
 def apply_loop_closure_correction(kf, loop_info: Dict[str, Any], t: float,
                                    cam_states: list, loop_detector,
                                    global_config: Optional[Dict[str, Any]] = None,
-                                   policy_decision: Optional[Any] = None) -> bool:
+                                   policy_decision: Optional[Any] = None,
+                                   yaw_authority_service: Optional[Any] = None) -> bool:
     """
     Apply yaw correction from loop closure detection.
     
@@ -815,6 +816,37 @@ def apply_loop_closure_correction(kf, loop_info: Dict[str, Any], t: float,
                 speed_sigma_inflate_m_s = float(policy_decision.extra("speed_sigma_inflate_m_s_normal", speed_sigma_inflate_m_s))
                 speed_sigma_mult = float(policy_decision.extra("speed_sigma_mult_normal", speed_sigma_mult))
         speed_now = float(np.linalg.norm(np.asarray(kf.x[3:6, 0], dtype=float)))
+
+        # Apply-side quality references used by yaw authority confidence scoring.
+        # Keep defaults robust in case older loop_info payloads do not include these fields.
+        spread_ratio = float(loop_info.get("spread_ratio", 0.0))
+        reproj_p95_px = float(loop_info.get("reproj_p95_px", np.inf))
+        yaw_abs_deg = abs(float(np.degrees(yaw_error)))
+        gate_inliers_hard = float(
+            global_config.get(
+                "LOOP_MIN_INLIERS_FAILSOFT" if fail_soft else "LOOP_MIN_INLIERS_HARD",
+                global_config.get("LOOP_MIN_INLIERS", 20 if fail_soft else 35),
+            )
+        )
+        gate_spread = float(global_config.get("LOOP_MIN_SPATIAL_SPREAD", 0.18))
+        gate_reproj = float(global_config.get("LOOP_MAX_REPROJ_PX", 2.5))
+        gate_yaw = float(global_config.get("LOOP_YAW_RESIDUAL_BOUND_DEG", reject_abs_deg))
+        if not np.isfinite(spread_ratio):
+            spread_ratio = 0.0
+        if not np.isfinite(reproj_p95_px):
+            reproj_p95_px = np.inf
+        if not np.isfinite(gate_inliers_hard):
+            gate_inliers_hard = 20.0 if fail_soft else 35.0
+        if not np.isfinite(gate_spread):
+            gate_spread = 0.18
+        if not np.isfinite(gate_reproj):
+            gate_reproj = 2.5
+        if not np.isfinite(gate_yaw):
+            gate_yaw = reject_abs_deg
+        gate_inliers_hard = max(1.0, gate_inliers_hard)
+        gate_spread = max(1e-6, gate_spread)
+        gate_reproj = max(1e-3, gate_reproj)
+        gate_yaw = max(1e-3, gate_yaw)
 
         # Temporal anti-burst gates (additional apply-side safety beyond detection-side confirm/cooldown).
         apply_confirm_enable = bool(global_config.get("LOOP_APPLY_CONFIRM_ENABLE", True))
@@ -935,10 +967,10 @@ def apply_loop_closure_correction(kf, loop_info: Dict[str, Any], t: float,
                 return False
             pending_map.pop(key, None)
 
-        if abs(np.degrees(yaw_error)) < min_abs_deg:
+        if yaw_abs_deg < min_abs_deg:
             return False
-        if abs(np.degrees(yaw_error)) > reject_abs_deg:
-            print(f"[LOOP] REJECT: yaw_error={np.degrees(yaw_error):.1f}° > {reject_abs_deg:.1f}°")
+        if yaw_abs_deg > reject_abs_deg:
+            print(f"[LOOP] REJECT: yaw_error={yaw_abs_deg:.1f}° > {reject_abs_deg:.1f}°")
             return False
         if np.isfinite(speed_now) and speed_now > speed_skip_m_s:
             if loop_detector is not None and hasattr(loop_detector, "stats"):
@@ -947,6 +979,51 @@ def apply_loop_closure_correction(kf, loop_info: Dict[str, Any], t: float,
                 f"[LOOP] SKIP apply at t={t:.2f}s: speed={speed_now:.2f}m/s > {speed_skip_m_s:.2f}m/s"
             )
             return False
+
+        yaw_auth_r_mult = 1.0
+        if yaw_authority_service is not None:
+            try:
+                p_abs = np.asarray(kf.P, dtype=float)
+                p_max = float(np.nanmax(np.abs(p_abs))) if p_abs.size > 0 else float("nan")
+                p_cond = float("inf")
+                if p_abs.ndim == 2 and p_abs.shape[0] > 0 and p_abs.shape[1] > 0:
+                    dim = min(48, int(p_abs.shape[0]))
+                    p_block = 0.5 * (p_abs[:dim, :dim] + p_abs[:dim, :dim].T)
+                    p_cond = float(np.linalg.cond(p_block))
+            except Exception:
+                p_max = float("nan")
+                p_cond = float("inf")
+
+            inlier_n = float(np.clip(num_inliers / max(1.0, float(gate_inliers_hard)), 0.0, 1.0))
+            spread_n = float(np.clip(spread_ratio / max(1e-6, float(gate_spread)), 0.0, 1.0))
+            reproj_ref = max(1e-3, float(gate_reproj) * (1.6 if fail_soft else 1.2))
+            reproj_n = float(np.clip((reproj_ref - float(reproj_p95_px)) / reproj_ref, 0.0, 1.0))
+            yaw_n = float(np.clip((float(gate_yaw) - yaw_abs_deg) / max(1e-3, float(gate_yaw)), 0.0, 1.0))
+            conf = float(np.clip(0.38 * inlier_n + 0.22 * spread_n + 0.28 * reproj_n + 0.12 * yaw_n, 0.0, 1.0))
+            if fail_soft:
+                conf *= 0.9
+
+            auth_dec = yaw_authority_service.request_decision(
+                source="LOOP",
+                timestamp=float(t),
+                requested_abs_dyaw_deg=float(abs(np.degrees(yaw_error))),
+                confidence=float(conf),
+                speed_m_s=float(speed_now),
+                health_state=str(health),
+                p_max=float(p_max),
+                p_cond=float(p_cond),
+            )
+            if not bool(auth_dec.allow) or str(auth_dec.mode).upper() in ("HOLD", "SKIP"):
+                if loop_detector is not None and hasattr(loop_detector, "stats"):
+                    loop_detector.stats["loop_speed_skipped"] = int(loop_detector.stats.get("loop_speed_skipped", 0)) + 1
+                print(
+                    f"[LOOP] YAW_AUTH skip at t={t:.2f}s: owner={auth_dec.owner}, src=LOOP, reason={auth_dec.reason}"
+                )
+                return False
+            if np.isfinite(float(auth_dec.max_update_dyaw_deg)):
+                max_abs_deg = min(max_abs_deg, max(0.05, float(auth_dec.max_update_dyaw_deg)))
+            if str(auth_dec.mode).upper() == "SOFT_APPLY":
+                yaw_auth_r_mult = max(1.0, float(auth_dec.r_mult))
 
         speed_caps_bp_raw = global_config.get(
             "LOOP_SPEED_YAW_CAP_BREAKPOINTS_M_S", [20.0, 35.0, 50.0]
@@ -1006,6 +1083,8 @@ def apply_loop_closure_correction(kf, loop_info: Dict[str, Any], t: float,
             sigma_loop *= float(warning_sigma_mult)
         elif health == "DEGRADED":
             sigma_loop *= float(degraded_sigma_mult)
+        if np.isfinite(yaw_auth_r_mult) and float(yaw_auth_r_mult) > 1.0:
+            sigma_loop *= float(yaw_auth_r_mult)
         R_loop = np.array([[sigma_loop**2]])
         
         # Apply EKF update
@@ -1039,6 +1118,15 @@ def apply_loop_closure_correction(kf, loop_info: Dict[str, Any], t: float,
         tag = "FAILSOFT" if fail_soft else "NORMAL"
         print(f"[LOOP] {tag} correction at t={t:.2f}s: Δyaw={np.degrees(yaw_error):.2f}° "
               f"(kf={kf_idx}, inliers={num_inliers}, sigma={np.degrees(sigma_loop):.2f}°)")
+        if yaw_authority_service is not None:
+            try:
+                yaw_authority_service.register_applied(
+                    source="LOOP",
+                    timestamp=float(t),
+                    abs_yaw_deg=float(abs(np.degrees(yaw_error))),
+                )
+            except Exception:
+                pass
         
         return True
         

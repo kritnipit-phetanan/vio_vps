@@ -93,7 +93,8 @@ def apply_magnetometer_update(kf,
                               use_estimated_bias: bool = True,
                               r_scale_extra: float = 1.0,
                               adaptive_info: Optional[Dict[str, Any]] = None,
-                              policy_decision: Optional["SensorPolicyDecision"] = None) -> Tuple[bool, str]:
+                              policy_decision: Optional["SensorPolicyDecision"] = None,
+                              max_update_dyaw_override_deg: Optional[float] = None) -> Tuple[bool, str]:
     """
     Apply magnetometer heading update.
     
@@ -122,6 +123,8 @@ def apply_magnetometer_update(kf,
         yaw_override: If provided, use this yaw instead of computing from mag (for filtered yaw)
         filter_info: Dictionary from apply_mag_filter() with {'high_rate': bool, 'gyro_inconsistent': bool}
         use_estimated_bias: If True, include mag_bias in Jacobian. If False, freeze mag_bias states.
+        max_update_dyaw_override_deg: Optional dynamic per-update yaw cap from
+            heading arbitration layer.
         
     Returns:
         Tuple of (update_applied: bool, rejection_reason: str)
@@ -413,6 +416,25 @@ def apply_magnetometer_update(kf,
             MAX_YAW_CORRECTION,
             np.radians(float(degraded_max_dyaw_deg))
         )
+    # MAG ablation weak mode: enforce a strict per-update yaw cap for all health states.
+    if policy_decision is not None:
+        mag_mode = str(policy_decision.extra_str("mag_mode", "normal")).lower()
+        if mag_mode == "weak":
+            weak_cap_deg = float(
+                policy_decision.extra(
+                    "ablation_max_update_dyaw_deg",
+                    float(global_config.get("MAG_ABLATION_MAX_UPDATE_DYAW_DEG", 180.0)),
+                )
+            )
+            if np.isfinite(weak_cap_deg) and weak_cap_deg > 0.0:
+                MAX_YAW_CORRECTION = min(MAX_YAW_CORRECTION, np.radians(float(weak_cap_deg)))
+    if max_update_dyaw_override_deg is not None:
+        try:
+            arb_cap_deg = float(max_update_dyaw_override_deg)
+        except Exception:
+            arb_cap_deg = float("nan")
+        if np.isfinite(arb_cap_deg) and arb_cap_deg > 0.0:
+            MAX_YAW_CORRECTION = min(MAX_YAW_CORRECTION, np.radians(arb_cap_deg))
     
     # Compute current Kalman gain
     P_yaw = float(kf.P[theta_cov_idx, theta_cov_idx])

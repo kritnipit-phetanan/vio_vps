@@ -603,6 +603,7 @@ class VIOService:
                     loop_detector=runner.loop_detector,
                     global_config=runner.global_config,
                     policy_decision=loop_decision,
+                    yaw_authority_service=getattr(runner, "yaw_authority_service", None),
                 )
                 if (
                     loop_decision is not None
@@ -946,6 +947,17 @@ class VIOService:
                     clone_id = str(vps_result_meta.get("clone_id", f"vps_{runner.state.img_idx}"))
                     health_key = _decision_health(vps_decision, "HEALTHY")
                     speed_now = float(np.linalg.norm(np.array(runner.kf.x[3:6, 0], dtype=float)))
+                    try:
+                        p_abs = np.asarray(runner.kf.P, dtype=float)
+                        p_max = float(np.nanmax(np.abs(p_abs))) if p_abs.size > 0 else float("nan")
+                        p_cond = float("inf")
+                        if p_abs.ndim == 2 and p_abs.shape[0] > 0 and p_abs.shape[1] > 0:
+                            dim = min(48, int(p_abs.shape[0]))
+                            p_block = 0.5 * (p_abs[:dim, :dim] + p_abs[:dim, :dim].T)
+                            p_cond = float(np.linalg.cond(p_block))
+                    except Exception:
+                        p_max = float("nan")
+                        p_cond = float("inf")
                     min_inliers_apply = int(round(float(vps_decision.extra("strict_min_inliers", 8.0))))
                     min_conf_apply = float(vps_decision.extra("strict_min_conf", 0.18))
                     max_reproj_apply = float(vps_decision.extra("strict_max_reproj", 1.2))
@@ -977,6 +989,22 @@ class VIOService:
                         and vps_reproj <= max_reproj_apply
                         and speed_now <= max_speed_apply
                     )
+                    force_soft_only_note = ""
+                    if getattr(runner, "yaw_authority_service", None) is not None:
+                        try:
+                            soft_only, soft_reason = runner.yaw_authority_service.should_force_soft_only(
+                                source="VPS",
+                                timestamp=float(t_cam),
+                                speed_m_s=float(speed_now),
+                                health_state=str(health_key),
+                                p_max=float(p_max),
+                                p_cond=float(p_cond),
+                            )
+                        except Exception:
+                            soft_only, soft_reason = False, ""
+                        if bool(soft_only):
+                            strict_quality_ok = False
+                            force_soft_only_note = f"soft_only_{soft_reason}" if soft_reason else "soft_only"
                     vps_offset = np.asarray(getattr(vps_result, "offset_m", (np.nan, np.nan)), dtype=float).reshape(-1)
                     vps_offset_m = float(np.linalg.norm(vps_offset[:2])) if vps_offset.size >= 2 else float("nan")
                     failsoft_enabled = bool(float(vps_decision.extra("failsoft_enabled", 1.0)) >= 0.5)
@@ -1041,6 +1069,8 @@ class VIOService:
                             vps_status = f"{temporal_reject_note} | {vps_status}"
                         if policy_reject_note:
                             vps_status = f"{policy_reject_note} | {vps_status}"
+                        if force_soft_only_note:
+                            vps_status = f"{force_soft_only_note} | {vps_status}"
                     else:
                         if quality_mode == "failsoft":
                             r_scale_apply *= float(vps_decision.extra("failsoft_r_mult", 1.5))
@@ -1193,6 +1223,7 @@ class VIOService:
         dyaw_deg = float(getattr(corr, "dyaw_deg", 0.0))
         if not np.isfinite(dyaw_deg):
             dyaw_deg = 0.0
+        yaw_auth_reason = ""
 
         max_dp = float(runner.global_config.get("BACKEND_MAX_APPLY_DP_XY_M", 25.0))
         dp_xy_norm = float(np.linalg.norm(dp[:2]))
@@ -1200,6 +1231,45 @@ class VIOService:
             dp[:2] *= float(max_dp / dp_xy_norm)
         max_dyaw_deg = float(runner.global_config.get("BACKEND_MAX_APPLY_DYAW_DEG", 2.5))
         dyaw_deg = float(np.clip(dyaw_deg, -max_dyaw_deg, max_dyaw_deg))
+
+        if abs(dyaw_deg) > 1e-9 and getattr(runner, "yaw_authority_service", None) is not None:
+            speed_now = float(np.linalg.norm(np.asarray(runner.kf.x[3:6, 0], dtype=float)))
+            adaptive_decision = getattr(runner, "current_adaptive_decision", None)
+            health_state = str(getattr(adaptive_decision, "health_state", "HEALTHY")).upper()
+            try:
+                p_abs = np.asarray(runner.kf.P, dtype=float)
+                p_max = float(np.nanmax(np.abs(p_abs))) if p_abs.size > 0 else float("nan")
+                p_cond = float("inf")
+                if p_abs.ndim == 2 and p_abs.shape[0] > 0 and p_abs.shape[1] > 0:
+                    dim = min(48, int(p_abs.shape[0]))
+                    p_block = 0.5 * (p_abs[:dim, :dim] + p_abs[:dim, :dim].T)
+                    p_cond = float(np.linalg.cond(p_block))
+            except Exception:
+                p_max = float("nan")
+                p_cond = float("inf")
+            conf = float(np.clip(float(getattr(corr, "quality_score", 0.6)), 0.0, 1.0))
+            auth_dec = runner.yaw_authority_service.request_decision(
+                source="BACKEND",
+                timestamp=float(getattr(corr, "t_ref", 0.0)),
+                requested_abs_dyaw_deg=float(abs(dyaw_deg)),
+                confidence=float(conf),
+                speed_m_s=float(speed_now),
+                health_state=str(health_state),
+                p_max=float(p_max),
+                p_cond=float(p_cond),
+            )
+            if (not bool(auth_dec.allow)) or str(auth_dec.mode).upper() in ("HOLD", "SKIP"):
+                yaw_auth_reason = f"skip:{auth_dec.reason}"
+                dyaw_deg = 0.0
+            else:
+                cap = float(auth_dec.max_update_dyaw_deg) if np.isfinite(float(auth_dec.max_update_dyaw_deg)) else float(max_dyaw_deg)
+                cap = max(0.05, min(float(max_dyaw_deg), cap))
+                dyaw_deg = float(np.clip(dyaw_deg, -cap, cap))
+                if str(auth_dec.mode).upper() == "SOFT_APPLY":
+                    yaw_auth_reason = f"soft:{auth_dec.reason}"
+                else:
+                    yaw_auth_reason = f"apply:{auth_dec.reason}"
+
         corr_weight = float(runner.global_config.get("BACKEND_CORRECTION_WEIGHT", 1.0))
         corr_weight = float(np.clip(corr_weight, 0.0, 1.0))
         if corr_weight < 1.0:
@@ -1210,6 +1280,17 @@ class VIOService:
         runner._backend_pending_dp_enu = dp.copy()
         runner._backend_pending_dyaw_deg = float(dyaw_deg)
         runner._backend_pending_steps_left = int(blend_steps)
+        if abs(dyaw_deg) > 1e-9 and getattr(runner, "yaw_authority_service", None) is not None:
+            try:
+                runner.yaw_authority_service.register_applied(
+                    source="BACKEND",
+                    timestamp=float(getattr(corr, "t_ref", 0.0)),
+                    abs_yaw_deg=float(abs(dyaw_deg)),
+                )
+            except Exception:
+                pass
+        if yaw_auth_reason and getattr(runner, "config", None) is not None and bool(getattr(runner.config, "save_debug_data", False)):
+            print(f"[BACKEND] yaw_auth {yaw_auth_reason}")
 
     def apply_pending_backend_blend(self, t_now: float) -> bool:
         """

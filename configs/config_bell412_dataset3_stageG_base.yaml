@@ -588,6 +588,45 @@ loop_closure:
     yaw_residual_bound_deg: 25.0
   use_loop_closure: true
 magnetometer:
+  ablation:
+    mode: "weak"
+    r_mult: 2.2
+    max_dyaw_deg: 18.0
+    max_update_dyaw_deg: 0.35
+    weak_skip_hard_mismatch: false
+  heading_arbitration:
+    enable: true
+    hard_mismatch_deg: 95.0
+    min_vision_quality: 0.55
+    streak_to_hold: 6
+    hold_sec: 0.9
+    soft_r_mult: 2.0
+    max_vision_age_sec: 0.8
+    score_ema_alpha: 0.22
+    score_soft_threshold: 0.58
+    score_hold_threshold: 0.24
+    score_vis_good_deg: 18.0
+    score_gyro_good_deg: 10.0
+    score_gyro_bad_deg: 48.0
+    score_state_good_deg: 24.0
+    score_state_bad_deg: 95.0
+    score_vis_weight: 0.45
+    score_gyro_weight: 0.30
+    score_state_weight: 0.25
+    yaw_budget_window_sec: 6.0
+    yaw_budget_abs_deg: 12.0
+    yaw_budget_min_remaining_deg: 0.20
+    recover_confirm_hits: 1
+    recover_min_score: 0.62
+    recover_soft_r_mult: 1.8
+    recover_max_update_dyaw_deg: 0.25
+  preprocessing:
+    enable: true
+    norm_range_enable: true
+    rolling_norm_dev_max: 0.45
+    gyro_delta_max_deg: 95.0
+    vision_delta_max_deg: 120.0
+    ewma_alpha: 0.08
   accuracy_policy:
     enabled: true
     good_min_score: 0.72
@@ -679,8 +718,10 @@ magnetometer:
     conditioning_guard_hard_pmax: 2.2e6
     conditioning_guard_warn_pcond: 1.0e10
     conditioning_guard_warn_pmax: 1.1e6
-    conditioning_guard_extreme_pcond: 1.3e11
-    conditioning_guard_extreme_pmax: 2.5e6
+    conditioning_guard_extreme_pcond: 1.6e11
+    conditioning_guard_extreme_pmax: 3.0e6
+    conditioning_guard_extreme_soft_enable: true
+    conditioning_guard_extreme_soft_r_mult: 2.2
     conditioning_guard_soft_enable: true
     conditioning_guard_soft_r_mult: 8.5
     conditioning_guard_soft_r_mult_healthy: 2.0
@@ -694,6 +735,38 @@ magnetometer:
     warning_extra_r_mult: 3.5
     warning_max_dyaw_deg: 0.8
     warning_r_mult: 6.0
+yaw_authority:
+  enable: true
+  activation_stage: 2  # S2 conservative retune
+  score_ema_alpha: 0.22
+  min_source_score: 0.35
+  switch_margin: 0.12
+  switch_min_interval_sec: 0.75
+  stage12_claim_enable: true
+  stage12_min_switch_interval_sec: 1.2
+  stage12_owner_timeout_sec: 1.0
+  stage12_claim_min_score: 0.40
+  stage12_claim_margin: 0.02
+  stage12_loop_force_claim_min_score: 0.85
+  stage12_loop_force_claim_max_speed_m_s: 20.0
+  stage12_allow_stale_reclaim_any: true
+  stage12_claim_sources: ["LOOP", "BACKEND"]
+  hold_score_threshold: 0.18
+  hold_sec: 0.8
+  yaw_budget_window_sec: 8.0
+  yaw_budget_abs_deg: 12.0
+  yaw_rate_max_deg_s: 6.0
+  budget_soft_r_mult: 1.6
+  soft_only_high_speed_m_s: 22.0
+  soft_only_unstable_pmax: 1.0e6
+  soft_only_unstable_pcond: 1.0e12
+  soft_only_unstable_health: ["WARNING", "DEGRADED"]
+  soft_only_max_dyaw_deg: 1.2
+  soft_only_r_mult: 1.5
+  source_priority:
+    MAG: 1.0
+    LOOP: 1.0
+    BACKEND: 0.9
 optimization:
   compute_budget: medium
   objective: accuracy

@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 from collections import deque
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import numpy as np
 
-from ..magnetometer import calibrate_magnetometer, apply_mag_filter
+from ..magnetometer import calibrate_magnetometer, apply_mag_filter, quaternion_to_yaw
 from ..measurement_updates import apply_magnetometer_update
 from ..output_utils import log_mag_quality
+from .heading_arbitration_service import HeadingArbitrationService
 
 
 class MagnetometerService:
@@ -23,6 +24,7 @@ class MagnetometerService:
         self._last_mag_t: float | None = None
         self._mag_chol_cooldown_until: float = -1e9
         self._mag_chol_fail_streak: int = 0
+        self._heading_arb = HeadingArbitrationService(runner)
 
     @staticmethod
     def _wrap_angle(rad: float) -> float:
@@ -173,6 +175,202 @@ class MagnetometerService:
             "vision_delta_deg": float(vision_delta_deg) if np.isfinite(vision_delta_deg) else np.nan,
             "reason": f"score={quality_score:.3f}",
         }
+
+    def _mag_mode(self, policy_decision: Optional[Any]) -> str:
+        mode = str(self.runner.global_config.get("MAG_MODE", "normal")).strip().lower()
+        if policy_decision is not None:
+            try:
+                mode = str(policy_decision.extra_str("mag_mode", mode)).strip().lower()
+            except Exception:
+                pass
+        if mode not in ("normal", "weak", "off"):
+            mode = "normal"
+        return mode
+
+    def _apply_mag_ablation(self,
+                            yaw_mag_filtered: float,
+                            sigma_mag_scaled: float,
+                            policy_decision: Optional[Any] = None) -> tuple[bool, float, str]:
+        """
+        Minimal MAG ablation mode.
+
+        - normal: no extra action
+        - weak: inflate R and optionally soften/skip hard yaw mismatch against state yaw
+        - off: skip MAG update
+        """
+        mode = self._mag_mode(policy_decision)
+        sigma_scaled = float(sigma_mag_scaled)
+        if mode == "off":
+            return True, sigma_scaled, "skip_mag_ablation_off"
+        if mode != "weak":
+            return False, sigma_scaled, ""
+
+        cfg = self.runner.global_config
+        r_mult = float(cfg.get("MAG_ABLATION_R_MULT", 1.0))
+        max_dyaw_deg = float(cfg.get("MAG_ABLATION_MAX_DYAW_DEG", 180.0))
+        weak_skip_hard = bool(cfg.get("MAG_ABLATION_WEAK_SKIP_HARD_MISMATCH", False))
+        if policy_decision is not None:
+            r_mult = float(policy_decision.extra("ablation_r_mult", r_mult))
+            max_dyaw_deg = float(policy_decision.extra("ablation_max_dyaw_deg", max_dyaw_deg))
+            weak_skip_hard = bool(policy_decision.extra("ablation_weak_skip_hard_mismatch", 1.0 if weak_skip_hard else 0.0) > 0.5)
+
+        sigma_scaled *= max(1.0, r_mult)
+        yaw_state = float(quaternion_to_yaw(np.asarray(self.runner.kf.x[6:10, 0], dtype=float)))
+        yaw_delta_deg = abs(np.degrees(self._wrap_angle(float(yaw_mag_filtered) - yaw_state)))
+        if yaw_delta_deg <= max_dyaw_deg:
+            return False, sigma_scaled, ""
+
+        if weak_skip_hard:
+            return True, sigma_scaled, "skip_mag_ablation_weak_hard_mismatch"
+
+        soften_ratio = min(4.0, yaw_delta_deg / max(1e-6, max_dyaw_deg))
+        sigma_scaled *= float(soften_ratio)
+        return False, sigma_scaled, "mag_ablation_weak_soften"
+
+    def _apply_heading_authority_layer(self,
+                                       yaw_mag_filtered: float,
+                                       yaw_state: float,
+                                       sigma_mag_scaled: float,
+                                       timestamp: float,
+                                       gyro_consistency_delta_deg: float,
+                                       policy_decision: Optional[Any] = None
+                                       ) -> tuple[bool, float, str, Optional[float], float]:
+        """Single-score heading authority arbitration for MAG."""
+        vis_yaw = getattr(self.runner, "_vision_yaw_ref", None)
+        vis_t = getattr(self.runner, "_vision_yaw_last_t", None)
+        vis_q = float(getattr(self.runner, "_vision_heading_quality", 0.0))
+        vis_age = float("inf")
+        if vis_t is not None:
+            vis_age = float(timestamp) - float(vis_t)
+
+        arb = self._heading_arb.evaluate_mag(
+            timestamp=float(timestamp),
+            yaw_mag=float(yaw_mag_filtered),
+            yaw_state=float(yaw_state),
+            vision_yaw=float(vis_yaw) if vis_yaw is not None else None,
+            vision_age_sec=float(vis_age),
+            vision_quality=float(vis_q),
+            gyro_consistency_delta_deg=float(gyro_consistency_delta_deg),
+            policy_decision=policy_decision,
+        )
+
+        sigma_scaled = float(sigma_mag_scaled) * float(max(1.0, arb.r_mult))
+        reason = str(arb.reason) if arb.reason else ""
+        if np.isfinite(float(arb.consistency_score)):
+            score_reason = f"arb_score={float(arb.consistency_score):.3f}"
+            reason = score_reason if reason == "" else f"{reason}|{score_reason}"
+        if arb.authority:
+            auth_reason = f"arb_authority={arb.authority}"
+            reason = auth_reason if reason == "" else f"{reason}|{auth_reason}"
+
+        max_update = float(arb.max_update_dyaw_deg) if np.isfinite(float(arb.max_update_dyaw_deg)) else None
+        if max_update is not None and max_update <= 0.0:
+            max_update = 0.05
+        score = float(arb.consistency_score) if np.isfinite(float(arb.consistency_score)) else float("nan")
+        return bool(arb.skip), float(sigma_scaled), reason, max_update, score
+
+    def _apply_global_yaw_authority(self,
+                                    yaw_source: str,
+                                    yaw_mag_filtered: float,
+                                    yaw_state: float,
+                                    sigma_mag_scaled: float,
+                                    timestamp: float,
+                                    health_key: str,
+                                    p_max: float,
+                                    p_cond: float,
+                                    consistency_score: float,
+                                    max_update_dyaw_deg: Optional[float]) -> tuple[bool, float, str, Optional[float]]:
+        """Global single-owner yaw authority layer (MAG source)."""
+        yaw_auth = getattr(self.runner, "yaw_authority_service", None)
+        if yaw_auth is None:
+            return False, float(sigma_mag_scaled), "", max_update_dyaw_deg
+
+        req_abs_deg = abs(np.degrees(self._wrap_angle(float(yaw_mag_filtered) - float(yaw_state))))
+        if max_update_dyaw_deg is not None and np.isfinite(float(max_update_dyaw_deg)):
+            req_abs_deg = min(req_abs_deg, max(0.05, float(max_update_dyaw_deg)))
+        speed_now = float(np.linalg.norm(np.asarray(self.runner.kf.x[3:6, 0], dtype=float)))
+        conf = float(consistency_score) if np.isfinite(float(consistency_score)) else 0.5
+
+        try:
+            auth_dec = yaw_auth.request_decision(
+                source=str(yaw_source),
+                timestamp=float(timestamp),
+                requested_abs_dyaw_deg=float(req_abs_deg),
+                confidence=float(conf),
+                speed_m_s=float(speed_now),
+                health_state=str(health_key),
+                p_max=float(p_max),
+                p_cond=float(p_cond),
+            )
+        except Exception:
+            return False, float(sigma_mag_scaled), "", max_update_dyaw_deg
+
+        if (not bool(auth_dec.allow)) or str(auth_dec.mode).upper() in ("HOLD", "SKIP"):
+            return True, float(sigma_mag_scaled), f"yaw_auth_skip:{auth_dec.reason}", 0.0
+
+        sigma_scaled = float(sigma_mag_scaled)
+        cap = max_update_dyaw_deg
+        reason = ""
+        if str(auth_dec.mode).upper() == "SOFT_APPLY":
+            sigma_scaled *= max(1.0, float(auth_dec.r_mult))
+            reason = f"yaw_auth_soft:{auth_dec.reason}"
+        else:
+            reason = f"yaw_auth_apply:{auth_dec.reason}"
+
+        if np.isfinite(float(auth_dec.max_update_dyaw_deg)):
+            auth_cap = max(0.05, float(auth_dec.max_update_dyaw_deg))
+            cap = auth_cap if cap is None else min(float(cap), auth_cap)
+
+        return False, float(sigma_scaled), reason, cap
+
+    def _preprocess_mag_guard(self,
+                              mag_norm: float,
+                              gyro_delta_deg: float,
+                              vision_delta_deg: float,
+                              policy_decision: Optional[Any] = None) -> tuple[bool, str]:
+        """
+        Lightweight real-time MAG preprocessing guard before EKF update.
+
+        - hard/soft-iron correction is already applied in `calibrate_magnetometer()`
+        - this function performs reject-only prechecks
+        """
+        cfg = self.runner.global_config
+        if not bool(cfg.get("MAG_PREPROC_ENABLE", True)):
+            return False, ""
+
+        norm_range_enable = bool(cfg.get("MAG_PREPROC_NORM_RANGE_ENABLE", True))
+        norm_dev_max = float(cfg.get("MAG_PREPROC_NORM_DEV_MAX", 0.45))
+        gyro_delta_max_deg = float(cfg.get("MAG_PREPROC_GYRO_DELTA_MAX_DEG", 95.0))
+        vision_delta_max_deg = float(cfg.get("MAG_PREPROC_VISION_DELTA_MAX_DEG", 120.0))
+        ewma_alpha = float(np.clip(cfg.get("MAG_PREPROC_EWMA_ALPHA", 0.08), 0.01, 0.8))
+        if policy_decision is not None:
+            norm_dev_max = float(policy_decision.extra("preproc_norm_dev_max", norm_dev_max))
+            gyro_delta_max_deg = float(policy_decision.extra("preproc_gyro_delta_max_deg", gyro_delta_max_deg))
+            vision_delta_max_deg = float(policy_decision.extra("preproc_vision_delta_max_deg", vision_delta_max_deg))
+            ewma_alpha = float(np.clip(policy_decision.extra("preproc_ewma_alpha", ewma_alpha), 0.01, 0.8))
+
+        if norm_range_enable and np.isfinite(float(mag_norm)):
+            min_norm = float(cfg.get("MAG_MIN_FIELD_STRENGTH", 0.1))
+            max_norm = float(cfg.get("MAG_MAX_FIELD_STRENGTH", 0.95))
+            if float(mag_norm) < float(min_norm) or float(mag_norm) > float(max_norm):
+                return True, "skip_preproc_norm_range"
+
+        if np.isfinite(float(mag_norm)):
+            if np.isfinite(float(self._mag_norm_ewma)):
+                self._mag_norm_ewma = (1.0 - ewma_alpha) * float(self._mag_norm_ewma) + ewma_alpha * float(mag_norm)
+            else:
+                self._mag_norm_ewma = float(mag_norm)
+            norm_dev = abs(float(mag_norm) - float(self._mag_norm_ewma)) / max(1e-6, abs(float(self._mag_norm_ewma)))
+            if np.isfinite(norm_dev) and norm_dev > float(norm_dev_max):
+                return True, "skip_preproc_norm_rolling_dev"
+
+        if np.isfinite(float(gyro_delta_deg)) and float(gyro_delta_deg) > float(gyro_delta_max_deg):
+            return True, "skip_preproc_gyro_consistency"
+
+        if np.isfinite(float(vision_delta_deg)) and float(vision_delta_deg) > float(vision_delta_max_deg):
+            return True, "skip_preproc_vision_consistency"
+
+        return False, ""
 
     def _apply_visual_heading_consistency(self,
                                           yaw_mag_filtered: float,
@@ -367,10 +565,16 @@ class MagnetometerService:
 
         extreme_pcond = float(cfg.get("MAG_CONDITIONING_GUARD_EXTREME_PCOND", 8.0 * pcond_hard))
         extreme_pmax = float(cfg.get("MAG_CONDITIONING_GUARD_EXTREME_PMAX", 4.0 * pmax_hard))
+        extreme_soft_enable = bool(cfg.get("MAG_CONDITIONING_GUARD_EXTREME_SOFT_ENABLE", True))
+        extreme_soft_r_mult = float(cfg.get("MAG_CONDITIONING_GUARD_EXTREME_SOFT_R_MULT", 2.0))
         if policy_decision is not None:
             extreme_pcond = float(policy_decision.extra("conditioning_extreme_pcond", extreme_pcond))
             extreme_pmax = float(policy_decision.extra("conditioning_extreme_pmax", extreme_pmax))
+            extreme_soft_enable = bool(policy_decision.extra("conditioning_extreme_soft_enable", 1.0 if extreme_soft_enable else 0.0) > 0.5)
+            extreme_soft_r_mult = float(policy_decision.extra("conditioning_extreme_soft_r_mult", extreme_soft_r_mult))
         if p_cond > extreme_pcond or p_max > extreme_pmax:
+            if extreme_soft_enable and health_key in ("WARNING", "RECOVERY"):
+                return False, "conditioning_extreme_soft_inflate", max(1.0, extreme_soft_r_mult)
             return True, "skip_conditioning_hard_extreme", 1.0
 
         if p_cond > pcond_hard or p_max > pmax_hard:
@@ -581,6 +785,20 @@ class MagnetometerService:
                 timestamp=float(mag_rec.t),
             )
             sigma_mag_scaled *= float(mag_quality.get("r_scale", 1.0))
+            skip_mag, sigma_mag_scaled, consistency_reason = self._apply_mag_ablation(
+                yaw_mag_filtered=yaw_mag_filtered,
+                sigma_mag_scaled=sigma_mag_scaled,
+                policy_decision=policy_decision,
+            )
+            preproc_skip, preproc_reason = self._preprocess_mag_guard(
+                mag_norm=float(mag_norm),
+                gyro_delta_deg=float(mag_quality.get("gyro_delta_deg", np.nan)),
+                vision_delta_deg=float(mag_quality.get("vision_delta_deg", np.nan)),
+                policy_decision=policy_decision,
+            )
+            if preproc_skip:
+                skip_mag = True
+                consistency_reason = preproc_reason if consistency_reason == "" else f"{consistency_reason}|{preproc_reason}"
             if health_key == "WARNING":
                 warn_soft = float(policy_decision.extra("conditioning_warn_pcond", self.runner.global_config.get("MAG_CONDITIONING_GUARD_WARN_PCOND", 8e11))) if policy_decision is not None else float(self.runner.global_config.get("MAG_CONDITIONING_GUARD_WARN_PCOND", 8e11))
                 if p_cond > warn_soft:
@@ -589,12 +807,16 @@ class MagnetometerService:
                 deg_soft = float(policy_decision.extra("conditioning_degraded_pcond", self.runner.global_config.get("MAG_CONDITIONING_GUARD_DEGRADED_PCOND", 1e11))) if policy_decision is not None else float(self.runner.global_config.get("MAG_CONDITIONING_GUARD_DEGRADED_PCOND", 1e11))
                 if p_cond > deg_soft:
                     sigma_mag_scaled *= float(policy_decision.extra("degraded_extra_r_mult", self.runner.global_config.get("MAG_DEGRADED_EXTRA_R_MULT", 2.8))) if policy_decision is not None else float(self.runner.global_config.get("MAG_DEGRADED_EXTRA_R_MULT", 2.8))
-            skip_mag, sigma_mag_scaled, consistency_reason = self._apply_visual_heading_consistency(
+            vis_skip, sigma_mag_scaled, vis_reason = self._apply_visual_heading_consistency(
                 yaw_mag_filtered=yaw_mag_filtered,
                 sigma_mag_scaled=sigma_mag_scaled,
                 timestamp=float(mag_rec.t),
                 health_key=health_key,
             )
+            if vis_skip:
+                skip_mag = True
+            if vis_reason:
+                consistency_reason = vis_reason if consistency_reason == "" else f"{consistency_reason}|{vis_reason}"
             cond_skip, cond_reason, cond_r_mult = self._check_conditioning_guard(
                 health_key=health_key,
                 p_max=p_max,
@@ -610,6 +832,35 @@ class MagnetometerService:
             if cond_skip:
                 skip_mag = True
                 consistency_reason = cond_reason if consistency_reason == "" else f"{consistency_reason}|{cond_reason}"
+            yaw_state_now = float(quaternion_to_yaw(np.asarray(self.runner.kf.x[6:10, 0], dtype=float)))
+            arb_skip, sigma_mag_scaled, arb_reason, arb_max_update_dyaw_deg, arb_score = self._apply_heading_authority_layer(
+                yaw_mag_filtered=yaw_mag_filtered,
+                yaw_state=yaw_state_now,
+                sigma_mag_scaled=sigma_mag_scaled,
+                timestamp=float(mag_rec.t),
+                gyro_consistency_delta_deg=float(mag_quality.get("gyro_delta_deg", np.nan)),
+                policy_decision=policy_decision,
+            )
+            if arb_skip:
+                skip_mag = True
+            if arb_reason:
+                consistency_reason = arb_reason if consistency_reason == "" else f"{consistency_reason}|{arb_reason}"
+            gauth_skip, sigma_mag_scaled, gauth_reason, arb_max_update_dyaw_deg = self._apply_global_yaw_authority(
+                yaw_source="MAG",
+                yaw_mag_filtered=yaw_mag_filtered,
+                yaw_state=yaw_state_now,
+                sigma_mag_scaled=sigma_mag_scaled,
+                timestamp=float(mag_rec.t),
+                health_key=health_key,
+                p_max=p_max,
+                p_cond=p_cond,
+                consistency_score=arb_score if np.isfinite(float(arb_score)) else float(mag_quality.get("quality_score", np.nan)),
+                max_update_dyaw_deg=arb_max_update_dyaw_deg,
+            )
+            if gauth_skip:
+                skip_mag = True
+            if gauth_reason:
+                consistency_reason = gauth_reason if consistency_reason == "" else f"{consistency_reason}|{gauth_reason}"
             decision = str(mag_quality.get("decision", "good"))
             if decision == "bad_skip":
                 skip_mag = True
@@ -682,6 +933,7 @@ class MagnetometerService:
                 use_estimated_bias=use_estimated_bias,
                 r_scale_extra=float(mag_policy_scales.get("r_scale", 1.0)),
                 policy_decision=policy_decision,
+                max_update_dyaw_override_deg=arb_max_update_dyaw_deg,
                 adaptive_info=mag_adaptive_info,
             )
             self._update_mag_chol_cooldown(
@@ -703,6 +955,19 @@ class MagnetometerService:
             )
 
             if applied:
+                planned_corr_deg = abs(np.degrees(self._wrap_angle(float(yaw_mag_filtered) - float(yaw_state_now))))
+                if arb_max_update_dyaw_deg is not None and np.isfinite(float(arb_max_update_dyaw_deg)):
+                    planned_corr_deg = min(planned_corr_deg, max(0.05, float(arb_max_update_dyaw_deg)))
+                self._heading_arb.register_applied_correction(float(mag_rec.t), float(planned_corr_deg))
+                if getattr(self.runner, "yaw_authority_service", None) is not None:
+                    try:
+                        self.runner.yaw_authority_service.register_applied(
+                            source="MAG",
+                            timestamp=float(mag_rec.t),
+                            abs_yaw_deg=float(planned_corr_deg),
+                        )
+                    except Exception:
+                        pass
                 self.runner.state.mag_updates += 1
             else:
                 self.runner.state.mag_rejects += 1
@@ -809,14 +1074,33 @@ class MagnetometerService:
             timestamp=float(mag_rec.t),
         )
         sigma_mag_scaled *= float(mag_quality.get("r_scale", 1.0))
-        skip_mag, sigma_mag_scaled, _ = self._apply_visual_heading_consistency(
+        skip_mag, sigma_mag_scaled, consistency_reason = self._apply_mag_ablation(
+            yaw_mag_filtered=yaw_mag_filtered,
+            sigma_mag_scaled=sigma_mag_scaled,
+            policy_decision=policy_decision,
+        )
+        preproc_skip, preproc_reason = self._preprocess_mag_guard(
+            mag_norm=float(np.linalg.norm(mag_cal)),
+            gyro_delta_deg=float(mag_quality.get("gyro_delta_deg", np.nan)),
+            vision_delta_deg=float(mag_quality.get("vision_delta_deg", np.nan)),
+            policy_decision=policy_decision,
+        )
+        if preproc_skip:
+            skip_mag = True
+            consistency_reason = preproc_reason if consistency_reason == "" else f"{consistency_reason}|{preproc_reason}"
+        vis_skip, sigma_mag_scaled, vis_reason = self._apply_visual_heading_consistency(
             yaw_mag_filtered=yaw_mag_filtered,
             sigma_mag_scaled=sigma_mag_scaled,
             timestamp=float(mag_rec.t),
             health_key=health_key,
         )
+        if vis_skip:
+            skip_mag = True
+        if vis_reason:
+            consistency_reason = vis_reason if consistency_reason == "" else f"{consistency_reason}|{vis_reason}"
         if str(mag_quality.get("decision", "")) == "bad_skip":
             skip_mag = True
+            consistency_reason = "skip_quality_bad" if consistency_reason == "" else f"{consistency_reason}|skip_quality_bad"
         cond_skip, cond_reason, cond_r_mult = self._check_conditioning_guard(
             health_key=health_key,
             p_max=p_max,
@@ -827,6 +1111,36 @@ class MagnetometerService:
             sigma_mag_scaled *= float(cond_r_mult)
         if cond_skip:
             skip_mag = True
+            consistency_reason = cond_reason if consistency_reason == "" else f"{consistency_reason}|{cond_reason}"
+        yaw_state_now = float(quaternion_to_yaw(np.asarray(self.runner.kf.x[6:10, 0], dtype=float)))
+        arb_skip, sigma_mag_scaled, arb_reason, arb_max_update_dyaw_deg, arb_score = self._apply_heading_authority_layer(
+            yaw_mag_filtered=yaw_mag_filtered,
+            yaw_state=yaw_state_now,
+            sigma_mag_scaled=sigma_mag_scaled,
+            timestamp=float(mag_rec.t),
+            gyro_consistency_delta_deg=float(mag_quality.get("gyro_delta_deg", np.nan)),
+            policy_decision=policy_decision,
+        )
+        if arb_skip:
+            skip_mag = True
+        if arb_reason:
+            consistency_reason = arb_reason if consistency_reason == "" else f"{consistency_reason}|{arb_reason}"
+        gauth_skip, sigma_mag_scaled, gauth_reason, arb_max_update_dyaw_deg = self._apply_global_yaw_authority(
+            yaw_source="MAG",
+            yaw_mag_filtered=yaw_mag_filtered,
+            yaw_state=yaw_state_now,
+            sigma_mag_scaled=sigma_mag_scaled,
+            timestamp=float(mag_rec.t),
+            health_key=health_key,
+            p_max=p_max,
+            p_cond=p_cond,
+            consistency_score=arb_score if np.isfinite(float(arb_score)) else float(mag_quality.get("quality_score", np.nan)),
+            max_update_dyaw_deg=arb_max_update_dyaw_deg,
+        )
+        if gauth_skip:
+            skip_mag = True
+        if gauth_reason:
+            consistency_reason = gauth_reason if consistency_reason == "" else f"{consistency_reason}|{gauth_reason}"
         log_mag_quality(
             getattr(self.runner, "mag_quality_csv", None),
             t=float(mag_rec.t),
@@ -836,7 +1150,7 @@ class MagnetometerService:
             gyro_delta_deg=float(mag_quality.get("gyro_delta_deg", np.nan)),
             vision_delta_deg=float(mag_quality.get("vision_delta_deg", np.nan)),
             quality_score=float(mag_quality.get("quality_score", np.nan)),
-            decision=str(mag_quality.get("decision", "good")),
+            decision=str(mag_quality.get("decision", "good")) if consistency_reason == "" else f"{str(mag_quality.get('decision', 'good'))}+{consistency_reason}",
             r_scale=float(max(1e-6, sigma_mag_scaled / max(1e-6, sigma_mag))),
             reason=str(mag_quality.get("reason", "")),
         )
@@ -876,6 +1190,7 @@ class MagnetometerService:
             use_estimated_bias=use_estimated_bias,
             r_scale_extra=float(policy_r_scale),
             policy_decision=policy_decision,
+            max_update_dyaw_override_deg=arb_max_update_dyaw_deg,
         )
         self._update_mag_chol_cooldown(
             timestamp=float(mag_rec.t),
@@ -886,6 +1201,19 @@ class MagnetometerService:
         )
 
         if applied:
+            planned_corr_deg = abs(np.degrees(self._wrap_angle(float(yaw_mag_filtered) - float(yaw_state_now))))
+            if arb_max_update_dyaw_deg is not None and np.isfinite(float(arb_max_update_dyaw_deg)):
+                planned_corr_deg = min(planned_corr_deg, max(0.05, float(arb_max_update_dyaw_deg)))
+            self._heading_arb.register_applied_correction(float(mag_rec.t), float(planned_corr_deg))
+            if getattr(self.runner, "yaw_authority_service", None) is not None:
+                try:
+                    self.runner.yaw_authority_service.register_applied(
+                        source="MAG",
+                        timestamp=float(mag_rec.t),
+                        abs_yaw_deg=float(planned_corr_deg),
+                    )
+                except Exception:
+                    pass
             self.runner.state.mag_updates += 1
         else:
             self.runner.state.mag_rejects += 1
