@@ -171,6 +171,8 @@ def summarize_spectacular_style(out_dir: Path) -> dict:
         "yaw_align_deg": np.nan,
         "heading_mae_deg": np.nan,
         "heading_final_abs_deg": np.nan,
+        "heading_p95_abs_deg": np.nan,
+        "spike_rate_abs_err_gt30_deg": np.nan,
         "aligned4dof_status": "not_computed",
         "aligned4dof_skip_reason": "",
     }
@@ -217,6 +219,8 @@ def summarize_spectacular_style(out_dir: Path) -> dict:
         if yaw_ok.size:
             res["heading_mae_deg"] = float(np.mean(yaw_ok))
             res["heading_final_abs_deg"] = float(yaw_ok[-1])
+            res["heading_p95_abs_deg"] = float(np.percentile(yaw_ok, 95))
+            res["spike_rate_abs_err_gt30_deg"] = float(np.mean(yaw_ok > 30.0))
 
         # 4-DoF alignment (yaw + xyz translation) reconstructed from error_log.
         if {"vio_E", "vio_N", "vio_U"}.issubset(df.columns):
@@ -299,6 +303,28 @@ def summarize_spectacular_style(out_dir: Path) -> dict:
                             v_z_fb = np.nan_to_num(v_z_fb, nan=0.0, posinf=0.0, neginf=0.0)
                             g_z_fb = np.nan_to_num(g_z_fb, nan=0.0, posinf=0.0, neginf=0.0)
 
+                            # Numeric guard: prevent fallback path from creating warning floods
+                            # on extreme values (overflow in matrix ops).
+                            max_abs_guard = 1.0e6
+                            fb_max = float(
+                                np.nanmax(
+                                    np.abs(
+                                        np.concatenate(
+                                            [
+                                                v_xy_fb.reshape(-1),
+                                                g_xy_fb.reshape(-1),
+                                                v_z_fb.reshape(-1),
+                                                g_z_fb.reshape(-1),
+                                            ]
+                                        )
+                                    )
+                                )
+                            )
+                            if not np.isfinite(fb_max) or fb_max > max_abs_guard:
+                                res["aligned4dof_status"] = "skipped"
+                                res["aligned4dof_skip_reason"] = "numeric_guard_magnitude"
+                                raise ValueError("numeric_guard_magnitude")
+
                             v_xy_mu = np.mean(v_xy_fb, axis=0)
                             g_xy_mu = np.mean(g_xy_fb, axis=0)
                             v_xy_c = v_xy_fb - v_xy_mu
@@ -310,16 +336,17 @@ def summarize_spectacular_style(out_dir: Path) -> dict:
                             cy, sy = np.cos(yaw), np.sin(yaw)
                             r2 = np.array([[cy, -sy], [sy, cy]], dtype=np.float64)
 
-                            v_xy_aligned = (r2 @ v_xy_fb.T).T
-                            t_xy = g_xy_mu - np.mean(v_xy_aligned, axis=0)
-                            v_xy_aligned = v_xy_aligned + t_xy
-                            t_z = float(np.mean(g_z_fb - v_z_fb))
-                            v_z_aligned = v_z_fb + t_z
+                            with np.errstate(over="raise", divide="raise", invalid="raise"):
+                                v_xy_aligned = (r2 @ v_xy_fb.T).T
+                                t_xy = g_xy_mu - np.mean(v_xy_aligned, axis=0)
+                                v_xy_aligned = v_xy_aligned + t_xy
+                                t_z = float(np.mean(g_z_fb - v_z_fb))
+                                v_z_aligned = v_z_fb + t_z
 
-                            err_xy = v_xy_aligned - g_xy_fb
-                            err_z = v_z_aligned - g_z_fb
-                            err_h = np.sqrt(np.sum(err_xy ** 2, axis=1))
-                            err_3d = np.sqrt(np.sum(err_xy ** 2, axis=1) + err_z ** 2)
+                                err_xy = v_xy_aligned - g_xy_fb
+                                err_z = v_z_aligned - g_z_fb
+                                err_h = np.sqrt(np.sum(err_xy ** 2, axis=1))
+                                err_3d = np.sqrt(np.sum(err_xy ** 2, axis=1) + err_z ** 2)
 
                             finite_mask = np.isfinite(err_h) & np.isfinite(err_3d)
                             if finite_mask.sum() >= 5:
@@ -337,8 +364,9 @@ def summarize_spectacular_style(out_dir: Path) -> dict:
                                 res["aligned4dof_status"] = "skipped"
                                 res["aligned4dof_skip_reason"] = "numeric_guard_floating_point"
                         except Exception:
-                            res["aligned4dof_status"] = "skipped"
-                            res["aligned4dof_skip_reason"] = "numeric_guard_floating_point"
+                            if res.get("aligned4dof_status") != "skipped":
+                                res["aligned4dof_status"] = "skipped"
+                                res["aligned4dof_skip_reason"] = "numeric_guard_floating_point"
                     except Exception:
                         res["aligned4dof_status"] = "skipped"
                         res["aligned4dof_skip_reason"] = "alignment_exception"
@@ -372,6 +400,8 @@ def summarize_spectacular_style(out_dir: Path) -> dict:
     print("Heading error:")
     print(f"  MAE            : {res['heading_mae_deg']:.3f} deg")
     print(f"  final |err|    : {res['heading_final_abs_deg']:.3f} deg")
+    print(f"  p95 |err|      : {res['heading_p95_abs_deg']:.3f} deg")
+    print(f"  spike(|err|>30): {res['spike_rate_abs_err_gt30_deg']:.3f}")
     print(f"saved: {out_csv}")
     print("")
     return res

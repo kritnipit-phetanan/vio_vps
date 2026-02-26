@@ -47,6 +47,18 @@ HEALTH_COLUMNS = [
     "vps_time_budget_stops",
     "vps_evaluated_candidates_mean",
     "policy_conflict_count",
+    "heading_owner_switch_count",
+    "heading_owner_mag_ratio",
+    "heading_owner_loop_ratio",
+    "heading_owner_backend_ratio",
+    "msckf_quality_p50",
+    "msckf_quality_p10",
+    "backend_stale_ratio",
+    "backend_emit_to_apply_ratio",
+    "backend_apply_quality_p50",
+    "backend_snap_reject_count",
+    "backend_apply_latency_ms_p95",
+    "backend_contract_violation_count",
     "rtf_proc_sim",
 ]
 
@@ -215,6 +227,8 @@ def _print_spectacular_delta(cur_dir: Path, base_dir: Path) -> None:
         "aligned4dof_h_cep50_m",
         "aligned4dof_h_cep95_m",
         "heading_mae_deg",
+        "heading_p95_abs_deg",
+        "spike_rate_abs_err_gt30_deg",
         "heading_final_abs_deg",
     ]
     print(f"Baseline spectacular-style delta vs: {base_dir}")
@@ -265,6 +279,18 @@ def _print_health_summary(current_row: pd.Series) -> None:
         "vps_time_budget_stops",
         "vps_evaluated_candidates_mean",
         "policy_conflict_count",
+        "heading_owner_switch_count",
+        "heading_owner_mag_ratio",
+        "heading_owner_loop_ratio",
+        "heading_owner_backend_ratio",
+        "msckf_quality_p50",
+        "msckf_quality_p10",
+        "backend_stale_ratio",
+        "backend_emit_to_apply_ratio",
+        "backend_apply_quality_p50",
+        "backend_snap_reject_count",
+        "backend_apply_latency_ms_p95",
+        "backend_contract_violation_count",
         "rtf_proc_sim",
     ]:
         if col in current_row.index:
@@ -286,17 +312,67 @@ def _print_health_delta(current_row: pd.Series, base_row: pd.Series, baseline_ru
     print("")
 
 
-def _load_heading_final_abs_deg(output_dir: Path) -> float:
-    p = output_dir / "accuracy_first_summary.csv"
+def _heading_metrics_from_error_log(output_dir: Path) -> dict[str, float]:
+    out = {
+        "heading_final_abs_deg": float("nan"),
+        "heading_mae_deg": float("nan"),
+        "heading_p95_abs_deg": float("nan"),
+        "spike_rate_abs_err_gt30_deg": float("nan"),
+    }
+    p = output_dir / "error_log.csv"
     if not p.is_file():
-        return float("nan")
+        return out
     try:
         df = pd.read_csv(p)
     except Exception:
-        return float("nan")
-    if len(df) == 0:
-        return float("nan")
-    return _to_float(df.iloc[-1].get("heading_final_abs_deg"))
+        return out
+    if len(df) == 0 or "yaw_error_deg" not in df.columns:
+        return out
+    yaw = np.abs(pd.to_numeric(df["yaw_error_deg"], errors="coerce").to_numpy(dtype=float))
+    yaw = yaw[np.isfinite(yaw)]
+    if yaw.size == 0:
+        return out
+    out["heading_final_abs_deg"] = float(yaw[-1])
+    out["heading_mae_deg"] = float(np.mean(yaw))
+    out["heading_p95_abs_deg"] = float(np.percentile(yaw, 95))
+    out["spike_rate_abs_err_gt30_deg"] = float(np.mean(yaw > 30.0))
+    return out
+
+
+def _load_heading_metrics(output_dir: Path) -> dict[str, float]:
+    metrics = _heading_metrics_from_error_log(output_dir)
+
+    # Primary source for final heading lock.
+    p_acc = output_dir / "accuracy_first_summary.csv"
+    if p_acc.is_file():
+        try:
+            df = pd.read_csv(p_acc)
+            if len(df) > 0:
+                v = _to_float(df.iloc[-1].get("heading_final_abs_deg"))
+                if np.isfinite(v):
+                    metrics["heading_final_abs_deg"] = v
+        except Exception:
+            pass
+
+    # Primary source for MAE/P95/spike lock metrics.
+    p_sp = output_dir / "spectacular_style_metrics.csv"
+    if p_sp.is_file():
+        try:
+            df = pd.read_csv(p_sp)
+            if len(df) > 0:
+                row = df.iloc[-1]
+                for k in ("heading_mae_deg", "heading_p95_abs_deg", "spike_rate_abs_err_gt30_deg"):
+                    v = _to_float(row.get(k))
+                    if np.isfinite(v):
+                        metrics[k] = v
+                # Keep final coherent with spectacular if accuracy file is missing.
+                if not np.isfinite(metrics["heading_final_abs_deg"]):
+                    v_final = _to_float(row.get("heading_final_abs_deg"))
+                    if np.isfinite(v_final):
+                        metrics["heading_final_abs_deg"] = v_final
+        except Exception:
+            pass
+    return metrics
 
 
 def evaluate_locks(
@@ -314,7 +390,11 @@ def evaluate_locks(
     backend_poll_count = _to_float(current_row.get("backend_poll_count"))
     policy_conflict_count = _to_float(current_row.get("policy_conflict_count"))
     vps_used = _to_float(current_row.get("vps_used"))
-    heading_final_abs_deg = _load_heading_final_abs_deg(output_dir)
+    heading_metrics = _load_heading_metrics(output_dir)
+    heading_final_abs_deg = float(heading_metrics.get("heading_final_abs_deg", float("nan")))
+    heading_mae_deg = float(heading_metrics.get("heading_mae_deg", float("nan")))
+    heading_p95_abs_deg = float(heading_metrics.get("heading_p95_abs_deg", float("nan")))
+    spike_rate_abs_err_gt30_deg = float(heading_metrics.get("spike_rate_abs_err_gt30_deg", float("nan")))
     overflow_hits: list[str] = []
 
     if run_log.is_file():
@@ -386,6 +466,25 @@ def evaluate_locks(
                     np.isfinite(heading_final_abs_deg) and heading_final_abs_deg <= 15.0,
                     f"value={heading_final_abs_deg:.3f}" if np.isfinite(heading_final_abs_deg) else "value=nan",
                 ),
+                (
+                    "heading_mae_deg <= 45",
+                    np.isfinite(heading_mae_deg) and heading_mae_deg <= 45.0,
+                    f"value={heading_mae_deg:.3f}" if np.isfinite(heading_mae_deg) else "value=nan",
+                ),
+                (
+                    "heading_p95_abs_deg <= 120",
+                    np.isfinite(heading_p95_abs_deg) and heading_p95_abs_deg <= 120.0,
+                    f"value={heading_p95_abs_deg:.3f}" if np.isfinite(heading_p95_abs_deg) else "value=nan",
+                ),
+                (
+                    "spike_rate_abs_err_gt30_deg <= 0.70",
+                    np.isfinite(spike_rate_abs_err_gt30_deg) and spike_rate_abs_err_gt30_deg <= 0.70,
+                    (
+                        f"value={spike_rate_abs_err_gt30_deg:.4f}"
+                        if np.isfinite(spike_rate_abs_err_gt30_deg)
+                        else "value=nan"
+                    ),
+                ),
             ]
         )
     elif profile in ("backend", "near_rt_backend"):
@@ -410,6 +509,25 @@ def evaluate_locks(
                     "heading_final_abs_deg <= 10",
                     np.isfinite(heading_final_abs_deg) and heading_final_abs_deg <= 10.0,
                     f"value={heading_final_abs_deg:.3f}" if np.isfinite(heading_final_abs_deg) else "value=nan",
+                ),
+                (
+                    "heading_mae_deg <= 35",
+                    np.isfinite(heading_mae_deg) and heading_mae_deg <= 35.0,
+                    f"value={heading_mae_deg:.3f}" if np.isfinite(heading_mae_deg) else "value=nan",
+                ),
+                (
+                    "heading_p95_abs_deg <= 90",
+                    np.isfinite(heading_p95_abs_deg) and heading_p95_abs_deg <= 90.0,
+                    f"value={heading_p95_abs_deg:.3f}" if np.isfinite(heading_p95_abs_deg) else "value=nan",
+                ),
+                (
+                    "spike_rate_abs_err_gt30_deg <= 0.60",
+                    np.isfinite(spike_rate_abs_err_gt30_deg) and spike_rate_abs_err_gt30_deg <= 0.60,
+                    (
+                        f"value={spike_rate_abs_err_gt30_deg:.4f}"
+                        if np.isfinite(spike_rate_abs_err_gt30_deg)
+                        else "value=nan"
+                    ),
                 ),
             ]
         )

@@ -120,7 +120,15 @@ class VIOFrontEnd:
 
     def _runtime_log(self, key: str, msg: str, force: bool = False):
         """Rate-limited runtime logging for non-critical per-frame messages."""
-        if force or not self._runtime_quiet:
+        if force:
+            print(msg)
+            self._last_runtime_log_ts[key] = time.time()
+            return
+        # In release/quiet modes, suppress non-critical runtime logs to reduce
+        # per-frame I/O overhead.
+        if self._runtime_quiet:
+            return
+        if not self._runtime_quiet:
             print(msg)
             self._last_runtime_log_ts[key] = time.time()
             return

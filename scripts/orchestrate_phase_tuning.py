@@ -37,7 +37,12 @@ DEFAULT_PHASE_SEQUENCE_STAGE_G = ["G5_1", "G5_2", "G6_1", "G7_1", "G7_2"]
 DEFAULT_PHASE_SEQUENCE_STAGE_G_CONT = ["G7_1_HALF", "G5_3"]
 DEFAULT_PHASE_SEQUENCE_STAGE_G_MAG = ["G5_MAG_SAFE", "G5_MAG_COND"]
 DEFAULT_PHASE_SEQUENCE_STAGE_YAW_AUTH = ["S1", "S2", "S3", "S4"]
+DEFAULT_PHASE_SEQUENCE_STAGE_H = ["H1", "H2", "H3", "G6_1", "G7_1", "G7_2"]
 DEFAULT_PHASE_SEQUENCE = list(DEFAULT_PHASE_SEQUENCE_STAGE_A)
+# These phases may intentionally have no config delta but still must execute
+# to validate pass criteria against runtime outputs.
+FORCE_RUN_IF_NO_CHANGE = {"H1", "H2", "H3"}
+H_COMPARE_PHASES = {"H1", "H2", "H3"}
 
 # One-knob assignments for Stage-A pre-backend tuning (Phase4-base roadmap).
 PHASE_ASSIGNMENTS: dict[str, dict[str, Any]] = {
@@ -214,6 +219,29 @@ PHASE_ASSIGNMENTS: dict[str, dict[str, Any]] = {
     "S4": {
         # Yaw authority stage-4: soft-only gating under high-speed/unstable state.
         "yaw_authority.activation_stage": 4,
+    },
+    "H1": {
+        # H1 instrumentation-first, low-risk delta:
+        # keep MSCKF quality logging decoupled from yaw scoring and run
+        # stage-1 owner policy as compare-focused reference.
+        "yaw_authority.activation_stage": 1,
+        "yaw_authority.use_msckf_confidence": False,
+    },
+    "H2": {
+        # H2 yaw-owner unification/hysteresis knobs.
+        "yaw_authority.activation_stage": 2,
+        "yaw_authority.owner_min_dwell_sec": 1.1,
+        "yaw_authority.switch_margin": 0.18,
+        "yaw_authority.switch_min_interval_sec": 1.1,
+    },
+    "H3": {
+        # H3 MAG preprocess weak-anchor knobs (half-step rollback):
+        # relax from aggressive cutoffs to recover mag_accept_rate while
+        # keeping safeguards tighter than stageG base.
+        "magnetometer.quality.norm_ewma_alpha": 0.09,
+        "magnetometer.quality.norm_mad_thresh": 0.425,
+        "magnetometer.quality.gyro_consistency_deg_s": 90.0,
+        "magnetometer.quality.vision_consistency_deg": 110.0,
     },
 }
 
@@ -422,6 +450,129 @@ def read_heading_final_abs(run_dir: Path | None) -> float:
         return float("nan")
 
 
+def read_spectacular_row(run_dir: Path | None) -> pd.Series | None:
+    if run_dir is None:
+        return None
+    p = run_dir / "spectacular_style_metrics.csv"
+    if not p.is_file():
+        return None
+    try:
+        df = pd.read_csv(p)
+    except Exception:
+        return None
+    if len(df) == 0:
+        return None
+    return df.iloc[-1]
+
+
+def _heading_metrics_from_error_log(run_dir: Path | None) -> dict[str, float]:
+    out = {
+        "heading_final_abs_deg": float("nan"),
+        "heading_mae_deg": float("nan"),
+        "heading_p95_abs_deg": float("nan"),
+        "spike_rate_abs_err_gt30_deg": float("nan"),
+    }
+    if run_dir is None:
+        return out
+    p = run_dir / "error_log.csv"
+    if not p.is_file():
+        return out
+    try:
+        df = pd.read_csv(p)
+    except Exception:
+        return out
+    if len(df) == 0 or "yaw_error_deg" not in df.columns:
+        return out
+    yaw = np.abs(pd.to_numeric(df["yaw_error_deg"], errors="coerce").to_numpy(dtype=float))
+    yaw = yaw[np.isfinite(yaw)]
+    if yaw.size == 0:
+        return out
+    out["heading_final_abs_deg"] = float(yaw[-1])
+    out["heading_mae_deg"] = float(np.mean(yaw))
+    out["heading_p95_abs_deg"] = float(np.percentile(yaw, 95))
+    out["spike_rate_abs_err_gt30_deg"] = float(np.mean(yaw > 30.0))
+    return out
+
+
+def read_heading_metrics(run_dir: Path | None) -> dict[str, float]:
+    metrics = _heading_metrics_from_error_log(run_dir)
+    acc_final = read_heading_final_abs(run_dir)
+    if np.isfinite(acc_final):
+        metrics["heading_final_abs_deg"] = float(acc_final)
+    sp_row = read_spectacular_row(run_dir)
+    if sp_row is not None:
+        for k in ("heading_mae_deg", "heading_p95_abs_deg", "spike_rate_abs_err_gt30_deg"):
+            v = _to_float(sp_row, k)
+            if np.isfinite(v):
+                metrics[k] = float(v)
+        if not np.isfinite(metrics["heading_final_abs_deg"]):
+            v_final = _to_float(sp_row, "heading_final_abs_deg")
+            if np.isfinite(v_final):
+                metrics["heading_final_abs_deg"] = float(v_final)
+    return metrics
+
+
+def parse_sim_time_sec(run_log: Path) -> float:
+    if not run_log.is_file():
+        return float("nan")
+    txt = run_log.read_text(errors="ignore")
+    patterns = [
+        r"sim_time\s*:\s*([0-9.]+)\s*s",
+        r"sim time\s*:\s*([0-9.]+)\s*s",
+        r"finished in\s*([0-9.]+)\s*seconds",
+    ]
+    for pat in patterns:
+        matches = re.findall(pat, txt, flags=re.IGNORECASE)
+        if matches:
+            try:
+                return float(matches[-1])
+            except Exception:
+                continue
+    return float("nan")
+
+
+def read_owner_switch_stats_from_trace(run_dir: Path | None) -> tuple[float, float, float]:
+    """Return (switch_count, switch_rate_hz, duration_sec) from heading_owner_trace.csv.
+
+    Any unavailable value is returned as NaN.
+    """
+    if run_dir is None:
+        return float("nan"), float("nan"), float("nan")
+    trace_csv = run_dir / "heading_owner_trace.csv"
+    if not trace_csv.is_file():
+        return float("nan"), float("nan"), float("nan")
+    try:
+        df = pd.read_csv(trace_csv)
+    except Exception:
+        return float("nan"), float("nan"), float("nan")
+    if len(df) < 2:
+        return 0.0, float("nan"), 0.0
+
+    owner_col = None
+    time_col = None
+    for c in df.columns:
+        lc = str(c).lower()
+        if owner_col is None and "owner" in lc:
+            owner_col = c
+        if time_col is None and (lc == "t" or "time" in lc or "timestamp" in lc):
+            time_col = c
+    if owner_col is None:
+        return float("nan"), float("nan"), float("nan")
+
+    owners = df[owner_col].astype(str)
+    switch_count = float((owners.shift() != owners).sum() - 1)
+
+    if time_col is None:
+        return switch_count, float("nan"), float("nan")
+    t = pd.to_numeric(df[time_col], errors="coerce").dropna()
+    if len(t) < 2:
+        return switch_count, float("nan"), float("nan")
+    duration_sec = float(t.iloc[-1] - t.iloc[0])
+    if duration_sec <= 1e-6:
+        return switch_count, float("nan"), duration_sec
+    return switch_count, float(switch_count / duration_sec), duration_sec
+
+
 def parse_vps_used(run_log: Path) -> float:
     if not run_log.is_file():
         return float("nan")
@@ -470,11 +621,16 @@ def evaluate_lock_profile(run_dir: Path | None, profile_name: str) -> tuple[bool
     cov_large = _to_float(row, "cov_large_rate")
     pmax_max = _to_float(row, "pmax_max")
     vps_used = parse_vps_used(run_log)
-    heading_final_abs = read_heading_final_abs(run_dir)
+    heading_metrics = read_heading_metrics(run_dir)
+    heading_final_abs = float(heading_metrics.get("heading_final_abs_deg", float("nan")))
+    heading_mae = float(heading_metrics.get("heading_mae_deg", float("nan")))
+    heading_p95 = float(heading_metrics.get("heading_p95_abs_deg", float("nan")))
+    heading_spike = float(heading_metrics.get("spike_rate_abs_err_gt30_deg", float("nan")))
     vps_jump_reject_count = _to_float(row, "vps_jump_reject_count")
     vps_attempt_count = _to_float(row, "vps_attempt_count")
     backend_stale_drop_count = _to_float(row, "backend_stale_drop_count")
     backend_poll_count = _to_float(row, "backend_poll_count")
+    policy_conflict_count = _to_float(row, "policy_conflict_count")
 
     jump_ratio = float("nan")
     if np.isfinite(vps_jump_reject_count) and np.isfinite(vps_attempt_count) and vps_attempt_count > 0:
@@ -500,6 +656,11 @@ def evaluate_lock_profile(run_dir: Path | None, profile_name: str) -> tuple[bool
         bool(len(over) == 0),
         f"hits={len(over)}",
     ))
+    checks.append((
+        "policy_conflict_count == 0",
+        bool(np.isfinite(policy_conflict_count) and abs(policy_conflict_count) <= 1e-12),
+        f"value={policy_conflict_count:.0f}" if np.isfinite(policy_conflict_count) else "value=nan",
+    ))
 
     profile = str(profile_name).strip().lower()
     if profile == "pre_backend":
@@ -524,6 +685,21 @@ def evaluate_lock_profile(run_dir: Path | None, profile_name: str) -> tuple[bool
                 bool(np.isfinite(heading_final_abs) and heading_final_abs <= 15.0),
                 f"value={heading_final_abs:.3f}" if np.isfinite(heading_final_abs) else "value=nan",
             ),
+            (
+                "heading_mae_deg <= 45",
+                bool(np.isfinite(heading_mae) and heading_mae <= 45.0),
+                f"value={heading_mae:.3f}" if np.isfinite(heading_mae) else "value=nan",
+            ),
+            (
+                "heading_p95_abs_deg <= 120",
+                bool(np.isfinite(heading_p95) and heading_p95 <= 120.0),
+                f"value={heading_p95:.3f}" if np.isfinite(heading_p95) else "value=nan",
+            ),
+            (
+                "spike_rate_abs_err_gt30_deg <= 0.70",
+                bool(np.isfinite(heading_spike) and heading_spike <= 0.70),
+                f"value={heading_spike:.4f}" if np.isfinite(heading_spike) else "value=nan",
+            ),
         ])
     elif profile in ("backend", "near_rt_backend"):
         checks.extend([
@@ -546,6 +722,21 @@ def evaluate_lock_profile(run_dir: Path | None, profile_name: str) -> tuple[bool
                 "heading_final_abs_deg <= 10",
                 bool(np.isfinite(heading_final_abs) and heading_final_abs <= 10.0),
                 f"value={heading_final_abs:.3f}" if np.isfinite(heading_final_abs) else "value=nan",
+            ),
+            (
+                "heading_mae_deg <= 35",
+                bool(np.isfinite(heading_mae) and heading_mae <= 35.0),
+                f"value={heading_mae:.3f}" if np.isfinite(heading_mae) else "value=nan",
+            ),
+            (
+                "heading_p95_abs_deg <= 90",
+                bool(np.isfinite(heading_p95) and heading_p95 <= 90.0),
+                f"value={heading_p95:.3f}" if np.isfinite(heading_p95) else "value=nan",
+            ),
+            (
+                "spike_rate_abs_err_gt30_deg <= 0.60",
+                bool(np.isfinite(heading_spike) and heading_spike <= 0.60),
+                f"value={heading_spike:.4f}" if np.isfinite(heading_spike) else "value=nan",
             ),
         ])
         if profile == "near_rt_backend":
@@ -571,12 +762,258 @@ def evaluate_lock_profile(run_dir: Path | None, profile_name: str) -> tuple[bool
         "pmax_max": pmax_max,
         "vps_used": vps_used,
         "heading_final_abs_deg": heading_final_abs,
+        "heading_mae_deg": heading_mae,
+        "heading_p95_abs_deg": heading_p95,
+        "spike_rate_abs_err_gt30_deg": heading_spike,
         "vps_jump_reject_ratio": jump_ratio,
         "backend_stale_drop_ratio": stale_ratio,
+        "policy_conflict_count": policy_conflict_count,
         "overflow_hits": len(over),
         "rtf_proc_sim": _to_float(row, "rtf_proc_sim"),
     }
     return ok, detail
+
+
+def _pct_delta_abs(cur: float, base: float) -> float:
+    if not (np.isfinite(cur) and np.isfinite(base)):
+        return float("nan")
+    if abs(base) <= 1e-12:
+        return float("nan")
+    return float(abs(cur - base) / abs(base) * 100.0)
+
+
+def evaluate_h_phase(
+    phase: str,
+    run_dir: Path | None,
+    heading_recovery_baseline: Path | None,
+    h2_reference_run: Path | None,
+) -> tuple[bool, dict[str, Any]]:
+    phase_u = str(phase).upper()
+    row = read_health_row(run_dir)
+    run_log = (run_dir / "run.log") if run_dir else Path("")
+    acc_err = read_err3d_mean(run_dir)
+    heading_metrics = read_heading_metrics(run_dir)
+    acc_heading_final = float(heading_metrics.get("heading_final_abs_deg", float("nan")))
+    heading_mae = float(heading_metrics.get("heading_mae_deg", float("nan")))
+    heading_p95 = float(heading_metrics.get("heading_p95_abs_deg", float("nan")))
+    heading_spike = float(heading_metrics.get("spike_rate_abs_err_gt30_deg", float("nan")))
+
+    checks: list[tuple[str, bool, str]] = []
+    failed_items: list[str] = []
+    detail: dict[str, Any] = {
+        "phase": phase_u,
+        "failed_items": failed_items,
+    }
+
+    policy_conflicts = _to_float(row, "policy_conflict_count") if row is not None else float("nan")
+    cov_large = _to_float(row, "cov_large_rate") if row is not None else float("nan")
+    pmax_max = _to_float(row, "pmax_max") if row is not None else float("nan")
+    mag_cholfail = _to_float(row, "mag_cholfail_rate") if row is not None else float("nan")
+    mag_accept_rate = _to_float(row, "mag_accept_rate") if row is not None else float("nan")
+    owner_switch_count = _to_float(row, "heading_owner_switch_count") if row is not None else float("nan")
+    sim_time_sec = parse_sim_time_sec(run_log)
+    owner_switch_rate = float("nan")
+    if np.isfinite(owner_switch_count) and np.isfinite(sim_time_sec) and sim_time_sec > 1e-6:
+        owner_switch_rate = float(owner_switch_count / sim_time_sec)
+    if not np.isfinite(owner_switch_rate):
+        trace_switch_count, trace_switch_rate, trace_duration_sec = read_owner_switch_stats_from_trace(run_dir)
+        if np.isfinite(trace_switch_count):
+            owner_switch_count = trace_switch_count
+        if np.isfinite(trace_switch_rate):
+            owner_switch_rate = trace_switch_rate
+        if (not np.isfinite(sim_time_sec)) and np.isfinite(trace_duration_sec):
+            sim_time_sec = trace_duration_sec
+    detail.update(
+        {
+            "policy_conflict_count": policy_conflicts,
+            "cov_large_rate": cov_large,
+            "pmax_max": pmax_max,
+            "mag_cholfail_rate": mag_cholfail,
+            "mag_accept_rate": mag_accept_rate,
+            "heading_final_abs_deg": acc_heading_final,
+            "heading_mae_deg": heading_mae,
+            "heading_p95_abs_deg": heading_p95,
+            "spike_rate_abs_err_gt30_deg": heading_spike,
+            "owner_switch_count": owner_switch_count,
+            "owner_switch_rate_hz": owner_switch_rate,
+            "sim_time_sec": sim_time_sec,
+        }
+    )
+
+    if phase_u == "H1":
+        msckf_q_csv = (run_dir / "msckf_quality.csv") if run_dir else Path("")
+        msckf_rows = 0
+        msckf_ok = False
+        if msckf_q_csv.is_file():
+            try:
+                msckf_rows = len(pd.read_csv(msckf_q_csv))
+                msckf_ok = bool(msckf_rows > 0)
+            except Exception:
+                msckf_rows = 0
+                msckf_ok = False
+        detail["msckf_quality_rows"] = float(msckf_rows)
+        checks.append(("msckf_quality.csv non-empty", msckf_ok, f"rows={msckf_rows}"))
+
+        base = heading_recovery_baseline
+        base_err = read_err3d_mean(base)
+        base_heading = read_heading_final_abs(base)
+        err_d = _pct_delta_abs(acc_err, base_err)
+        heading_d = _pct_delta_abs(acc_heading_final, base_heading)
+        detail["h1_err3d_delta_pct_vs_heading_baseline"] = err_d
+        detail["h1_heading_final_delta_pct_vs_heading_baseline"] = heading_d
+        checks.append(("err3d_mean drift <= 5%", bool(np.isfinite(err_d) and err_d <= 5.0), f"delta={err_d:.2f}%"))
+        checks.append(
+            (
+                "heading_final_abs_deg drift <= 5%",
+                bool(np.isfinite(heading_d) and heading_d <= 5.0),
+                f"delta={heading_d:.2f}%",
+            )
+        )
+        checks.append(
+            (
+                "policy_conflict_count == 0",
+                bool(np.isfinite(policy_conflicts) and abs(policy_conflicts) <= 1e-12),
+                f"value={policy_conflicts:.0f}" if np.isfinite(policy_conflicts) else "value=nan",
+            )
+        )
+
+    elif phase_u == "H2":
+        checks.append(
+            (
+                "heading_final_abs_deg <= 10",
+                bool(np.isfinite(acc_heading_final) and acc_heading_final <= 10.0),
+                f"value={acc_heading_final:.3f}" if np.isfinite(acc_heading_final) else "value=nan",
+            )
+        )
+        checks.append(
+            (
+                "heading_mae_deg <= 35",
+                bool(np.isfinite(heading_mae) and heading_mae <= 35.0),
+                f"value={heading_mae:.3f}" if np.isfinite(heading_mae) else "value=nan",
+            )
+        )
+        checks.append(
+            (
+                "heading_p95_abs_deg <= 90",
+                bool(np.isfinite(heading_p95) and heading_p95 <= 90.0),
+                f"value={heading_p95:.3f}" if np.isfinite(heading_p95) else "value=nan",
+            )
+        )
+        checks.append(
+            (
+                "spike_rate_abs_err_gt30_deg <= 0.60",
+                bool(np.isfinite(heading_spike) and heading_spike <= 0.60),
+                f"value={heading_spike:.4f}" if np.isfinite(heading_spike) else "value=nan",
+            )
+        )
+        checks.append(
+            (
+                "owner switch rate <= 0.25 Hz",
+                bool(np.isfinite(owner_switch_rate) and owner_switch_rate <= 0.25),
+                f"value={owner_switch_rate:.4f}" if np.isfinite(owner_switch_rate) else "value=nan",
+            )
+        )
+        checks.append(
+            (
+                "policy_conflict_count == 0",
+                bool(np.isfinite(policy_conflicts) and abs(policy_conflicts) <= 1e-12),
+                f"value={policy_conflicts:.0f}" if np.isfinite(policy_conflicts) else "value=nan",
+            )
+        )
+
+    elif phase_u == "H3":
+        checks.append(
+            (
+                "mag_cholfail_rate <= 0.08",
+                bool(np.isfinite(mag_cholfail) and mag_cholfail <= 0.08),
+                f"value={mag_cholfail:.6f}" if np.isfinite(mag_cholfail) else "value=nan",
+            )
+        )
+        checks.append(
+            (
+                "mag_accept_rate in [0.15,0.50]",
+                bool(np.isfinite(mag_accept_rate) and 0.15 <= mag_accept_rate <= 0.50),
+                f"value={mag_accept_rate:.6f}" if np.isfinite(mag_accept_rate) else "value=nan",
+            )
+        )
+        checks.append(
+            (
+                "policy_conflict_count == 0",
+                bool(np.isfinite(policy_conflicts) and abs(policy_conflicts) <= 1e-12),
+                f"value={policy_conflicts:.0f}" if np.isfinite(policy_conflicts) else "value=nan",
+            )
+        )
+        checks.append(
+            (
+                "cov_large_rate == 0",
+                bool(np.isfinite(cov_large) and abs(cov_large) <= 1e-12),
+                f"value={cov_large:.6f}" if np.isfinite(cov_large) else "value=nan",
+            )
+        )
+        checks.append(
+            (
+                "pmax_max <= 1e6",
+                bool(np.isfinite(pmax_max) and pmax_max <= 1.0e6),
+                f"value={pmax_max:.3e}" if np.isfinite(pmax_max) else "value=nan",
+            )
+        )
+
+        ref_run = h2_reference_run
+        ref_label = "H2"
+        if ref_run is None:
+            ref_run = heading_recovery_baseline
+            ref_label = "heading_baseline_fallback"
+        ref_heading = read_heading_metrics(ref_run)
+        ref_heading_final = float(ref_heading.get("heading_final_abs_deg", float("nan")))
+        ref_heading_mae = float(ref_heading.get("heading_mae_deg", float("nan")))
+        ref_heading_p95 = float(ref_heading.get("heading_p95_abs_deg", float("nan")))
+        ref_heading_spike = float(ref_heading.get("spike_rate_abs_err_gt30_deg", float("nan")))
+        detail["h3_ref_run"] = str(ref_run) if ref_run else ""
+        h_final_reg = _pct_delta_abs(acc_heading_final, ref_heading_final)
+        h_mae_reg = _pct_delta_abs(heading_mae, ref_heading_mae)
+        h_p95_reg = _pct_delta_abs(heading_p95, ref_heading_p95)
+        h_spike_reg = _pct_delta_abs(heading_spike, ref_heading_spike)
+        detail["h3_heading_final_regress_pct_vs_ref"] = h_final_reg
+        detail["h3_heading_mae_regress_pct_vs_ref"] = h_mae_reg
+        detail["h3_heading_p95_regress_pct_vs_ref"] = h_p95_reg
+        detail["h3_heading_spike_regress_pct_vs_ref"] = h_spike_reg
+        checks.append(
+            (
+                f"heading_final_abs regress <= 10% vs {ref_label}",
+                bool(np.isfinite(h_final_reg) and h_final_reg <= 10.0),
+                f"delta={h_final_reg:.2f}%",
+            )
+        )
+        checks.append(
+            (
+                f"heading_mae regress <= 10% vs {ref_label}",
+                bool(np.isfinite(h_mae_reg) and h_mae_reg <= 10.0),
+                f"delta={h_mae_reg:.2f}%",
+            )
+        )
+        checks.append(
+            (
+                f"heading_p95_abs regress <= 10% vs {ref_label}",
+                bool(np.isfinite(h_p95_reg) and h_p95_reg <= 10.0),
+                f"delta={h_p95_reg:.2f}%",
+            )
+        )
+        checks.append(
+            (
+                f"spike_rate_abs_err_gt30 regress <= 10% vs {ref_label}",
+                bool(np.isfinite(h_spike_reg) and h_spike_reg <= 10.0),
+                f"delta={h_spike_reg:.2f}%",
+            )
+        )
+    else:
+        checks.append(("known H phase", False, f"phase={phase_u}"))
+
+    for name, ok, msg in checks:
+        if not ok:
+            failed_items.append(name)
+    detail["checks"] = checks
+    detail["failed_items"] = failed_items
+    return len(failed_items) == 0, detail
 
 
 def classify_rtf_pass_tier(rtf_proc_sim: float) -> str:
@@ -635,13 +1072,25 @@ def main() -> int:
     parser.add_argument("--save_debug_data", type=int, default=0, choices=[0, 1])
     parser.add_argument("--save_keyframe_images", type=int, default=0, choices=[0, 1])
     parser.add_argument("--baseline_run", default="")
+    parser.add_argument(
+        "--h_baseline_run",
+        default="",
+        help="Optional heading-recovery baseline run dir used for compare-focused H1/H2/H3 checks",
+    )
     parser.add_argument("--lock_profile", default="pre_backend", choices=["pre_backend", "backend", "near_rt_backend"])
     parser.add_argument("--max_regress_pct", type=float, default=15.0)
+    parser.add_argument(
+        "--h_compare_focused",
+        type=int,
+        default=1,
+        choices=[0, 1],
+        help="When 1, H1/H2/H3 use phase-specific compare criteria instead of lock-profile rollback gates",
+    )
     parser.add_argument("--apply_best_config", type=int, default=0, choices=[0, 1])
     parser.add_argument(
         "--phase_set",
         default="stageA",
-        choices=["stageA", "stageE", "stageF", "stageG", "stageG_cont", "stageG_mag", "stageYawAuth", "custom"],
+        choices=["stageA", "stageE", "stageF", "stageG", "stageG_cont", "stageG_mag", "stageYawAuth", "stageH", "custom"],
     )
     parser.add_argument("--phases", default="")
     parser.add_argument("--dry_run", action="store_true", help="Plan and emit phase table without running benchmarks")
@@ -662,8 +1111,17 @@ def main() -> int:
     baseline_file = (repo_dir / "scripts" / "baseline_run.txt").resolve()
     baseline_run = resolve_baseline(repo_dir, args.baseline_run, baseline_file)
     baseline_err = read_err3d_mean(baseline_run)
+    h_baseline_file = (repo_dir / "scripts" / "heading_recovery_baseline.txt").resolve()
+    heading_recovery_baseline = resolve_baseline(
+        repo_dir,
+        args.h_baseline_run,
+        h_baseline_file,
+    )
+    if heading_recovery_baseline is None:
+        heading_recovery_baseline = baseline_run
     print(f"Baseline run: {baseline_run if baseline_run else 'None'}")
     print(f"Baseline err3d_mean: {baseline_err:.3f} m" if np.isfinite(baseline_err) else "Baseline err3d_mean: nan")
+    print(f"Heading-recovery baseline: {heading_recovery_baseline if heading_recovery_baseline else 'None'}")
     print(f"Lock profile: {args.lock_profile}")
     print(f"Phase set: {args.phase_set}")
     print(f"Phase base config: {base_cfg_path}")
@@ -685,6 +1143,8 @@ def main() -> int:
         default_phases = DEFAULT_PHASE_SEQUENCE_STAGE_G_MAG
     elif args.phase_set == "stageYawAuth":
         default_phases = DEFAULT_PHASE_SEQUENCE_STAGE_YAW_AUTH
+    elif args.phase_set == "stageH":
+        default_phases = DEFAULT_PHASE_SEQUENCE_STAGE_H
     else:
         default_phases = DEFAULT_PHASE_SEQUENCE
     phases_raw = args.phases if str(args.phases).strip() else ",".join(default_phases)
@@ -706,6 +1166,7 @@ def main() -> int:
     current_cfg = copy.deepcopy(base_cfg)
     cfg_by_run: dict[str, dict[str, Any]] = {}
     rows: list[dict[str, Any]] = []
+    h2_reference_run: Path | None = None
 
     for phase in phases:
         print(f"\n================ Phase {phase} ================")
@@ -720,7 +1181,11 @@ def main() -> int:
         else:
             print("  changed keys (0): phase is already at target values")
 
-        if not changed_keys and not args.force_run_noop:
+        force_run_no_change = (phase in FORCE_RUN_IF_NO_CHANGE)
+        if not changed_keys and force_run_no_change:
+            print(f"  forcing run for {phase} (runtime validation phase)")
+
+        if not changed_keys and not args.force_run_noop and not force_run_no_change:
             rows.append(
                 {
                     "phase": phase,
@@ -736,12 +1201,21 @@ def main() -> int:
                     "locks_ok": np.nan,
                     "vps_used": np.nan,
                     "heading_final_abs_deg": np.nan,
+                    "heading_mae_deg": np.nan,
+                    "heading_p95_abs_deg": np.nan,
+                    "spike_rate_abs_err_gt30_deg": np.nan,
                     "mag_cholfail_rate": np.nan,
                     "cov_large_rate": np.nan,
                     "pmax_max": np.nan,
                     "overflow_hits": np.nan,
                     "rtf_proc_sim": np.nan,
                     "rtf_pass_tier": "nan",
+                    "decision_mode": "skip_no_change",
+                    "compare_ok": np.nan,
+                    "compare_failed_items": "",
+                    "backend_locks_ok": np.nan,
+                    "backend_lock_failed_items": "",
+                    "h_reference_run": "",
                     "changed_key_count": 0,
                     "changed_keys": "",
                 }
@@ -766,12 +1240,21 @@ def main() -> int:
                     "locks_ok": np.nan,
                     "vps_used": np.nan,
                     "heading_final_abs_deg": np.nan,
+                    "heading_mae_deg": np.nan,
+                    "heading_p95_abs_deg": np.nan,
+                    "spike_rate_abs_err_gt30_deg": np.nan,
                     "mag_cholfail_rate": np.nan,
                     "cov_large_rate": np.nan,
                     "pmax_max": np.nan,
                     "overflow_hits": np.nan,
                     "rtf_proc_sim": np.nan,
                     "rtf_pass_tier": "nan",
+                    "decision_mode": "dry_run",
+                    "compare_ok": np.nan,
+                    "compare_failed_items": "",
+                    "backend_locks_ok": np.nan,
+                    "backend_lock_failed_items": "",
+                    "h_reference_run": "",
                     "changed_key_count": len(changed_keys),
                     "changed_keys": "|".join(changed_keys),
                 }
@@ -808,12 +1291,21 @@ def main() -> int:
                     "locks_ok": False,
                     "vps_used": np.nan,
                     "heading_final_abs_deg": np.nan,
+                    "heading_mae_deg": np.nan,
+                    "heading_p95_abs_deg": np.nan,
+                    "spike_rate_abs_err_gt30_deg": np.nan,
                     "mag_cholfail_rate": np.nan,
                     "cov_large_rate": np.nan,
                     "pmax_max": np.nan,
                     "overflow_hits": np.nan,
                     "rtf_proc_sim": np.nan,
                     "rtf_pass_tier": "nan",
+                    "decision_mode": "no_run_dir",
+                    "compare_ok": np.nan,
+                    "compare_failed_items": "",
+                    "backend_locks_ok": np.nan,
+                    "backend_lock_failed_items": "",
+                    "h_reference_run": "",
                     "changed_key_count": len(changed_keys),
                     "changed_keys": "|".join(changed_keys),
                 }
@@ -832,7 +1324,29 @@ def main() -> int:
             delta_pct = 100.0 * (err_cur - baseline_err) / abs(baseline_err)
             regress_fail = bool(delta_pct > args.max_regress_pct)
 
-        locks_ok, lock_detail = evaluate_lock_profile(run_dir, args.lock_profile)
+        backend_locks_ok, backend_lock_detail = evaluate_lock_profile(run_dir, args.lock_profile)
+        use_h_compare = bool(int(args.h_compare_focused) == 1 and phase in H_COMPARE_PHASES)
+        compare_ok = np.nan
+        compare_detail: dict[str, Any] = {}
+        locks_ok = backend_locks_ok
+        lock_detail = backend_lock_detail
+        h_reference_run = ""
+
+        if use_h_compare:
+            compare_ok, compare_detail = evaluate_h_phase(
+                phase=phase,
+                run_dir=run_dir,
+                heading_recovery_baseline=heading_recovery_baseline,
+                h2_reference_run=h2_reference_run,
+            )
+            locks_ok = bool(compare_ok)
+            lock_detail = compare_detail
+            regress_fail = False  # H1/H2/H3 use dedicated compare criteria.
+            if phase == "H3":
+                h_reference_run = str(compare_detail.get("h3_ref_run", "") or "")
+            elif heading_recovery_baseline is not None:
+                h_reference_run = str(heading_recovery_baseline)
+
         phase_ok = bool(ret == 0 and locks_ok and not regress_fail and np.isfinite(err_cur))
         reason = []
         if ret != 0:
@@ -840,7 +1354,7 @@ def main() -> int:
         if regress_fail:
             reason.append(f"err_regress={delta_pct:.2f}%>{args.max_regress_pct:.2f}%")
         if not locks_ok:
-            reason.append("lock_fail")
+            reason.append("h_compare_fail" if use_h_compare else "lock_fail")
         if not np.isfinite(err_cur):
             reason.append("missing_err3d")
         reason_text = "|".join(reason) if reason else "pass"
@@ -857,14 +1371,38 @@ def main() -> int:
             "err3d_baseline": baseline_err,
             "err3d_delta_pct": delta_pct,
             "locks_ok": locks_ok,
-            "vps_used": lock_detail.get("vps_used", np.nan),
-            "heading_final_abs_deg": lock_detail.get("heading_final_abs_deg", np.nan),
-            "mag_cholfail_rate": lock_detail.get("mag_cholfail_rate", np.nan),
-            "cov_large_rate": lock_detail.get("cov_large_rate", np.nan),
-            "pmax_max": lock_detail.get("pmax_max", np.nan),
-            "overflow_hits": lock_detail.get("overflow_hits", np.nan),
-            "rtf_proc_sim": lock_detail.get("rtf_proc_sim", np.nan),
-            "rtf_pass_tier": classify_rtf_pass_tier(float(lock_detail.get("rtf_proc_sim", np.nan))),
+            "vps_used": backend_lock_detail.get("vps_used", np.nan),
+            "heading_final_abs_deg": lock_detail.get(
+                "heading_final_abs_deg",
+                backend_lock_detail.get("heading_final_abs_deg", np.nan),
+            ),
+            "heading_mae_deg": lock_detail.get(
+                "heading_mae_deg",
+                backend_lock_detail.get("heading_mae_deg", np.nan),
+            ),
+            "heading_p95_abs_deg": lock_detail.get(
+                "heading_p95_abs_deg",
+                backend_lock_detail.get("heading_p95_abs_deg", np.nan),
+            ),
+            "spike_rate_abs_err_gt30_deg": lock_detail.get(
+                "spike_rate_abs_err_gt30_deg",
+                backend_lock_detail.get("spike_rate_abs_err_gt30_deg", np.nan),
+            ),
+            "mag_cholfail_rate": lock_detail.get(
+                "mag_cholfail_rate",
+                backend_lock_detail.get("mag_cholfail_rate", np.nan),
+            ),
+            "cov_large_rate": backend_lock_detail.get("cov_large_rate", np.nan),
+            "pmax_max": backend_lock_detail.get("pmax_max", np.nan),
+            "overflow_hits": backend_lock_detail.get("overflow_hits", np.nan),
+            "rtf_proc_sim": backend_lock_detail.get("rtf_proc_sim", np.nan),
+            "rtf_pass_tier": classify_rtf_pass_tier(float(backend_lock_detail.get("rtf_proc_sim", np.nan))),
+            "decision_mode": "h_compare_focused" if use_h_compare else "lock_profile",
+            "compare_ok": compare_ok,
+            "compare_failed_items": "|".join(compare_detail.get("failed_items", [])) if use_h_compare else "",
+            "backend_locks_ok": backend_locks_ok,
+            "backend_lock_failed_items": "|".join(backend_lock_detail.get("failed_items", [])),
+            "h_reference_run": h_reference_run,
             "changed_key_count": len(changed_keys),
             "changed_keys": "|".join(changed_keys),
         }
@@ -874,6 +1412,8 @@ def main() -> int:
             current_cfg = candidate_cfg
             baseline_run = run_dir
             baseline_err = err_cur
+            if phase == "H2":
+                h2_reference_run = run_dir
             print(f"[Phase {phase}] PASS -> new baseline: {run_dir} (err3d_mean={err_cur:.3f} m)")
         else:
             print(f"[Phase {phase}] ROLLBACK ({reason_text})")

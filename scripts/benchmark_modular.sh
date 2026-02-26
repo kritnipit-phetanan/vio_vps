@@ -163,6 +163,16 @@ if [ -n "$BASELINE_RUN" ] && [ ! -d "$BASELINE_RUN" ]; then
     BASELINE_RUN=""
 fi
 
+SECONDARY_BASELINE_FILE="$SCRIPT_DIR/heading_recovery_baseline.txt"
+SECONDARY_BASELINE_RUN="${SECONDARY_BASELINE_RUN:-}"
+if [ -z "$SECONDARY_BASELINE_RUN" ] && [ -f "$SECONDARY_BASELINE_FILE" ]; then
+    SECONDARY_BASELINE_RUN="$(head -n 1 "$SECONDARY_BASELINE_FILE" | tr -d '\r')"
+fi
+if [ -n "$SECONDARY_BASELINE_RUN" ] && [ ! -d "$SECONDARY_BASELINE_RUN" ]; then
+    echo "⚠️  Secondary baseline path not found, ignore: $SECONDARY_BASELINE_RUN"
+    SECONDARY_BASELINE_RUN=""
+fi
+
 fail_fast() {
     echo "❌ $1"
     exit 1
@@ -276,6 +286,7 @@ fi
 echo "  VIO_RUNTIME_VERBOSITY: ${VIO_RUNTIME_VERBOSITY}"
 echo "  Active sensors: ${RUN_MODE_LABEL}"
 [ -n "$BASELINE_RUN" ] && echo "  Baseline run: ${BASELINE_RUN}"
+[ -n "$SECONDARY_BASELINE_RUN" ] && echo "  Secondary baseline: ${SECONDARY_BASELINE_RUN}"
 [ "$USE_CAM" -eq 1 ] && echo "    - Camera: ${IMAGES_DIR}"
 [ "$USE_MAG" -eq 1 ] && echo "    - Magnetometer: ${MAG_PATH}"
 [ "$USE_DEM" -eq 1 ] && echo "    - DEM: ${DEM_PATH}"
@@ -374,6 +385,15 @@ if [ -n "$BASELINE_RUN" ]; then
 fi
 COMPARE_ARGS+=(--lock_profile "$LOCK_PROFILE")
 "${COMPARE_ARGS[@]}"
+
+if [ -n "$SECONDARY_BASELINE_RUN" ] && [ "$SECONDARY_BASELINE_RUN" != "$BASELINE_RUN" ]; then
+    echo ""
+    echo "=== Secondary Baseline Compare ==="
+    python3 scripts/compare_benchmark.py \
+        --output_dir "$OUTPUT_DIR" \
+        --baseline_run "$SECONDARY_BASELINE_RUN" \
+        --lock_profile "$LOCK_PROFILE"
+fi
 
 echo ""
 echo "=== Runtime ==="

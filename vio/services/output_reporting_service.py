@@ -718,13 +718,50 @@ class OutputReportingService:
         abs_corr_soft_count = float(int(getattr(self.runner, "_abs_corr_soft_count", 0)))
         backend_apply_count = float(int(getattr(self.runner, "_backend_apply_count", 0)))
         backend_stale_drop_count = float(int(getattr(self.runner, "_backend_stale_drop_count", 0)))
+        backend_emit_stale_drop_count = float(int(getattr(self.runner, "_backend_emit_stale_drop_count", 0)))
+        backend_overwrite_count = float(int(getattr(self.runner, "_backend_overwrite_count", 0)))
         backend_poll_count = float(int(getattr(self.runner, "_backend_poll_count", 0)))
+        backend_emit_count = float(int(getattr(self.runner, "_backend_emit_count", 0)))
         vps_worker_busy_skips = float(int(getattr(self.runner, "_vps_thread_busy_skip_count", 0)))
         vps_attempt_ms_p50 = float("nan")
         vps_attempt_ms_p95 = float("nan")
         vps_time_budget_stops = float("nan")
         vps_evaluated_candidates_mean = float("nan")
         policy_conflict_count = float(int(getattr(self.runner, "_policy_conflict_count", 0)))
+        heading_owner_switch_count = float("nan")
+        heading_owner_mag_ratio = float("nan")
+        heading_owner_loop_ratio = float("nan")
+        heading_owner_backend_ratio = float("nan")
+        heading_owner_hold_ratio = float("nan")
+        yaw_owner_mag_block_count = float("nan")
+        yaw_owner_mag_block_ratio = float("nan")
+        yaw_owner_dead_fallback_count = float("nan")
+        if getattr(self.runner, "yaw_authority_service", None) is not None and hasattr(
+            self.runner.yaw_authority_service, "get_runtime_metrics"
+        ):
+            try:
+                owner_rt = self.runner.yaw_authority_service.get_runtime_metrics()
+                heading_owner_switch_count = float(owner_rt.get("owner_switch_count", np.nan))
+                heading_owner_mag_ratio = float(owner_rt.get("owner_mag_ratio", np.nan))
+                heading_owner_loop_ratio = float(owner_rt.get("owner_loop_ratio", np.nan))
+                heading_owner_backend_ratio = float(owner_rt.get("owner_backend_ratio", np.nan))
+                heading_owner_hold_ratio = float(owner_rt.get("owner_hold_ratio", np.nan))
+                yaw_owner_mag_block_count = float(owner_rt.get("mag_owner_block_count", np.nan))
+                yaw_owner_mag_block_ratio = float(owner_rt.get("mag_owner_block_ratio", np.nan))
+                yaw_owner_dead_fallback_count = float(owner_rt.get("owner_dead_fallback_count", np.nan))
+            except Exception:
+                pass
+
+        msckf_quality_p50 = float("nan")
+        msckf_quality_p10 = float("nan")
+        try:
+            q_hist = np.asarray(getattr(self.runner, "_msckf_quality_history", []), dtype=float)
+            q_hist = q_hist[np.isfinite(q_hist)]
+            if q_hist.size > 0:
+                msckf_quality_p50 = float(np.percentile(q_hist, 50))
+                msckf_quality_p10 = float(np.percentile(q_hist, 10))
+        except Exception:
+            pass
         if getattr(self.runner, "vps_runner", None) is not None and hasattr(self.runner.vps_runner, "get_runtime_metrics"):
             try:
                 vps_rt = self.runner.vps_runner.get_runtime_metrics()
@@ -734,6 +771,44 @@ class OutputReportingService:
                 vps_evaluated_candidates_mean = float(vps_rt.get("evaluated_candidates_mean", float("nan")))
             except Exception:
                 pass
+        if getattr(self.runner, "backend_optimizer", None) is not None:
+            try:
+                b_stats = getattr(self.runner.backend_optimizer, "stats", {})
+                backend_emit_count = float(
+                    int(max(float(backend_emit_count), float(b_stats.get("corrections_emitted", 0.0))))
+                )
+                backend_emit_stale_drop_count = float(
+                    int(max(float(backend_emit_stale_drop_count), float(b_stats.get("corrections_emit_stale_dropped", 0.0))))
+                )
+                backend_overwrite_count = float(
+                    int(max(float(backend_overwrite_count), float(b_stats.get("corrections_overwritten", 0.0))))
+                )
+            except Exception:
+                pass
+        backend_stale_ratio = float("nan")
+        if np.isfinite(backend_emit_stale_drop_count) and np.isfinite(backend_emit_count) and backend_emit_count > 0:
+            backend_stale_ratio = float(backend_emit_stale_drop_count / backend_emit_count)
+        backend_emit_to_apply_ratio = float("nan")
+        if np.isfinite(backend_emit_count) and backend_emit_count > 0 and np.isfinite(backend_apply_count):
+            backend_emit_to_apply_ratio = float(backend_apply_count / backend_emit_count)
+        backend_apply_quality_p50 = float("nan")
+        try:
+            q_hist = np.asarray(getattr(self.runner, "_backend_apply_quality_history", []), dtype=float)
+            q_hist = q_hist[np.isfinite(q_hist)]
+            if q_hist.size > 0:
+                backend_apply_quality_p50 = float(np.percentile(q_hist, 50))
+        except Exception:
+            pass
+        backend_snap_reject_count = float(int(getattr(self.runner, "_backend_snap_reject_count", 0)))
+        backend_apply_latency_ms_p95 = float("nan")
+        try:
+            lat_hist = np.asarray(getattr(self.runner, "_backend_apply_latency_ms_history", []), dtype=float)
+            lat_hist = lat_hist[np.isfinite(lat_hist)]
+            if lat_hist.size > 0:
+                backend_apply_latency_ms_p95 = float(np.percentile(lat_hist, 95))
+        except Exception:
+            pass
+        backend_contract_violation_count = float(int(getattr(self.runner, "_backend_contract_violation_count", 0)))
         mag_accept_rate = float("nan")
         mag_total = int(getattr(self.runner.state, "mag_updates", 0)) + int(getattr(self.runner.state, "mag_rejects", 0))
         if mag_total > 0:
@@ -776,6 +851,8 @@ class OutputReportingService:
             abs_corr_soft_count=abs_corr_soft_count,
             backend_apply_count=backend_apply_count,
             backend_stale_drop_count=backend_stale_drop_count,
+            backend_emit_stale_drop_count=backend_emit_stale_drop_count,
+            backend_overwrite_count=backend_overwrite_count,
             backend_poll_count=backend_poll_count,
             vps_attempt_count=vps_attempt_count,
             vps_worker_busy_skips=vps_worker_busy_skips,
@@ -784,6 +861,22 @@ class OutputReportingService:
             vps_time_budget_stops=vps_time_budget_stops,
             vps_evaluated_candidates_mean=vps_evaluated_candidates_mean,
             policy_conflict_count=policy_conflict_count,
+            heading_owner_switch_count=heading_owner_switch_count,
+            heading_owner_mag_ratio=heading_owner_mag_ratio,
+            heading_owner_loop_ratio=heading_owner_loop_ratio,
+            heading_owner_backend_ratio=heading_owner_backend_ratio,
+            heading_owner_hold_ratio=heading_owner_hold_ratio,
+            yaw_owner_mag_block_count=yaw_owner_mag_block_count,
+            yaw_owner_mag_block_ratio=yaw_owner_mag_block_ratio,
+            yaw_owner_dead_fallback_count=yaw_owner_dead_fallback_count,
+            msckf_quality_p50=msckf_quality_p50,
+            msckf_quality_p10=msckf_quality_p10,
+            backend_stale_ratio=backend_stale_ratio,
+            backend_emit_to_apply_ratio=backend_emit_to_apply_ratio,
+            backend_apply_quality_p50=backend_apply_quality_p50,
+            backend_snap_reject_count=backend_snap_reject_count,
+            backend_apply_latency_ms_p95=backend_apply_latency_ms_p95,
+            backend_contract_violation_count=backend_contract_violation_count,
             rtf_proc_sim=rtf_proc_sim,
         )
         print(
@@ -798,6 +891,14 @@ class OutputReportingService:
             f"vps_busy_skips={vps_worker_busy_skips:.0f}, "
             f"vps_p95={vps_attempt_ms_p95:.1f}ms, "
             f"policy_conflicts={policy_conflict_count:.0f}, "
+            f"owner_sw={heading_owner_switch_count:.0f}, "
+            f"owner_hold={heading_owner_hold_ratio:.3f}, "
+            f"mag_blk={yaw_owner_mag_block_count:.0f}, "
+            f"owner_dead={yaw_owner_dead_fallback_count:.0f}, "
+            f"msckf_q50={msckf_quality_p50:.3f}, "
+            f"backend_stale_ratio={backend_stale_ratio:.3f}, "
+            f"backend_emit_to_apply={backend_emit_to_apply_ratio:.3f}, "
+            f"backend_q50={backend_apply_quality_p50:.3f}, "
             f"rtf_proc_sim={rtf_proc_sim:.3f}"
         )
 

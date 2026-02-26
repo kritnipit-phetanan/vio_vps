@@ -19,6 +19,7 @@ from typing import Optional, Tuple, List, Dict, Any
 from scipy.spatial.transform import Rotation as R_scipy
 
 from .math_utils import quat_to_rot, quaternion_to_yaw, skew_symmetric, safe_matrix_inverse
+from .policy.types import MsckfQualitySnapshot
 
 
 _MSCKF_LOG_EVERY_N = max(1, int(os.getenv("MSCKF_LOG_EVERY_N", "20")))
@@ -210,6 +211,89 @@ def print_msckf_stats():
     for key, val in MSCKF_STATS.items():
         if key.startswith('fail_') and val > 0:
             print(f"  {key}: {val} ({100*val/total:.1f}%)")
+
+
+def _pairwise_parallax_med_px(obs_list: List[dict], norm_scale_px: float) -> float:
+    """Estimate median pairwise parallax in pixels from normalized observations."""
+    pts: List[np.ndarray] = []
+    for obs in obs_list:
+        try:
+            x, y = obs.get("pt_norm", (np.nan, np.nan))
+            pt = np.array([float(x), float(y)], dtype=float)
+            if np.all(np.isfinite(pt)):
+                pts.append(pt)
+        except Exception:
+            continue
+    if len(pts) < 2:
+        return float("nan")
+    dists: List[float] = []
+    for i in range(len(pts)):
+        for j in range(i + 1, len(pts)):
+            d = float(np.linalg.norm(pts[j] - pts[i]))
+            if np.isfinite(d):
+                dists.append(d)
+    if len(dists) == 0:
+        return float("nan")
+    scale = float(norm_scale_px if np.isfinite(norm_scale_px) and norm_scale_px > 1e-6 else 120.0)
+    return float(np.median(np.asarray(dists, dtype=float)) * scale)
+
+
+def _summarize_msckf_quality(
+    t: float,
+    track_count: int,
+    accepted_count: int,
+    parallax_px: List[float],
+    reproj_p95_norm: List[float],
+    depth_positive_ratio: List[float],
+    feature_quality: List[float],
+) -> MsckfQualitySnapshot:
+    """Build compact MSCKF quality snapshot from per-feature aggregates."""
+    tc = int(max(0, track_count))
+    acc = int(max(0, accepted_count))
+    inlier_ratio = float(acc / tc) if tc > 0 else float("nan")
+    px_arr = np.asarray(parallax_px, dtype=float)
+    rp_arr = np.asarray(reproj_p95_norm, dtype=float)
+    dp_arr = np.asarray(depth_positive_ratio, dtype=float)
+    q_arr = np.asarray(feature_quality, dtype=float)
+    parallax_med = float(np.nanmedian(px_arr)) if px_arr.size else float("nan")
+    reproj_p95 = float(np.nanpercentile(rp_arr, 95)) if rp_arr.size else float("nan")
+    depth_ratio = float(np.nanmean(dp_arr)) if dp_arr.size else float("nan")
+    q_score = float(np.nanmedian(q_arr)) if q_arr.size else float("nan")
+    if not np.isfinite(q_score):
+        # Fallback score from geometry consistency if feature quality unavailable.
+        score_terms = []
+        if np.isfinite(inlier_ratio):
+            score_terms.append(float(np.clip(inlier_ratio, 0.0, 1.0)))
+        if np.isfinite(reproj_p95):
+            score_terms.append(float(np.clip(1.0 / (1.0 + 40.0 * reproj_p95), 0.0, 1.0)))
+        if np.isfinite(depth_ratio):
+            score_terms.append(float(np.clip(depth_ratio, 0.0, 1.0)))
+        q_score = float(np.mean(score_terms)) if score_terms else float("nan")
+
+    return MsckfQualitySnapshot(
+        timestamp=float(t),
+        track_count=tc,
+        inlier_ratio=float(inlier_ratio),
+        parallax_med_px=float(parallax_med),
+        reproj_p95_norm=float(reproj_p95),
+        depth_positive_ratio=float(depth_ratio),
+        quality_score=float(q_score),
+    )
+
+
+def _log_msckf_quality_csv(path: Optional[str], snap: MsckfQualitySnapshot) -> None:
+    if path is None:
+        return
+    try:
+        with open(path, "a", newline="") as f:
+            f.write(
+                f"{float(snap.timestamp):.6f},{int(snap.track_count)},"
+                f"{float(snap.inlier_ratio):.6f},{float(snap.parallax_med_px):.6f},"
+                f"{float(snap.reproj_p95_norm):.6f},{float(snap.depth_positive_ratio):.6f},"
+                f"{float(snap.quality_score):.6f}\n"
+            )
+    except Exception:
+        pass
 
 
 def _get_active_body_to_camera_transform(global_config: Optional[dict]) -> np.ndarray:
@@ -853,6 +937,7 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
     total_error = 0.0
     max_pixel_error = 0.0
     valid_obs: List[dict] = []
+    obs_error_norm_values: List[float] = []
     depth_rejects = 0
     reproj_rejects = 0
     pixel_rejects = 0
@@ -929,6 +1014,8 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
         MSCKF_STATS['fail_geometry_borderline'] += 1
         return None
     
+    parallax_med_px = _pairwise_parallax_med_px(obs_list, norm_scale_px)
+
     for obs in obs_list:
         cam_id = obs['cam_id']
         if cam_id >= len(cam_states):
@@ -1005,6 +1092,7 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
                         borderline_rejects += 1
 
         total_error += float(obs_error_metric)
+        obs_error_norm_values.append(float(obs_error_metric))
         valid_obs.append(obs)
 
     if len(valid_obs) < 2:
@@ -1088,6 +1176,9 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
         'observations': valid_obs,
         'quality': float(quality_base * reproj_quality_scale),
         'avg_reproj_error': avg_error,
+        'reproj_p95_norm': float(np.percentile(obs_error_norm_values, 95)) if len(obs_error_norm_values) > 0 else np.nan,
+        'depth_positive_ratio': float(len(valid_obs) / max(1, len(obs_list))),
+        'parallax_med_px': float(parallax_med_px),
         'num_obs_used': len(valid_obs),
         'num_obs_total': len(obs_list),
         'quality_band': str(reproj_policy.get("quality_band", "mid")),
@@ -1950,7 +2041,9 @@ def perform_msckf_updates(vio_fe, cam_observations: List[dict],
                           reproj_scale: float = 1.0,
                           phase: int = 2,
                           health_state: str = "HEALTHY",
-                          stats_out: Optional[Dict[str, float]] = None) -> int:
+                          stats_out: Optional[Dict[str, float]] = None,
+                          quality_out: Optional[Dict[str, float]] = None,
+                          timestamp: float = float("nan")) -> int:
     """
     Perform MSCKF updates for mature features.
     
@@ -1988,6 +2081,16 @@ def perform_msckf_updates(vio_fe, cam_observations: List[dict],
     num_attempted = 0
     dof_samples: List[int] = []
     chi2_norm_samples: List[float] = []
+    parallax_samples: List[float] = []
+    reproj_p95_samples: List[float] = []
+    depth_ratio_samples: List[float] = []
+    feature_quality_samples: List[float] = []
+    runtime_verbosity = (
+        str(global_config.get("LOG_RUNTIME_VERBOSITY", "debug")).lower()
+        if isinstance(global_config, dict)
+        else "debug"
+    )
+    runtime_quiet = runtime_verbosity in ("release", "quiet", "minimal")
     
     # =========================================================================
     # Plane Detection (if enabled)
@@ -2015,7 +2118,10 @@ def perform_msckf_updates(vio_fe, cam_observations: List[dict],
             try:
                 detected_planes = plane_detector.detect_planes(points_array)
                 if len(detected_planes) > 0:
-                    print(f"[MSCKF-PLANE] Detected {len(detected_planes)} planes from {len(points_array)} points")
+                    if not runtime_quiet:
+                        print(
+                            f"[MSCKF-PLANE] Detected {len(detected_planes)} planes from {len(points_array)} points"
+                        )
             except Exception as e:
                 print(f"[MSCKF-PLANE] Plane detection failed: {e}")
     
@@ -2059,6 +2165,19 @@ def perform_msckf_updates(vio_fe, cam_observations: List[dict],
                 with open(msckf_dbg_path, "a", newline="") as mf:
                     mf.write(f"{vio_fe.frame_idx},{fid},{num_obs},0,nan,nan,0,nan,{fail_reason}\n")
             continue
+
+        parallax_val = float(triangulated.get("parallax_med_px", np.nan))
+        reproj_p95_val = float(triangulated.get("reproj_p95_norm", np.nan))
+        depth_ratio_val = float(triangulated.get("depth_positive_ratio", np.nan))
+        quality_val = float(triangulated.get("quality", np.nan))
+        if np.isfinite(parallax_val):
+            parallax_samples.append(parallax_val)
+        if np.isfinite(reproj_p95_val):
+            reproj_p95_samples.append(reproj_p95_val)
+        if np.isfinite(depth_ratio_val):
+            depth_ratio_samples.append(depth_ratio_val)
+        if np.isfinite(quality_val):
+            feature_quality_samples.append(quality_val)
         
         # Check if feature is associated with a plane
         associated_plane = None
@@ -2115,12 +2234,22 @@ def perform_msckf_updates(vio_fe, cam_observations: List[dict],
         if success:
             num_successful += 1
     
+    if len(chi2_norm_samples) > 0:
+        nis_norm = float(np.mean(chi2_norm_samples))
+    else:
+        nis_norm = np.nan
+    quality_snap = _summarize_msckf_quality(
+        t=float(timestamp),
+        track_count=int(num_attempted),
+        accepted_count=int(num_successful),
+        parallax_px=parallax_samples,
+        reproj_p95_norm=reproj_p95_samples,
+        depth_positive_ratio=depth_ratio_samples,
+        feature_quality=feature_quality_samples,
+    )
+
     if stats_out is not None:
         stats_out.clear()
-        if len(chi2_norm_samples) > 0:
-            nis_norm = float(np.mean(chi2_norm_samples))
-        else:
-            nis_norm = np.nan
         stats_out.update({
             "sensor": "MSCKF",
             "accepted": bool(num_successful > 0),
@@ -2131,7 +2260,15 @@ def perform_msckf_updates(vio_fe, cam_observations: List[dict],
             "r_scale_used": 1.0,
             "attempted": int(num_attempted),
             "accepted_count": int(num_successful),
+            "quality_score": float(quality_snap.quality_score),
+            "inlier_ratio": float(quality_snap.inlier_ratio),
+            "parallax_med_px": float(quality_snap.parallax_med_px),
+            "reproj_p95_norm": float(quality_snap.reproj_p95_norm),
+            "depth_positive_ratio": float(quality_snap.depth_positive_ratio),
         })
+    if quality_out is not None:
+        quality_out.clear()
+        quality_out.update(quality_snap.as_dict())
     
     return num_successful
 
@@ -2153,7 +2290,8 @@ def trigger_msckf_update(kf, cam_states: list, cam_observations: list,
                          phase: int = 2,
                          health_state: str = "HEALTHY",
                          adaptive_info: Optional[Dict[str, Any]] = None,
-                         policy_decision: Optional[Any] = None) -> int:
+                         policy_decision: Optional[Any] = None,
+                         runner: Optional[Any] = None) -> int:
     """
     Trigger MSCKF multi-view geometric update.
     
@@ -2244,6 +2382,7 @@ def trigger_msckf_update(kf, cam_states: list, cam_observations: list,
     if should_update:
         try:
             stats = {}
+            quality_stats: Dict[str, float] = {}
             num_updates = perform_msckf_updates(
                 vio_fe,
                 cam_observations,
@@ -2263,7 +2402,41 @@ def trigger_msckf_update(kf, cam_states: list, cam_observations: list,
                 phase=int(phase),
                 health_state=str(health_state),
                 stats_out=stats,
+                quality_out=quality_stats,
+                timestamp=float(t),
             )
+            if len(quality_stats) > 0:
+                snap = MsckfQualitySnapshot(
+                    timestamp=float(quality_stats.get("timestamp", t)),
+                    track_count=int(quality_stats.get("track_count", 0)),
+                    inlier_ratio=float(quality_stats.get("inlier_ratio", np.nan)),
+                    parallax_med_px=float(quality_stats.get("parallax_med_px", np.nan)),
+                    reproj_p95_norm=float(quality_stats.get("reproj_p95_norm", np.nan)),
+                    depth_positive_ratio=float(quality_stats.get("depth_positive_ratio", np.nan)),
+                    quality_score=float(quality_stats.get("quality_score", np.nan)),
+                )
+                if runner is not None:
+                    try:
+                        runner._msckf_quality_snapshot = snap
+                        hist = getattr(runner, "_msckf_quality_history", None)
+                        if isinstance(hist, list) and np.isfinite(float(snap.quality_score)):
+                            hist.append(float(snap.quality_score))
+                            if len(hist) > 20000:
+                                del hist[:-20000]
+                        _log_msckf_quality_csv(getattr(runner, "msckf_quality_csv", None), snap)
+                        if (
+                            getattr(runner, "yaw_authority_service", None) is not None
+                            and bool(global_config.get("YAW_AUTH_USE_MSCKF_CONFIDENCE", True))
+                        ):
+                            runner.yaw_authority_service.set_external_confidence(
+                                source="MSCKF",
+                                timestamp=float(t),
+                                confidence=float(np.clip(snap.quality_score, 0.0, 1.0))
+                                if np.isfinite(float(snap.quality_score))
+                                else 0.0,
+                            )
+                    except Exception:
+                        pass
             if adaptive_info is not None:
                 adaptive_info.clear()
                 if len(stats) > 0:

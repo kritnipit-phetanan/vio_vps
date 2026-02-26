@@ -898,6 +898,55 @@ def apply_loop_closure_correction(kf, loop_info: Dict[str, Any], t: float,
             required_hits = max(required_hits, max(1, int(apply_confirm_phase_dynamic_min_hits)))
         required_hits = max(1, int(required_hits))
 
+        # Reject invalid/unsafe corrections before temporal gating so counters are faithful.
+        try:
+            p_abs = np.asarray(kf.P, dtype=float)
+            p_max_state = float(np.nanmax(np.abs(p_abs))) if p_abs.size > 0 else float("nan")
+            p_cond_state = float("inf")
+            if p_abs.ndim == 2 and p_abs.shape[0] > 0 and p_abs.shape[1] > 0:
+                dim = min(48, int(p_abs.shape[0]))
+                p_block = 0.5 * (p_abs[:dim, :dim] + p_abs[:dim, :dim].T)
+                p_cond_state = float(np.linalg.cond(p_block))
+        except Exception:
+            p_max_state = float("nan")
+            p_cond_state = float("inf")
+
+        if yaw_abs_deg < min_abs_deg:
+            return False
+        soft_clamp_from_yaw_exceed = False
+        if yaw_abs_deg > reject_abs_deg:
+            soft_clamp_enable = bool(global_config.get("LOOP_SOFT_CLAMP_YAW_EXCEED_ENABLE", True))
+            soft_cap_deg = float(global_config.get("LOOP_SOFT_CLAMP_YAW_EXCEED_CAP_DEG", max_abs_deg))
+            soft_speed_max_m_s = float(
+                global_config.get("LOOP_SOFT_CLAMP_YAW_EXCEED_MAX_SPEED_M_S", min(speed_skip_m_s, 45.0))
+            )
+            soft_unstable_pmax = float(global_config.get("LOOP_SOFT_CLAMP_YAW_EXCEED_MAX_PMAX", 1.0e6))
+            soft_unstable_pcond = float(global_config.get("LOOP_SOFT_CLAMP_YAW_EXCEED_MAX_PCOND", 2.5e10))
+            state_unstable = (
+                (np.isfinite(speed_now) and speed_now > soft_speed_max_m_s)
+                or (np.isfinite(p_max_state) and p_max_state > soft_unstable_pmax)
+                or (np.isfinite(p_cond_state) and p_cond_state > soft_unstable_pcond)
+            )
+            if (not soft_clamp_enable) or state_unstable:
+                print(
+                    f"[LOOP] REJECT: yaw_error={yaw_abs_deg:.1f}° > {reject_abs_deg:.1f}° "
+                    f"(soft_clamp={'off' if not soft_clamp_enable else 'unstable'})"
+                )
+                return False
+            soft_clamp_from_yaw_exceed = True
+            max_abs_deg = min(max_abs_deg, max(min_abs_deg, soft_cap_deg))
+            if loop_detector is not None and hasattr(loop_detector, "stats"):
+                loop_detector.stats["loop_soft_clamp_yaw_exceed"] = int(
+                    loop_detector.stats.get("loop_soft_clamp_yaw_exceed", 0)
+                ) + 1
+        if np.isfinite(speed_now) and speed_now > speed_skip_m_s:
+            if loop_detector is not None and hasattr(loop_detector, "stats"):
+                loop_detector.stats["loop_speed_skipped"] = int(loop_detector.stats.get("loop_speed_skipped", 0)) + 1
+            print(
+                f"[LOOP] SKIP apply at t={t:.2f}s: speed={speed_now:.2f}m/s > {speed_skip_m_s:.2f}m/s"
+            )
+            return False
+
         # Adaptive cooldown: stronger at high speed and after correction bursts.
         effective_cooldown_sec = cooldown_sec_failsoft if fail_soft else cooldown_sec_normal
         if np.isfinite(speed_now) and speed_now >= cooldown_speed_m_s:
@@ -967,33 +1016,8 @@ def apply_loop_closure_correction(kf, loop_info: Dict[str, Any], t: float,
                 return False
             pending_map.pop(key, None)
 
-        if yaw_abs_deg < min_abs_deg:
-            return False
-        if yaw_abs_deg > reject_abs_deg:
-            print(f"[LOOP] REJECT: yaw_error={yaw_abs_deg:.1f}° > {reject_abs_deg:.1f}°")
-            return False
-        if np.isfinite(speed_now) and speed_now > speed_skip_m_s:
-            if loop_detector is not None and hasattr(loop_detector, "stats"):
-                loop_detector.stats["loop_speed_skipped"] = int(loop_detector.stats.get("loop_speed_skipped", 0)) + 1
-            print(
-                f"[LOOP] SKIP apply at t={t:.2f}s: speed={speed_now:.2f}m/s > {speed_skip_m_s:.2f}m/s"
-            )
-            return False
-
         yaw_auth_r_mult = 1.0
         if yaw_authority_service is not None:
-            try:
-                p_abs = np.asarray(kf.P, dtype=float)
-                p_max = float(np.nanmax(np.abs(p_abs))) if p_abs.size > 0 else float("nan")
-                p_cond = float("inf")
-                if p_abs.ndim == 2 and p_abs.shape[0] > 0 and p_abs.shape[1] > 0:
-                    dim = min(48, int(p_abs.shape[0]))
-                    p_block = 0.5 * (p_abs[:dim, :dim] + p_abs[:dim, :dim].T)
-                    p_cond = float(np.linalg.cond(p_block))
-            except Exception:
-                p_max = float("nan")
-                p_cond = float("inf")
-
             inlier_n = float(np.clip(num_inliers / max(1.0, float(gate_inliers_hard)), 0.0, 1.0))
             spread_n = float(np.clip(spread_ratio / max(1e-6, float(gate_spread)), 0.0, 1.0))
             reproj_ref = max(1e-3, float(gate_reproj) * (1.6 if fail_soft else 1.2))
@@ -1002,6 +1026,8 @@ def apply_loop_closure_correction(kf, loop_info: Dict[str, Any], t: float,
             conf = float(np.clip(0.38 * inlier_n + 0.22 * spread_n + 0.28 * reproj_n + 0.12 * yaw_n, 0.0, 1.0))
             if fail_soft:
                 conf *= 0.9
+            if soft_clamp_from_yaw_exceed:
+                conf *= 0.75
 
             auth_dec = yaw_authority_service.request_decision(
                 source="LOOP",
@@ -1010,8 +1036,8 @@ def apply_loop_closure_correction(kf, loop_info: Dict[str, Any], t: float,
                 confidence=float(conf),
                 speed_m_s=float(speed_now),
                 health_state=str(health),
-                p_max=float(p_max),
-                p_cond=float(p_cond),
+                p_max=float(p_max_state),
+                p_cond=float(p_cond_state),
             )
             if not bool(auth_dec.allow) or str(auth_dec.mode).upper() in ("HOLD", "SKIP"):
                 if loop_detector is not None and hasattr(loop_detector, "stats"):
@@ -1024,6 +1050,11 @@ def apply_loop_closure_correction(kf, loop_info: Dict[str, Any], t: float,
                 max_abs_deg = min(max_abs_deg, max(0.05, float(auth_dec.max_update_dyaw_deg)))
             if str(auth_dec.mode).upper() == "SOFT_APPLY":
                 yaw_auth_r_mult = max(1.0, float(auth_dec.r_mult))
+            if soft_clamp_from_yaw_exceed:
+                yaw_auth_r_mult = max(
+                    float(yaw_auth_r_mult),
+                    float(global_config.get("LOOP_SOFT_CLAMP_YAW_EXCEED_R_MULT", 2.2)),
+                )
 
         speed_caps_bp_raw = global_config.get(
             "LOOP_SPEED_YAW_CAP_BREAKPOINTS_M_S", [20.0, 35.0, 50.0]

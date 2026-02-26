@@ -35,6 +35,12 @@ def _resolve_total_candidate_budget(raw_num_candidates: int, max_total_candidate
     return min(raw, cap)
 
 
+def _wrap_angle_deg(angle_deg: float) -> float:
+    """Wrap angle to [-180, 180)."""
+    a = float(angle_deg)
+    return float((a + 180.0) % 360.0 - 180.0)
+
+
 @dataclass
 class VPSConfig:
     """Configuration for VPS system."""
@@ -97,6 +103,9 @@ class VPSConfig:
     min_altitude_high_speed: float = 20.0
     high_speed_threshold_m_s: float = 25.0
     altitude_gate_hysteresis_m: float = 4.0
+    position_first_altitude_bypass_enable: bool = True
+    position_first_altitude_bypass_min_m: float = -150.0
+    position_first_altitude_bypass_max_m: float = 1500.0
 
     # Relocalization (local/global search)
     reloc_enabled: bool = True
@@ -257,6 +266,7 @@ class VPSRunner:
             'global_backoff_triggers': 0,
             'global_backoff_probes': 0,
             'coverage_recovery_used': 0,
+            'altitude_bypass': 0,
         }
         
         print("[VPSRunner] Ready")
@@ -441,6 +451,15 @@ class VPSRunner:
                 min_altitude_high_speed=float(vps_cfg.get("min_altitude_high_speed", 20.0)),
                 high_speed_threshold_m_s=float(vps_cfg.get("high_speed_threshold_m_s", 25.0)),
                 altitude_gate_hysteresis_m=float(vps_cfg.get("altitude_gate_hysteresis_m", 4.0)),
+                position_first_altitude_bypass_enable=bool(
+                    vps_cfg.get("position_first_altitude_bypass_enable", True)
+                ),
+                position_first_altitude_bypass_min_m=float(
+                    vps_cfg.get("position_first_altitude_bypass_min_m", -150.0)
+                ),
+                position_first_altitude_bypass_max_m=float(
+                    vps_cfg.get("position_first_altitude_bypass_max_m", 1500.0)
+                ),
                 min_content_ratio=float(vps_cfg.get("min_content_ratio", 0.20)),
                 min_texture_std=float(vps_cfg.get("min_texture_std", 8.0)),
                 accuracy_mode=bool(vps_cfg.get("accuracy_mode", False)),
@@ -1125,9 +1144,30 @@ class VPSRunner:
         
         # 2. Check altitude limits (AGL fail-soft + hysteresis).
         if not altitude_ok:
-            _log_reloc(False, "altitude_out_of_range")
-            _record_runtime_stats_once()
-            return None
+            pos_first_bypass = bool(
+                bool(self.config.position_first_altitude_bypass_enable)
+                and (str(objective_mode).lower() == "accuracy" or bool(self.config.accuracy_mode))
+            )
+            est_alt_f = float(est_alt)
+            if (
+                pos_first_bypass
+                and np.isfinite(est_alt_f)
+                and float(self.config.position_first_altitude_bypass_min_m) <= est_alt_f <= float(self.config.position_first_altitude_bypass_max_m)
+            ):
+                altitude_ok = True
+                self._altitude_gate_open = True
+                self.stats["altitude_bypass"] = int(self.stats.get("altitude_bypass", 0)) + 1
+                self._runtime_log(
+                    "vps_altitude_bypass",
+                    (
+                        f"[VPS] altitude gate bypass (position-first): alt={est_alt_f:.1f}m, "
+                        f"gate=[{float(agl_gate_min_thresh):.1f},{float(agl_gate_max_thresh):.1f}]"
+                    ),
+                )
+            else:
+                _log_reloc(False, "altitude_out_of_range")
+                _record_runtime_stats_once()
+                return None
 
         if img is None or getattr(img, "size", 0) == 0:
             self.stats['fail_match'] += 1
@@ -1457,6 +1497,26 @@ class VPSRunner:
         self._last_success_center_lat = float(selected_center_lat)
         self._last_success_center_lon = float(selected_center_lon)
         self.last_result = vps_measurement
+
+        # Optional yaw hint metadata for backend factor-lite.
+        # This is a weak hint (not direct EKF apply) and must be quality-gated upstream.
+        try:
+            yaw_base_deg = float(np.degrees(float(camera_yaw_base)))
+            if np.isfinite(selected_yaw_deg) and np.isfinite(yaw_base_deg):
+                yaw_delta_deg_hint = float(_wrap_angle_deg(float(selected_yaw_deg) - float(yaw_base_deg)))
+            else:
+                yaw_delta_deg_hint = float("nan")
+            q_conf = float(np.clip(match_result.confidence, 0.0, 1.0))
+            q_inl = float(np.clip(float(match_result.num_inliers) / 40.0, 0.0, 1.0))
+            q_repr = float(np.clip(1.2 / max(float(match_result.reproj_error), 0.25), 0.0, 1.0))
+            yaw_hint_q = float(np.clip(0.50 * q_conf + 0.30 * q_inl + 0.20 * q_repr, 0.0, 1.0))
+            if selected_reason == "matched_failsoft":
+                yaw_hint_q *= 0.75
+            setattr(vps_measurement, "yaw_delta_deg", float(yaw_delta_deg_hint))
+            setattr(vps_measurement, "yaw_hint_quality", float(yaw_hint_q))
+            setattr(vps_measurement, "selected_yaw_deg", float(selected_yaw_deg))
+        except Exception:
+            pass
         
         # Log processing time
         success_reason = "matched_failsoft" if selected_reason == "matched_failsoft" else "matched"

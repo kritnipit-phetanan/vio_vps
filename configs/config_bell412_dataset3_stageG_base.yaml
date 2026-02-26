@@ -358,17 +358,74 @@ adaptive:
 backend:
   apply_cov_inflate: 1.05
   blend_steps: 3
+  correction_blend:
+    mode: exp
+    alpha: 0.50
+    max_step_dp_xy_m: 6.0
+    max_step_dyaw_deg: 0.8
+    quality_soft_scale: true
   enabled: true
   fixed_lag_window: 10
   max_abs_dp_xy_m: 60.0
   max_abs_dyaw_deg: 8.0
   max_apply_dp_xy_m: 25.0
   max_apply_dyaw_deg: 2.5
+  xy_priority_enable: true
+  xy_priority_min_vps_mix: 0.70
+  xy_priority_max_loop_mix: 0.10
+  xy_priority_max_mag_mix: 0.15
+  xy_priority_quality_th: 0.55
+  xy_priority_max_dyaw_deg: 0.35
+  xy_priority_lowq_max_dyaw_deg: 0.15
   max_correction_age_sec: 2.0
   max_iteration_ms: 35.0
-  min_quality_score: 0.2
-  optimize_rate_hz: 1.0
+  min_quality_score: 0.16
+  min_emit_dp_xy_m: 0.08
+  min_emit_dyaw_deg: 0.03
+  optimize_rate_hz: 2.0
   poll_interval_sec: 1.0
+  robust_yaw:
+    enable: true
+    huber_deg: 5.0
+  switchable_constraints:
+    enable: true
+    quality_floor: 0.08
+    residual_xy_m: 12.0
+    residual_yaw_deg: 12.0
+    min_weight: 0.15
+  transport:
+    latest_wins_enable: true
+    drop_stale_on_emit: true
+    poll_on_camera_tick_only: true
+    poll_min_interval_sec: 1.0
+  contract:
+    strict_require_source_mix: true
+    strict_require_residual_summary: true
+  vps_yaw_hint_enable: true
+  vps_yaw_hint_gain: 0.35
+  vps_yaw_hint_max_abs_deg: 35.0
+  vps_yaw_hint_min_quality: 0.45
+  vps_yaw_hint_min_inliers: 8
+  vps_yaw_hint_max_reproj: 1.2
+  vps_yaw_hint_max_apply_deg: 2.0
+  position_first_force_xy_only: true
+  position_first_min_vps_mix: 0.30
+  position_first_max_apply_dp_xy_m: 90.0
+  position_first_corr_weight: 1.0
+  position_first_blend_steps: 1
+  hybrid_factor_lite:
+    enable: true
+    window: 10
+    loss_xy_m: 8.0
+    loss_yaw_deg: 10.0
+    use_imu: false
+    use_visual: false
+    use_vps: true
+    use_dem: false
+    use_vps_xy: true
+    use_vps_yaw: true
+    use_loop_yaw: false
+    use_mag_yaw: false
 camera:
   image_height: 1080
   image_width: 1440
@@ -588,6 +645,12 @@ loop_closure:
     yaw_residual_bound_deg: 25.0
   use_loop_closure: true
 magnetometer:
+  calibration:
+    hard_iron: [0.24914, -0.261974, 0.317021]
+    soft_iron:
+      - [0.753133, 0.0, 0.0]
+      - [0.0, 0.726562, 0.0]
+      - [0.0, 0.0, 3.379869]
   ablation:
     mode: "weak"
     r_mult: 2.2
@@ -595,7 +658,7 @@ magnetometer:
     max_update_dyaw_deg: 0.35
     weak_skip_hard_mismatch: false
   heading_arbitration:
-    enable: true
+    enable: false  # global yaw_authority is canonical owner in stage G/H
     hard_mismatch_deg: 95.0
     min_vision_quality: 0.55
     streak_to_hold: 6
@@ -623,10 +686,11 @@ magnetometer:
   preprocessing:
     enable: true
     norm_range_enable: true
-    rolling_norm_dev_max: 0.45
-    gyro_delta_max_deg: 95.0
-    vision_delta_max_deg: 120.0
-    ewma_alpha: 0.08
+  quality:
+    norm_ewma_alpha: 0.08
+    norm_mad_thresh: 0.45
+    gyro_consistency_deg_s: 95.0
+    vision_consistency_deg: 120.0
   accuracy_policy:
     enabled: true
     good_min_score: 0.72
@@ -649,10 +713,6 @@ magnetometer:
   enabled: true
   expected_field_strength: 0.63
   gyro_consistency_threshold_deg: 30.0
-  hard_iron_offset:
-  - 0.24914
-  - -0.261974
-  - 0.317021
   heading_formula: atan2(-mag_y, mag_x)
   max_field_strength: 0.95
   max_yaw_rate_deg: 150.0
@@ -660,16 +720,6 @@ magnetometer:
   r_inflate: 2.0
   sigma_mag_bias: 0.0001
   sigma_mag_bias_init: 0.01
-  soft_iron_matrix:
-  - - 0.753133
-    - 0.0
-    - 0.0
-  - - 0.0
-    - 0.726562
-    - 0.0
-  - - 0.0
-    - 0.0
-    - 3.379869
   update_rate_limit: 1
   use_estimated_bias: true
   use_raw_heading: true
@@ -737,12 +787,77 @@ magnetometer:
     warning_r_mult: 6.0
 yaw_authority:
   enable: true
-  activation_stage: 2  # S2 conservative retune
+  activation_stage: 4  # stage4: add soft-only high-speed/unstable guard
+  use_msckf_confidence: true
+  msckf_conf_blend:
+    MAG: 0.60
+    LOOP: 0.20
+    BACKEND: 0.05
+  mag_owner_min_accept_rate: 0.10
+  mag_owner_accept_window_sec: 8.0
+  mag_owner_min_samples: 20
+  mag_owner_ban_sec: 2.5
+  mag_block_require_alt_source: true
+  mag_block_min_alt_applies: 1
+  mag_block_require_alt_window_sec: 8.0
+  mag_block_force_rate: 0.06
+  mag_block_force_ban_sec: 10.0
+  mag_score_accept_enable: true
+  mag_score_accept_window_sec: 8.0
+  mag_score_accept_ref_rate: 0.20
+  mag_score_min_samples: 20
+  mag_score_floor: 0.15
+  mag_score_cold_start_scale: 0.55
+  mag_low_accept_soft_r_mult: 3.0
+  mag_low_accept_max_dyaw_deg: 0.35
+  position_first_disable_mag_owner: true
+  owner_dead_enable: true
+  owner_dead_timeout_sec: 1.4
+  owner_dead_timeout_sec_map:
+    BACKEND: 4.5
+    LOOP: 2.8
+    MAG: 1.6
+  owner_dead_hold_sec: 0.5
+  owner_dead_rearm_sec: 1.2
+  owner_dead_min_freshness: 0.15
+  owner_dead_min_requests_map:
+    LOOP: 1
+    BACKEND: 2
+  source_stale_sec: 1.2
+  source_stale_tau_sec: 1.2
+  source_stale_sec_map:
+    BACKEND: 4.0
+    LOOP: 2.2
+    MAG: 1.2
+  source_stale_tau_sec_map:
+    BACKEND: 4.0
+    LOOP: 2.2
+    MAG: 1.2
+  strict_single_path_enable: true
+  strict_hold_reclaim_sources: ["BACKEND", "LOOP"]
+  strict_hold_reclaim_min_confidence: 0.18
+  strict_hold_reclaim_min_confidence_map:
+    BACKEND: 0.16
+    LOOP: 0.28
+  strict_hold_reclaim_min_freshness: 0.10
+  min_effective_score: 0.06
+  owner_dead_reclaim_min_score: 0.45
+  owner_dead_reclaim_min_freshness: 0.35
+  activity_enable: true
+  activity_window_sec: 8.0
+  activity_min_samples: 8
+  activity_ratio_floor: 0.25
+  owner_min_dwell_sec: 0.8
   score_ema_alpha: 0.22
   min_source_score: 0.35
+  min_source_score_map:
+    MAG: 0.35
+    LOOP: 0.28
+    BACKEND: 0.26
   switch_margin: 0.12
   switch_min_interval_sec: 0.75
-  stage12_claim_enable: true
+  switch_eval_min_interval_sec: 0.35
+  stage12_claim_enable: false
   stage12_min_switch_interval_sec: 1.2
   stage12_owner_timeout_sec: 1.0
   stage12_claim_min_score: 0.40
@@ -753,23 +868,52 @@ yaw_authority:
   stage12_claim_sources: ["LOOP", "BACKEND"]
   hold_score_threshold: 0.18
   hold_sec: 0.8
+  hold_reclaim_sources: ["BACKEND"]
+  hold_reclaim_min_confidence: 0.20
+  hold_mag_anchor_enable: true
+  hold_mag_anchor_min_confidence: 0.62
+  hold_mag_anchor_require_alt_quiet: true
+  hold_mag_anchor_alt_window_sec: 6.0
+  hold_mag_anchor_max_alt_applies: 0
+  hold_mag_anchor_r_mult: 6.0
+  hold_mag_anchor_max_dyaw_deg: 0.12
+  hold_escape_min_score: 0.16
+  hold_escape_min_sec: 0.35
+  hold_bypass_sources: ["BACKEND"]
+  hold_bypass_min_confidence: 0.55
+  hold_bypass_min_freshness: 0.20
+  hold_bypass_min_confidence_map:
+    LOOP: 0.45
+    BACKEND: 0.40
+  owner_require_apply_recent_enable: true
+  owner_apply_recent_window_sec: 8.0
+  owner_min_apply_recent_map:
+    LOOP: 2
+    BACKEND: 1
+  backend_bootstrap_min_requests: 2
+  backend_bootstrap_min_score: 0.24
+  backend_request_alive_enable: true
+  backend_request_alive_window_sec: 10.0
+  backend_request_alive_min_requests: 1
+  backend_request_alive_min_score: 0.18
   yaw_budget_window_sec: 8.0
   yaw_budget_abs_deg: 12.0
   yaw_rate_max_deg_s: 6.0
   budget_soft_r_mult: 1.6
-  soft_only_high_speed_m_s: 22.0
+  soft_only_high_speed_m_s: 20.0
   soft_only_unstable_pmax: 1.0e6
   soft_only_unstable_pcond: 1.0e12
   soft_only_unstable_health: ["WARNING", "DEGRADED"]
-  soft_only_max_dyaw_deg: 1.2
-  soft_only_r_mult: 1.5
+  soft_only_max_dyaw_deg: 0.8
+  soft_only_r_mult: 1.8
   source_priority:
-    MAG: 1.0
-    LOOP: 1.0
-    BACKEND: 0.9
+    MAG: 0.6
+    LOOP: 0.9
+    BACKEND: 1.2
 optimization:
   compute_budget: medium
   objective: accuracy
+  position_first_lane: true
 plane:
   angle_threshold_deg: 15.0
   distance_threshold_m: 0.15
@@ -896,8 +1040,40 @@ vio_vel:
   xy_only_chi2_scale: 1.1
 vps:
   abs_hard_reject_dir_change_deg: 75.0
+  abs_hard_reject_dir_change_max_speed_m_s: 12.0
+  abs_hard_reject_dir_change_min_accepts: 3
   abs_hard_reject_offset_m: 180.0
   abs_max_apply_dp_xy_m: 25.0
+  xy_drift_recovery_enable: true
+  xy_drift_recovery_min_offset_m: 120.0
+  xy_drift_recovery_max_offset_m: 1800.0
+  xy_drift_recovery_min_no_apply_sec: 5.0
+  xy_drift_recovery_min_inliers: 6
+  xy_drift_recovery_min_confidence: 0.10
+  xy_drift_recovery_max_reproj_error: 1.6
+  xy_drift_recovery_max_speed_m_s: 95.0
+  xy_drift_recovery_r_mult: 2.8
+  xy_drift_recovery_max_apply_dp_xy_m: 55.0
+  xy_drift_recovery_allow_dir_change_bypass: true
+  xy_drift_recovery_allow_offset_bypass: true
+  xy_drift_recovery_skip_temporal_gate: true
+  xy_drift_recovery_report_backend_hint_on_reject: true
+  xy_drift_recovery_hint_quality_scale: 0.65
+  position_first_soft_enable: true
+  position_first_soft_min_offset_m: 10.0
+  position_first_soft_min_no_apply_sec: 0.5
+  position_first_soft_min_inliers: 3
+  position_first_soft_min_confidence: 0.03
+  position_first_soft_max_reproj_error: 3.0
+  position_first_soft_max_speed_m_s: 110.0
+  position_first_soft_skip_temporal_gate: true
+  position_first_soft_ignore_policy_hold: true
+  position_first_soft_r_mult: 4.0
+  position_first_soft_max_apply_dp_xy_m: 90.0
+  position_first_soft_hint_quality_scale: 0.85
+  position_first_altitude_bypass_enable: true
+  position_first_altitude_bypass_min_m: -150.0
+  position_first_altitude_bypass_max_m: 1500.0
   accuracy_mode: true
   allow_failsoft_accept: true
   apply_degraded_conf_mult: 1.3
@@ -929,6 +1105,10 @@ vps:
   failsoft_r_inflate: 4.0
   max_altitude: 500.0
   max_candidates: 6
+  global_max_candidates: 10
+  max_total_candidates: 16
+  max_frame_time_ms_local: 300.0
+  max_frame_time_ms_global: 900.0
   max_clones: 3
   max_delay_sec: 0.5
   max_keypoints: 2048
@@ -943,6 +1123,11 @@ vps:
   min_inliers_failsoft: 5
   min_texture_std: 8.0
   min_update_interval: 0.5
+  worker_busy_force_local_streak: 120
+  worker_busy_force_local_sec: 8.0
+  worker_busy_backpressure_sec: 0.35
+  worker_busy_backpressure_max_sec: 2.0
+  worker_busy_backpressure_step: 25
   output_size:
   - 512
   - 512
@@ -951,6 +1136,10 @@ vps:
   relocalization:
     enabled: true
     fail_streak_trigger: 6
+    global_backoff_fail_streak: 8
+    busy_backoff_force_local_streak: 4
+    global_backoff_probe_every_attempts: 6
+    global_backoff_probe_min_interval_sec: 1.5
     force_global_on_warning_phase: false
     global_interval_sec: 12.0
     global_scale_hypotheses:
@@ -969,6 +1158,8 @@ vps:
     - -90
     - -135
     max_centers: 10
+    no_coverage_use_last_success: true
+    no_coverage_use_last_coverage: true
     ring_radius_m:
     - 35.0
     - 80.0

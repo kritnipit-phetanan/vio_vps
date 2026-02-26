@@ -134,6 +134,8 @@ class VIORunner:
         self.policy_trace_csv = None
         self.policy_conflict_csv = None
         self.policy_owner_map_csv = None
+        self.heading_owner_trace_csv = None
+        self.msckf_quality_csv = None
         self.conditioning_events_csv = None
         self.benchmark_health_summary_csv = None
         
@@ -187,10 +189,18 @@ class VIORunner:
         self._backend_apply_count: int = 0
         self._backend_stale_drop_count: int = 0
         self._backend_poll_count: int = 0
+        self._backend_emit_count: int = 0
+        self._backend_emit_stale_drop_count: int = 0
+        self._backend_overwrite_count: int = 0
+        self._backend_apply_quality_history: list[float] = []
+        self._backend_snap_reject_count: int = 0
+        self._backend_contract_violation_count: int = 0
+        self._backend_apply_latency_ms_history: list[float] = []
         self._backend_pending_dp_enu: Optional[np.ndarray] = None
         self._backend_pending_dyaw_deg: float = 0.0
         self._backend_pending_steps_left: int = 0
         self._backend_last_poll_t: float = -1e9
+        self._backend_last_poll_vio_frame: int = -1
         
         # Timestamp base tracking (for GT/error alignment)
         self.imu_time_col: Optional[str] = None
@@ -225,6 +235,8 @@ class VIORunner:
         self._vio_vel_attempt_count: int = 0
         self._vio_vel_accept_count: int = 0
         self._policy_conflict_count: int = 0
+        self._msckf_quality_history: list[float] = []
+        self._msckf_quality_snapshot = None
         self._yaw_auth_skip_count: int = 0
         self._kin_guard_samples: int = 0
         self._kin_guard_trigger_count: int = 0

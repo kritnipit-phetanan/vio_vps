@@ -112,8 +112,15 @@ class PolicyRuntimeService:
         "MAG_PREPROC_GYRO_DELTA_MAX_DEG": "yaml.magnetometer.preprocessing",
         "MAG_PREPROC_VISION_DELTA_MAX_DEG": "yaml.magnetometer.preprocessing",
         "MAG_PREPROC_EWMA_ALPHA": "yaml.magnetometer.preprocessing",
+        "MAG_HARD_IRON_OFFSET": "yaml.magnetometer.calibration",
+        "MAG_SOFT_IRON_MATRIX": "yaml.magnetometer.calibration",
+        "MAG_QUALITY_NORM_EWMA_ALPHA": "yaml.magnetometer.quality",
+        "MAG_QUALITY_NORM_MAD_THRESH": "yaml.magnetometer.quality",
+        "MAG_QUALITY_GYRO_CONSISTENCY_DEG_S": "yaml.magnetometer.quality",
+        "MAG_QUALITY_VISION_CONSISTENCY_DEG": "yaml.magnetometer.quality",
         "YAW_AUTH_ENABLE": "yaml.yaw_authority",
         "YAW_AUTH_STAGE": "yaml.yaw_authority",
+        "YAW_AUTH_OWNER_MIN_DWELL_SEC": "yaml.yaw_authority",
         "YAW_AUTH_MIN_SOURCE_SCORE": "yaml.yaw_authority",
         "YAW_AUTH_SWITCH_MARGIN": "yaml.yaw_authority",
         "YAW_AUTH_SWITCH_MIN_INTERVAL_SEC": "yaml.yaw_authority",
@@ -125,6 +132,13 @@ class PolicyRuntimeService:
         "YAW_AUTH_STAGE12_LOOP_FORCE_CLAIM_MIN_SCORE": "yaml.yaw_authority",
         "YAW_AUTH_STAGE12_LOOP_FORCE_CLAIM_MAX_SPEED_M_S": "yaml.yaw_authority",
         "YAW_AUTH_STAGE12_ALLOW_STALE_RECLAIM_ANY": "yaml.yaw_authority",
+        "YAW_AUTH_MAG_OWNER_MIN_ACCEPT_RATE": "yaml.yaw_authority",
+        "YAW_AUTH_MAG_OWNER_ACCEPT_WINDOW_SEC": "yaml.yaw_authority",
+        "YAW_AUTH_MAG_OWNER_MIN_SAMPLES": "yaml.yaw_authority",
+        "YAW_AUTH_MAG_OWNER_BAN_SEC": "yaml.yaw_authority",
+        "YAW_AUTH_OWNER_DEAD_ENABLE": "yaml.yaw_authority",
+        "YAW_AUTH_OWNER_DEAD_TIMEOUT_SEC": "yaml.yaw_authority",
+        "YAW_AUTH_OWNER_DEAD_HOLD_SEC": "yaml.yaw_authority",
         "YAW_AUTH_YAW_BUDGET_WINDOW_SEC": "yaml.yaw_authority",
         "YAW_AUTH_YAW_BUDGET_ABS_DEG": "yaml.yaw_authority",
         "YAW_AUTH_YAW_RATE_MAX_DEG_S": "yaml.yaw_authority",
@@ -133,6 +147,12 @@ class PolicyRuntimeService:
         "YAW_AUTH_SOFT_ONLY_UNSTABLE_PCOND": "yaml.yaw_authority",
         "YAW_AUTH_SOFT_ONLY_MAX_DYAW_DEG": "yaml.yaw_authority",
         "YAW_AUTH_SOFT_ONLY_R_MULT": "yaml.yaw_authority",
+        "BACKEND_TRANSPORT_LATEST_WINS_ENABLE": "yaml.backend.transport",
+        "BACKEND_TRANSPORT_DROP_STALE_ON_EMIT": "yaml.backend.transport",
+        "BACKEND_TRANSPORT_POLL_ON_CAMERA_TICK_ONLY": "yaml.backend.transport",
+        "BACKEND_TRANSPORT_POLL_MIN_INTERVAL_SEC": "yaml.backend.transport",
+        "BACKEND_CONTRACT_STRICT_REQUIRE_SOURCE_MIX": "yaml.backend.contract",
+        "BACKEND_CONTRACT_STRICT_REQUIRE_RESIDUAL_SUMMARY": "yaml.backend.contract",
         "VPS_MATCHER_MODE": "yaml.vps",
         "VPS_MIN_UPDATE_INTERVAL": "yaml.vps",
         "VPS_MAX_TOTAL_CANDIDATES": "yaml.vps",
@@ -207,6 +227,17 @@ class PolicyRuntimeService:
         extras["speed_m_s"] = float(speed_m_s)
         extras["aiding_level"] = str(aiding_level)
 
+        msckf_q = getattr(self.runner, "_msckf_quality_snapshot", None)
+        if msckf_q is not None:
+            try:
+                extras["msckf_quality_score"] = float(getattr(msckf_q, "quality_score", np.nan))
+                extras["msckf_inlier_ratio"] = float(getattr(msckf_q, "inlier_ratio", np.nan))
+                extras["msckf_reproj_p95_norm"] = float(getattr(msckf_q, "reproj_p95_norm", np.nan))
+                extras["msckf_depth_positive_ratio"] = float(getattr(msckf_q, "depth_positive_ratio", np.nan))
+                extras["msckf_parallax_med_px"] = float(getattr(msckf_q, "parallax_med_px", np.nan))
+            except Exception:
+                pass
+
         # Carry adaptive per-sensor extras into snapshot so consumers don't read adaptive directly.
         for key, val in scales.items():
             if key in ("r_scale", "chi2_scale", "threshold_scale", "reproj_scale"):
@@ -225,6 +256,11 @@ class PolicyRuntimeService:
             extras["reproj_failsoft_max_mult"] = float(cfg.get("MSCKF_REPROJ_FAILSOFT_MAX_MULT", 1.35))
             extras["reproj_failsoft_min_quality"] = float(cfg.get("MSCKF_REPROJ_FAILSOFT_MIN_QUALITY", 0.35))
             extras["reproj_failsoft_min_obs"] = float(cfg.get("MSCKF_REPROJ_FAILSOFT_MIN_OBS", 3))
+            extras["quality_score"] = float(extras.get("msckf_quality_score", np.nan))
+            extras["inlier_ratio"] = float(extras.get("msckf_inlier_ratio", np.nan))
+            extras["reproj_p95_norm"] = float(extras.get("msckf_reproj_p95_norm", np.nan))
+            extras["depth_positive_ratio"] = float(extras.get("msckf_depth_positive_ratio", np.nan))
+            extras["parallax_med_px"] = float(extras.get("msckf_parallax_med_px", np.nan))
             phase_key = str(max(0, min(2, int(phase))))
             extras["phase_chi2_scale"] = float(cfg.get("MSCKF_PHASE_CHI2_SCALE", {}).get(phase_key, 1.0))
             extras["phase_reproj_scale"] = float(cfg.get("MSCKF_PHASE_REPROJ_SCALE", {}).get(phase_key, 1.0))
@@ -482,10 +518,14 @@ class PolicyRuntimeService:
             extras["heading_arb_recover_max_update_dyaw_deg"] = float(
                 cfg.get("MAG_HEADING_ARB_RECOVER_MAX_UPDATE_DYAW_DEG", 0.30)
             )
-            extras["preproc_norm_dev_max"] = float(cfg.get("MAG_PREPROC_NORM_DEV_MAX", 0.45))
-            extras["preproc_gyro_delta_max_deg"] = float(cfg.get("MAG_PREPROC_GYRO_DELTA_MAX_DEG", 95.0))
-            extras["preproc_vision_delta_max_deg"] = float(cfg.get("MAG_PREPROC_VISION_DELTA_MAX_DEG", 120.0))
-            extras["preproc_ewma_alpha"] = float(cfg.get("MAG_PREPROC_EWMA_ALPHA", 0.08))
+            extras["quality_norm_ewma_alpha"] = float(cfg.get("MAG_QUALITY_NORM_EWMA_ALPHA", 0.08))
+            extras["quality_norm_mad_thresh"] = float(cfg.get("MAG_QUALITY_NORM_MAD_THRESH", 0.45))
+            extras["quality_gyro_consistency_deg_s"] = float(
+                cfg.get("MAG_QUALITY_GYRO_CONSISTENCY_DEG_S", 95.0)
+            )
+            extras["quality_vision_consistency_deg"] = float(
+                cfg.get("MAG_QUALITY_VISION_CONSISTENCY_DEG", 120.0)
+            )
             extras["conditioning_warn_pcond"] = float(cfg.get("MAG_CONDITIONING_GUARD_WARN_PCOND", 8e11))
             extras["conditioning_warn_pmax"] = float(cfg.get("MAG_CONDITIONING_GUARD_WARN_PMAX", 8e6))
             extras["conditioning_degraded_pcond"] = float(cfg.get("MAG_CONDITIONING_GUARD_DEGRADED_PCOND", 1e11))

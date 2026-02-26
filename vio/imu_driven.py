@@ -20,6 +20,23 @@ from .data_loaders import ProjectionCache
 from .output_utils import log_state_debug
 
 
+def _backend_poll_due(global_config, t_now: float, last_poll_t: float, cam_tick: bool) -> bool:
+    """Return whether backend correction poll/apply should run at this step."""
+    poll_on_cam = bool(global_config.get("BACKEND_TRANSPORT_POLL_ON_CAMERA_TICK_ONLY", True))
+    if poll_on_cam:
+        if bool(cam_tick):
+            return True
+        min_interval = float(
+            global_config.get(
+                "BACKEND_TRANSPORT_POLL_MIN_INTERVAL_SEC",
+                global_config.get("BACKEND_POLL_INTERVAL_SEC", 0.5),
+            )
+        )
+        return (float(t_now) - float(last_poll_t)) >= max(0.05, float(min_interval))
+    poll_interval_sec = float(global_config.get("BACKEND_POLL_INTERVAL_SEC", 0.5))
+    return (float(t_now) - float(last_poll_t)) >= max(0.01, float(poll_interval_sec))
+
+
 def run_imu_driven_loop(runner):
     """
     IMU-driven VIO loop (v3.7.0).
@@ -123,8 +140,11 @@ def run_imu_driven_loop(runner):
     if runner.global_config.get('TRN_ENABLED', False):
         runner.trn = create_trn_from_config(runner.dem, runner.global_config)
         if runner.trn:
-            print(f"[TRN] Initialized: search_radius={runner.global_config.get('TRN_SEARCH_RADIUS', 500)}m, "
-                    f"update_interval={runner.global_config.get('TRN_UPDATE_INTERVAL', 10)}s")
+            trn_cfg = runner.global_config.get('trn', {}) or {}
+            print(
+                f"[TRN] Initialized: search_radius={trn_cfg.get('search_radius_m', 500)}m, "
+                f"update_interval={trn_cfg.get('update_interval_sec', 10)}s"
+            )
         else:
             print("[TRN] WARNING: Failed to initialize TRN")
     else:
@@ -216,6 +236,7 @@ def run_imu_driven_loop(runner):
         t_current = rec.t
         
         # Detect camera crossing: last_t < t_cam <= current_t
+        vio_frame_before = int(getattr(runner.state, "vio_frame", 0))
         if t_last < next_cam_time <= t_current and dt > 0:
             # Split dt at camera timestamp for sub-sample precision
             dt_before = next_cam_time - t_last  # Propagate to camera time
@@ -351,10 +372,26 @@ def run_imu_driven_loop(runner):
 
         # Async backend correction polling + blended apply (non-blocking frontend).
         if runner.backend_optimizer is not None:
-            poll_interval_sec = float(runner.global_config.get("BACKEND_POLL_INTERVAL_SEC", 0.5))
-            if (t - float(getattr(runner, "_backend_last_poll_t", -1e9))) >= poll_interval_sec:
+            cam_tick = int(getattr(runner.state, "vio_frame", 0)) > int(vio_frame_before)
+            if _backend_poll_due(
+                runner.global_config,
+                t_now=float(t),
+                last_poll_t=float(getattr(runner, "_backend_last_poll_t", -1e9)),
+                cam_tick=bool(cam_tick),
+            ):
                 runner._backend_last_poll_t = float(t)
                 runner._backend_poll_count = int(getattr(runner, "_backend_poll_count", 0)) + 1
+                try:
+                    b_stats = getattr(runner.backend_optimizer, "stats", {})
+                    runner._backend_emit_count = int(b_stats.get("corrections_emitted", runner._backend_emit_count))
+                    runner._backend_emit_stale_drop_count = int(
+                        b_stats.get("corrections_emit_stale_dropped", getattr(runner, "_backend_emit_stale_drop_count", 0))
+                    )
+                    runner._backend_overwrite_count = int(
+                        b_stats.get("corrections_overwritten", getattr(runner, "_backend_overwrite_count", 0))
+                    )
+                except Exception:
+                    pass
                 corr = runner.backend_optimizer.poll_correction(t_now=float(t))
                 stale_drops = int(getattr(runner.backend_optimizer, "last_poll_stale_drops", 0))
                 if stale_drops > 0:
@@ -363,8 +400,12 @@ def run_imu_driven_loop(runner):
                     max_age = float(runner.global_config.get("BACKEND_MAX_CORRECTION_AGE_SEC", 2.0))
                     if float(getattr(corr, "age_sec", 0.0)) > max_age:
                         runner._backend_stale_drop_count = int(getattr(runner, "_backend_stale_drop_count", 0)) + 1
+                        runner._backend_snap_reject_count = int(getattr(runner, "_backend_snap_reject_count", 0)) + 1
                     else:
                         runner.vio_service.schedule_backend_correction(corr)
+            # Deterministic blend apply cadence:
+            # - poll is gated by camera/fallback timing
+            # - apply of already scheduled correction runs every IMU tick
             runner.vio_service.apply_pending_backend_blend(float(t))
 
         # Log error vs ground truth (every sample, like vio_vps.py)

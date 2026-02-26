@@ -508,8 +508,12 @@ class BootstrapService:
         runner.policy_trace_csv = csv_paths.get("policy_trace_csv")
         runner.policy_conflict_csv = csv_paths.get("policy_conflict_csv")
         runner.policy_owner_map_csv = csv_paths.get("policy_owner_map_csv")
+        runner.heading_owner_trace_csv = csv_paths.get("heading_owner_trace_csv")
+        runner.msckf_quality_csv = csv_paths.get("msckf_quality_csv")
         runner._policy_conflict_count = 0
         runner.current_policy_snapshot = None
+        runner._msckf_quality_snapshot = None
+        runner._msckf_quality_history = []
         if getattr(runner, "policy_runtime_service", None) is not None:
             try:
                 runner.policy_runtime_service._owner_map_written = False
@@ -664,8 +668,69 @@ class BootstrapService:
                 max_iteration_ms=float(runner.global_config.get("BACKEND_MAX_ITERATION_MS", 35.0)),
                 max_correction_age_sec=float(runner.global_config.get("BACKEND_MAX_CORRECTION_AGE_SEC", 2.0)),
                 min_quality_score=float(runner.global_config.get("BACKEND_MIN_QUALITY_SCORE", 0.20)),
+                min_emit_dp_xy_m=float(runner.global_config.get("BACKEND_MIN_EMIT_DP_XY_M", 0.5)),
+                min_emit_dyaw_deg=float(runner.global_config.get("BACKEND_MIN_EMIT_DYAW_DEG", 0.2)),
                 max_abs_dp_xy_m=float(runner.global_config.get("BACKEND_MAX_ABS_DP_XY_M", 60.0)),
                 max_abs_dyaw_deg=float(runner.global_config.get("BACKEND_MAX_ABS_DYAW_DEG", 8.0)),
+                robust_yaw_enable=bool(runner.global_config.get("BACKEND_ROBUST_YAW_ENABLE", True)),
+                robust_yaw_huber_deg=float(runner.global_config.get("BACKEND_ROBUST_YAW_HUBER_DEG", 6.0)),
+                switchable_constraints_enable=bool(
+                    runner.global_config.get("BACKEND_SWITCHABLE_CONSTRAINTS_ENABLE", True)
+                ),
+                switchable_quality_floor=float(
+                    runner.global_config.get("BACKEND_SWITCHABLE_QUALITY_FLOOR", 0.08)
+                ),
+                switchable_residual_xy_m=float(
+                    runner.global_config.get("BACKEND_SWITCHABLE_RESIDUAL_XY_M", 12.0)
+                ),
+                switchable_residual_yaw_deg=float(
+                    runner.global_config.get("BACKEND_SWITCHABLE_RESIDUAL_YAW_DEG", 15.0)
+                ),
+                switchable_min_weight=float(
+                    runner.global_config.get("BACKEND_SWITCHABLE_MIN_WEIGHT", 0.15)
+                ),
+                hybrid_factor_lite_enable=bool(
+                    runner.global_config.get("BACKEND_HYBRID_FACTOR_LITE_ENABLE", False)
+                ),
+                hybrid_factor_lite_window=int(
+                    runner.global_config.get("BACKEND_HYBRID_FACTOR_LITE_WINDOW", 10)
+                ),
+                hybrid_factor_lite_loss_xy_m=float(
+                    runner.global_config.get("BACKEND_HYBRID_FACTOR_LITE_LOSS_XY_M", 8.0)
+                ),
+                hybrid_factor_lite_loss_yaw_deg=float(
+                    runner.global_config.get("BACKEND_HYBRID_FACTOR_LITE_LOSS_YAW_DEG", 10.0)
+                ),
+                hybrid_factor_lite_use_imu=bool(
+                    runner.global_config.get("BACKEND_HYBRID_FACTOR_LITE_USE_IMU", True)
+                ),
+                hybrid_factor_lite_use_visual=bool(
+                    runner.global_config.get("BACKEND_HYBRID_FACTOR_LITE_USE_VISUAL", True)
+                ),
+                hybrid_factor_lite_use_vps=bool(
+                    runner.global_config.get("BACKEND_HYBRID_FACTOR_LITE_USE_VPS", True)
+                ),
+                hybrid_factor_lite_use_dem=bool(
+                    runner.global_config.get("BACKEND_HYBRID_FACTOR_LITE_USE_DEM", True)
+                ),
+                hybrid_factor_lite_use_vps_xy=bool(
+                    runner.global_config.get("BACKEND_HYBRID_FACTOR_LITE_USE_VPS_XY", True)
+                ),
+                hybrid_factor_lite_use_vps_yaw=bool(
+                    runner.global_config.get("BACKEND_HYBRID_FACTOR_LITE_USE_VPS_YAW", True)
+                ),
+                hybrid_factor_lite_use_loop_yaw=bool(
+                    runner.global_config.get("BACKEND_HYBRID_FACTOR_LITE_USE_LOOP_YAW", True)
+                ),
+                hybrid_factor_lite_use_mag_yaw=bool(
+                    runner.global_config.get("BACKEND_HYBRID_FACTOR_LITE_USE_MAG_YAW", True)
+                ),
+                latest_wins_enable=bool(
+                    runner.global_config.get("BACKEND_TRANSPORT_LATEST_WINS_ENABLE", True)
+                ),
+                drop_stale_on_emit=bool(
+                    runner.global_config.get("BACKEND_TRANSPORT_DROP_STALE_ON_EMIT", True)
+                ),
             )
             runner.backend_optimizer.start()
             print(

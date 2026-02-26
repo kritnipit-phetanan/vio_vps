@@ -219,7 +219,6 @@ def load_config(config_path: str) -> VIOConfig:
     result['PLANE_SIGMA'] = plane_config.get('measurement_noise_m', 0.05)
     result['PLANE_USE_AIDED_TRIANGULATION'] = plane_config.get('use_aided_triangulation', True)
     result['PLANE_USE_CONSTRAINTS'] = plane_config.get('use_constraints', True)
-    result['PLANE_MAX_PLANES'] = plane_config.get('max_planes', 10)
     
     # ========================================
     # Extrinsics (Camera-to-Body Transforms)
@@ -303,8 +302,14 @@ def load_config(config_path: str) -> VIOConfig:
     mag = config['magnetometer']
     # v2.9.10.4: Add enabled flag to allow disabling mag from config
     result['MAG_ENABLED'] = mag.get('enabled', True)
-    result['MAG_HARD_IRON_OFFSET'] = np.array(mag['hard_iron_offset'], dtype=float)
-    result['MAG_SOFT_IRON_MATRIX'] = np.array(mag['soft_iron_matrix'], dtype=float)
+    mag_cal = mag.get('calibration', {}) if isinstance(mag.get('calibration', {}), dict) else {}
+    hard_iron = mag_cal.get('hard_iron', mag.get('hard_iron_offset', [0.0, 0.0, 0.0]))
+    soft_iron = mag_cal.get(
+        'soft_iron',
+        mag.get('soft_iron_matrix', np.eye(3, dtype=float).tolist()),
+    )
+    result['MAG_HARD_IRON_OFFSET'] = np.array(hard_iron, dtype=float)
+    result['MAG_SOFT_IRON_MATRIX'] = np.array(soft_iron, dtype=float)
     result['MAG_DECLINATION'] = mag['declination']
     result['MAG_FIELD_STRENGTH'] = mag['expected_field_strength']
     result['MAG_MIN_FIELD_STRENGTH'] = mag['min_field_strength']
@@ -543,22 +548,30 @@ def load_config(config_path: str) -> VIOConfig:
         heading_arb.get('recover_max_update_dyaw_deg', 0.30)
     )
     mag_preproc = mag.get('preprocessing', {})
+    mag_quality = mag.get('quality', {}) if isinstance(mag.get('quality', {}), dict) else {}
     result['MAG_PREPROC_ENABLE'] = bool(mag_preproc.get('enable', True))
     result['MAG_PREPROC_NORM_RANGE_ENABLE'] = bool(
         mag_preproc.get('norm_range_enable', True)
     )
-    result['MAG_PREPROC_NORM_DEV_MAX'] = float(
-        mag_preproc.get('rolling_norm_dev_max', 0.45)
-    )
-    result['MAG_PREPROC_GYRO_DELTA_MAX_DEG'] = float(
-        mag_preproc.get('gyro_delta_max_deg', 95.0)
-    )
-    result['MAG_PREPROC_VISION_DELTA_MAX_DEG'] = float(
-        mag_preproc.get('vision_delta_max_deg', 120.0)
-    )
-    result['MAG_PREPROC_EWMA_ALPHA'] = float(
-        mag_preproc.get('ewma_alpha', 0.08)
-    )
+    preproc_norm_dev = float(mag_preproc.get('rolling_norm_dev_max', 0.45))
+    preproc_gyro_deg = float(mag_preproc.get('gyro_delta_max_deg', 95.0))
+    preproc_vision_deg = float(mag_preproc.get('vision_delta_max_deg', 120.0))
+    preproc_ewma_alpha = float(mag_preproc.get('ewma_alpha', 0.08))
+    # Canonical source: quality.* (if present). preprocessing.* acts as legacy alias.
+    q_norm_ewma = float(mag_quality.get('norm_ewma_alpha', preproc_ewma_alpha))
+    q_norm_mad = float(mag_quality.get('norm_mad_thresh', preproc_norm_dev))
+    q_gyro_consistency = float(mag_quality.get('gyro_consistency_deg_s', preproc_gyro_deg))
+    q_vision_consistency = float(mag_quality.get('vision_consistency_deg', preproc_vision_deg))
+    result['MAG_QUALITY_NORM_EWMA_ALPHA'] = q_norm_ewma
+    result['MAG_QUALITY_NORM_MAD_THRESH'] = q_norm_mad
+    result['MAG_QUALITY_GYRO_CONSISTENCY_DEG_S'] = q_gyro_consistency
+    result['MAG_QUALITY_VISION_CONSISTENCY_DEG'] = q_vision_consistency
+    # Runtime de-coupling: keep preproc keys as aliases to canonical quality values
+    # so no dual-threshold disagreement can happen in policy consumers.
+    result['MAG_PREPROC_NORM_DEV_MAX'] = q_norm_mad
+    result['MAG_PREPROC_GYRO_DELTA_MAX_DEG'] = q_gyro_consistency
+    result['MAG_PREPROC_VISION_DELTA_MAX_DEG'] = q_vision_consistency
+    result['MAG_PREPROC_EWMA_ALPHA'] = q_norm_ewma
     result['VISION_HEADING_MIN_INLIERS'] = int(
         mag.get('vision_heading_min_inliers', 25)
     )
@@ -580,14 +593,100 @@ def load_config(config_path: str) -> VIOConfig:
     result['YAW_AUTH_STAGE'] = int(yaw_auth.get('activation_stage', 0))
     result['YAW_AUTH_SCORE_EMA_ALPHA'] = float(yaw_auth.get('score_ema_alpha', 0.22))
     result['YAW_AUTH_MIN_SOURCE_SCORE'] = float(yaw_auth.get('min_source_score', 0.35))
+    result['YAW_AUTH_MIN_SOURCE_SCORE_MAP'] = yaw_auth.get(
+        'min_source_score_map',
+        {},
+    )
     result['YAW_AUTH_SWITCH_MARGIN'] = float(yaw_auth.get('switch_margin', 0.12))
     result['YAW_AUTH_SWITCH_MIN_INTERVAL_SEC'] = float(
         yaw_auth.get('switch_min_interval_sec', 0.75)
+    )
+    result['YAW_AUTH_OWNER_MIN_DWELL_SEC'] = float(
+        yaw_auth.get('owner_min_dwell_sec', 0.0)
     )
     result['YAW_AUTH_HOLD_SCORE_THRESHOLD'] = float(
         yaw_auth.get('hold_score_threshold', 0.18)
     )
     result['YAW_AUTH_HOLD_SEC'] = float(yaw_auth.get('hold_sec', 0.8))
+    result['YAW_AUTH_HOLD_RECLAIM_SOURCES'] = yaw_auth.get(
+        'hold_reclaim_sources',
+        ['LOOP', 'BACKEND'],
+    )
+    result['YAW_AUTH_HOLD_RECLAIM_MIN_CONFIDENCE'] = float(
+        yaw_auth.get('hold_reclaim_min_confidence', 0.20)
+    )
+    result['YAW_AUTH_HOLD_ESCAPE_MIN_SCORE'] = float(
+        yaw_auth.get('hold_escape_min_score', 0.16)
+    )
+    result['YAW_AUTH_HOLD_ESCAPE_MIN_SEC'] = float(
+        yaw_auth.get('hold_escape_min_sec', 0.35)
+    )
+    result['YAW_AUTH_HOLD_BYPASS_SOURCES'] = yaw_auth.get(
+        'hold_bypass_sources',
+        ['LOOP', 'BACKEND'],
+    )
+    result['YAW_AUTH_HOLD_BYPASS_MIN_CONFIDENCE'] = float(
+        yaw_auth.get('hold_bypass_min_confidence', 0.55)
+    )
+    result['YAW_AUTH_HOLD_BYPASS_MIN_FRESHNESS'] = float(
+        yaw_auth.get('hold_bypass_min_freshness', 0.20)
+    )
+    result['YAW_AUTH_HOLD_BYPASS_MIN_CONFIDENCE_MAP'] = yaw_auth.get(
+        'hold_bypass_min_confidence_map',
+        {},
+    )
+    result['YAW_AUTH_HOLD_MAG_ANCHOR_ENABLE'] = bool(
+        yaw_auth.get('hold_mag_anchor_enable', True)
+    )
+    result['YAW_AUTH_HOLD_MAG_ANCHOR_MIN_CONFIDENCE'] = float(
+        yaw_auth.get('hold_mag_anchor_min_confidence', 0.55)
+    )
+    result['YAW_AUTH_HOLD_MAG_ANCHOR_REQUIRE_ALT_QUIET'] = bool(
+        yaw_auth.get('hold_mag_anchor_require_alt_quiet', True)
+    )
+    result['YAW_AUTH_HOLD_MAG_ANCHOR_ALT_WINDOW_SEC'] = float(
+        yaw_auth.get('hold_mag_anchor_alt_window_sec', 8.0)
+    )
+    result['YAW_AUTH_HOLD_MAG_ANCHOR_MAX_ALT_APPLIES'] = int(
+        yaw_auth.get('hold_mag_anchor_max_alt_applies', 0)
+    )
+    result['YAW_AUTH_HOLD_MAG_ANCHOR_R_MULT'] = float(
+        yaw_auth.get('hold_mag_anchor_r_mult', 4.0)
+    )
+    result['YAW_AUTH_HOLD_MAG_ANCHOR_MAX_DYAW_DEG'] = float(
+        yaw_auth.get('hold_mag_anchor_max_dyaw_deg', 0.20)
+    )
+    result['YAW_AUTH_MAG_WARMUP_MIN_SCORE'] = float(
+        yaw_auth.get('mag_warmup_min_score', 0.55)
+    )
+    result['YAW_AUTH_OWNER_REQUIRE_APPLY_RECENT_ENABLE'] = bool(
+        yaw_auth.get('owner_require_apply_recent_enable', True)
+    )
+    result['YAW_AUTH_OWNER_APPLY_RECENT_WINDOW_SEC'] = float(
+        yaw_auth.get('owner_apply_recent_window_sec', 8.0)
+    )
+    result['YAW_AUTH_OWNER_MIN_APPLY_RECENT_MAP'] = yaw_auth.get(
+        'owner_min_apply_recent_map',
+        {'BACKEND': 2},
+    )
+    result['YAW_AUTH_BACKEND_BOOTSTRAP_MIN_REQUESTS'] = int(
+        yaw_auth.get('backend_bootstrap_min_requests', 3)
+    )
+    result['YAW_AUTH_BACKEND_BOOTSTRAP_MIN_SCORE'] = float(
+        yaw_auth.get('backend_bootstrap_min_score', 0.28)
+    )
+    result['YAW_AUTH_BACKEND_REQUEST_ALIVE_ENABLE'] = bool(
+        yaw_auth.get('backend_request_alive_enable', True)
+    )
+    result['YAW_AUTH_BACKEND_REQUEST_ALIVE_WINDOW_SEC'] = float(
+        yaw_auth.get('backend_request_alive_window_sec', yaw_auth.get('owner_apply_recent_window_sec', 8.0))
+    )
+    result['YAW_AUTH_BACKEND_REQUEST_ALIVE_MIN_REQUESTS'] = int(
+        yaw_auth.get('backend_request_alive_min_requests', yaw_auth.get('backend_bootstrap_min_requests', 3))
+    )
+    result['YAW_AUTH_BACKEND_REQUEST_ALIVE_MIN_SCORE'] = float(
+        yaw_auth.get('backend_request_alive_min_score', yaw_auth.get('backend_bootstrap_min_score', 0.28))
+    )
     result['YAW_AUTH_YAW_BUDGET_WINDOW_SEC'] = float(
         yaw_auth.get('yaw_budget_window_sec', 8.0)
     )
@@ -599,6 +698,16 @@ def load_config(config_path: str) -> VIOConfig:
     )
     result['YAW_AUTH_BUDGET_SOFT_R_MULT'] = float(
         yaw_auth.get('budget_soft_r_mult', 1.6)
+    )
+    # Whether MSCKF quality is allowed to update yaw-owner confidence scores.
+    # Keep default True for backward compatibility; can be disabled per config
+    # to make instrumentation-only phases behavior-neutral.
+    result['YAW_AUTH_USE_MSCKF_CONFIDENCE'] = bool(
+        yaw_auth.get('use_msckf_confidence', True)
+    )
+    result['YAW_AUTH_MSCKF_CONF_BLEND'] = yaw_auth.get(
+        'msckf_conf_blend',
+        {'MAG': 0.55, 'LOOP': 0.25, 'BACKEND': 0.20},
     )
     result['YAW_AUTH_SOFT_ONLY_HIGH_SPEED_M_S'] = float(
         yaw_auth.get('soft_only_high_speed_m_s', 22.0)
@@ -651,6 +760,138 @@ def load_config(config_path: str) -> VIOConfig:
     result['YAW_AUTH_STAGE12_CLAIM_SOURCES'] = yaw_auth.get(
         'stage12_claim_sources',
         ['LOOP', 'BACKEND'],
+    )
+    result['YAW_AUTH_MAG_OWNER_MIN_ACCEPT_RATE'] = float(
+        yaw_auth.get('mag_owner_min_accept_rate', 0.15)
+    )
+    result['YAW_AUTH_MAG_OWNER_ACCEPT_WINDOW_SEC'] = float(
+        yaw_auth.get('mag_owner_accept_window_sec', 8.0)
+    )
+    result['YAW_AUTH_MAG_OWNER_MIN_SAMPLES'] = int(
+        yaw_auth.get('mag_owner_min_samples', 20)
+    )
+    result['YAW_AUTH_MAG_OWNER_BAN_SEC'] = float(
+        yaw_auth.get('mag_owner_ban_sec', 2.5)
+    )
+    result['YAW_AUTH_MAG_BLOCK_REQUIRE_ALT_SOURCE'] = bool(
+        yaw_auth.get('mag_block_require_alt_source', False)
+    )
+    result['YAW_AUTH_MAG_BLOCK_MIN_ALT_APPLIES'] = int(
+        yaw_auth.get('mag_block_min_alt_applies', 1)
+    )
+    result['YAW_AUTH_MAG_BLOCK_REQUIRE_ALT_WINDOW_SEC'] = float(
+        yaw_auth.get('mag_block_require_alt_window_sec', yaw_auth.get('mag_owner_accept_window_sec', 8.0))
+    )
+    result['YAW_AUTH_MAG_BLOCK_FORCE_RATE'] = float(
+        yaw_auth.get('mag_block_force_rate', 0.03)
+    )
+    result['YAW_AUTH_MAG_BLOCK_FORCE_BAN_SEC'] = float(
+        yaw_auth.get('mag_block_force_ban_sec', 8.0)
+    )
+    result['YAW_AUTH_MAG_SCORE_ACCEPT_ENABLE'] = bool(
+        yaw_auth.get('mag_score_accept_enable', True)
+    )
+    result['YAW_AUTH_MAG_SCORE_ACCEPT_WINDOW_SEC'] = float(
+        yaw_auth.get('mag_score_accept_window_sec', yaw_auth.get('mag_owner_accept_window_sec', 8.0))
+    )
+    result['YAW_AUTH_MAG_SCORE_ACCEPT_REF_RATE'] = float(
+        yaw_auth.get('mag_score_accept_ref_rate', 0.20)
+    )
+    result['YAW_AUTH_MAG_SCORE_MIN_SAMPLES'] = int(
+        yaw_auth.get('mag_score_min_samples', yaw_auth.get('mag_owner_min_samples', 20))
+    )
+    result['YAW_AUTH_MAG_SCORE_FLOOR'] = float(
+        yaw_auth.get('mag_score_floor', 0.15)
+    )
+    result['YAW_AUTH_MAG_SCORE_COLD_START_SCALE'] = float(
+        yaw_auth.get('mag_score_cold_start_scale', 1.0)
+    )
+    result['YAW_AUTH_MAG_LOW_ACCEPT_SOFT_R_MULT'] = float(
+        yaw_auth.get('mag_low_accept_soft_r_mult', 3.0)
+    )
+    result['YAW_AUTH_MAG_LOW_ACCEPT_MAX_DYAW_DEG'] = float(
+        yaw_auth.get('mag_low_accept_max_dyaw_deg', 0.35)
+    )
+    result['YAW_AUTH_POSITION_FIRST_DISABLE_MAG_OWNER'] = bool(
+        yaw_auth.get('position_first_disable_mag_owner', True)
+    )
+    result['YAW_AUTH_OWNER_DEAD_ENABLE'] = bool(
+        yaw_auth.get('owner_dead_enable', True)
+    )
+    result['YAW_AUTH_OWNER_DEAD_TIMEOUT_SEC'] = float(
+        yaw_auth.get('owner_dead_timeout_sec', 2.5)
+    )
+    result['YAW_AUTH_OWNER_DEAD_TIMEOUT_SEC_MAP'] = yaw_auth.get(
+        'owner_dead_timeout_sec_map',
+        {},
+    )
+    result['YAW_AUTH_OWNER_DEAD_HOLD_SEC'] = float(
+        yaw_auth.get('owner_dead_hold_sec', 0.35)
+    )
+    result['YAW_AUTH_OWNER_DEAD_REARM_SEC'] = float(
+        yaw_auth.get('owner_dead_rearm_sec', 0.8)
+    )
+    result['YAW_AUTH_SOURCE_STALE_SEC'] = float(
+        yaw_auth.get('source_stale_sec', yaw_auth.get('owner_dead_timeout_sec', 2.5))
+    )
+    result['YAW_AUTH_SOURCE_STALE_SEC_MAP'] = yaw_auth.get(
+        'source_stale_sec_map',
+        {},
+    )
+    result['YAW_AUTH_SOURCE_STALE_TAU_SEC'] = float(
+        yaw_auth.get('source_stale_tau_sec', yaw_auth.get('source_stale_sec', yaw_auth.get('owner_dead_timeout_sec', 2.5)))
+    )
+    result['YAW_AUTH_SOURCE_STALE_TAU_SEC_MAP'] = yaw_auth.get(
+        'source_stale_tau_sec_map',
+        {},
+    )
+    result['YAW_AUTH_OWNER_DEAD_MIN_REQUESTS_MAP'] = yaw_auth.get(
+        'owner_dead_min_requests_map',
+        {'BACKEND': 2, 'LOOP': 1},
+    )
+    result['YAW_AUTH_OWNER_DEAD_MIN_FRESHNESS'] = float(
+        yaw_auth.get('owner_dead_min_freshness', 0.20)
+    )
+    result['YAW_AUTH_MIN_EFFECTIVE_SCORE'] = float(
+        yaw_auth.get('min_effective_score', 0.06)
+    )
+    result['YAW_AUTH_OWNER_DEAD_RECLAIM_MIN_SCORE'] = float(
+        yaw_auth.get('owner_dead_reclaim_min_score', max(yaw_auth.get('min_source_score', 0.35), 0.45))
+    )
+    result['YAW_AUTH_OWNER_DEAD_RECLAIM_MIN_FRESHNESS'] = float(
+        yaw_auth.get('owner_dead_reclaim_min_freshness', 0.35)
+    )
+    result['YAW_AUTH_ACTIVITY_ENABLE'] = bool(
+        yaw_auth.get('activity_enable', True)
+    )
+    result['YAW_AUTH_ACTIVITY_WINDOW_SEC'] = float(
+        yaw_auth.get('activity_window_sec', 8.0)
+    )
+    result['YAW_AUTH_ACTIVITY_MIN_SAMPLES'] = int(
+        yaw_auth.get('activity_min_samples', 8)
+    )
+    result['YAW_AUTH_ACTIVITY_RATIO_FLOOR'] = float(
+        yaw_auth.get('activity_ratio_floor', 0.25)
+    )
+    result['YAW_AUTH_SWITCH_EVAL_MIN_INTERVAL_SEC'] = float(
+        yaw_auth.get('switch_eval_min_interval_sec', 0.25)
+    )
+    result['YAW_AUTH_STRICT_SINGLE_PATH_ENABLE'] = bool(
+        yaw_auth.get('strict_single_path_enable', True)
+    )
+    result['YAW_AUTH_STRICT_HOLD_RECLAIM_SOURCES'] = yaw_auth.get(
+        'strict_hold_reclaim_sources',
+        ['BACKEND', 'LOOP'],
+    )
+    result['YAW_AUTH_STRICT_HOLD_RECLAIM_MIN_CONFIDENCE'] = float(
+        yaw_auth.get('strict_hold_reclaim_min_confidence', 0.22)
+    )
+    result['YAW_AUTH_STRICT_HOLD_RECLAIM_MIN_CONFIDENCE_MAP'] = yaw_auth.get(
+        'strict_hold_reclaim_min_confidence_map',
+        {},
+    )
+    result['YAW_AUTH_STRICT_HOLD_RECLAIM_MIN_FRESHNESS'] = float(
+        yaw_auth.get('strict_hold_reclaim_min_freshness', 0.15)
     )
     
     # Process noise
@@ -1107,15 +1348,6 @@ def load_config(config_path: str) -> VIOConfig:
     if 'trn' in config:
         trn_cfg = config['trn']
         result['TRN_ENABLED'] = trn_cfg.get('enabled', False)
-        result['TRN_PROFILE_WINDOW'] = trn_cfg.get('profile_window_sec', 30.0)
-        result['TRN_MIN_SAMPLES'] = trn_cfg.get('min_samples', 20)
-        result['TRN_SEARCH_RADIUS'] = trn_cfg.get('search_radius_m', 500.0)
-        result['TRN_SEARCH_STEP'] = trn_cfg.get('search_step_m', 30.0)
-        result['TRN_MIN_TERRAIN_VAR'] = trn_cfg.get('min_terrain_variation_m', 10.0)
-        result['TRN_CORR_THRESHOLD'] = trn_cfg.get('max_correlation_threshold', 0.7)
-        result['TRN_MIN_ALT_VAR'] = trn_cfg.get('min_altitude_variation_m', 5.0)
-        result['TRN_UPDATE_INTERVAL'] = trn_cfg.get('update_interval_sec', 10.0)
-        result['TRN_SIGMA_XY'] = trn_cfg.get('sigma_trn_xy', 50.0)
         result['trn'] = trn_cfg  # Store full config for TRN module
     else:
         result['TRN_ENABLED'] = False
@@ -1126,7 +1358,7 @@ def load_config(config_path: str) -> VIOConfig:
     # =========================================================================
     opt_cfg = config.get('optimization', {})
     result['OBJECTIVE_MODE'] = str(opt_cfg.get('objective', 'stability')).lower()
-    result['COMPUTE_BUDGET'] = str(opt_cfg.get('compute_budget', 'low')).lower()
+    result['POSITION_FIRST_LANE'] = bool(opt_cfg.get('position_first_lane', False))
 
     # =========================================================================
     # VPS accuracy mode + relocalization policy
@@ -1188,8 +1420,95 @@ def load_config(config_path: str) -> VIOConfig:
     result['VPS_ABS_HARD_REJECT_DIR_CHANGE_DEG'] = float(
         vps_cfg.get('abs_hard_reject_dir_change_deg', 75.0)
     )
+    result['VPS_ABS_HARD_REJECT_DIR_CHANGE_MAX_SPEED_M_S'] = float(
+        vps_cfg.get('abs_hard_reject_dir_change_max_speed_m_s', 12.0)
+    )
+    result['VPS_ABS_HARD_REJECT_DIR_CHANGE_MIN_ACCEPTS'] = int(
+        vps_cfg.get('abs_hard_reject_dir_change_min_accepts', 3)
+    )
     result['VPS_ABS_MAX_APPLY_DP_XY_M'] = float(
         vps_cfg.get('abs_max_apply_dp_xy_m', 25.0)
+    )
+    result['VPS_XY_DRIFT_RECOVERY_ENABLE'] = bool(
+        vps_cfg.get('xy_drift_recovery_enable', True)
+    )
+    result['VPS_XY_DRIFT_RECOVERY_MIN_OFFSET_M'] = float(
+        vps_cfg.get('xy_drift_recovery_min_offset_m', 120.0)
+    )
+    result['VPS_XY_DRIFT_RECOVERY_MAX_OFFSET_M'] = float(
+        vps_cfg.get('xy_drift_recovery_max_offset_m', 500.0)
+    )
+    result['VPS_XY_DRIFT_RECOVERY_MIN_NO_APPLY_SEC'] = float(
+        vps_cfg.get('xy_drift_recovery_min_no_apply_sec', 5.0)
+    )
+    result['VPS_XY_DRIFT_RECOVERY_MIN_INLIERS'] = int(
+        vps_cfg.get('xy_drift_recovery_min_inliers', 6)
+    )
+    result['VPS_XY_DRIFT_RECOVERY_MIN_CONFIDENCE'] = float(
+        vps_cfg.get('xy_drift_recovery_min_confidence', 0.10)
+    )
+    result['VPS_XY_DRIFT_RECOVERY_MAX_REPROJ_ERROR'] = float(
+        vps_cfg.get('xy_drift_recovery_max_reproj_error', 1.6)
+    )
+    result['VPS_XY_DRIFT_RECOVERY_MAX_SPEED_M_S'] = float(
+        vps_cfg.get('xy_drift_recovery_max_speed_m_s', 95.0)
+    )
+    result['VPS_XY_DRIFT_RECOVERY_R_MULT'] = float(
+        vps_cfg.get('xy_drift_recovery_r_mult', 2.8)
+    )
+    result['VPS_XY_DRIFT_RECOVERY_MAX_APPLY_DP_XY_M'] = float(
+        vps_cfg.get('xy_drift_recovery_max_apply_dp_xy_m', 55.0)
+    )
+    result['VPS_XY_DRIFT_RECOVERY_ALLOW_DIR_CHANGE_BYPASS'] = bool(
+        vps_cfg.get('xy_drift_recovery_allow_dir_change_bypass', True)
+    )
+    result['VPS_XY_DRIFT_RECOVERY_ALLOW_OFFSET_BYPASS'] = bool(
+        vps_cfg.get('xy_drift_recovery_allow_offset_bypass', True)
+    )
+    result['VPS_XY_DRIFT_RECOVERY_SKIP_TEMPORAL_GATE'] = bool(
+        vps_cfg.get('xy_drift_recovery_skip_temporal_gate', True)
+    )
+    result['VPS_XY_DRIFT_RECOVERY_REPORT_BACKEND_HINT_ON_REJECT'] = bool(
+        vps_cfg.get('xy_drift_recovery_report_backend_hint_on_reject', True)
+    )
+    result['VPS_XY_DRIFT_RECOVERY_HINT_QUALITY_SCALE'] = float(
+        vps_cfg.get('xy_drift_recovery_hint_quality_scale', 0.65)
+    )
+    result['VPS_POSITION_FIRST_SOFT_ENABLE'] = bool(
+        vps_cfg.get('position_first_soft_enable', True)
+    )
+    result['VPS_POSITION_FIRST_SOFT_MIN_OFFSET_M'] = float(
+        vps_cfg.get('position_first_soft_min_offset_m', 30.0)
+    )
+    result['VPS_POSITION_FIRST_SOFT_MIN_NO_APPLY_SEC'] = float(
+        vps_cfg.get('position_first_soft_min_no_apply_sec', 2.0)
+    )
+    result['VPS_POSITION_FIRST_SOFT_MIN_INLIERS'] = int(
+        vps_cfg.get('position_first_soft_min_inliers', 4)
+    )
+    result['VPS_POSITION_FIRST_SOFT_MIN_CONFIDENCE'] = float(
+        vps_cfg.get('position_first_soft_min_confidence', 0.06)
+    )
+    result['VPS_POSITION_FIRST_SOFT_MAX_REPROJ_ERROR'] = float(
+        vps_cfg.get('position_first_soft_max_reproj_error', 2.2)
+    )
+    result['VPS_POSITION_FIRST_SOFT_MAX_SPEED_M_S'] = float(
+        vps_cfg.get('position_first_soft_max_speed_m_s', 110.0)
+    )
+    result['VPS_POSITION_FIRST_SOFT_SKIP_TEMPORAL_GATE'] = bool(
+        vps_cfg.get('position_first_soft_skip_temporal_gate', True)
+    )
+    result['VPS_POSITION_FIRST_SOFT_IGNORE_POLICY_HOLD'] = bool(
+        vps_cfg.get('position_first_soft_ignore_policy_hold', True)
+    )
+    result['VPS_POSITION_FIRST_SOFT_R_MULT'] = float(
+        vps_cfg.get('position_first_soft_r_mult', 4.0)
+    )
+    result['VPS_POSITION_FIRST_SOFT_MAX_APPLY_DP_XY_M'] = float(
+        vps_cfg.get('position_first_soft_max_apply_dp_xy_m', 80.0)
+    )
+    result['VPS_POSITION_FIRST_SOFT_HINT_QUALITY_SCALE'] = float(
+        vps_cfg.get('position_first_soft_hint_quality_scale', 0.85)
     )
     result['VPS_WORKER_BUSY_FORCE_LOCAL_STREAK'] = int(
         vps_cfg.get('worker_busy_force_local_streak', 120)
@@ -1197,40 +1516,14 @@ def load_config(config_path: str) -> VIOConfig:
     result['VPS_WORKER_BUSY_FORCE_LOCAL_SEC'] = float(
         vps_cfg.get('worker_busy_force_local_sec', 8.0)
     )
-
-    vps_reloc_defaults = {
-        'enabled': True,
-        'global_interval_sec': 12.0,
-        'fail_streak_trigger': 6,
-        'stale_success_sec': 8.0,
-        'xy_sigma_trigger_m': 35.0,
-        'max_centers': 10,
-        'ring_radius_m': [35.0, 80.0],
-        'ring_samples': 8,
-        'global_yaw_hypotheses_deg': [0.0, 45.0, 90.0, 135.0, 180.0, -45.0, -90.0, -135.0],
-        'global_scale_hypotheses': [0.80, 0.90, 1.00, 1.10, 1.20],
-        'force_global_on_warning_phase': False,
-    }
-    result['VPS_RELOCALIZATION'] = _merge_dict_defaults(
-        vps_reloc_defaults, vps_cfg.get('relocalization', {})
+    result['VPS_WORKER_BUSY_BACKPRESSURE_SEC'] = float(
+        vps_cfg.get('worker_busy_backpressure_sec', 0.40)
     )
-    _vps_reloc = result['VPS_RELOCALIZATION']
-    result['VPS_RELOC_ENABLED'] = bool(_vps_reloc.get('enabled', True))
-    result['VPS_RELOC_GLOBAL_INTERVAL_SEC'] = float(_vps_reloc.get('global_interval_sec', 12.0))
-    result['VPS_RELOC_FAIL_STREAK_TRIGGER'] = int(_vps_reloc.get('fail_streak_trigger', 6))
-    result['VPS_RELOC_STALE_SUCCESS_SEC'] = float(_vps_reloc.get('stale_success_sec', 8.0))
-    result['VPS_RELOC_XY_SIGMA_TRIGGER_M'] = float(_vps_reloc.get('xy_sigma_trigger_m', 35.0))
-    result['VPS_RELOC_MAX_CENTERS'] = int(_vps_reloc.get('max_centers', 10))
-    result['VPS_RELOC_RING_RADIUS_M'] = list(_vps_reloc.get('ring_radius_m', [35.0, 80.0]))
-    result['VPS_RELOC_RING_SAMPLES'] = int(_vps_reloc.get('ring_samples', 8))
-    result['VPS_RELOC_GLOBAL_YAW_HYPOTHESES_DEG'] = list(
-        _vps_reloc.get('global_yaw_hypotheses_deg', [0.0, 45.0, 90.0, 135.0, 180.0, -45.0, -90.0, -135.0])
+    result['VPS_WORKER_BUSY_BACKPRESSURE_MAX_SEC'] = float(
+        vps_cfg.get('worker_busy_backpressure_max_sec', 2.5)
     )
-    result['VPS_RELOC_GLOBAL_SCALE_HYPOTHESES'] = list(
-        _vps_reloc.get('global_scale_hypotheses', [0.80, 0.90, 1.00, 1.10, 1.20])
-    )
-    result['VPS_RELOC_FORCE_GLOBAL_ON_WARNING_PHASE'] = bool(
-        _vps_reloc.get('force_global_on_warning_phase', False)
+    result['VPS_WORKER_BUSY_BACKPRESSURE_STEP'] = int(
+        vps_cfg.get('worker_busy_backpressure_step', 30)
     )
 
     # =========================================================================
@@ -1249,8 +1542,123 @@ def load_config(config_path: str) -> VIOConfig:
     result['BACKEND_CORRECTION_WEIGHT'] = float(backend_cfg.get('correction_weight', 1.0))
     result['BACKEND_APPLY_COV_INFLATE'] = float(backend_cfg.get('apply_cov_inflate', 1.05))
     result['BACKEND_MIN_QUALITY_SCORE'] = float(backend_cfg.get('min_quality_score', 0.20))
+    result['BACKEND_MIN_EMIT_DP_XY_M'] = float(backend_cfg.get('min_emit_dp_xy_m', 0.5))
+    result['BACKEND_MIN_EMIT_DYAW_DEG'] = float(backend_cfg.get('min_emit_dyaw_deg', 0.2))
     result['BACKEND_MAX_ABS_DP_XY_M'] = float(backend_cfg.get('max_abs_dp_xy_m', 60.0))
     result['BACKEND_MAX_ABS_DYAW_DEG'] = float(backend_cfg.get('max_abs_dyaw_deg', 8.0))
+    robust_yaw_cfg = backend_cfg.get('robust_yaw', {})
+    switchable_cfg = backend_cfg.get('switchable_constraints', {})
+    blend_cfg = backend_cfg.get('correction_blend', {})
+    factor_lite_cfg = backend_cfg.get('hybrid_factor_lite', {})
+    transport_cfg = backend_cfg.get('transport', {})
+    contract_cfg = backend_cfg.get('contract', {})
+    result['BACKEND_ROBUST_YAW_ENABLE'] = bool(robust_yaw_cfg.get('enable', True))
+    result['BACKEND_ROBUST_YAW_HUBER_DEG'] = float(robust_yaw_cfg.get('huber_deg', 6.0))
+    result['BACKEND_SWITCHABLE_CONSTRAINTS_ENABLE'] = bool(switchable_cfg.get('enable', True))
+    result['BACKEND_SWITCHABLE_QUALITY_FLOOR'] = float(switchable_cfg.get('quality_floor', 0.08))
+    result['BACKEND_SWITCHABLE_RESIDUAL_XY_M'] = float(switchable_cfg.get('residual_xy_m', 12.0))
+    result['BACKEND_SWITCHABLE_RESIDUAL_YAW_DEG'] = float(switchable_cfg.get('residual_yaw_deg', 15.0))
+    result['BACKEND_SWITCHABLE_MIN_WEIGHT'] = float(switchable_cfg.get('min_weight', 0.15))
+    result['BACKEND_BLEND_MODE'] = str(blend_cfg.get('mode', 'linear')).lower()
+    result['BACKEND_BLEND_ALPHA'] = float(blend_cfg.get('alpha', 0.45))
+    result['BACKEND_BLEND_MAX_STEP_DP_XY_M'] = float(blend_cfg.get('max_step_dp_xy_m', 8.0))
+    result['BACKEND_BLEND_MAX_STEP_DYAW_DEG'] = float(blend_cfg.get('max_step_dyaw_deg', 0.8))
+    result['BACKEND_BLEND_QUALITY_SOFT_SCALE'] = bool(blend_cfg.get('quality_soft_scale', True))
+    result['BACKEND_HYBRID_FACTOR_LITE_ENABLE'] = bool(factor_lite_cfg.get('enable', False))
+    result['BACKEND_HYBRID_FACTOR_LITE_WINDOW'] = int(factor_lite_cfg.get('window', 10))
+    result['BACKEND_HYBRID_FACTOR_LITE_LOSS_XY_M'] = float(factor_lite_cfg.get('loss_xy_m', 8.0))
+    result['BACKEND_HYBRID_FACTOR_LITE_LOSS_YAW_DEG'] = float(factor_lite_cfg.get('loss_yaw_deg', 10.0))
+    result['BACKEND_HYBRID_FACTOR_LITE_USE_IMU'] = bool(factor_lite_cfg.get('use_imu', True))
+    result['BACKEND_HYBRID_FACTOR_LITE_USE_VISUAL'] = bool(factor_lite_cfg.get('use_visual', True))
+    result['BACKEND_HYBRID_FACTOR_LITE_USE_VPS'] = bool(factor_lite_cfg.get('use_vps', True))
+    result['BACKEND_HYBRID_FACTOR_LITE_USE_DEM'] = bool(factor_lite_cfg.get('use_dem', True))
+    result['BACKEND_HYBRID_FACTOR_LITE_USE_VPS_XY'] = bool(
+        factor_lite_cfg.get('use_vps_xy', factor_lite_cfg.get('use_vps', True))
+    )
+    result['BACKEND_HYBRID_FACTOR_LITE_USE_VPS_YAW'] = bool(
+        factor_lite_cfg.get('use_vps_yaw', factor_lite_cfg.get('use_vps', True))
+    )
+    result['BACKEND_HYBRID_FACTOR_LITE_USE_LOOP_YAW'] = bool(
+        factor_lite_cfg.get('use_loop_yaw', factor_lite_cfg.get('use_visual', True))
+    )
+    result['BACKEND_HYBRID_FACTOR_LITE_USE_MAG_YAW'] = bool(
+        factor_lite_cfg.get('use_mag_yaw', True)
+    )
+    result['BACKEND_TRANSPORT_LATEST_WINS_ENABLE'] = bool(
+        transport_cfg.get('latest_wins_enable', True)
+    )
+    result['BACKEND_TRANSPORT_DROP_STALE_ON_EMIT'] = bool(
+        transport_cfg.get('drop_stale_on_emit', True)
+    )
+    result['BACKEND_TRANSPORT_POLL_ON_CAMERA_TICK_ONLY'] = bool(
+        transport_cfg.get('poll_on_camera_tick_only', True)
+    )
+    result['BACKEND_TRANSPORT_POLL_MIN_INTERVAL_SEC'] = float(
+        transport_cfg.get('poll_min_interval_sec', backend_cfg.get('poll_interval_sec', 0.5))
+    )
+    result['BACKEND_CONTRACT_STRICT_REQUIRE_SOURCE_MIX'] = bool(
+        contract_cfg.get('strict_require_source_mix', True)
+    )
+    result['BACKEND_CONTRACT_STRICT_REQUIRE_RESIDUAL_SUMMARY'] = bool(
+        contract_cfg.get('strict_require_residual_summary', True)
+    )
+    result['BACKEND_VPS_YAW_HINT_ENABLE'] = bool(
+        backend_cfg.get('vps_yaw_hint_enable', True)
+    )
+    result['BACKEND_VPS_YAW_HINT_GAIN'] = float(
+        backend_cfg.get('vps_yaw_hint_gain', 0.35)
+    )
+    result['BACKEND_VPS_YAW_HINT_MAX_ABS_DEG'] = float(
+        backend_cfg.get('vps_yaw_hint_max_abs_deg', 35.0)
+    )
+    result['BACKEND_VPS_YAW_HINT_MIN_QUALITY'] = float(
+        backend_cfg.get('vps_yaw_hint_min_quality', 0.45)
+    )
+    result['BACKEND_VPS_YAW_HINT_MIN_INLIERS'] = int(
+        backend_cfg.get('vps_yaw_hint_min_inliers', 8)
+    )
+    result['BACKEND_VPS_YAW_HINT_MAX_REPROJ'] = float(
+        backend_cfg.get('vps_yaw_hint_max_reproj', 1.2)
+    )
+    result['BACKEND_VPS_YAW_HINT_MAX_APPLY_DEG'] = float(
+        backend_cfg.get('vps_yaw_hint_max_apply_deg', 2.0)
+    )
+    result['BACKEND_POSITION_FIRST_FORCE_XY_ONLY'] = bool(
+        backend_cfg.get('position_first_force_xy_only', True)
+    )
+    result['BACKEND_POSITION_FIRST_MIN_VPS_MIX'] = float(
+        backend_cfg.get('position_first_min_vps_mix', 0.35)
+    )
+    result['BACKEND_POSITION_FIRST_MAX_APPLY_DP_XY_M'] = float(
+        backend_cfg.get('position_first_max_apply_dp_xy_m', backend_cfg.get('max_apply_dp_xy_m', 25.0))
+    )
+    result['BACKEND_POSITION_FIRST_CORR_WEIGHT'] = float(
+        backend_cfg.get('position_first_corr_weight', backend_cfg.get('correction_weight', 1.0))
+    )
+    result['BACKEND_POSITION_FIRST_BLEND_STEPS'] = int(
+        backend_cfg.get('position_first_blend_steps', backend_cfg.get('blend_steps', 3))
+    )
+    result['BACKEND_XY_PRIORITY_ENABLE'] = bool(
+        backend_cfg.get('xy_priority_enable', True)
+    )
+    result['BACKEND_XY_PRIORITY_MIN_VPS_MIX'] = float(
+        backend_cfg.get('xy_priority_min_vps_mix', 0.70)
+    )
+    result['BACKEND_XY_PRIORITY_MAX_LOOP_MIX'] = float(
+        backend_cfg.get('xy_priority_max_loop_mix', 0.10)
+    )
+    result['BACKEND_XY_PRIORITY_MAX_MAG_MIX'] = float(
+        backend_cfg.get('xy_priority_max_mag_mix', 0.15)
+    )
+    result['BACKEND_XY_PRIORITY_QUALITY_TH'] = float(
+        backend_cfg.get('xy_priority_quality_th', 0.55)
+    )
+    result['BACKEND_XY_PRIORITY_MAX_DYAW_DEG'] = float(
+        backend_cfg.get('xy_priority_max_dyaw_deg', 0.35)
+    )
+    result['BACKEND_XY_PRIORITY_LOWQ_MAX_DYAW_DEG'] = float(
+        backend_cfg.get('xy_priority_lowq_max_dyaw_deg', 0.15)
+    )
 
     # =========================================================================
     # NEW: Adaptive + State-aware control policy (IMU-driven)
@@ -1557,10 +1965,9 @@ def load_config(config_path: str) -> VIOConfig:
         'vision_weight': 0.25,
         'skip_on_bad': True,
     }
-    result['MAG_ACCURACY_POLICY'] = _merge_dict_defaults(
+    _mag_acc = _merge_dict_defaults(
         mag_accuracy_defaults, mag.get('accuracy_policy', {})
     )
-    _mag_acc = result['MAG_ACCURACY_POLICY']
     result['MAG_ACCURACY_ENABLED'] = bool(_mag_acc.get('enabled', True))
     result['MAG_ACCURACY_GOOD_MIN_SCORE'] = float(_mag_acc.get('good_min_score', 0.72))
     result['MAG_ACCURACY_MID_MIN_SCORE'] = float(_mag_acc.get('mid_min_score', 0.45))
@@ -1576,15 +1983,6 @@ def load_config(config_path: str) -> VIOConfig:
     result['MAG_ACCURACY_VISION_WEIGHT'] = float(_mag_acc.get('vision_weight', 0.25))
     result['MAG_ACCURACY_SKIP_ON_BAD'] = bool(_mag_acc.get('skip_on_bad', True))
 
-    # Compiler metadata (for debug/traceability)
-    result['CONFIG_COMPILE_META'] = {
-        'source': os.path.abspath(config_path),
-        'estimator_mode': result['ESTIMATOR_MODE'],
-        'accel_includes_gravity': bool(result['IMU_PARAMS']['accel_includes_gravity']),
-        'adaptive_mode': result['ADAPTIVE']['mode'],
-        'objective_mode': result['OBJECTIVE_MODE'],
-    }
-    
     # =========================================================================
     # Create VIOConfig dataclass from parsed YAML (v3.2.0)
     # =========================================================================

@@ -236,6 +236,11 @@ class MagnetometerService:
                                        policy_decision: Optional[Any] = None
                                        ) -> tuple[bool, float, str, Optional[float], float]:
         """Single-score heading authority arbitration for MAG."""
+        # De-coupling: when global yaw authority is enabled, bypass local MAG-only
+        # arbitration to avoid double-gating the same yaw update.
+        if bool(self.runner.global_config.get("YAW_AUTH_ENABLE", False)):
+            return False, float(sigma_mag_scaled), "arb_bypass_global", None, float("nan")
+
         vis_yaw = getattr(self.runner, "_vision_yaw_ref", None)
         vis_t = getattr(self.runner, "_vision_yaw_last_t", None)
         vis_q = float(getattr(self.runner, "_vision_heading_quality", 0.0))
@@ -323,6 +328,56 @@ class MagnetometerService:
 
         return False, float(sigma_scaled), reason, cap
 
+    def _register_mag_owner_observation(self, timestamp: float, accepted: bool) -> None:
+        """Feed MAG accept/reject outcomes into global yaw-owner gating."""
+        yaw_auth = getattr(self.runner, "yaw_authority_service", None)
+        if yaw_auth is None:
+            return
+        try:
+            yaw_auth.register_source_observation(
+                source="MAG",
+                timestamp=float(timestamp),
+                accepted=bool(accepted),
+            )
+        except Exception:
+            pass
+
+    def _should_count_mag_owner_observation(self, accepted: bool, reason: str) -> bool:
+        """
+        Owner-rate gating should reflect MAG signal quality, not owner arbitration outcomes.
+
+        Do not penalize MAG acceptance-rate window when update is skipped only because
+        another source currently owns yaw authority.
+        """
+        if bool(accepted):
+            return True
+        reason_l = str(reason or "").strip().lower()
+        if reason_l == "":
+            return True
+        owner_skip_tags = (
+            "yaw_auth_skip:",
+            "owner_is_",
+            "owner_hold",
+            "hold_active",
+            "owner_blocked_",
+            "budget_exhausted",
+            "owner_dead_timeout_",
+        )
+        if not any(tag in reason_l for tag in owner_skip_tags):
+            return True
+        # Option3 owner-unification path: if MAG is repeatedly skipped by authority,
+        # treat these as ineffective observations so MAG ownership can be demoted.
+        try:
+            count_owner_skip_as_reject = bool(
+                getattr(self.runner, "global_config", {}).get(
+                    "YAW_AUTH_MAG_COUNT_OWNER_SKIP_AS_REJECT",
+                    True,
+                )
+            )
+        except Exception:
+            count_owner_skip_as_reject = True
+        return bool(count_owner_skip_as_reject)
+
     def _preprocess_mag_guard(self,
                               mag_norm: float,
                               gyro_delta_deg: float,
@@ -339,15 +394,25 @@ class MagnetometerService:
             return False, ""
 
         norm_range_enable = bool(cfg.get("MAG_PREPROC_NORM_RANGE_ENABLE", True))
-        norm_dev_max = float(cfg.get("MAG_PREPROC_NORM_DEV_MAX", 0.45))
-        gyro_delta_max_deg = float(cfg.get("MAG_PREPROC_GYRO_DELTA_MAX_DEG", 95.0))
-        vision_delta_max_deg = float(cfg.get("MAG_PREPROC_VISION_DELTA_MAX_DEG", 120.0))
-        ewma_alpha = float(np.clip(cfg.get("MAG_PREPROC_EWMA_ALPHA", 0.08), 0.01, 0.8))
+        norm_dev_max = float(cfg.get("MAG_QUALITY_NORM_MAD_THRESH", cfg.get("MAG_PREPROC_NORM_DEV_MAX", 0.45)))
+        gyro_delta_max_deg = float(
+            cfg.get("MAG_QUALITY_GYRO_CONSISTENCY_DEG_S", cfg.get("MAG_PREPROC_GYRO_DELTA_MAX_DEG", 95.0))
+        )
+        vision_delta_max_deg = float(
+            cfg.get("MAG_QUALITY_VISION_CONSISTENCY_DEG", cfg.get("MAG_PREPROC_VISION_DELTA_MAX_DEG", 120.0))
+        )
+        ewma_alpha = float(
+            np.clip(
+                cfg.get("MAG_QUALITY_NORM_EWMA_ALPHA", cfg.get("MAG_PREPROC_EWMA_ALPHA", 0.08)),
+                0.01,
+                0.8,
+            )
+        )
         if policy_decision is not None:
-            norm_dev_max = float(policy_decision.extra("preproc_norm_dev_max", norm_dev_max))
-            gyro_delta_max_deg = float(policy_decision.extra("preproc_gyro_delta_max_deg", gyro_delta_max_deg))
-            vision_delta_max_deg = float(policy_decision.extra("preproc_vision_delta_max_deg", vision_delta_max_deg))
-            ewma_alpha = float(np.clip(policy_decision.extra("preproc_ewma_alpha", ewma_alpha), 0.01, 0.8))
+            norm_dev_max = float(policy_decision.extra("quality_norm_mad_thresh", norm_dev_max))
+            gyro_delta_max_deg = float(policy_decision.extra("quality_gyro_consistency_deg_s", gyro_delta_max_deg))
+            vision_delta_max_deg = float(policy_decision.extra("quality_vision_consistency_deg", vision_delta_max_deg))
+            ewma_alpha = float(np.clip(policy_decision.extra("quality_norm_ewma_alpha", ewma_alpha), 0.01, 0.8))
 
         if norm_range_enable and np.isfinite(float(mag_norm)):
             min_norm = float(cfg.get("MAG_MIN_FIELD_STRENGTH", 0.1))
@@ -565,7 +630,8 @@ class MagnetometerService:
 
         extreme_pcond = float(cfg.get("MAG_CONDITIONING_GUARD_EXTREME_PCOND", 8.0 * pcond_hard))
         extreme_pmax = float(cfg.get("MAG_CONDITIONING_GUARD_EXTREME_PMAX", 4.0 * pmax_hard))
-        extreme_soft_enable = bool(cfg.get("MAG_CONDITIONING_GUARD_EXTREME_SOFT_ENABLE", True))
+        # Keep extreme region conservative by default: soft-path must be explicitly enabled.
+        extreme_soft_enable = bool(cfg.get("MAG_CONDITIONING_GUARD_EXTREME_SOFT_ENABLE", False))
         extreme_soft_r_mult = float(cfg.get("MAG_CONDITIONING_GUARD_EXTREME_SOFT_R_MULT", 2.0))
         if policy_decision is not None:
             extreme_pcond = float(policy_decision.extra("conditioning_extreme_pcond", extreme_pcond))
@@ -662,6 +728,7 @@ class MagnetometerService:
                 continue
 
             if policy_decision is not None and str(policy_decision.mode).upper() in ("HOLD", "SKIP"):
+                policy_reason = f"policy_mode_{str(policy_decision.mode).lower()}"
                 mag_adaptive_info = {
                     "sensor": "MAG",
                     "accepted": False,
@@ -671,7 +738,7 @@ class MagnetometerService:
                     "chi2": np.nan,
                     "threshold": np.nan,
                     "r_scale_used": float(mag_policy_scales.get("r_scale", 1.0)),
-                    "reason_code": f"policy_mode_{str(policy_decision.mode).lower()}",
+                    "reason_code": policy_reason,
                 }
                 self.runner.adaptive_service.record_adaptive_measurement(
                     "MAG",
@@ -679,6 +746,8 @@ class MagnetometerService:
                     timestamp=float(mag_rec.t),
                     policy_scales=mag_policy_scales,
                 )
+                if self._should_count_mag_owner_observation(accepted=False, reason=policy_reason):
+                    self._register_mag_owner_observation(timestamp=float(mag_rec.t), accepted=False)
                 self.runner.state.mag_rejects += 1
                 continue
 
@@ -701,6 +770,8 @@ class MagnetometerService:
                     timestamp=float(mag_rec.t),
                     policy_scales=mag_policy_scales,
                 )
+                if self._should_count_mag_owner_observation(accepted=False, reason="skip_chol_cooldown"):
+                    self._register_mag_owner_observation(timestamp=float(mag_rec.t), accepted=False)
                 self.runner.state.mag_rejects += 1
                 continue
 
@@ -733,6 +804,8 @@ class MagnetometerService:
                     adaptive_info=mag_adaptive_info,
                     timestamp=float(mag_rec.t),
                 )
+                if self._should_count_mag_owner_observation(accepted=False, reason="skip_time_mismatch"):
+                    self._register_mag_owner_observation(timestamp=float(mag_rec.t), accepted=False)
                 self.runner.state.mag_rejects += 1
                 continue
 
@@ -897,6 +970,8 @@ class MagnetometerService:
                     timestamp=float(mag_rec.t),
                     policy_scales=mag_policy_scales,
                 )
+                if self._should_count_mag_owner_observation(accepted=False, reason=consistency_reason):
+                    self._register_mag_owner_observation(timestamp=float(mag_rec.t), accepted=False)
                 self.runner.state.mag_rejects += 1
                 continue
 
@@ -969,7 +1044,10 @@ class MagnetometerService:
                     except Exception:
                         pass
                 self.runner.state.mag_updates += 1
+                self._register_mag_owner_observation(timestamp=float(mag_rec.t), accepted=True)
             else:
+                if self._should_count_mag_owner_observation(accepted=False, reason=reason):
+                    self._register_mag_owner_observation(timestamp=float(mag_rec.t), accepted=False)
                 self.runner.state.mag_rejects += 1
 
     def process_single_mag(self, mag_rec, t: float):
@@ -1155,6 +1233,8 @@ class MagnetometerService:
             reason=str(mag_quality.get("reason", "")),
         )
         if skip_mag:
+            if self._should_count_mag_owner_observation(accepted=False, reason=consistency_reason):
+                self._register_mag_owner_observation(timestamp=float(mag_rec.t), accepted=False)
             self.runner.state.mag_rejects += 1
             return
 
@@ -1215,5 +1295,8 @@ class MagnetometerService:
                 except Exception:
                     pass
             self.runner.state.mag_updates += 1
+            self._register_mag_owner_observation(timestamp=float(mag_rec.t), accepted=True)
         else:
+            if self._should_count_mag_owner_observation(accepted=False, reason=reason):
+                self._register_mag_owner_observation(timestamp=float(mag_rec.t), accepted=False)
             self.runner.state.mag_rejects += 1

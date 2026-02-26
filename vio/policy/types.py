@@ -69,3 +69,43 @@ class PolicySnapshot:
             str(sensor),
             SensorPolicyDecision(sensor=str(sensor)),
         )
+
+
+@dataclass(frozen=True)
+class MsckfQualitySnapshot:
+    """Compact MSCKF quality view exported to policy/runtime logs."""
+
+    timestamp: float
+    track_count: int
+    inlier_ratio: float
+    parallax_med_px: float
+    reproj_p95_norm: float
+    depth_positive_ratio: float
+    quality_score: float
+
+    def as_dict(self) -> Dict[str, float]:
+        return {
+            "timestamp": float(self.timestamp),
+            "track_count": float(self.track_count),
+            "inlier_ratio": float(self.inlier_ratio),
+            "parallax_med_px": float(self.parallax_med_px),
+            "reproj_p95_norm": float(self.reproj_p95_norm),
+            "depth_positive_ratio": float(self.depth_positive_ratio),
+            "quality_score": float(self.quality_score),
+        }
+
+
+@dataclass(frozen=True)
+class HeadingOwnerState:
+    """Runtime owner state snapshot for yaw authority tracing."""
+
+    timestamp: float
+    owner: str
+    source: str
+    mode: str
+    reason: str
+    score_mag: float
+    score_loop: float
+    score_backend: float
+    score_msckf: float
+    switched: bool = False
