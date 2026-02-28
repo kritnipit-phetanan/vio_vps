@@ -377,6 +377,9 @@ backend:
   xy_priority_quality_th: 0.55
   xy_priority_max_dyaw_deg: 0.35
   xy_priority_lowq_max_dyaw_deg: 0.15
+  yaw_auth_min_request_deg: 0.05
+  yaw_auth_zero_request_deadband_deg: 0.03
+  yaw_auth_zero_dyaw_as_request: false
   max_correction_age_sec: 2.0
   max_iteration_ms: 35.0
   min_quality_score: 0.16
@@ -413,6 +416,9 @@ backend:
   position_first_max_apply_dp_xy_m: 90.0
   position_first_corr_weight: 1.0
   position_first_blend_steps: 1
+  position_first_direct_xy_max_apply_dp_xy_m: 28.0
+  position_first_direct_xy_corr_weight: 0.72
+  position_first_direct_xy_min_blend_steps: 3
   hybrid_factor_lite:
     enable: true
     window: 10
@@ -583,6 +589,7 @@ kinematic_guard:
   vel_mismatch_warn: 8.0
   window_sec: 0.5
 loop_closure:
+  max_keyframes: 320
   fail_soft:
     base_sigma_yaw_deg: 5.0
     degraded_sigma_mult: 1.4
@@ -624,6 +631,14 @@ loop_closure:
     burst_window_sec: 10.0
     burst_max_corrections: 2
     burst_cooldown_sec: 5.5
+    burst_abs_yaw_budget_deg: 6.5
+    burst_rate_window_sec: 1.0
+    burst_rate_max_deg_per_sec: 1.8
+    burst_min_apply_deg: 0.15
+    high_speed_soft_apply_enable: true
+    high_speed_soft_cap_deg: 0.65
+    high_speed_soft_r_mult: 3.2
+    high_speed_soft_extra_confirm_hits: 1
   min_frame_gap: 50
   min_inliers: 15
   min_keyframe_dist: 15.0
@@ -810,6 +825,7 @@ yaw_authority:
   mag_score_cold_start_scale: 0.55
   mag_low_accept_soft_r_mult: 3.0
   mag_low_accept_max_dyaw_deg: 0.35
+  mag_count_owner_skip_as_reject: false
   position_first_disable_mag_owner: true
   owner_dead_enable: true
   owner_dead_timeout_sec: 1.4
@@ -840,6 +856,25 @@ yaw_authority:
     BACKEND: 0.16
     LOOP: 0.28
   strict_hold_reclaim_min_freshness: 0.10
+  loop_reclaim_enable: true
+  loop_reclaim_allow_from_hold: true
+  loop_reclaim_hold_require_backend_dead: true
+  loop_reclaim_hold_allow_no_dead: true
+  loop_reclaim_hold_min_sec: 0.45
+  loop_reclaim_hold_cooldown_sec: 1.6
+  loop_reclaim_bypass_min_interval_on_backend_dead: true
+  loop_reclaim_min_interval_sec: 0.75
+  loop_reclaim_window_sec: 6.0
+  loop_reclaim_min_requests: 2
+  loop_reclaim_min_requests_on_backend_dead: 1
+  loop_reclaim_min_score: 0.56
+  loop_reclaim_min_score_on_backend_dead: 0.52
+  loop_reclaim_margin: 0.02
+  loop_reclaim_margin_on_backend_dead: 0.0
+  loop_reclaim_min_freshness: 0.12
+  loop_reclaim_max_speed_m_s: 90.0
+  loop_reclaim_min_apply_eff: 0.05
+  loop_reclaim_min_apply_samples: 4
   min_effective_score: 0.06
   owner_dead_reclaim_min_score: 0.45
   owner_dead_reclaim_min_freshness: 0.35
@@ -866,6 +901,8 @@ yaw_authority:
   stage12_loop_force_claim_max_speed_m_s: 20.0
   stage12_allow_stale_reclaim_any: true
   stage12_claim_sources: ["LOOP", "BACKEND"]
+  backend_min_request_dyaw_deg: 0.15
+  backend_noop_max_score: 0.12
   hold_score_threshold: 0.18
   hold_sec: 0.8
   hold_reclaim_sources: ["BACKEND"]
@@ -896,6 +933,22 @@ yaw_authority:
   backend_request_alive_window_sec: 10.0
   backend_request_alive_min_requests: 1
   backend_request_alive_min_score: 0.18
+  loop_request_alive_enable: true
+  loop_request_alive_window_sec: 8.0
+  loop_request_alive_min_requests: 2
+  loop_request_alive_min_score: 0.24
+  request_alive_window_sec_map:
+    BACKEND: 10.0
+    LOOP: 8.0
+  request_alive_min_requests_map:
+    BACKEND: 1
+    LOOP: 2
+  request_alive_min_score_map:
+    BACKEND: 0.18
+    LOOP: 0.24
+  request_alive_min_freshness_map:
+    BACKEND: 0.10
+    LOOP: 0.08
   yaw_budget_window_sec: 8.0
   yaw_budget_abs_deg: 12.0
   yaw_rate_max_deg_s: 6.0
@@ -996,6 +1049,9 @@ vio:
       quality_high_th: 0.75
       quality_low_th: 0.45
       warning_scale: 1.2
+  frontend:
+    max_track_history: 80
+    max_total_tracks: 4500
   msckf_chi2_multiplier: 15.0
   msckf_max_reprojection_error: 12.0
   nadir_enforce_xy_motion: true
@@ -1041,6 +1097,7 @@ vio_vel:
 vps:
   abs_hard_reject_dir_change_deg: 75.0
   abs_hard_reject_dir_change_max_speed_m_s: 12.0
+  abs_hard_reject_dir_change_max_yaw_rate_deg_s: 25.0
   abs_hard_reject_dir_change_min_accepts: 3
   abs_hard_reject_offset_m: 180.0
   abs_max_apply_dp_xy_m: 25.0
@@ -1071,9 +1128,77 @@ vps:
   position_first_soft_r_mult: 4.0
   position_first_soft_max_apply_dp_xy_m: 90.0
   position_first_soft_hint_quality_scale: 0.85
+  position_controller:
+    enable: true
+    consensus_window_sec: 4.0
+    min_samples: 3
+    max_apply_step_m: 32.0
+    window_budget_m: 22.0
+    force_failsoft_on_reject: true
+    high_speed_soft_clamp_enable: true
+  position_first_direct_xy_enable: true
+  position_first_direct_xy_min_interval_sec: 0.8
+  position_first_direct_xy_max_apply_dp_xy_m: 32.0
+  position_first_direct_xy_quality_scale: 0.95
+  position_first_direct_xy_fallback_on_apply_fail: true
+  position_first_direct_xy_force_failsoft_on_reject: true
+  position_first_direct_xy_force_failsoft_max_offset_m: 180.0
+  position_first_direct_xy_force_failsoft_min_inliers: 5
+  position_first_direct_xy_force_failsoft_max_reproj_error: 1.4
+  position_first_direct_xy_force_failsoft_max_speed_m_s: 95.0
+  position_first_direct_only_failsoft: true
+  position_first_direct_xy_min_offset_m: 8.0
+  position_first_direct_xy_max_offset_m: 1800.0
+  position_first_direct_xy_min_inliers: 3
+  position_first_direct_xy_min_confidence: 0.02
+  position_first_direct_xy_max_reproj_error: 4.0
+  position_first_direct_xy_max_speed_m_s: 120.0
+  position_first_direct_xy_high_speed_th_m_s: 18.0
+  position_first_direct_xy_min_inliers_high_speed: 7
+  position_first_direct_xy_max_reproj_high_speed: 0.9
+  position_first_direct_xy_max_offset_high_speed_m: 95.0
+  position_first_direct_xy_ignore_policy_hold: false
+  position_first_direct_xy_ignore_hard_reject: false
+  position_first_direct_xy_allow_hard_reject_with_consensus: true
+  position_first_direct_xy_consensus_enable: true
+  position_first_direct_xy_consensus_window_sec: 4.0
+  position_first_direct_xy_consensus_min_samples: 3
+  position_first_direct_xy_consensus_max_dev_m: 35.0
+  position_first_direct_xy_consensus_max_dir_deg: 70.0
+  position_first_direct_xy_consensus_max_keep: 24
+  position_first_direct_xy_use_consensus_vector: true
+  position_first_direct_xy_quality_cap_min_m: 6.0
+  position_first_direct_xy_budget_window_sec: 5.0
+  position_first_direct_xy_budget_max_total_dp_xy_m: 22.0
+  position_first_direct_xy_recovery_min_offset_m: 120.0
+  position_first_direct_xy_recovery_min_no_apply_sec: 6.0
+  position_first_direct_xy_recovery_max_speed_m_s: 14.0
+  position_first_direct_xy_recovery_min_inliers: 7
+  position_first_direct_xy_recovery_max_reproj_error: 0.9
+  position_first_direct_xy_recovery_max_dp_mult: 1.8
+  position_first_direct_xy_recovery_max_dp_cap_m: 90.0
+  position_first_direct_xy_recovery_budget_mult: 2.5
+  position_first_direct_xy_recovery_budget_cap_m: 120.0
+  position_first_direct_xy_guard_enable: true
+  position_first_direct_xy_guard_fail_streak_th: 18
+  position_first_direct_xy_guard_no_coverage_streak_th: 6
+  position_first_direct_xy_guard_max_apply_dp_xy_m: 14.0
+  position_first_direct_xy_guard_budget_max_total_dp_xy_m: 18.0
+  position_first_direct_xy_guard_quality_mult: 0.78
+  position_first_direct_xy_guard_min_quality: 0.28
+  position_first_direct_xy_guard_extra_confirm_hits: 1
+  position_first_direct_xy_guard_max_dir_change_deg: 55.0
+  position_first_direct_xy_guard_min_dir_check_m: 8.0
+  position_first_direct_xy_failsoft_recovery_min_inliers: 5
+  position_first_direct_xy_failsoft_recovery_max_reproj_error: 1.3
+  position_first_direct_xy_failsoft_guard_lowq_enable: true
+  position_first_direct_xy_failsoft_guard_lowq_min_inliers: 4
+  position_first_direct_xy_failsoft_guard_lowq_max_reproj_error: 1.6
+  position_first_direct_xy_failsoft_guard_lowq_max_apply_dp_xy_m: 7.0
   position_first_altitude_bypass_enable: true
   position_first_altitude_bypass_min_m: -150.0
   position_first_altitude_bypass_max_m: 1500.0
+  position_first_altitude_bypass_below_floor_m: 4.0
   accuracy_mode: true
   allow_failsoft_accept: true
   apply_degraded_conf_mult: 1.3
@@ -1085,6 +1210,12 @@ vps:
   apply_failsoft_large_offset_confirm_hits: 2
   apply_failsoft_large_offset_confirm_m: 60.0
   apply_failsoft_max_dir_change_deg: 55.0
+  apply_failsoft_dir_gate_max_speed_m_s: 12.0
+  apply_failsoft_dir_gate_max_yaw_rate_deg_s: 25.0
+  apply_failsoft_dir_gate_relax_mult_speed: 1.8
+  apply_failsoft_dir_gate_relax_mult_yaw_rate: 1.8
+  apply_failsoft_dir_gate_disable_speed_m_s: 24.0
+  apply_failsoft_dir_gate_disable_yaw_rate_deg_s: 45.0
   apply_failsoft_max_offset_m: 130.0
   apply_failsoft_max_reproj_error: 1.2
   apply_failsoft_max_speed_m_s: 95.0
@@ -1100,6 +1231,7 @@ vps:
   apply_warning_reproj_mult: 0.9
   camera_view: nadir
   device: cuda
+  matcher_mode: orb
   enabled: true
   failover_fail_streak: 6
   failsoft_r_inflate: 4.0
@@ -1112,10 +1244,14 @@ vps:
   max_clones: 3
   max_delay_sec: 0.5
   max_keypoints: 2048
+  tile_cache_max_tiles: 48
+  mps_cache_clear_interval: 6
   max_offset_px_failsoft: 900.0
   max_reproj_error: 5.0
   max_reproj_error_failsoft: 1.2
   min_altitude: 30.0
+  min_altitude_unknown_speed: 12.0
+  min_altitude_accuracy_mode: 10.0
   min_confidence: 0.3
   min_confidence_failsoft: 0.12
   min_content_ratio: 0.2
@@ -1160,6 +1296,14 @@ vps:
     max_centers: 10
     no_coverage_use_last_success: true
     no_coverage_use_last_coverage: true
+    budget_escalator_enable: true
+    budget_escalator_trigger_streak: 3
+    budget_escalator_max_level: 3
+    budget_escalator_candidate_scale_step: 0.35
+    budget_escalator_time_scale_step: 0.40
+    budget_escalator_max_candidate_scale: 2.5
+    budget_escalator_max_time_scale: 2.5
+    budget_escalator_decay_successes: 2
     ring_radius_m:
     - 35.0
     - 80.0
@@ -1190,3 +1334,16 @@ zupt:
 logging:
   runtime_verbosity: release
   runtime_log_interval_sec: 1.0
+memory:
+  watchdog_enable: true
+  check_interval_sec: 0.7
+  soft_limit_gb: 8.0
+  hard_limit_gb: 12.0
+  compact_cooldown_sec: 2.0
+  periodic_compact_sec: 6.0
+  vps_pause_sec: 4.0
+  compact_frontend_track_len: 80
+  compact_frontend_max_tracks: 4500
+  compact_loop_max_keyframes: 260
+  compact_vps_tile_cache_max: 32
+  compact_vps_wall_samples: 900

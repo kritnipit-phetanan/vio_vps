@@ -9,6 +9,7 @@ import cv2
 import numpy as np
 from scipy.spatial.transform import Rotation as R_scipy
 
+from ..backend_optimizer import BackendCorrection
 from ..config import CAMERA_VIEW_CONFIGS
 from ..loop_closure import check_loop_closure, apply_loop_closure_correction
 from ..math_utils import quaternion_to_yaw
@@ -24,6 +25,7 @@ from ..output_utils import (
 from ..propagation import apply_preintegration_at_camera, clone_camera_for_msckf
 from ..state_manager import imu_to_gnss_position
 from ..policy.types import SensorPolicyDecision
+from .vps_position_controller import VPSPositionController, VpsMatchEvidence
 
 
 class VIOService:
@@ -31,6 +33,7 @@ class VIOService:
 
     def __init__(self, runner: Any):
         self.runner = runner
+        self.vps_position_controller = VPSPositionController(runner=runner, vio_service=self)
 
     def _compute_vps_quality_metrics(self, img: np.ndarray) -> Dict[str, float]:
         """Compute lightweight image-quality metrics for VPS call-rate adaptation."""
@@ -163,7 +166,13 @@ class VIOService:
         runner._vps_skip_streak = 0
         return True, "run"
 
-    def _evaluate_vps_failsoft_temporal_gate(self, vps_offset: np.ndarray, vps_offset_m: float) -> Tuple[bool, str]:
+    def _evaluate_vps_failsoft_temporal_gate(
+        self,
+        vps_offset: np.ndarray,
+        vps_offset_m: float,
+        speed_m_s: float = float("nan"),
+        yaw_rate_deg_s: float = float("nan"),
+    ) -> Tuple[bool, str]:
         """
         Evaluate fail-soft temporal consistency for VPS update apply path.
 
@@ -182,6 +191,36 @@ class VIOService:
         max_dir_change_deg = float(
             runner.global_config.get("VPS_APPLY_FAILSOFT_MAX_DIR_CHANGE_DEG", 60.0)
         )
+        dir_gate_relax_max_speed = float(
+            runner.global_config.get("VPS_APPLY_FAILSOFT_DIR_GATE_MAX_SPEED_M_S", 12.0)
+        )
+        dir_gate_relax_max_yaw_rate = float(
+            runner.global_config.get("VPS_APPLY_FAILSOFT_DIR_GATE_MAX_YAW_RATE_DEG_S", 25.0)
+        )
+        dir_gate_relax_mult_speed = float(
+            runner.global_config.get("VPS_APPLY_FAILSOFT_DIR_GATE_RELAX_MULT_SPEED", 1.6)
+        )
+        dir_gate_relax_mult_yaw = float(
+            runner.global_config.get("VPS_APPLY_FAILSOFT_DIR_GATE_RELAX_MULT_YAW_RATE", 1.6)
+        )
+        dir_gate_disable_speed = float(
+            runner.global_config.get("VPS_APPLY_FAILSOFT_DIR_GATE_DISABLE_SPEED_M_S", 24.0)
+        )
+        dir_gate_disable_yaw_rate = float(
+            runner.global_config.get("VPS_APPLY_FAILSOFT_DIR_GATE_DISABLE_YAW_RATE_DEG_S", 45.0)
+        )
+        speed_high = np.isfinite(speed_m_s) and float(speed_m_s) > float(dir_gate_relax_max_speed)
+        yaw_high = np.isfinite(yaw_rate_deg_s) and float(yaw_rate_deg_s) > float(dir_gate_relax_max_yaw_rate)
+        if speed_high:
+            max_dir_change_deg *= max(1.0, float(dir_gate_relax_mult_speed))
+        if yaw_high:
+            max_dir_change_deg *= max(1.0, float(dir_gate_relax_mult_yaw))
+        max_dir_change_deg = float(np.clip(max_dir_change_deg, 5.0, 175.0))
+        if (
+            (np.isfinite(speed_m_s) and float(speed_m_s) > float(dir_gate_disable_speed))
+            or (np.isfinite(yaw_rate_deg_s) and float(yaw_rate_deg_s) > float(dir_gate_disable_yaw_rate))
+        ):
+            return True, "SOFT_BYPASS_DIR_DYNAMIC"
         last_vec = getattr(runner, "_vps_last_accepted_offset_vec", None)
         if isinstance(last_vec, np.ndarray) and last_vec.size >= 2:
             last = np.array(last_vec[:2], dtype=float)
@@ -232,6 +271,7 @@ class VIOService:
                                vps_offset: np.ndarray,
                                vps_offset_m: float,
                                speed_m_s: float = float("nan"),
+                               yaw_rate_deg_s: float = float("nan"),
                                allow_dir_change_override: bool = False) -> Tuple[bool, str]:
         """
         Hard safety gate for absolute correction before delayed-update apply.
@@ -262,7 +302,12 @@ class VIOService:
         dir_check_max_speed = float(
             runner.global_config.get("VPS_ABS_HARD_REJECT_DIR_CHANGE_MAX_SPEED_M_S", 12.0)
         )
+        dir_check_max_yaw_rate = float(
+            runner.global_config.get("VPS_ABS_HARD_REJECT_DIR_CHANGE_MAX_YAW_RATE_DEG_S", 25.0)
+        )
         if np.isfinite(speed_m_s) and float(speed_m_s) > float(dir_check_max_speed):
+            return True, ""
+        if np.isfinite(yaw_rate_deg_s) and float(yaw_rate_deg_s) > float(dir_check_max_yaw_rate):
             return True, ""
         min_accepts_for_dir = int(
             max(1, round(float(runner.global_config.get("VPS_ABS_HARD_REJECT_DIR_CHANGE_MIN_ACCEPTS", 3.0))))
@@ -413,6 +458,712 @@ class VIOService:
         if np.isfinite(speed_m_s) and float(speed_m_s) > float(max_speed):
             return False, "speed_high"
         return True, "position_first_soft_apply"
+
+    def _apply_position_first_direct_xy_correction(
+        self,
+        *,
+        t_cam: float,
+        abs_offset_vec: np.ndarray,
+        abs_offset_m: float,
+        vps_num_inliers: int,
+        vps_conf: float,
+        vps_reproj: float,
+        base_quality: float,
+        failsoft_selected: bool = False,
+    ) -> Tuple[bool, str]:
+        """
+        Schedule deterministic XY-only backend correction directly from VPS hint.
+        This path bypasses VPS EKF accept requirement for position-first recovery.
+        """
+        runner = self.runner
+        if not bool(runner.global_config.get("POSITION_FIRST_LANE", False)):
+            return False, "position_first_lane_off"
+        if not bool(runner.global_config.get("VPS_POSITION_FIRST_DIRECT_XY_ENABLE", True)):
+            return False, "position_first_direct_xy_disabled"
+        if not np.isfinite(abs_offset_m) or float(abs_offset_m) <= 1e-6:
+            return False, "position_first_direct_xy_invalid_offset"
+
+        last_t = float(getattr(runner, "_position_first_direct_last_t", -1e9))
+        min_interval = float(runner.global_config.get("VPS_POSITION_FIRST_DIRECT_XY_MIN_INTERVAL_SEC", 0.8))
+        if float(t_cam) - last_t < max(0.0, float(min_interval)):
+            return False, "position_first_direct_xy_cooldown"
+        try:
+            speed_m_s = float(np.linalg.norm(np.asarray(runner.kf.x[3:6, 0], dtype=float)))
+        except Exception:
+            speed_m_s = float("nan")
+        if not np.isfinite(speed_m_s):
+            speed_m_s = float("nan")
+        vps_runner = getattr(runner, "vps_runner", None)
+        fail_streak = int(getattr(vps_runner, "_fail_streak", 0)) if vps_runner is not None else 0
+        no_coverage_streak = int(getattr(vps_runner, "_no_coverage_streak", 0)) if vps_runner is not None else 0
+        guarded_mode = bool(runner.global_config.get("VPS_POSITION_FIRST_DIRECT_XY_GUARD_ENABLE", True)) and (
+            fail_streak >= int(runner.global_config.get("VPS_POSITION_FIRST_DIRECT_XY_GUARD_FAIL_STREAK_TH", 18))
+            or no_coverage_streak >= int(runner.global_config.get("VPS_POSITION_FIRST_DIRECT_XY_GUARD_NO_COVERAGE_STREAK_TH", 6))
+        )
+
+        vec_in = np.asarray(abs_offset_vec, dtype=float).reshape(-1,)
+        if vec_in.size < 2 or (not np.all(np.isfinite(vec_in[:2]))):
+            return False, "position_first_direct_xy_invalid_vec"
+        vec_xy = np.array([float(vec_in[0]), float(vec_in[1])], dtype=float)
+        # Prefer robust consensus center over raw one-shot offset to reduce
+        # outlier-driven XY jumps in position-first lane.
+        use_consensus_vec = bool(
+            runner.global_config.get("VPS_POSITION_FIRST_DIRECT_XY_USE_CONSENSUS_VECTOR", True)
+        )
+        if use_consensus_vec:
+            hist_raw = getattr(runner, "_position_first_direct_hint_hist", None)
+            if isinstance(hist_raw, list):
+                cons_window = max(
+                    0.5,
+                    float(
+                        runner.global_config.get(
+                            "VPS_POSITION_FIRST_DIRECT_XY_CONSENSUS_WINDOW_SEC",
+                            4.0,
+                        )
+                    ),
+                )
+                cons_min_samples = max(
+                    1,
+                    int(
+                        round(
+                            runner.global_config.get(
+                                "VPS_POSITION_FIRST_DIRECT_XY_CONSENSUS_MIN_SAMPLES",
+                                3,
+                            )
+                        )
+                    ),
+                )
+                cutoff = float(t_cam) - float(cons_window)
+                vals = []
+                for item in hist_raw:
+                    try:
+                        tt = float(item[0])
+                        vv = np.asarray(item[1], dtype=float).reshape(2,)
+                    except Exception:
+                        continue
+                    if np.isfinite(tt) and np.all(np.isfinite(vv)) and tt >= cutoff:
+                        vals.append(vv)
+                if len(vals) >= cons_min_samples:
+                    arr = np.asarray(vals, dtype=float)
+                    med_vec = np.nanmedian(arr, axis=0)
+                    if np.all(np.isfinite(med_vec)):
+                        vec_xy = med_vec.astype(float)
+
+        dp = np.array([float(vec_xy[0]), float(vec_xy[1]), 0.0], dtype=float)
+        max_dp = float(
+            runner.global_config.get(
+                "VPS_POSITION_FIRST_DIRECT_XY_MAX_APPLY_DP_XY_M",
+                runner.global_config.get(
+                    "BACKEND_POSITION_FIRST_MAX_APPLY_DP_XY_M",
+                    runner.global_config.get("BACKEND_MAX_APPLY_DP_XY_M", 25.0),
+                ),
+            )
+        )
+        max_dp = max(1.0, float(max_dp))
+        if guarded_mode:
+            max_dp = min(
+                max_dp,
+                max(
+                    2.0,
+                    float(runner.global_config.get("VPS_POSITION_FIRST_DIRECT_XY_GUARD_MAX_APPLY_DP_XY_M", 14.0)),
+                ),
+            )
+        since_last_vps = float(t_cam) - float(getattr(runner, "last_vps_update_time", -1e9))
+        recovery_boost_max_speed = float(
+            runner.global_config.get("VPS_POSITION_FIRST_DIRECT_XY_RECOVERY_MAX_SPEED_M_S", 14.0)
+        )
+        recovery_boost_min_inliers = int(
+            runner.global_config.get("VPS_POSITION_FIRST_DIRECT_XY_RECOVERY_MIN_INLIERS", 7)
+        )
+        recovery_boost_max_reproj = float(
+            runner.global_config.get("VPS_POSITION_FIRST_DIRECT_XY_RECOVERY_MAX_REPROJ_ERROR", 0.9)
+        )
+        recovery_quality_ok = bool(
+            int(vps_num_inliers) >= max(1, int(recovery_boost_min_inliers))
+            and np.isfinite(vps_reproj)
+            and float(vps_reproj) <= float(recovery_boost_max_reproj)
+        )
+        # When VPS already marked this measurement as failsoft-success, keep the
+        # same deterministic guardrails but allow a relaxed recovery-quality gate.
+        if bool(failsoft_selected) and not bool(recovery_quality_ok):
+            fs_rec_min_inliers = max(
+                1,
+                int(
+                    round(
+                        runner.global_config.get(
+                            "VPS_POSITION_FIRST_DIRECT_XY_FAILSOFT_RECOVERY_MIN_INLIERS",
+                            5,
+                        )
+                    )
+                ),
+            )
+            fs_rec_max_reproj = float(
+                runner.global_config.get(
+                    "VPS_POSITION_FIRST_DIRECT_XY_FAILSOFT_RECOVERY_MAX_REPROJ_ERROR",
+                    1.3,
+                )
+            )
+            recovery_quality_ok = bool(
+                int(vps_num_inliers) >= fs_rec_min_inliers
+                and np.isfinite(vps_reproj)
+                and float(vps_reproj) <= float(fs_rec_max_reproj)
+            )
+        speed_recovery_ok = bool(
+            (not np.isfinite(speed_m_s))
+            or float(speed_m_s) <= float(recovery_boost_max_speed)
+        )
+        recovery_boost = bool(
+            np.isfinite(float(abs_offset_m))
+            and float(abs_offset_m)
+            >= float(runner.global_config.get("VPS_POSITION_FIRST_DIRECT_XY_RECOVERY_MIN_OFFSET_M", 120.0))
+            and np.isfinite(since_last_vps)
+            and since_last_vps
+            >= max(
+                0.0,
+                float(
+                    runner.global_config.get(
+                        "VPS_POSITION_FIRST_DIRECT_XY_RECOVERY_MIN_NO_APPLY_SEC",
+                        6.0,
+                    )
+                ),
+            )
+            and speed_recovery_ok
+            and recovery_quality_ok
+        )
+        if recovery_boost:
+            boost_mult = max(
+                1.0,
+                float(
+                    runner.global_config.get(
+                        "VPS_POSITION_FIRST_DIRECT_XY_RECOVERY_MAX_DP_MULT",
+                        1.8,
+                    )
+                ),
+            )
+            boost_cap = max(
+                max_dp,
+                float(
+                    runner.global_config.get(
+                        "VPS_POSITION_FIRST_DIRECT_XY_RECOVERY_MAX_DP_CAP_M",
+                        90.0,
+                    )
+                ),
+            )
+            max_dp = min(boost_cap, max_dp * boost_mult)
+        dp_norm = float(np.linalg.norm(dp[:2]))
+        if dp_norm > max_dp and dp_norm > 1e-9:
+            dp[:2] *= float(max_dp / dp_norm)
+            dp_norm = float(np.linalg.norm(dp[:2]))
+
+        quality_scale = float(runner.global_config.get("VPS_POSITION_FIRST_DIRECT_XY_QUALITY_SCALE", 0.90))
+        if guarded_mode:
+            quality_scale *= float(
+                np.clip(
+                    runner.global_config.get("VPS_POSITION_FIRST_DIRECT_XY_GUARD_QUALITY_MULT", 0.78),
+                    0.2,
+                    1.0,
+                )
+            )
+        quality_scale = float(np.clip(quality_scale, 0.05, 2.0))
+        q = float(np.clip(float(base_quality) * quality_scale, 0.0, 1.0))
+        if guarded_mode:
+            min_q_guard = float(
+                np.clip(
+                    runner.global_config.get("VPS_POSITION_FIRST_DIRECT_XY_GUARD_MIN_QUALITY", 0.28),
+                    0.0,
+                    1.0,
+                )
+            )
+            if float(q) < float(min_q_guard):
+                allow_lowq_failsoft = bool(
+                    bool(failsoft_selected)
+                    and bool(
+                        runner.global_config.get(
+                            "VPS_POSITION_FIRST_DIRECT_XY_FAILSOFT_GUARD_LOWQ_ENABLE",
+                            True,
+                        )
+                    )
+                )
+                if not allow_lowq_failsoft:
+                    return False, "position_first_direct_xy_guard_low_quality"
+                lowq_min_inliers = max(
+                    1,
+                    int(
+                        round(
+                            runner.global_config.get(
+                                "VPS_POSITION_FIRST_DIRECT_XY_FAILSOFT_GUARD_LOWQ_MIN_INLIERS",
+                                4,
+                            )
+                        )
+                    ),
+                )
+                lowq_max_reproj = float(
+                    runner.global_config.get(
+                        "VPS_POSITION_FIRST_DIRECT_XY_FAILSOFT_GUARD_LOWQ_MAX_REPROJ_ERROR",
+                        1.6,
+                    )
+                )
+                if int(vps_num_inliers) < lowq_min_inliers:
+                    return False, "position_first_direct_xy_guard_low_quality"
+                if not np.isfinite(vps_reproj) or float(vps_reproj) > float(lowq_max_reproj):
+                    return False, "position_first_direct_xy_guard_low_quality"
+                lowq_max_dp = max(
+                    1.0,
+                    float(
+                        runner.global_config.get(
+                            "VPS_POSITION_FIRST_DIRECT_XY_FAILSOFT_GUARD_LOWQ_MAX_APPLY_DP_XY_M",
+                            7.0,
+                        )
+                    ),
+                )
+                max_dp = min(float(max_dp), float(lowq_max_dp))
+        # Quality-aware deterministic cap (logic, not threshold-only tuning):
+        # low-confidence hints get a much smaller per-apply XY displacement.
+        q_cap_floor = max(
+            0.5,
+            float(
+                runner.global_config.get(
+                    "VPS_POSITION_FIRST_DIRECT_XY_QUALITY_CAP_MIN_M",
+                    6.0,
+                )
+            ),
+        )
+        q_cap = float(q_cap_floor + (max_dp - q_cap_floor) * np.clip(q, 0.0, 1.0))
+        q_cap = max(0.5, min(max_dp, q_cap))
+        if dp_norm > q_cap and dp_norm > 1e-9:
+            dp[:2] *= float(q_cap / dp_norm)
+            dp_norm = float(np.linalg.norm(dp[:2]))
+
+        # Deterministic multi-hit commit for large direct-XY jumps:
+        # avoid applying single-frame outliers (especially at high speed tails).
+        confirm_offset_m = max(
+            1.0,
+            float(
+                runner.global_config.get(
+                    "VPS_POSITION_FIRST_DIRECT_XY_CONFIRM_OFFSET_M",
+                    35.0,
+                )
+            ),
+        )
+        confirm_hits = max(
+            1,
+            int(
+                round(
+                    runner.global_config.get(
+                        "VPS_POSITION_FIRST_DIRECT_XY_CONFIRM_HITS",
+                        2,
+                    )
+                )
+            ),
+        )
+        confirm_window_sec = max(
+            0.2,
+            float(
+                runner.global_config.get(
+                    "VPS_POSITION_FIRST_DIRECT_XY_CONFIRM_WINDOW_SEC",
+                    2.0,
+                )
+            ),
+        )
+        confirm_max_dev_m = max(
+            0.5,
+            float(
+                runner.global_config.get(
+                    "VPS_POSITION_FIRST_DIRECT_XY_CONFIRM_MAX_DEV_M",
+                    18.0,
+                )
+            ),
+        )
+        confirm_max_dir_deg = float(
+            np.clip(
+                runner.global_config.get(
+                    "VPS_POSITION_FIRST_DIRECT_XY_CONFIRM_MAX_DIR_DEG",
+                    25.0,
+                ),
+                3.0,
+                180.0,
+            )
+        )
+        high_speed_m_s = float(
+            runner.global_config.get(
+                "VPS_POSITION_FIRST_DIRECT_XY_CONFIRM_HIGH_SPEED_M_S",
+                18.0,
+            )
+        )
+        high_speed_extra_hits = max(
+            0,
+            int(
+                round(
+                    runner.global_config.get(
+                        "VPS_POSITION_FIRST_DIRECT_XY_CONFIRM_HIGH_SPEED_EXTRA_HITS",
+                        1,
+                    )
+                )
+            ),
+        )
+        required_hits = int(confirm_hits)
+        if np.isfinite(speed_m_s) and float(speed_m_s) >= float(high_speed_m_s):
+            required_hits += int(high_speed_extra_hits)
+        if guarded_mode:
+            required_hits += int(
+                max(
+                    0,
+                    int(
+                        round(
+                            runner.global_config.get(
+                                "VPS_POSITION_FIRST_DIRECT_XY_GUARD_EXTRA_CONFIRM_HITS",
+                                1,
+                            )
+                        )
+                    ),
+                )
+            )
+        required_hits = max(1, int(required_hits))
+
+        if float(dp_norm) >= float(confirm_offset_m):
+            pending = getattr(runner, "_position_first_direct_confirm_pending", None)
+            cur_vec = np.array([float(dp[0]), float(dp[1])], dtype=float)
+            new_count = 1
+            if isinstance(pending, dict):
+                try:
+                    prev_t = float(pending.get("t", -1e9))
+                    prev_vec = np.asarray(pending.get("vec", [0.0, 0.0]), dtype=float).reshape(2,)
+                    prev_count = int(pending.get("count", 0))
+                except Exception:
+                    prev_t = -1e9
+                    prev_vec = np.array([0.0, 0.0], dtype=float)
+                    prev_count = 0
+                dt = float(t_cam) - float(prev_t)
+                if np.isfinite(dt) and dt <= float(confirm_window_sec):
+                    dev_m = float(np.linalg.norm(cur_vec - prev_vec))
+                    dir_ok = True
+                    prev_n = float(np.linalg.norm(prev_vec))
+                    cur_n = float(np.linalg.norm(cur_vec))
+                    if prev_n > 1e-6 and cur_n > 1e-6:
+                        cosang = float(np.clip(np.dot(cur_vec, prev_vec) / max(1e-9, cur_n * prev_n), -1.0, 1.0))
+                        dir_ok = bool(cosang >= float(np.cos(np.deg2rad(confirm_max_dir_deg))))
+                    if dev_m <= float(confirm_max_dev_m) and dir_ok:
+                        new_count = int(prev_count) + 1
+            runner._position_first_direct_confirm_pending = {
+                "t": float(t_cam),
+                "vec": cur_vec.copy(),
+                "count": int(new_count),
+            }
+            if int(new_count) < int(required_hits):
+                return False, "position_first_direct_xy_confirm_wait"
+        else:
+            runner._position_first_direct_confirm_pending = None
+
+        # Windowed XY budget avoids bursty cumulative injections from repeated
+        # direct-lane triggers in a short time span.
+        budget_window_sec = max(
+            0.5,
+            float(
+                runner.global_config.get(
+                    "VPS_POSITION_FIRST_DIRECT_XY_BUDGET_WINDOW_SEC",
+                    5.0,
+                )
+            ),
+        )
+        budget_max_total = max(
+            1.0,
+            float(
+                runner.global_config.get(
+                    "VPS_POSITION_FIRST_DIRECT_XY_BUDGET_MAX_TOTAL_DP_XY_M",
+                    max(2.0 * q_cap_floor, 35.0),
+                )
+            ),
+        )
+        if guarded_mode:
+            budget_max_total = min(
+                budget_max_total,
+                max(
+                    2.0,
+                    float(
+                        runner.global_config.get(
+                            "VPS_POSITION_FIRST_DIRECT_XY_GUARD_BUDGET_MAX_TOTAL_DP_XY_M",
+                            18.0,
+                        )
+                    ),
+                ),
+            )
+        if recovery_boost:
+            budget_mult = max(
+                1.0,
+                float(
+                    runner.global_config.get(
+                        "VPS_POSITION_FIRST_DIRECT_XY_RECOVERY_BUDGET_MULT",
+                        2.5,
+                    )
+                ),
+            )
+            budget_cap = max(
+                budget_max_total,
+                float(
+                    runner.global_config.get(
+                        "VPS_POSITION_FIRST_DIRECT_XY_RECOVERY_BUDGET_CAP_M",
+                        120.0,
+                    )
+                ),
+            )
+            budget_max_total = min(budget_cap, budget_max_total * budget_mult)
+        budget_t0 = float(getattr(runner, "_position_first_direct_budget_t0", -1e9))
+        budget_used = float(getattr(runner, "_position_first_direct_budget_used_m", 0.0))
+        if (float(t_cam) - budget_t0) > float(budget_window_sec):
+            budget_t0 = float(t_cam)
+            budget_used = 0.0
+        remaining = max(0.0, float(budget_max_total) - float(budget_used))
+        if remaining <= 1e-6:
+            runner._position_first_direct_budget_t0 = float(budget_t0)
+            runner._position_first_direct_budget_used_m = float(budget_used)
+            return False, "position_first_direct_xy_budget_exhausted"
+        if dp_norm > remaining and dp_norm > 1e-9:
+            dp[:2] *= float(remaining / dp_norm)
+            dp_norm = float(np.linalg.norm(dp[:2]))
+        if guarded_mode:
+            last_apply_vec = getattr(runner, "_position_first_direct_last_apply_vec", None)
+            if isinstance(last_apply_vec, np.ndarray) and last_apply_vec.size >= 2:
+                prev_vec = np.asarray(last_apply_vec[:2], dtype=float)
+                prev_n = float(np.linalg.norm(prev_vec))
+                cur_n = float(np.linalg.norm(dp[:2]))
+                min_dir_check_m = float(
+                    max(
+                        0.5,
+                        runner.global_config.get(
+                            "VPS_POSITION_FIRST_DIRECT_XY_GUARD_MIN_DIR_CHECK_M",
+                            8.0,
+                        ),
+                    )
+                )
+                if prev_n >= min_dir_check_m and cur_n >= min_dir_check_m:
+                    cosang = float(np.clip(np.dot(prev_vec, dp[:2]) / max(1e-9, prev_n * cur_n), -1.0, 1.0))
+                    max_dir_change_deg = float(
+                        np.clip(
+                            runner.global_config.get(
+                                "VPS_POSITION_FIRST_DIRECT_XY_GUARD_MAX_DIR_CHANGE_DEG",
+                                55.0,
+                            ),
+                            5.0,
+                            180.0,
+                        )
+                    )
+                    if cosang < float(np.cos(np.deg2rad(max_dir_change_deg))):
+                        return False, "position_first_direct_xy_guard_dir_change"
+
+        cov_scale = float(np.clip(1.0 + 0.9 * (1.0 - q), 1.0, 2.0))
+        corr = BackendCorrection(
+            t_ref=float(t_cam),
+            dp_enu=dp,
+            dyaw_deg=0.0,
+            cov_scale=cov_scale,
+            age_sec=0.0,
+            quality_score=q,
+            source_mix={"VPS": 1.0},
+            residual_summary={
+                "direct_xy_lane": 1.0,
+                "offset_m": float(abs_offset_m),
+                "offset_clamped_m": float(dp_norm),
+                "offset_budget_remaining_m": float(max(0.0, remaining - dp_norm)),
+                "recovery_boost": 1.0 if recovery_boost else 0.0,
+                "guarded_mode": 1.0 if guarded_mode else 0.0,
+                "fail_streak": float(fail_streak),
+                "no_coverage_streak": float(no_coverage_streak),
+                "since_last_vps_sec": float(since_last_vps) if np.isfinite(since_last_vps) else float("nan"),
+                "inliers": float(max(0, int(vps_num_inliers))),
+                "confidence": float(vps_conf) if np.isfinite(vps_conf) else 0.0,
+                "reproj_error": float(vps_reproj) if np.isfinite(vps_reproj) else 999.0,
+            },
+        )
+        self.schedule_backend_correction(corr)
+        runner._position_first_direct_last_t = float(t_cam)
+        runner._position_first_direct_last_apply_vec = np.array([float(dp[0]), float(dp[1])], dtype=float)
+        runner._position_first_direct_confirm_pending = None
+        runner._position_first_direct_budget_t0 = float(budget_t0)
+        runner._position_first_direct_budget_used_m = float(budget_used + dp_norm)
+        runner._position_first_direct_xy_count = int(getattr(runner, "_position_first_direct_xy_count", 0)) + 1
+        return True, "position_first_direct_xy_apply"
+
+    def _should_use_vps_position_first_direct_xy(
+        self,
+        *,
+        t_cam: float,
+        abs_offset_vec: np.ndarray,
+        abs_offset_m: float,
+        speed_m_s: float,
+        vps_num_inliers: int,
+        vps_conf: float,
+        vps_reproj: float,
+        policy_mode: str,
+        hard_reject_note: str,
+        failsoft_selected: bool = False,
+        failsoft_min_inliers: Optional[int] = None,
+        failsoft_min_conf: Optional[float] = None,
+        failsoft_max_reproj: Optional[float] = None,
+    ) -> Tuple[bool, str]:
+        """Eligibility gate for direct XY lane (position-first)."""
+        runner = self.runner
+        try:
+            off = np.asarray(abs_offset_vec, dtype=float).reshape(-1,)
+        except Exception:
+            return False, "offset_vec_invalid"
+        if off.size < 2 or (not np.all(np.isfinite(off[:2]))):
+            return False, "offset_vec_invalid"
+        if not bool(runner.global_config.get("POSITION_FIRST_LANE", False)):
+            return False, "position_first_lane_off"
+        if not bool(runner.global_config.get("VPS_POSITION_FIRST_DIRECT_XY_ENABLE", True)):
+            return False, "position_first_direct_xy_disabled"
+        if not np.isfinite(abs_offset_m):
+            return False, "offset_nan"
+
+        if str(policy_mode).upper() in ("HOLD", "SKIP"):
+            if not bool(runner.global_config.get("VPS_POSITION_FIRST_DIRECT_XY_IGNORE_POLICY_HOLD", False)):
+                return False, "policy_hold_skip"
+        hard_reject_soft_path = False
+        if hard_reject_note and not bool(runner.global_config.get("VPS_POSITION_FIRST_DIRECT_XY_IGNORE_HARD_REJECT", False)):
+            # Logic path: allow recovery even after hard reject only when consensus
+            # is explicitly enabled and later passes strict checks.
+            allow_hard_reject_with_consensus = bool(
+                runner.global_config.get(
+                    "VPS_POSITION_FIRST_DIRECT_XY_ALLOW_HARD_REJECT_WITH_CONSENSUS",
+                    True,
+                )
+            )
+            if not allow_hard_reject_with_consensus:
+                return False, "hard_reject"
+            if not bool(runner.global_config.get("VPS_POSITION_FIRST_DIRECT_XY_CONSENSUS_ENABLE", True)):
+                return False, "hard_reject_no_consensus"
+            hard_reject_soft_path = True
+
+        min_offset = float(runner.global_config.get("VPS_POSITION_FIRST_DIRECT_XY_MIN_OFFSET_M", 8.0))
+        if float(abs_offset_m) < max(0.0, min_offset):
+            return False, "offset_small"
+        max_offset = float(
+            runner.global_config.get(
+                "VPS_POSITION_FIRST_DIRECT_XY_MAX_OFFSET_M",
+                runner.global_config.get("VPS_XY_DRIFT_RECOVERY_MAX_OFFSET_M", 1800.0),
+            )
+        )
+        if np.isfinite(max_offset) and float(abs_offset_m) > max(1.0, float(max_offset)):
+            return False, "offset_too_large"
+
+        min_inliers = int(runner.global_config.get("VPS_POSITION_FIRST_DIRECT_XY_MIN_INLIERS", 3))
+        min_conf = float(runner.global_config.get("VPS_POSITION_FIRST_DIRECT_XY_MIN_CONFIDENCE", 0.02))
+        max_reproj = float(runner.global_config.get("VPS_POSITION_FIRST_DIRECT_XY_MAX_REPROJ_ERROR", 4.0))
+        max_speed = float(runner.global_config.get("VPS_POSITION_FIRST_DIRECT_XY_MAX_SPEED_M_S", 120.0))
+        high_speed_th = float(
+            runner.global_config.get("VPS_POSITION_FIRST_DIRECT_XY_HIGH_SPEED_TH_M_S", 18.0)
+        )
+        high_speed_soft_clamp_enable = bool(
+            runner.global_config.get("VPS_POSITION_FIRST_DIRECT_XY_HIGH_SPEED_SOFT_CLAMP_ENABLE", True)
+        )
+        if bool(failsoft_selected):
+            # VPS matched_failsoft is already a filtered success path from runner.
+            # Use a relaxed direct-lane entry gate, then rely on consensus+budget+clamp.
+            fs_inl = int(failsoft_min_inliers) if failsoft_min_inliers is not None else max(3, int(min_inliers))
+            fs_conf = float(failsoft_min_conf) if failsoft_min_conf is not None else float(min_conf)
+            fs_repr = float(failsoft_max_reproj) if failsoft_max_reproj is not None else float(max_reproj)
+            min_inliers = min(int(min_inliers), max(3, int(fs_inl)))
+            min_conf = min(float(min_conf), max(0.0, float(fs_conf)))
+            max_reproj = max(float(max_reproj), min(5.0, max(0.6, float(fs_repr))))
+        if (
+            high_speed_soft_clamp_enable
+            and np.isfinite(speed_m_s)
+            and float(speed_m_s) >= float(high_speed_th)
+        ):
+            max_offset = min(
+                float(max_offset),
+                float(runner.global_config.get("VPS_POSITION_FIRST_DIRECT_XY_MAX_OFFSET_HIGH_SPEED_M", 140.0)),
+            )
+            # Do not over-tighten matched_failsoft candidates at high speed here;
+            # downstream deterministic caps/consensus/budget handle safety.
+            if not bool(failsoft_selected):
+                min_inliers = max(
+                    int(min_inliers),
+                    int(runner.global_config.get("VPS_POSITION_FIRST_DIRECT_XY_MIN_INLIERS_HIGH_SPEED", 6)),
+                )
+                max_reproj = min(
+                    float(max_reproj),
+                    float(runner.global_config.get("VPS_POSITION_FIRST_DIRECT_XY_MAX_REPROJ_HIGH_SPEED", 1.2)),
+                )
+        if int(vps_num_inliers) < max(1, min_inliers):
+            return False, "quality_inliers"
+        if not np.isfinite(vps_conf) or float(vps_conf) < float(min_conf):
+            return False, "quality_conf"
+        if not np.isfinite(vps_reproj) or float(vps_reproj) > float(max_reproj):
+            return False, "quality_reproj"
+        if np.isfinite(speed_m_s) and float(speed_m_s) > float(max_speed):
+            return False, "speed_high"
+
+        if bool(runner.global_config.get("VPS_POSITION_FIRST_DIRECT_XY_CONSENSUS_ENABLE", True)):
+            cons_window = max(
+                0.5,
+                float(runner.global_config.get("VPS_POSITION_FIRST_DIRECT_XY_CONSENSUS_WINDOW_SEC", 4.0)),
+            )
+            cons_min_samples = max(
+                1,
+                int(round(runner.global_config.get("VPS_POSITION_FIRST_DIRECT_XY_CONSENSUS_MIN_SAMPLES", 3))),
+            )
+            if hard_reject_soft_path:
+                cons_min_samples = max(cons_min_samples, 5)
+            cons_max_dev = max(
+                1.0,
+                float(runner.global_config.get("VPS_POSITION_FIRST_DIRECT_XY_CONSENSUS_MAX_DEV_M", 35.0)),
+            )
+            if hard_reject_soft_path:
+                cons_max_dev = min(float(cons_max_dev), 20.0)
+            cons_max_dir_deg = float(
+                np.clip(
+                    runner.global_config.get("VPS_POSITION_FIRST_DIRECT_XY_CONSENSUS_MAX_DIR_DEG", 70.0),
+                    5.0,
+                    180.0,
+                )
+            )
+            if hard_reject_soft_path:
+                cons_max_dir_deg = min(float(cons_max_dir_deg), 35.0)
+            cons_max_keep = max(
+                4,
+                int(round(runner.global_config.get("VPS_POSITION_FIRST_DIRECT_XY_CONSENSUS_MAX_KEEP", 24))),
+            )
+            cur_vec = np.array([float(off[0]), float(off[1])], dtype=float)
+            hist_raw = getattr(runner, "_position_first_direct_hint_hist", None)
+            hist: list[tuple[float, np.ndarray]] = []
+            if isinstance(hist_raw, list):
+                cutoff = float(t_cam) - float(cons_window)
+                for item in hist_raw:
+                    try:
+                        tt = float(item[0])
+                        vv = np.asarray(item[1], dtype=float).reshape(2,)
+                    except Exception:
+                        continue
+                    if np.isfinite(tt) and np.all(np.isfinite(vv)) and tt >= cutoff:
+                        hist.append((tt, vv))
+            if len(hist) < cons_min_samples:
+                hist.append((float(t_cam), cur_vec.copy()))
+                if len(hist) > cons_max_keep:
+                    hist = hist[-cons_max_keep:]
+                runner._position_first_direct_hint_hist = hist
+                return False, "consensus_warmup"
+            hist_arr = np.asarray([v for _, v in hist], dtype=float)
+            med_vec = np.nanmedian(hist_arr, axis=0)
+            cur_dev = float(np.linalg.norm(cur_vec - med_vec))
+            if cur_dev > cons_max_dev:
+                runner._position_first_direct_hint_hist = hist
+                return False, "consensus_dev"
+            med_norm = float(np.linalg.norm(med_vec))
+            cur_norm = float(np.linalg.norm(cur_vec))
+            if med_norm > 1e-6 and cur_norm > 1e-6:
+                cosang = float(np.clip(np.dot(cur_vec, med_vec) / max(1e-9, cur_norm * med_norm), -1.0, 1.0))
+                min_cos = float(np.cos(np.deg2rad(cons_max_dir_deg)))
+                if cosang < min_cos:
+                    runner._position_first_direct_hint_hist = hist
+                    return False, "consensus_dir"
+            hist.append((float(t_cam), cur_vec.copy()))
+            if len(hist) > cons_max_keep:
+                hist = hist[-cons_max_keep:]
+            runner._position_first_direct_hint_hist = hist
+        if hard_reject_soft_path:
+            return True, "position_first_direct_xy_hard_reject_soft_recovery"
+        return True, "position_first_direct_xy_eligible"
 
     def process_vio(self, rec, t: float, ongoing_preint=None) -> Tuple[bool, Optional[Dict[str, float]]]:
         """
@@ -567,6 +1318,8 @@ class VIOService:
                 )
                 if is_fast_rotation:
                     should_run_vps, skip_reason = False, "fast_rotation"
+                elif float(t_cam) < float(getattr(runner, "_vps_memory_pressure_until_t", -1e9)):
+                    should_run_vps, skip_reason = False, "memory_pressure"
                 elif worker_busy:
                     busy_until = float(getattr(runner, "_vps_busy_backpressure_until_t", -1e9))
                     if float(t_cam) < busy_until:
@@ -614,6 +1367,11 @@ class VIOService:
                                 f"[VPS] worker busy; skipped {runner._vps_thread_busy_skip_count} frame(s) "
                                 "while previous VPS attempt is still running"
                             )
+                    elif skip_reason == "memory_pressure":
+                        runner._vps_thread_busy_streak = 0
+                        if (int(runner._vps_attempt_count) % 100) == 0 and bool(getattr(runner.config, "save_debug_data", False)):
+                            rem = float(getattr(runner, "_vps_memory_pressure_until_t", -1e9)) - float(t_cam)
+                            print(f"[VPS] memory pressure: suppress VPS submit (remaining={max(0.0, rem):.1f}s)")
                     elif skip_reason != "busy_backpressure":
                         runner._vps_thread_busy_streak = 0
                     if runner.vps_logger is not None and skip_reason != "interval_hold":
@@ -1113,6 +1871,15 @@ class VIOService:
                     clone_id = str(vps_result_meta.get("clone_id", f"vps_{runner.state.img_idx}"))
                     health_key = _decision_health(vps_decision, "HEALTHY")
                     speed_now = float(np.linalg.norm(np.array(runner.kf.x[3:6, 0], dtype=float)))
+                    yaw_rate_deg_s = float("nan")
+                    try:
+                        ang = np.asarray(getattr(rec, "ang", np.zeros(3)), dtype=float).reshape(-1,)
+                        if ang.size >= 3 and np.isfinite(float(ang[2])):
+                            yaw_rate_deg_s = float(abs(float(ang[2])) * 180.0 / np.pi)
+                        elif ang.size > 0 and np.any(np.isfinite(ang)):
+                            yaw_rate_deg_s = float(np.linalg.norm(np.nan_to_num(ang, nan=0.0)) * 180.0 / np.pi)
+                    except Exception:
+                        yaw_rate_deg_s = float("nan")
                     try:
                         p_abs = np.asarray(runner.kf.P, dtype=float)
                         p_max = float(np.nanmax(np.abs(p_abs))) if p_abs.size > 0 else float("nan")
@@ -1140,6 +1907,11 @@ class VIOService:
                     vps_num_inliers = int(getattr(vps_result, "num_inliers", 0))
                     vps_conf = float(getattr(vps_result, "confidence", 0.0))
                     vps_reproj = float(getattr(vps_result, "reproj_error", float("inf")))
+                    vps_match_reason = str(getattr(vps_result, "match_reason", "")).lower()
+                    vps_match_failsoft = bool(
+                        bool(getattr(vps_result, "match_is_failsoft", False))
+                        or vps_match_reason == "matched_failsoft"
+                    )
                     current_xy = np.array(runner.kf.x[0:2, 0], dtype=float).reshape(2,)
                     vps_xy = np.array(
                         runner.proj_cache.latlon_to_xy(float(vps_result.lat), float(vps_result.lon), runner.lat0, runner.lon0),
@@ -1198,82 +1970,38 @@ class VIOService:
                     )
                     quality_mode = "strict" if strict_quality_ok else ("failsoft" if failsoft_quality_ok else "reject")
                     r_scale_apply = float(vps_policy_scales.get("r_scale", 1.0))
-                    policy_reject_note = ""
-                    drift_recovery_active = False
-                    drift_recovery_note = ""
-                    position_first_soft_active = False
-                    position_first_soft_note = ""
-                    if vps_decision is not None and str(getattr(vps_decision, "mode", "APPLY")).upper() in ("HOLD", "SKIP"):
-                        quality_mode = "reject"
-                        policy_reject_note = f"policy_mode_{str(getattr(vps_decision, 'mode', 'skip')).lower()}"
-                    drift_recovery_candidate, drift_recovery_note_candidate = self._should_use_vps_xy_drift_recovery(
+                    position_first_direct_xy_applied = False
+                    evidence = VpsMatchEvidence(
                         t_cam=float(t_cam),
-                        abs_offset_m=float(abs_offset_m),
+                        frame_idx=int(runner.state.img_idx),
+                        policy_mode=str(getattr(vps_decision, "mode", "APPLY")),
+                        health_key=str(health_key),
                         speed_m_s=float(speed_now),
+                        yaw_rate_deg_s=float(yaw_rate_deg_s),
+                        abs_offset_vec=np.asarray(abs_offset_vec, dtype=float).reshape(-1,),
+                        abs_offset_m=float(abs_offset_m),
                         vps_num_inliers=int(vps_num_inliers),
                         vps_conf=float(vps_conf),
                         vps_reproj=float(vps_reproj),
-                        policy_mode=str(getattr(vps_decision, "mode", "APPLY")),
+                        strict_quality_ok=bool(strict_quality_ok),
+                        failsoft_quality_ok=bool(failsoft_quality_ok),
+                        vps_match_failsoft=bool(vps_match_failsoft),
+                        fs_min_inliers=int(fs_min_inliers),
+                        fs_min_conf=float(fs_min_conf),
+                        fs_max_reproj=float(fs_max_reproj),
                     )
-                    allow_dir_change_override = (
-                        bool(drift_recovery_candidate)
-                        and bool(runner.global_config.get("VPS_XY_DRIFT_RECOVERY_ALLOW_DIR_CHANGE_BYPASS", True))
-                    )
-                    temporal_reject_note = ""
-                    hard_reject_note = ""
-                    hard_ok, hard_note = self._check_vps_hard_reject(
-                        abs_offset_vec,
-                        abs_offset_m,
-                        speed_m_s=float(speed_now),
-                        allow_dir_change_override=bool(allow_dir_change_override),
-                    )
-                    if not hard_ok:
-                        quality_mode = "reject"
-                        hard_reject_note = str(hard_note)
-
-                    if (
-                        quality_mode == "reject"
-                        and bool(drift_recovery_candidate)
-                        and not bool(policy_reject_note)
-                        and not bool(hard_reject_note)
-                    ):
-                        quality_mode = "failsoft"
-                        drift_recovery_active = True
-                        drift_recovery_note = str(drift_recovery_note_candidate)
-                    if quality_mode == "reject":
-                        pos_first_candidate, pos_first_note_candidate = self._should_use_vps_position_first_soft_apply(
-                            t_cam=float(t_cam),
-                            abs_offset_m=float(abs_offset_m),
-                            speed_m_s=float(speed_now),
-                            vps_num_inliers=int(vps_num_inliers),
-                            vps_conf=float(vps_conf),
-                            vps_reproj=float(vps_reproj),
-                            policy_mode=str(getattr(vps_decision, "mode", "APPLY")),
-                        )
-                        if bool(pos_first_candidate) and not bool(policy_reject_note) and not bool(hard_reject_note):
-                            quality_mode = "failsoft"
-                            position_first_soft_active = True
-                            position_first_soft_note = str(pos_first_note_candidate)
-
-                    if quality_mode == "failsoft":
-                        skip_temporal = bool(
-                            drift_recovery_active
-                            and bool(runner.global_config.get("VPS_XY_DRIFT_RECOVERY_SKIP_TEMPORAL_GATE", True))
-                        )
-                        if (
-                            not skip_temporal
-                            and bool(position_first_soft_active)
-                            and bool(runner.global_config.get("VPS_POSITION_FIRST_SOFT_SKIP_TEMPORAL_GATE", True))
-                        ):
-                            skip_temporal = True
-                        if not skip_temporal:
-                            temporal_ok, temporal_note = self._evaluate_vps_failsoft_temporal_gate(
-                                vps_offset=abs_offset_vec,
-                                vps_offset_m=abs_offset_m,
-                            )
-                            if not temporal_ok:
-                                quality_mode = "reject"
-                                temporal_reject_note = str(temporal_note)
+                    pos_decision = self.vps_position_controller.decide(evidence)
+                    quality_mode = str(pos_decision.quality_mode)
+                    policy_reject_note = str(pos_decision.policy_reject_note)
+                    hard_reject_note = str(pos_decision.hard_reject_note)
+                    temporal_reject_note = str(pos_decision.temporal_reject_note)
+                    drift_recovery_candidate = bool(pos_decision.drift_recovery_candidate)
+                    drift_recovery_active = bool(pos_decision.drift_recovery_active)
+                    drift_recovery_note = str(pos_decision.drift_recovery_note)
+                    position_first_soft_active = bool(pos_decision.position_first_soft_active)
+                    position_first_soft_note = str(pos_decision.position_first_soft_note)
+                    position_first_direct_xy_candidate = bool(pos_decision.position_first_direct_xy_candidate)
+                    position_first_direct_xy_note = str(pos_decision.position_first_direct_xy_note)
 
                     if quality_mode == "reject":
                         if hasattr(runner, "vps_clone_manager"):
@@ -1298,6 +2026,11 @@ class VIOService:
                             vps_status = f"{drift_recovery_note} | {vps_status}"
                         if position_first_soft_note:
                             vps_status = f"{position_first_soft_note} | {vps_status}"
+                        if position_first_direct_xy_note:
+                            vps_status = f"{position_first_direct_xy_note} | {vps_status}"
+                        hint_quality: Optional[float] = None
+                        if np.isfinite(float(pos_decision.hint_quality)):
+                            hint_quality = float(pos_decision.hint_quality)
                         if (
                             bool(drift_recovery_candidate)
                             and runner.backend_optimizer is not None
@@ -1309,38 +2042,8 @@ class VIOService:
                             )
                         ):
                             try:
-                                hint_quality_scale = float(
-                                    runner.global_config.get(
-                                        "VPS_XY_DRIFT_RECOVERY_HINT_QUALITY_SCALE",
-                                        0.65,
-                                    )
-                                )
-                                hint_quality = float(
-                                    np.clip(
-                                        (
-                                            0.45 * np.clip(vps_conf, 0.0, 1.0)
-                                            + 0.35 * np.clip(vps_num_inliers / 80.0, 0.0, 1.0)
-                                            + 0.20 * np.clip(1.2 / max(vps_reproj, 0.1), 0.0, 1.0)
-                                        )
-                                        * max(0.1, hint_quality_scale),
-                                        0.0,
-                                        1.0,
-                                    )
-                                )
-                                if bool(position_first_soft_active):
-                                    hint_quality = float(
-                                        np.clip(
-                                            hint_quality
-                                            * float(
-                                                runner.global_config.get(
-                                                    "VPS_POSITION_FIRST_SOFT_HINT_QUALITY_SCALE",
-                                                    0.85,
-                                                )
-                                            ),
-                                            0.0,
-                                            1.0,
-                                        )
-                                    )
+                                if hint_quality is None:
+                                    hint_quality = 0.0
                                 runner.backend_optimizer.report_absolute_hint(
                                     t_ref=float(t_cam),
                                     dp_enu=np.array([abs_offset_vec[0], abs_offset_vec[1], 0.0], dtype=float),
@@ -1349,6 +2052,20 @@ class VIOService:
                                     source="VPS",
                                 )
                                 vps_status = f"{vps_status} | XY_DRIFT_RECOVERY_HINT_ONLY"
+                            except Exception:
+                                pass
+                        allow_direct_xy_apply = bool(pos_decision.allow_direct_xy_apply)
+                        if bool(allow_direct_xy_apply) and hint_quality is not None:
+                            try:
+                                direct_ok, direct_note = self.vps_position_controller.apply_direct_xy(
+                                    evidence=evidence,
+                                    base_quality=float(hint_quality),
+                                )
+                                if direct_ok:
+                                    position_first_direct_xy_applied = True
+                                    vps_status = f"{vps_status} | POSITION_FIRST_DIRECT_XY_APPLIED"
+                                elif str(direct_note).strip():
+                                    vps_status = f"{vps_status} | {direct_note}"
                             except Exception:
                                 pass
                     else:
@@ -1366,56 +2083,100 @@ class VIOService:
                                 r_scale_apply *= float(
                                     runner.global_config.get("VPS_POSITION_FIRST_SOFT_R_MULT", 4.0)
                                 )
-                        vps_lat_apply = float(vps_result.lat)
-                        vps_lon_apply = float(vps_result.lon)
-                        clamp_scale = 1.0
-                        if quality_mode == "failsoft":
-                            clamp_override = None
-                            if drift_recovery_active:
-                                clamp_override = float(
-                                    runner.global_config.get(
-                                        "VPS_XY_DRIFT_RECOVERY_MAX_APPLY_DP_XY_M",
-                                        runner.global_config.get("VPS_ABS_MAX_APPLY_DP_XY_M", 25.0),
-                                    )
-                                )
-                            if position_first_soft_active:
-                                clamp_override = float(
-                                    runner.global_config.get(
-                                        "VPS_POSITION_FIRST_SOFT_MAX_APPLY_DP_XY_M",
+                        direct_only_failsoft = bool(
+                            runner.global_config.get("VPS_POSITION_FIRST_DIRECT_ONLY_FAILSOFT", True)
+                        )
+                        if (
+                            quality_mode == "failsoft"
+                            and bool(runner.global_config.get("POSITION_FIRST_LANE", False))
+                            and direct_only_failsoft
+                        ):
+                            vps_applied, vps_innovation_m = False, None
+                            vps_status = "FAILSOFT_DIRECT_ONLY_BYPASS"
+                        else:
+                            vps_lat_apply = float(vps_result.lat)
+                            vps_lon_apply = float(vps_result.lon)
+                            clamp_scale = 1.0
+                            if quality_mode == "failsoft":
+                                clamp_override = None
+                                if drift_recovery_active:
+                                    clamp_override = float(
                                         runner.global_config.get(
                                             "VPS_XY_DRIFT_RECOVERY_MAX_APPLY_DP_XY_M",
                                             runner.global_config.get("VPS_ABS_MAX_APPLY_DP_XY_M", 25.0),
-                                        ),
+                                        )
                                     )
+                                if position_first_soft_active:
+                                    clamp_override = float(
+                                        runner.global_config.get(
+                                            "VPS_POSITION_FIRST_SOFT_MAX_APPLY_DP_XY_M",
+                                            runner.global_config.get(
+                                                "VPS_XY_DRIFT_RECOVERY_MAX_APPLY_DP_XY_M",
+                                                runner.global_config.get("VPS_ABS_MAX_APPLY_DP_XY_M", 25.0),
+                                            ),
+                                        )
+                                    )
+                                vps_lat_apply, vps_lon_apply, clamp_scale = self._clamp_vps_latlon(
+                                    current_xy=current_xy,
+                                    vps_lat=vps_lat_apply,
+                                    vps_lon=vps_lon_apply,
+                                    max_apply_dp_xy_override=clamp_override,
                                 )
-                            vps_lat_apply, vps_lon_apply, clamp_scale = self._clamp_vps_latlon(
-                                current_xy=current_xy,
+                            vps_applied, vps_innovation_m, vps_status = apply_vps_delayed_update(
+                                kf=runner.kf,
+                                clone_manager=runner.vps_clone_manager,
+                                image_id=clone_id,
                                 vps_lat=vps_lat_apply,
                                 vps_lon=vps_lon_apply,
-                                max_apply_dp_xy_override=clamp_override,
+                                R_vps=np.array(vps_result.R_vps, dtype=float) * float(r_scale_apply),
+                                proj_cache=runner.proj_cache,
+                                lat0=runner.lat0,
+                                lon0=runner.lon0,
+                                time_since_last_vps=(t_cam - runner.last_vps_update_time),
                             )
-                        vps_applied, vps_innovation_m, vps_status = apply_vps_delayed_update(
-                            kf=runner.kf,
-                            clone_manager=runner.vps_clone_manager,
-                            image_id=clone_id,
-                            vps_lat=vps_lat_apply,
-                            vps_lon=vps_lon_apply,
-                            R_vps=np.array(vps_result.R_vps, dtype=float) * float(r_scale_apply),
-                            proj_cache=runner.proj_cache,
-                            lat0=runner.lat0,
-                            lon0=runner.lon0,
-                            time_since_last_vps=(t_cam - runner.last_vps_update_time),
-                        )
-                        if vps_applied and clamp_scale < 0.999:
-                            vps_status = f"{vps_status} | CLAMPED(scale={clamp_scale:.3f})"
-                        if drift_recovery_active:
-                            vps_status = f"{vps_status} | XY_DRIFT_RECOVERY"
-                        if position_first_soft_active:
-                            vps_status = f"{vps_status} | POSITION_FIRST_SOFT"
+                            if vps_applied and clamp_scale < 0.999:
+                                vps_status = f"{vps_status} | CLAMPED(scale={clamp_scale:.3f})"
+                            if drift_recovery_active:
+                                vps_status = f"{vps_status} | XY_DRIFT_RECOVERY"
+                            if position_first_soft_active:
+                                vps_status = f"{vps_status} | POSITION_FIRST_SOFT"
+                        if (
+                            not bool(vps_applied)
+                            and bool(quality_mode == "failsoft")
+                            and (
+                                bool(position_first_soft_active)
+                                or bool(drift_recovery_active)
+                                or bool(position_first_direct_xy_candidate)
+                            )
+                            and bool(runner.global_config.get("VPS_POSITION_FIRST_DIRECT_XY_FALLBACK_ON_APPLY_FAIL", True))
+                        ):
+                            try:
+                                fallback_quality = float(
+                                    np.clip(
+                                        0.45 * np.clip(vps_conf, 0.0, 1.0)
+                                        + 0.35 * np.clip(vps_num_inliers / 80.0, 0.0, 1.0)
+                                        + 0.20 * np.clip(1.2 / max(vps_reproj, 0.1), 0.0, 1.0),
+                                        0.0,
+                                        1.0,
+                                    )
+                                )
+                                direct_ok, direct_note = self.vps_position_controller.apply_direct_xy(
+                                    evidence=evidence,
+                                    base_quality=float(fallback_quality),
+                                )
+                                if direct_ok:
+                                    position_first_direct_xy_applied = True
+                                    vps_status = f"{vps_status} | POSITION_FIRST_DIRECT_XY_APPLIED"
+                                elif str(direct_note).strip():
+                                    vps_status = f"{vps_status} | {direct_note}"
+                            except Exception:
+                                pass
                     if drift_recovery_active and vps_applied:
                         reason_code = "xy_drift_recovery_apply"
                     elif position_first_soft_active and vps_applied:
                         reason_code = "position_first_soft_apply"
+                    elif position_first_direct_xy_applied:
+                        reason_code = "position_first_direct_xy_apply"
                     elif quality_mode == "failsoft" and vps_applied:
                         reason_code = "soft_accept"
                     else:
@@ -1427,6 +2188,8 @@ class VIOService:
                             reason_code = "skip_missing_clone"
                         elif "position_first_soft" in status_lower and "applied" in status_lower:
                             reason_code = "position_first_soft_apply"
+                        elif "position_first_direct_xy_applied" in status_lower:
+                            reason_code = "position_first_direct_xy_apply"
                         elif "xy_drift_recovery_hint_only" in status_lower:
                             reason_code = "xy_drift_recovery_hint_only"
                         elif "xy_drift_recovery" in status_lower and "applied" in status_lower:
@@ -1451,9 +2214,18 @@ class VIOService:
                             reason_code = "abs_corr_clamped_apply"
                         elif "applied" in status_lower:
                             reason_code = "abs_corr_soft_apply" if quality_mode == "failsoft" else "normal_accept"
+                    try:
+                        self.vps_position_controller.log_trace(
+                            evidence=evidence,
+                            decision=pos_decision,
+                            applied=bool(vps_applied or position_first_direct_xy_applied),
+                            reason_code=str(reason_code),
+                        )
+                    except Exception:
+                        pass
                     vps_adaptive_info.update({
                         "sensor": "VPS",
-                        "accepted": bool(vps_applied),
+                        "accepted": bool(vps_applied or position_first_direct_xy_applied),
                         "attempted": 1,
                         "dof": 2,
                         "nis_norm": nis_norm_vps,
@@ -1473,14 +2245,19 @@ class VIOService:
                         or reason_code == "abs_corr_soft_apply"
                         or reason_code == "xy_drift_recovery_apply"
                         or reason_code == "position_first_soft_apply"
+                        or reason_code == "position_first_direct_xy_apply"
                     ):
                         runner._vps_soft_accept_count = int(getattr(runner, "_vps_soft_accept_count", 0)) + 1
                     elif reason_code.startswith("soft_reject") or reason_code == "abs_corr_temporal_wait":
                         runner._vps_soft_reject_count = int(getattr(runner, "_vps_soft_reject_count", 0)) + 1
-                    if vps_applied:
+                    if vps_applied or position_first_direct_xy_applied:
                         runner._abs_corr_apply_count = int(getattr(runner, "_abs_corr_apply_count", 0)) + 1
-                        if quality_mode == "failsoft":
+                        if quality_mode == "failsoft" or position_first_direct_xy_applied:
                             runner._abs_corr_soft_count = int(getattr(runner, "_abs_corr_soft_count", 0)) + 1
+                        if bool(vps_match_failsoft):
+                            runner._vps_failsoft_applied_count = int(
+                                getattr(runner, "_vps_failsoft_applied_count", 0)
+                            ) + 1
                         runner.last_vps_update_time = t_cam
                         runner.state.vps_idx += 1
                         runner._vps_pending_large_offset_vec = None
@@ -1490,7 +2267,7 @@ class VIOService:
                         runner._vps_last_accepted_offset_count = int(
                             getattr(runner, "_vps_last_accepted_offset_count", 0)
                         ) + 1
-                        if runner.backend_optimizer is not None:
+                        if vps_applied and runner.backend_optimizer is not None:
                             try:
                                 use_vps_yaw_hint = bool(runner.global_config.get("BACKEND_VPS_YAW_HINT_ENABLE", True))
                                 if drift_recovery_active or position_first_soft_active:
@@ -1607,6 +2384,9 @@ class VIOService:
         yaw_auth_reason = ""
         src_mix_raw = getattr(corr, "source_mix", None)
         src_mix = src_mix_raw if isinstance(src_mix_raw, dict) else {}
+        resid_raw = getattr(corr, "residual_summary", None)
+        resid = resid_raw if isinstance(resid_raw, dict) else {}
+        direct_xy_lane = bool(float(resid.get("direct_xy_lane", 0.0)) >= 0.5)
         corr_quality = float(np.clip(float(getattr(corr, "quality_score", 0.6)), 0.0, 1.0))
         if not np.isfinite(corr_quality):
             corr_quality = 0.0
@@ -1625,6 +2405,15 @@ class VIOService:
         max_dp = float(runner.global_config.get("BACKEND_MAX_APPLY_DP_XY_M", 25.0))
         if position_first_lane:
             max_dp = float(runner.global_config.get("BACKEND_POSITION_FIRST_MAX_APPLY_DP_XY_M", max_dp))
+            if direct_xy_lane:
+                # Direct XY lane carries raw absolute offsets; keep per-apply cap
+                # tighter than generic position-first to reduce drift bursts.
+                max_dp = float(
+                    runner.global_config.get(
+                        "BACKEND_POSITION_FIRST_DIRECT_XY_MAX_APPLY_DP_XY_M",
+                        min(max_dp, 28.0),
+                    )
+                )
         dp_xy_norm = float(np.linalg.norm(dp[:2]))
         if dp_xy_norm > max_dp and dp_xy_norm > 1e-9:
             dp[:2] *= float(max_dp / dp_xy_norm)
@@ -1692,39 +2481,60 @@ class VIOService:
                 p_max = float("nan")
                 p_cond = float("inf")
             conf = float(corr_quality)
-            req_abs_dyaw = float(
-                max(
-                    abs(dyaw_deg),
-                    runner.global_config.get("BACKEND_YAW_AUTH_MIN_REQUEST_DEG", 0.05),
-                )
+            req_abs_dyaw = float(abs(dyaw_deg))
+            zero_req_deadband = max(
+                0.0,
+                float(runner.global_config.get("BACKEND_YAW_AUTH_ZERO_REQUEST_DEADBAND_DEG", 0.02)),
             )
-            auth_dec = runner.yaw_authority_service.request_decision(
-                source="BACKEND",
-                timestamp=float(getattr(corr, "t_ref", 0.0)),
-                requested_abs_dyaw_deg=float(req_abs_dyaw),
-                confidence=float(conf),
-                speed_m_s=float(speed_now),
-                health_state=str(health_state),
-                p_max=float(p_max),
-                p_cond=float(p_cond),
+            count_zero_as_request = bool(
+                runner.global_config.get("BACKEND_YAW_AUTH_ZERO_DYAW_AS_REQUEST", False)
             )
-            if (not bool(auth_dec.allow)) or str(auth_dec.mode).upper() in ("HOLD", "SKIP"):
-                yaw_auth_reason = f"skip:{auth_dec.reason}"
+            if req_abs_dyaw <= zero_req_deadband and not count_zero_as_request:
+                # Deterministic no-op path: XY-only backend corrections should not
+                # claim yaw ownership nor keep yaw-owner activity alive.
+                yaw_auth_reason = "apply:backend_zero_dyaw_bypass"
                 dyaw_deg = 0.0
             else:
-                cap = float(auth_dec.max_update_dyaw_deg) if np.isfinite(float(auth_dec.max_update_dyaw_deg)) else float(max_dyaw_deg)
-                cap = max(0.05, min(float(max_dyaw_deg), cap))
-                dyaw_deg = float(np.clip(dyaw_deg, -cap, cap))
-                if str(auth_dec.mode).upper() == "SOFT_APPLY":
-                    yaw_auth_reason = f"soft:{auth_dec.reason}"
+                req_abs_dyaw = float(
+                    max(
+                        req_abs_dyaw,
+                        float(runner.global_config.get("BACKEND_YAW_AUTH_MIN_REQUEST_DEG", 0.05)),
+                    )
+                )
+                auth_dec = runner.yaw_authority_service.request_decision(
+                    source="BACKEND",
+                    timestamp=float(getattr(corr, "t_ref", 0.0)),
+                    requested_abs_dyaw_deg=float(req_abs_dyaw),
+                    confidence=float(conf),
+                    speed_m_s=float(speed_now),
+                    health_state=str(health_state),
+                    p_max=float(p_max),
+                    p_cond=float(p_cond),
+                )
+                if (not bool(auth_dec.allow)) or str(auth_dec.mode).upper() in ("HOLD", "SKIP"):
+                    yaw_auth_reason = f"skip:{auth_dec.reason}"
+                    dyaw_deg = 0.0
                 else:
-                    yaw_auth_reason = f"apply:{auth_dec.reason}"
+                    cap = float(auth_dec.max_update_dyaw_deg) if np.isfinite(float(auth_dec.max_update_dyaw_deg)) else float(max_dyaw_deg)
+                    cap = max(0.05, min(float(max_dyaw_deg), cap))
+                    dyaw_deg = float(np.clip(dyaw_deg, -cap, cap))
+                    if str(auth_dec.mode).upper() == "SOFT_APPLY":
+                        yaw_auth_reason = f"soft:{auth_dec.reason}"
+                    else:
+                        yaw_auth_reason = f"apply:{auth_dec.reason}"
 
         corr_weight = float(runner.global_config.get("BACKEND_CORRECTION_WEIGHT", 1.0))
         if position_first_lane:
             corr_weight = float(runner.global_config.get("BACKEND_POSITION_FIRST_CORR_WEIGHT", corr_weight))
+            if direct_xy_lane:
+                corr_weight = float(
+                    runner.global_config.get(
+                        "BACKEND_POSITION_FIRST_DIRECT_XY_CORR_WEIGHT",
+                        min(corr_weight, 0.72),
+                    )
+                )
         corr_weight = float(np.clip(corr_weight, 0.0, 1.0))
-        if bool(runner.global_config.get("BACKEND_BLEND_QUALITY_SOFT_SCALE", True)):
+        if bool(runner.global_config.get("BACKEND_BLEND_QUALITY_SOFT_SCALE", True)) and not direct_xy_lane:
             q_corr = float(corr_quality)
             corr_weight *= float(np.clip(0.55 + 0.45 * q_corr, 0.25, 1.0))
         if corr_weight < 1.0:
@@ -1734,6 +2544,21 @@ class VIOService:
         blend_steps = max(1, int(runner.global_config.get("BACKEND_BLEND_STEPS", 3)))
         if position_first_lane:
             blend_steps = max(1, int(runner.global_config.get("BACKEND_POSITION_FIRST_BLEND_STEPS", blend_steps)))
+            if direct_xy_lane:
+                blend_steps = max(
+                    blend_steps,
+                    int(
+                        max(
+                            1,
+                            round(
+                                runner.global_config.get(
+                                    "BACKEND_POSITION_FIRST_DIRECT_XY_MIN_BLEND_STEPS",
+                                    3,
+                                )
+                            ),
+                        )
+                    ),
+                )
         runner._backend_pending_dp_enu = dp.copy()
         runner._backend_pending_dyaw_deg = float(dyaw_deg)
         runner._backend_pending_steps_left = int(blend_steps)

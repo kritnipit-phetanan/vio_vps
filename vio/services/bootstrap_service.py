@@ -394,6 +394,13 @@ class BootstrapService:
 
         # Override min_track_length from config
         runner.vio_fe.min_track_length = runner.global_config.get("MSCKF_MIN_TRACK_LENGTH", 4)
+        runner.vio_fe.max_track_length = int(
+            runner.global_config.get("VIO_FRONTEND_MAX_TRACK_HISTORY", runner.vio_fe.max_track_length)
+        )
+        runner.vio_fe.max_total_tracks = int(
+            runner.global_config.get("VIO_FRONTEND_MAX_TOTAL_TRACKS", runner.vio_fe.max_total_tracks)
+        )
+        runner._vio_frontend_max_total_tracks = int(runner.vio_fe.max_total_tracks)
 
         print(f"[VIO] Camera view mode: {runner.config.camera_view}")
         print(
@@ -458,6 +465,7 @@ class BootstrapService:
                 min_frame_gap=int(runner.global_config.get("LOOP_MIN_FRAME_GAP", 50)),
                 min_match_ratio=float(runner.global_config.get("LOOP_MIN_MATCH_RATIO", 0.12)),
                 min_inliers=int(runner.global_config.get("LOOP_MIN_INLIERS", 15)),
+                max_keyframes=int(runner.global_config.get("LOOP_MAX_KEYFRAMES", 220)),
                 quality_gate={
                     "min_inliers_hard": int(runner.global_config.get("LOOP_MIN_INLIERS_HARD", 35)),
                     "min_inliers_failsoft": int(runner.global_config.get("LOOP_MIN_INLIERS_FAILSOFT", 20)),
@@ -505,6 +513,7 @@ class BootstrapService:
         runner.mag_quality_csv = csv_paths.get("mag_quality_csv")
         runner.sensor_time_audit_csv = csv_paths.get("sensor_time_audit_csv")
         runner.vps_reloc_summary_csv = csv_paths.get("vps_reloc_summary_csv")
+        runner.vps_position_trace_csv = csv_paths.get("vps_position_trace_csv")
         runner.policy_trace_csv = csv_paths.get("policy_trace_csv")
         runner.policy_conflict_csv = csv_paths.get("policy_conflict_csv")
         runner.policy_owner_map_csv = csv_paths.get("policy_owner_map_csv")

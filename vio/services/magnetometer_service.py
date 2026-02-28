@@ -365,18 +365,35 @@ class MagnetometerService:
         )
         if not any(tag in reason_l for tag in owner_skip_tags):
             return True
-        # Option3 owner-unification path: if MAG is repeatedly skipped by authority,
-        # treat these as ineffective observations so MAG ownership can be demoted.
+        # Option3 owner-unification path:
+        # do not demote MAG from ownership by counting owner-arbitration skips as
+        # sensor-quality rejects (self-lock pattern).
         try:
             count_owner_skip_as_reject = bool(
                 getattr(self.runner, "global_config", {}).get(
                     "YAW_AUTH_MAG_COUNT_OWNER_SKIP_AS_REJECT",
-                    True,
+                    False,
                 )
             )
         except Exception:
-            count_owner_skip_as_reject = True
+            count_owner_skip_as_reject = False
         return bool(count_owner_skip_as_reject)
+
+    @staticmethod
+    def _is_owner_skip_reason(reason: str) -> bool:
+        reason_l = str(reason or "").strip().lower()
+        if reason_l == "":
+            return False
+        owner_skip_tags = (
+            "yaw_auth_skip:",
+            "owner_is_",
+            "owner_hold",
+            "hold_active",
+            "owner_blocked_",
+            "budget_exhausted",
+            "owner_dead_timeout_",
+        )
+        return any(tag in reason_l for tag in owner_skip_tags)
 
     def _preprocess_mag_guard(self,
                               mag_norm: float,
@@ -972,6 +989,10 @@ class MagnetometerService:
                 )
                 if self._should_count_mag_owner_observation(accepted=False, reason=consistency_reason):
                     self._register_mag_owner_observation(timestamp=float(mag_rec.t), accepted=False)
+                if self._is_owner_skip_reason(consistency_reason):
+                    self.runner.state.mag_owner_skips = int(
+                        getattr(self.runner.state, "mag_owner_skips", 0)
+                    ) + 1
                 self.runner.state.mag_rejects += 1
                 continue
 
@@ -1048,6 +1069,10 @@ class MagnetometerService:
             else:
                 if self._should_count_mag_owner_observation(accepted=False, reason=reason):
                     self._register_mag_owner_observation(timestamp=float(mag_rec.t), accepted=False)
+                if self._is_owner_skip_reason(reason):
+                    self.runner.state.mag_owner_skips = int(
+                        getattr(self.runner.state, "mag_owner_skips", 0)
+                    ) + 1
                 self.runner.state.mag_rejects += 1
 
     def process_single_mag(self, mag_rec, t: float):

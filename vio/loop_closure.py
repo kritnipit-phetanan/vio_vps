@@ -84,6 +84,7 @@ class LoopClosureDetector:
                  min_frame_gap: int = 50,             # REDUCED: faster loop detection
                  min_match_ratio: float = 0.12,       # REDUCED: accept partial overlaps
                  min_inliers: int = 15,               # REDUCED: accept partial matches
+                 max_keyframes: int = 220,
                  quality_gate: Optional[Dict[str, Any]] = None,
                  fail_soft: Optional[Dict[str, Any]] = None):
         """
@@ -103,6 +104,7 @@ class LoopClosureDetector:
         self.min_frame_gap = min_frame_gap
         self.min_match_ratio = min_match_ratio
         self.min_inliers = min_inliers
+        self.max_keyframes = max(32, int(max_keyframes))
         self.quality_gate = dict(quality_gate or {})
         self.fail_soft = dict(fail_soft or {})
         
@@ -131,6 +133,9 @@ class LoopClosureDetector:
             'loop_speed_skipped': 0,
             'loop_apply_pending_confirm': 0,
             'loop_apply_burst_suppressed': 0,
+            'loop_apply_high_speed_soft_clamped': 0,
+            'loop_apply_budget_clamped': 0,
+            'loop_apply_budget_blocked': 0,
             'yaw_corrections_applied': 0,
             'total_yaw_correction': 0.0,
         }
@@ -143,6 +148,7 @@ class LoopClosureDetector:
         self._last_apply_t: float = -1e9
         self._apply_pending_confirm: Dict[str, Dict[str, float]] = {}
         self._recent_apply_times: List[float] = []
+        self._recent_apply_events: List[Tuple[float, float]] = []
         
     def should_add_keyframe(self, position: np.ndarray, yaw: float, frame_idx: int) -> bool:
         """
@@ -192,16 +198,25 @@ class LoopClosureDetector:
         
         if descriptors is None or len(keypoints) < 50:
             return  # Not enough features
+
+        keypoints_xy = np.asarray([kp.pt for kp in keypoints], dtype=np.float32)
+        if keypoints_xy.ndim != 2 or keypoints_xy.shape[0] < 50:
+            return
             
         # Store keyframe
         kf = {
             'frame_idx': frame_idx,
             'position': position.copy(),
             'yaw': yaw,
-            'keypoints': keypoints,
-            'descriptors': descriptors,
+            # Store compact xy array instead of cv2.KeyPoint objects to reduce memory.
+            'keypoints_xy': keypoints_xy,
+            'descriptors': np.asarray(descriptors, dtype=np.uint8).copy(),
         }
         self.keyframes.append(kf)
+        if len(self.keyframes) > self.max_keyframes:
+            drop_n = len(self.keyframes) - self.max_keyframes
+            if drop_n > 0:
+                del self.keyframes[:drop_n]
         
         # Update last keyframe info
         self.last_kf_position = position.copy()
@@ -312,6 +327,9 @@ class LoopClosureDetector:
         
         if descriptors_curr is None or len(keypoints_curr) < 30:
             return None
+        keypoints_curr_xy = np.asarray([kp.pt for kp in keypoints_curr], dtype=np.float32)
+        if keypoints_curr_xy.ndim != 2 or keypoints_curr_xy.shape[0] < 30:
+            return None
             
         # Match descriptors
         try:
@@ -333,8 +351,11 @@ class LoopClosureDetector:
             return None
             
         # Get matched point coordinates
-        pts_kf = np.float32([kf['keypoints'][m.queryIdx].pt for m in good_matches])
-        pts_curr = np.float32([keypoints_curr[m.trainIdx].pt for m in good_matches])
+        keypoints_kf_xy = np.asarray(kf.get("keypoints_xy", np.empty((0, 2))), dtype=np.float32)
+        if keypoints_kf_xy.ndim != 2 or keypoints_kf_xy.shape[1] != 2:
+            return None
+        pts_kf = np.float32([keypoints_kf_xy[m.queryIdx] for m in good_matches])
+        pts_curr = np.float32([keypoints_curr_xy[m.trainIdx] for m in good_matches])
         
         # Compute Essential matrix with RANSAC
         try:
@@ -613,9 +634,17 @@ class LoopClosureDetector:
         self.last_kf_frame = -1000
         self._apply_pending_confirm = {}
         self._recent_apply_times = []
+        self._recent_apply_events = []
         for key in self.stats:
             if isinstance(self.stats[key], (int, float)):
                 self.stats[key] = 0 if isinstance(self.stats[key], int) else 0.0
+
+    def compact_memory(self, max_keyframes: Optional[int] = None) -> None:
+        """Compact loop DB to bound memory during long runs."""
+        target = self.max_keyframes if max_keyframes is None else max(16, int(max_keyframes))
+        self.max_keyframes = int(target)
+        if len(self.keyframes) > target:
+            del self.keyframes[: len(self.keyframes) - target]
 
 
 # ===============================
@@ -630,6 +659,7 @@ def init_loop_closure(position_threshold: float = 50.0,
                       min_frame_gap: int = 50,
                       min_match_ratio: float = 0.12,
                       min_inliers: int = 15,
+                      max_keyframes: int = 220,
                       quality_gate: Optional[Dict[str, Any]] = None,
                       fail_soft: Optional[Dict[str, Any]] = None) -> LoopClosureDetector:
     """
@@ -649,6 +679,7 @@ def init_loop_closure(position_threshold: float = 50.0,
         min_frame_gap=min_frame_gap,
         min_match_ratio=min_match_ratio,
         min_inliers=min_inliers,
+        max_keyframes=max_keyframes,
         quality_gate=quality_gate,
         fail_soft=fail_soft,
     )
@@ -870,6 +901,16 @@ def apply_loop_closure_correction(kf, loop_info: Dict[str, Any], t: float,
         burst_window_sec = float(global_config.get("LOOP_BURST_WINDOW_SEC", 12.0))
         burst_max_corrections = int(global_config.get("LOOP_BURST_MAX_CORRECTIONS", 2))
         burst_cooldown_sec = float(global_config.get("LOOP_BURST_COOLDOWN_SEC", 6.0))
+        burst_abs_budget_deg = float(global_config.get("LOOP_BURST_ABS_YAW_BUDGET_DEG", 8.0))
+        burst_rate_window_sec = float(global_config.get("LOOP_BURST_RATE_WINDOW_SEC", 1.0))
+        burst_rate_deg_per_sec = float(global_config.get("LOOP_BURST_RATE_MAX_DEG_PER_SEC", 2.4))
+        burst_min_apply_deg = float(global_config.get("LOOP_BURST_MIN_APPLY_DEG", 0.18))
+        high_speed_soft_apply_enable = bool(global_config.get("LOOP_HIGH_SPEED_SOFT_APPLY_ENABLE", True))
+        high_speed_soft_cap_deg = float(global_config.get("LOOP_HIGH_SPEED_SOFT_CAP_DEG", 0.9))
+        high_speed_soft_r_mult = float(global_config.get("LOOP_HIGH_SPEED_SOFT_R_MULT", 3.0))
+        high_speed_soft_extra_confirm_hits = int(
+            global_config.get("LOOP_HIGH_SPEED_SOFT_EXTRA_CONFIRM_HITS", 1)
+        )
         if policy_decision is not None:
             apply_confirm_enable = bool(policy_decision.extra("apply_confirm_enable", 1.0) > 0.5)
             apply_confirm_window_sec = float(policy_decision.extra("apply_confirm_window_sec", apply_confirm_window_sec))
@@ -890,6 +931,27 @@ def apply_loop_closure_correction(kf, loop_info: Dict[str, Any], t: float,
             burst_window_sec = float(policy_decision.extra("burst_window_sec", burst_window_sec))
             burst_max_corrections = int(round(policy_decision.extra("burst_max_corrections", burst_max_corrections)))
             burst_cooldown_sec = float(policy_decision.extra("burst_cooldown_sec", burst_cooldown_sec))
+            burst_abs_budget_deg = float(policy_decision.extra("burst_abs_yaw_budget_deg", burst_abs_budget_deg))
+            burst_rate_window_sec = float(policy_decision.extra("burst_rate_window_sec", burst_rate_window_sec))
+            burst_rate_deg_per_sec = float(policy_decision.extra("burst_rate_max_deg_per_sec", burst_rate_deg_per_sec))
+            burst_min_apply_deg = float(policy_decision.extra("burst_min_apply_deg", burst_min_apply_deg))
+            high_speed_soft_apply_enable = bool(
+                policy_decision.extra(
+                    "high_speed_soft_apply_enable",
+                    1.0 if high_speed_soft_apply_enable else 0.0,
+                )
+                > 0.5
+            )
+            high_speed_soft_cap_deg = float(policy_decision.extra("high_speed_soft_cap_deg", high_speed_soft_cap_deg))
+            high_speed_soft_r_mult = float(policy_decision.extra("high_speed_soft_r_mult", high_speed_soft_r_mult))
+            high_speed_soft_extra_confirm_hits = int(
+                round(
+                    policy_decision.extra(
+                        "high_speed_soft_extra_confirm_hits",
+                        high_speed_soft_extra_confirm_hits,
+                    )
+                )
+            )
 
         required_hits = apply_confirm_hits_failsoft if fail_soft else apply_confirm_hits_normal
         if np.isfinite(speed_now) and speed_now >= apply_confirm_speed_m_s:
@@ -913,6 +975,7 @@ def apply_loop_closure_correction(kf, loop_info: Dict[str, Any], t: float,
 
         if yaw_abs_deg < min_abs_deg:
             return False
+        yaw_auth_r_mult = 1.0
         soft_clamp_from_yaw_exceed = False
         if yaw_abs_deg > reject_abs_deg:
             soft_clamp_enable = bool(global_config.get("LOOP_SOFT_CLAMP_YAW_EXCEED_ENABLE", True))
@@ -922,30 +985,66 @@ def apply_loop_closure_correction(kf, loop_info: Dict[str, Any], t: float,
             )
             soft_unstable_pmax = float(global_config.get("LOOP_SOFT_CLAMP_YAW_EXCEED_MAX_PMAX", 1.0e6))
             soft_unstable_pcond = float(global_config.get("LOOP_SOFT_CLAMP_YAW_EXCEED_MAX_PCOND", 2.5e10))
+            soft_unstable_enable = bool(
+                global_config.get("LOOP_SOFT_CLAMP_YAW_EXCEED_UNSTABLE_ENABLE", True)
+            )
+            soft_unstable_cap_deg = float(
+                global_config.get("LOOP_SOFT_CLAMP_YAW_EXCEED_UNSTABLE_CAP_DEG", 0.55)
+            )
+            soft_unstable_r_mult = float(
+                global_config.get("LOOP_SOFT_CLAMP_YAW_EXCEED_UNSTABLE_R_MULT", 6.0)
+            )
+            soft_unstable_extra_confirm_hits = int(
+                global_config.get("LOOP_SOFT_CLAMP_YAW_EXCEED_UNSTABLE_EXTRA_CONFIRM_HITS", 1)
+            )
             state_unstable = (
                 (np.isfinite(speed_now) and speed_now > soft_speed_max_m_s)
                 or (np.isfinite(p_max_state) and p_max_state > soft_unstable_pmax)
                 or (np.isfinite(p_cond_state) and p_cond_state > soft_unstable_pcond)
             )
-            if (not soft_clamp_enable) or state_unstable:
+            if not soft_clamp_enable:
                 print(
-                    f"[LOOP] REJECT: yaw_error={yaw_abs_deg:.1f}° > {reject_abs_deg:.1f}° "
-                    f"(soft_clamp={'off' if not soft_clamp_enable else 'unstable'})"
+                    f"[LOOP] REJECT: yaw_error={yaw_abs_deg:.1f}° > {reject_abs_deg:.1f}° (soft_clamp=off)"
                 )
                 return False
             soft_clamp_from_yaw_exceed = True
-            max_abs_deg = min(max_abs_deg, max(min_abs_deg, soft_cap_deg))
-            if loop_detector is not None and hasattr(loop_detector, "stats"):
-                loop_detector.stats["loop_soft_clamp_yaw_exceed"] = int(
-                    loop_detector.stats.get("loop_soft_clamp_yaw_exceed", 0)
-                ) + 1
+            if state_unstable:
+                if not soft_unstable_enable:
+                    print(
+                        f"[LOOP] REJECT: yaw_error={yaw_abs_deg:.1f}° > {reject_abs_deg:.1f}° (soft_clamp=unstable)"
+                    )
+                    return False
+                max_abs_deg = min(max_abs_deg, max(0.05, soft_unstable_cap_deg))
+                yaw_auth_r_mult = max(float(yaw_auth_r_mult), max(1.0, soft_unstable_r_mult))
+                required_hits += max(0, int(soft_unstable_extra_confirm_hits))
+                if loop_detector is not None and hasattr(loop_detector, "stats"):
+                    loop_detector.stats["loop_soft_clamp_yaw_exceed_unstable"] = int(
+                        loop_detector.stats.get("loop_soft_clamp_yaw_exceed_unstable", 0)
+                    ) + 1
+            else:
+                max_abs_deg = min(max_abs_deg, max(min_abs_deg, soft_cap_deg))
+                if loop_detector is not None and hasattr(loop_detector, "stats"):
+                    loop_detector.stats["loop_soft_clamp_yaw_exceed"] = int(
+                        loop_detector.stats.get("loop_soft_clamp_yaw_exceed", 0)
+                    ) + 1
+        high_speed_soft_applied = False
         if np.isfinite(speed_now) and speed_now > speed_skip_m_s:
-            if loop_detector is not None and hasattr(loop_detector, "stats"):
-                loop_detector.stats["loop_speed_skipped"] = int(loop_detector.stats.get("loop_speed_skipped", 0)) + 1
-            print(
-                f"[LOOP] SKIP apply at t={t:.2f}s: speed={speed_now:.2f}m/s > {speed_skip_m_s:.2f}m/s"
-            )
-            return False
+            if high_speed_soft_apply_enable:
+                max_abs_deg = min(max_abs_deg, max(min_abs_deg, high_speed_soft_cap_deg))
+                yaw_auth_r_mult = max(float(yaw_auth_r_mult), max(1.0, high_speed_soft_r_mult))
+                required_hits += max(0, int(high_speed_soft_extra_confirm_hits))
+                high_speed_soft_applied = True
+                if loop_detector is not None and hasattr(loop_detector, "stats"):
+                    loop_detector.stats["loop_apply_high_speed_soft_clamped"] = int(
+                        loop_detector.stats.get("loop_apply_high_speed_soft_clamped", 0)
+                    ) + 1
+            else:
+                if loop_detector is not None and hasattr(loop_detector, "stats"):
+                    loop_detector.stats["loop_speed_skipped"] = int(loop_detector.stats.get("loop_speed_skipped", 0)) + 1
+                print(
+                    f"[LOOP] SKIP apply at t={t:.2f}s: speed={speed_now:.2f}m/s > {speed_skip_m_s:.2f}m/s"
+                )
+                return False
 
         # Adaptive cooldown: stronger at high speed and after correction bursts.
         effective_cooldown_sec = cooldown_sec_failsoft if fail_soft else cooldown_sec_normal
@@ -1016,7 +1115,42 @@ def apply_loop_closure_correction(kf, loop_info: Dict[str, Any], t: float,
                 return False
             pending_map.pop(key, None)
 
-        yaw_auth_r_mult = 1.0
+        # Deterministic anti-burst by cumulative |dyaw| budget and rate limit, not just count cooldown.
+        if not hasattr(loop_detector, "_recent_apply_events") or not isinstance(
+            getattr(loop_detector, "_recent_apply_events"), list
+        ):
+            loop_detector._recent_apply_events = []
+        recent_events = []
+        now_t = float(t)
+        burst_window_sec = max(1e-3, float(burst_window_sec))
+        burst_rate_window_sec = max(1e-3, float(burst_rate_window_sec))
+        for ev in loop_detector._recent_apply_events:
+            try:
+                ev_t = float(ev[0])
+                ev_abs = abs(float(ev[1]))
+            except Exception:
+                continue
+            if now_t - ev_t <= max(burst_window_sec, burst_rate_window_sec):
+                recent_events.append((ev_t, ev_abs))
+        loop_detector._recent_apply_events = recent_events
+        used_budget_deg = float(sum(v for ts, v in recent_events if now_t - ts <= burst_window_sec))
+        used_rate_deg = float(sum(v for ts, v in recent_events if now_t - ts <= burst_rate_window_sec))
+        remaining_budget_deg = max(0.0, float(burst_abs_budget_deg) - used_budget_deg)
+        remaining_rate_deg = max(0.0, float(burst_rate_deg_per_sec) * burst_rate_window_sec - used_rate_deg)
+        pre_budget_cap_deg = float(max_abs_deg)
+        max_abs_deg = min(float(max_abs_deg), remaining_budget_deg, remaining_rate_deg)
+        if max_abs_deg < pre_budget_cap_deg:
+            if loop_detector is not None and hasattr(loop_detector, "stats"):
+                loop_detector.stats["loop_apply_budget_clamped"] = int(
+                    loop_detector.stats.get("loop_apply_budget_clamped", 0)
+                ) + 1
+        if max_abs_deg < max(float(min_abs_deg), float(burst_min_apply_deg)):
+            if loop_detector is not None and hasattr(loop_detector, "stats"):
+                loop_detector.stats["loop_apply_budget_blocked"] = int(
+                    loop_detector.stats.get("loop_apply_budget_blocked", 0)
+                ) + 1
+            return False
+
         if yaw_authority_service is not None:
             inlier_n = float(np.clip(num_inliers / max(1.0, float(gate_inliers_hard)), 0.0, 1.0))
             spread_n = float(np.clip(spread_ratio / max(1e-6, float(gate_spread)), 0.0, 1.0))
@@ -1146,7 +1280,11 @@ def apply_loop_closure_correction(kf, loop_info: Dict[str, Any], t: float,
         loop_detector._last_apply_t = float(t)
         if hasattr(loop_detector, "_recent_apply_times") and isinstance(loop_detector._recent_apply_times, list):
             loop_detector._recent_apply_times.append(float(t))
+        if hasattr(loop_detector, "_recent_apply_events") and isinstance(loop_detector._recent_apply_events, list):
+            loop_detector._recent_apply_events.append((float(t), float(abs(np.degrees(yaw_error)))))
         tag = "FAILSOFT" if fail_soft else "NORMAL"
+        if high_speed_soft_applied:
+            tag = f"{tag}+HS_SOFT"
         print(f"[LOOP] {tag} correction at t={t:.2f}s: Δyaw={np.degrees(yaw_error):.2f}° "
               f"(kf={kf_idx}, inliers={num_inliers}, sigma={np.degrees(sigma_loop):.2f}°)")
         if yaw_authority_service is not None:

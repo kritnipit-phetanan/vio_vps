@@ -86,6 +86,7 @@ class VPSConfig:
     rescue_max_reproj_error: float = 2.5
     max_image_side: int = 1024
     mps_cache_clear_interval: int = 0
+    max_cached_tiles: int = 50
 
     # Accuracy-first controls
     accuracy_mode: bool = False
@@ -99,6 +100,8 @@ class VPSConfig:
     min_altitude_floor: float = 8.0
     min_altitude_phase_early: float = 12.0
     min_altitude_low_speed: float = 10.0
+    min_altitude_unknown_speed: float = 12.0
+    min_altitude_accuracy_mode: float = 10.0
     low_speed_threshold_m_s: float = 12.0
     min_altitude_high_speed: float = 20.0
     high_speed_threshold_m_s: float = 25.0
@@ -106,6 +109,7 @@ class VPSConfig:
     position_first_altitude_bypass_enable: bool = True
     position_first_altitude_bypass_min_m: float = -150.0
     position_first_altitude_bypass_max_m: float = 1500.0
+    position_first_altitude_bypass_below_floor_m: float = 12.0
 
     # Relocalization (local/global search)
     reloc_enabled: bool = True
@@ -121,6 +125,7 @@ class VPSConfig:
     reloc_force_global_on_warning_phase: bool = False
     reloc_global_backoff_fail_streak: int = 10
     reloc_global_backoff_sec: float = 8.0
+    reloc_backoff_refresh_min_sec: float = 2.0
     reloc_busy_backoff_force_local_streak: int = 6
     reloc_busy_backoff_sec: float = 6.0
     reloc_global_backoff_probe_every_attempts: int = 12
@@ -128,13 +133,46 @@ class VPSConfig:
     reloc_global_probe_on_no_coverage: bool = True
     reloc_global_probe_no_coverage_streak: int = 3
     reloc_no_coverage_recovery_streak: int = 3
+    reloc_no_coverage_fail_streak_cap: int = 48
+    reloc_no_coverage_backoff_refresh_min_sec: float = 2.5
     reloc_no_coverage_use_last_success: bool = True
     reloc_no_coverage_use_last_coverage: bool = True
     reloc_no_coverage_radius_m: tuple = (25.0, 60.0)
     reloc_no_coverage_samples: int = 6
     reloc_no_coverage_max_centers: int = 6
+    reloc_budget_stop_fail_accumulate: int = 3
+    reloc_match_recovery_streak: int = 14
+    reloc_budget_escalator_enable: bool = True
+    reloc_budget_escalator_trigger_streak: int = 3
+    reloc_budget_escalator_max_level: int = 3
+    reloc_budget_escalator_candidate_scale_step: float = 0.35
+    reloc_budget_escalator_time_scale_step: float = 0.40
+    reloc_budget_escalator_max_candidate_scale: float = 2.5
+    reloc_budget_escalator_max_time_scale: float = 2.5
+    reloc_budget_escalator_decay_successes: int = 2
     runtime_verbosity: str = "debug"
     runtime_log_interval_sec: float = 1.0
+
+
+@dataclass
+class VPSRelocalizationPlan:
+    """Resolved relocalization/search plan for one VPS attempt."""
+
+    global_mode: bool
+    trigger_reason: str
+    search_centers: List[Tuple[float, float]]
+    coverage_recovery_active: bool
+    global_probe_allowed: bool
+    force_global_requested: bool
+
+
+@dataclass
+class VPSBudgetPlan:
+    """Resolved per-frame candidate/time budgets with escalation applied."""
+
+    raw_num_candidates: int
+    budget_num_candidates: int
+    frame_budget_ms: float
 
 
 class VPSRunner:
@@ -184,7 +222,10 @@ class VPSRunner:
         print("[VPSRunner] Initializing...")
         
         # 1. Tile cache
-        self.tile_cache = TileCache(mbtiles_path)
+        self.tile_cache = TileCache(
+            mbtiles_path,
+            max_cached_tiles=max(8, int(getattr(config, "max_cached_tiles", 50))),
+        )
         print(f"[VPSRunner] TileCache loaded: {self.tile_cache.get_tile_count()} tiles")
         
         # 2. Image preprocessor
@@ -233,6 +274,10 @@ class VPSRunner:
         self._global_backoff_probe_count = 0
         self._force_local_streak = 0
         self._no_coverage_streak = 0
+        self._budget_stop_streak = 0
+        self._budget_escalation_level = 0
+        self._budget_escalation_stop_streak = 0
+        self._budget_success_streak = 0
         self._altitude_gate_open = True
         self.reloc_summary_csv: Optional[str] = None
         
@@ -263,6 +308,8 @@ class VPSRunner:
             'candidate_budget_stops': 0,
             'evaluated_candidates_total': 0,
             'evaluated_candidates_samples': 0,
+            'budget_escalation_level_sum': 0.0,
+            'budget_escalation_level_samples': 0,
             'global_backoff_triggers': 0,
             'global_backoff_probes': 0,
             'coverage_recovery_used': 0,
@@ -282,6 +329,305 @@ class VPSRunner:
         if (now - last) >= self._runtime_log_interval_sec:
             print(msg)
             self._last_runtime_log_ts[key] = now
+
+    def _activate_global_backoff(self, *, t_cam: float, backoff_sec: float, reason_tag: str) -> None:
+        """Activate/extend global-search backoff window."""
+        if backoff_sec <= 0.0:
+            return
+        now_t = float(t_cam)
+        new_until = now_t + float(backoff_sec)
+        if new_until > float(self._global_backoff_until_t):
+            self._global_backoff_until_t = float(new_until)
+            self._global_backoff_trigger_count = int(self._global_backoff_trigger_count) + 1
+            self.stats["global_backoff_triggers"] = int(self._global_backoff_trigger_count)
+            self._runtime_log(
+                "vps_global_backoff",
+                "[VPS] global-search backoff "
+                f"reason={reason_tag}, duration={backoff_sec:.1f}s, "
+                f"fail_streak={int(self._fail_streak)}, until={self._global_backoff_until_t:.2f}",
+            )
+
+    def _resolve_relocalization_plan(
+        self,
+        *,
+        t_cam: float,
+        est_lat: float,
+        est_lon: float,
+        objective_mode: str,
+        force_global: bool,
+        force_local: bool,
+        est_cov_xy: Optional[np.ndarray],
+        phase: Optional[int],
+        since_success_sec: float,
+    ) -> VPSRelocalizationPlan:
+        """Resolve local/global search centers with backoff/probe/recovery policy."""
+        if force_local:
+            self._force_local_streak = int(self._force_local_streak) + 1
+        else:
+            self._force_local_streak = 0
+        if (
+            int(self.config.reloc_busy_backoff_force_local_streak) > 0
+            and int(self._force_local_streak) >= int(self.config.reloc_busy_backoff_force_local_streak)
+        ):
+            self._activate_global_backoff(
+                t_cam=float(t_cam),
+                backoff_sec=float(self.config.reloc_busy_backoff_sec),
+                reason_tag="busy_force_local_streak",
+            )
+
+        force_global_requested = bool(force_global)
+        since_global_sec = float(t_cam - self._last_global_search_time) if np.isfinite(self._last_global_search_time) else float("inf")
+        global_mode, trigger_reason = should_force_global_relocalization(
+            force_global=bool(force_global),
+            accuracy_mode=bool(self.config.accuracy_mode),
+            objective=str(objective_mode).lower(),
+            reloc_enabled=bool(self.config.reloc_enabled),
+            fail_streak=int(self._fail_streak),
+            fail_streak_trigger=int(self.config.reloc_fail_streak_trigger),
+            since_success_sec=float(since_success_sec),
+            stale_success_sec=float(self.config.reloc_stale_success_sec),
+            since_global_sec=since_global_sec,
+            global_interval_sec=float(self.config.reloc_global_interval_sec),
+            est_cov_xy=est_cov_xy,
+            xy_sigma_trigger_m=float(self.config.reloc_xy_sigma_trigger_m),
+            phase=phase,
+            force_global_on_warning_phase=bool(self.config.reloc_force_global_on_warning_phase),
+        )
+        global_probe_allowed = False
+        global_backoff_active = bool(float(t_cam) < float(self._global_backoff_until_t))
+        allow_probe_from_no_coverage = bool(
+            bool(self.config.reloc_global_probe_on_no_coverage)
+            and int(self._no_coverage_streak) >= int(self.config.reloc_global_probe_no_coverage_streak)
+        )
+        if global_backoff_active and (global_mode or allow_probe_from_no_coverage):
+            probe_every = int(self.config.reloc_global_backoff_probe_every_attempts)
+            probe_min_interval = float(self.config.reloc_global_backoff_probe_min_interval_sec)
+            attempts_since_probe = int(self.stats.get("total_attempts", 0)) - int(self._last_backoff_probe_attempt)
+            time_since_probe = float(t_cam - self._last_backoff_probe_time)
+            if (
+                probe_every > 0
+                and attempts_since_probe >= probe_every
+                and time_since_probe >= max(0.0, probe_min_interval)
+            ):
+                global_probe_allowed = True
+                if global_mode:
+                    trigger_reason = "global_backoff_probe"
+                else:
+                    trigger_reason = "global_backoff_probe_recovery"
+                    global_mode = True
+                self._last_backoff_probe_attempt = int(self.stats.get("total_attempts", 0))
+                self._last_backoff_probe_time = float(t_cam)
+                self._global_backoff_probe_count = int(self._global_backoff_probe_count) + 1
+                self.stats["global_backoff_probes"] = int(self._global_backoff_probe_count)
+                self._runtime_log(
+                    "vps_global_probe",
+                    "[VPS] global-search probe allowed during backoff "
+                    f"(attempts_since_probe={attempts_since_probe}, fail_streak={int(self._fail_streak)})",
+                )
+            elif global_mode:
+                global_mode = False
+                trigger_reason = "global_backoff_active"
+        if force_local and global_mode:
+            global_mode = False
+            trigger_reason = "force_local_busy_guard"
+
+        has_last_success_center = bool(
+            np.isfinite(self._last_success_center_lat) and np.isfinite(self._last_success_center_lon)
+        )
+        has_last_coverage_center = bool(
+            np.isfinite(self._last_coverage_center_lat) and np.isfinite(self._last_coverage_center_lon)
+        )
+        use_no_coverage_recovery = bool(
+            int(self._no_coverage_streak) >= int(self.config.reloc_no_coverage_recovery_streak)
+            and (
+                (bool(self.config.reloc_no_coverage_use_last_success) and has_last_success_center)
+                or (bool(self.config.reloc_no_coverage_use_last_coverage) and has_last_coverage_center)
+            )
+        )
+        use_match_recovery = bool(
+            int(self._fail_streak) >= int(self.config.reloc_match_recovery_streak)
+            and float(since_success_sec)
+            >= max(1.0, 0.5 * float(self.config.reloc_stale_success_sec))
+            and (
+                (bool(self.config.reloc_no_coverage_use_last_success) and has_last_success_center)
+                or (bool(self.config.reloc_no_coverage_use_last_coverage) and has_last_coverage_center)
+            )
+        )
+        use_coverage_recovery = bool(use_no_coverage_recovery or use_match_recovery)
+        recovery_source = "none"
+        if use_coverage_recovery and bool(self.config.reloc_no_coverage_use_last_success) and has_last_success_center:
+            search_base_lat = float(self._last_success_center_lat)
+            search_base_lon = float(self._last_success_center_lon)
+            recovery_source = "last_success"
+        elif use_coverage_recovery and bool(self.config.reloc_no_coverage_use_last_coverage) and has_last_coverage_center:
+            search_base_lat = float(self._last_coverage_center_lat)
+            search_base_lon = float(self._last_coverage_center_lon)
+            recovery_source = "last_coverage"
+        else:
+            search_base_lat = float(est_lat)
+            search_base_lon = float(est_lon)
+
+        coverage_recovery_active = False
+        if global_mode:
+            search_centers = build_relocalization_centers(
+                est_lat=search_base_lat,
+                est_lon=search_base_lon,
+                max_centers=int(self.config.reloc_max_centers),
+                ring_radius_m=list(self.config.reloc_ring_radius_m),
+                ring_samples=int(self.config.reloc_ring_samples),
+            )
+            if use_coverage_recovery:
+                coverage_recovery_active = True
+                trigger_reason = (
+                    f"coverage_recovery_{recovery_source}_global"
+                    if trigger_reason in ("", "global_interval", "global_fail_streak")
+                    else f"{trigger_reason}+coverage_recovery"
+                )
+                self.stats["coverage_recovery_used"] = int(self.stats.get("coverage_recovery_used", 0)) + 1
+        else:
+            if use_coverage_recovery:
+                coverage_recovery_active = True
+                self.stats["coverage_recovery_used"] = int(self.stats.get("coverage_recovery_used", 0)) + 1
+                rec_centers = build_relocalization_centers(
+                    est_lat=search_base_lat,
+                    est_lon=search_base_lon,
+                    max_centers=max(1, int(self.config.reloc_no_coverage_max_centers)),
+                    ring_radius_m=list(self.config.reloc_no_coverage_radius_m),
+                    ring_samples=max(1, int(self.config.reloc_no_coverage_samples)),
+                )
+                search_centers = []
+                seen = set()
+                for lat_c, lon_c in rec_centers:
+                    key = (round(float(lat_c), 7), round(float(lon_c), 7))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    search_centers.append((float(lat_c), float(lon_c)))
+                est_key = (round(float(est_lat), 7), round(float(est_lon), 7))
+                if est_key not in seen:
+                    search_centers.append((float(est_lat), float(est_lon)))
+                trigger_reason = (
+                    f"coverage_recovery_{recovery_source}"
+                    if trigger_reason in ("", "local_default", "none")
+                    else f"{trigger_reason}+coverage_recovery"
+                )
+            else:
+                search_centers = [(float(est_lat), float(est_lon))]
+
+        return VPSRelocalizationPlan(
+            global_mode=bool(global_mode),
+            trigger_reason=str(trigger_reason),
+            search_centers=[(float(a), float(b)) for a, b in search_centers],
+            coverage_recovery_active=bool(coverage_recovery_active),
+            global_probe_allowed=bool(global_probe_allowed),
+            force_global_requested=bool(force_global_requested),
+        )
+
+    def _resolve_budget_plan(self, *, raw_num_candidates: int, global_mode: bool) -> VPSBudgetPlan:
+        """Resolve per-frame candidate/time budget with escalator scaling."""
+        num_candidates_base = _resolve_total_candidate_budget(
+            int(raw_num_candidates), int(self.config.max_total_candidates)
+        )
+        frame_budget_ms_base = float(
+            self.config.max_frame_time_ms_global if global_mode else self.config.max_frame_time_ms_local
+        )
+        cand_scale, time_scale = self._budget_escalator_scales()
+        if num_candidates_base > 0:
+            if cand_scale > 1.0:
+                max_raw = max(1, int(raw_num_candidates))
+                cfg_cap = int(self.config.max_total_candidates)
+                if cfg_cap > 0:
+                    max_esc = int(
+                        round(
+                            float(cfg_cap)
+                            * max(1.0, float(self.config.reloc_budget_escalator_max_candidate_scale))
+                        )
+                    )
+                    max_raw = min(max_raw, max(cfg_cap, max_esc))
+                num_candidates = min(
+                    max_raw,
+                    max(1, int(round(float(num_candidates_base) * float(cand_scale)))),
+                )
+            else:
+                num_candidates = int(num_candidates_base)
+        else:
+            num_candidates = 0
+        if frame_budget_ms_base > 0.0 and time_scale > 1.0:
+            frame_budget_ms = float(frame_budget_ms_base) * float(time_scale)
+        else:
+            frame_budget_ms = float(frame_budget_ms_base)
+        return VPSBudgetPlan(
+            raw_num_candidates=int(raw_num_candidates),
+            budget_num_candidates=int(num_candidates),
+            frame_budget_ms=float(frame_budget_ms),
+        )
+
+    def _budget_escalator_scales(self) -> Tuple[float, float]:
+        """Return candidate/time scale from current escalation level."""
+        if not bool(self.config.reloc_budget_escalator_enable):
+            return 1.0, 1.0
+        level = max(0, int(getattr(self, "_budget_escalation_level", 0)))
+        if level <= 0:
+            return 1.0, 1.0
+        cand_scale = 1.0 + float(level) * max(0.0, float(self.config.reloc_budget_escalator_candidate_scale_step))
+        time_scale = 1.0 + float(level) * max(0.0, float(self.config.reloc_budget_escalator_time_scale_step))
+        cand_scale = min(
+            max(1.0, cand_scale),
+            max(1.0, float(self.config.reloc_budget_escalator_max_candidate_scale)),
+        )
+        time_scale = min(
+            max(1.0, time_scale),
+            max(1.0, float(self.config.reloc_budget_escalator_max_time_scale)),
+        )
+        return float(cand_scale), float(time_scale)
+
+    def _budget_escalator_note_budget_stop(self, *, t_cam: float, reason_tag: str) -> None:
+        """Increase escalation level after consecutive budget-stop streaks."""
+        if not bool(self.config.reloc_budget_escalator_enable):
+            return
+        self._budget_success_streak = 0
+        self._budget_escalation_stop_streak = int(self._budget_escalation_stop_streak) + 1
+        trigger = max(1, int(self.config.reloc_budget_escalator_trigger_streak))
+        max_level = max(0, int(self.config.reloc_budget_escalator_max_level))
+        cur_level = max(0, int(getattr(self, "_budget_escalation_level", 0)))
+        if cur_level >= max_level:
+            return
+        if int(self._budget_escalation_stop_streak) < trigger:
+            return
+        self._budget_escalation_level = min(max_level, cur_level + 1)
+        self._budget_escalation_stop_streak = 0
+        self._runtime_log(
+            "vps_budget_escalate",
+            "[VPS] budget escalator up "
+            f"reason={reason_tag}, level={int(self._budget_escalation_level)}/{max_level}",
+        )
+
+    def _budget_escalator_note_success(self) -> None:
+        """Decay escalation level when matches recover consistently."""
+        if not bool(self.config.reloc_budget_escalator_enable):
+            self._budget_escalation_level = 0
+            self._budget_escalation_stop_streak = 0
+            self._budget_success_streak = 0
+            return
+        self._budget_escalation_stop_streak = 0
+        self._budget_success_streak = int(self._budget_success_streak) + 1
+        decay_n = max(1, int(self.config.reloc_budget_escalator_decay_successes))
+        cur_level = max(0, int(getattr(self, "_budget_escalation_level", 0)))
+        if cur_level <= 0:
+            return
+        if int(self._budget_success_streak) < decay_n:
+            return
+        self._budget_escalation_level = max(0, cur_level - 1)
+        self._budget_success_streak = 0
+        self._runtime_log(
+            "vps_budget_decay",
+            "[VPS] budget escalator down "
+            f"level={int(self._budget_escalation_level)}",
+        )
+
+    def _budget_escalator_note_nonbudget_failure(self) -> None:
+        """Reset success streak on non-budget failures (keep current level)."""
+        self._budget_success_streak = 0
     
     @classmethod
     def create_from_config(cls, 
@@ -435,7 +781,8 @@ class VPSRunner:
                 rescue_min_confidence=float(vps_cfg.get("rescue_min_confidence", 0.12)),
                 rescue_max_reproj_error=float(vps_cfg.get("rescue_max_reproj_error", 2.5)),
                 max_image_side=int(vps_cfg.get("max_image_side", 1024)),
-                mps_cache_clear_interval=int(vps_cfg.get("mps_cache_clear_interval", 0)),
+                mps_cache_clear_interval=int(vps_cfg.get("mps_cache_clear_interval", 8)),
+                max_cached_tiles=int(vps_cfg.get("tile_cache_max_tiles", 50)),
                 yaw_hypotheses_deg=yaw_hyp if len(yaw_hyp) > 0 else (0.0, 180.0, 90.0, -90.0),
                 scale_hypotheses=scale_hyp if len(scale_hyp) > 0 else (1.0, 0.90, 1.10),
                 max_candidates=int(vps_cfg.get("max_candidates", 6)),
@@ -447,6 +794,8 @@ class VPSRunner:
                 min_altitude_floor=float(vps_cfg.get("min_altitude_floor", 8.0)),
                 min_altitude_phase_early=float(vps_cfg.get("min_altitude_phase_early", 12.0)),
                 min_altitude_low_speed=float(vps_cfg.get("min_altitude_low_speed", 10.0)),
+                min_altitude_unknown_speed=float(vps_cfg.get("min_altitude_unknown_speed", 12.0)),
+                min_altitude_accuracy_mode=float(vps_cfg.get("min_altitude_accuracy_mode", 10.0)),
                 low_speed_threshold_m_s=float(vps_cfg.get("low_speed_threshold_m_s", 12.0)),
                 min_altitude_high_speed=float(vps_cfg.get("min_altitude_high_speed", 20.0)),
                 high_speed_threshold_m_s=float(vps_cfg.get("high_speed_threshold_m_s", 25.0)),
@@ -459,6 +808,9 @@ class VPSRunner:
                 ),
                 position_first_altitude_bypass_max_m=float(
                     vps_cfg.get("position_first_altitude_bypass_max_m", 1500.0)
+                ),
+                position_first_altitude_bypass_below_floor_m=float(
+                    vps_cfg.get("position_first_altitude_bypass_below_floor_m", 12.0)
                 ),
                 min_content_ratio=float(vps_cfg.get("min_content_ratio", 0.20)),
                 min_texture_std=float(vps_cfg.get("min_texture_std", 8.0)),
@@ -476,6 +828,9 @@ class VPSRunner:
                 reloc_force_global_on_warning_phase=bool(reloc_cfg.get("force_global_on_warning_phase", False)),
                 reloc_global_backoff_fail_streak=int(reloc_cfg.get("global_backoff_fail_streak", 10)),
                 reloc_global_backoff_sec=float(reloc_cfg.get("global_backoff_sec", 8.0)),
+                reloc_backoff_refresh_min_sec=float(
+                    reloc_cfg.get("backoff_refresh_min_sec", 2.0)
+                ),
                 reloc_busy_backoff_force_local_streak=int(
                     reloc_cfg.get("busy_backoff_force_local_streak", 6)
                 ),
@@ -495,6 +850,12 @@ class VPSRunner:
                 reloc_no_coverage_recovery_streak=int(
                     reloc_cfg.get("no_coverage_recovery_streak", 3)
                 ),
+                reloc_no_coverage_fail_streak_cap=int(
+                    reloc_cfg.get("no_coverage_fail_streak_cap", 48)
+                ),
+                reloc_no_coverage_backoff_refresh_min_sec=float(
+                    reloc_cfg.get("no_coverage_backoff_refresh_min_sec", 2.5)
+                ),
                 reloc_no_coverage_use_last_success=bool(
                     reloc_cfg.get("no_coverage_use_last_success", True)
                 ),
@@ -507,6 +868,36 @@ class VPSRunner:
                 reloc_no_coverage_samples=int(reloc_cfg.get("no_coverage_recovery_samples", 6)),
                 reloc_no_coverage_max_centers=int(
                     reloc_cfg.get("no_coverage_recovery_max_centers", 6)
+                ),
+                reloc_budget_stop_fail_accumulate=int(
+                    reloc_cfg.get("budget_stop_fail_accumulate", 3)
+                ),
+                reloc_match_recovery_streak=int(
+                    reloc_cfg.get("match_recovery_streak", 14)
+                ),
+                reloc_budget_escalator_enable=bool(
+                    reloc_cfg.get("budget_escalator_enable", True)
+                ),
+                reloc_budget_escalator_trigger_streak=int(
+                    reloc_cfg.get("budget_escalator_trigger_streak", 3)
+                ),
+                reloc_budget_escalator_max_level=int(
+                    reloc_cfg.get("budget_escalator_max_level", 3)
+                ),
+                reloc_budget_escalator_candidate_scale_step=float(
+                    reloc_cfg.get("budget_escalator_candidate_scale_step", 0.35)
+                ),
+                reloc_budget_escalator_time_scale_step=float(
+                    reloc_cfg.get("budget_escalator_time_scale_step", 0.40)
+                ),
+                reloc_budget_escalator_max_candidate_scale=float(
+                    reloc_cfg.get("budget_escalator_max_candidate_scale", 2.5)
+                ),
+                reloc_budget_escalator_max_time_scale=float(
+                    reloc_cfg.get("budget_escalator_max_time_scale", 2.5)
+                ),
+                reloc_budget_escalator_decay_successes=int(
+                    reloc_cfg.get("budget_escalator_decay_successes", 2)
                 ),
                 runtime_verbosity=str(
                     vps_cfg.get(
@@ -529,7 +920,8 @@ class VPSRunner:
                 f"max_total_candidates={vps_config.max_total_candidates}, "
                 f"budget_ms(local/global)={vps_config.max_frame_time_ms_local:.0f}/{vps_config.max_frame_time_ms_global:.0f}, "
                 f"gbackoff_fail={vps_config.reloc_global_backoff_fail_streak},"
-                f"{vps_config.reloc_global_backoff_sec:.1f}s"
+                f"{vps_config.reloc_global_backoff_sec:.1f}s, "
+                f"budget_escalator={int(bool(vps_config.reloc_budget_escalator_enable))}"
             )
         
         # Create VPSRunner
@@ -656,6 +1048,7 @@ class VPSRunner:
                            stopped_by_time_budget: bool,
                            stopped_by_candidate_budget: bool,
                            fail_streak: int,
+                           budget_escalation_level: int,
                            global_backoff_active: bool,
                            global_backoff_until_t: float,
                            global_probe_allowed: bool,
@@ -687,7 +1080,8 @@ class VPSRunner:
                     f"{int(centers_total)},{int(centers_in_cache)},{int(centers_with_patch)},{int(coverage_found)},"
                     f"{int(raw_num_candidates)},{int(budget_num_candidates)},{int(evaluated_candidates)},"
                     f"{int(stopped_by_time_budget)},{int(stopped_by_candidate_budget)},"
-                    f"{int(fail_streak)},{int(global_backoff_active)},{float(global_backoff_until_t):.6f},"
+                    f"{int(fail_streak)},{int(budget_escalation_level)},"
+                    f"{int(global_backoff_active)},{float(global_backoff_until_t):.6f},"
                     f"{int(global_probe_allowed)},{int(no_coverage_streak)},{int(coverage_recovery_active)},"
                     f"{float(state_speed_m_s):.3f},{float(since_success_sec):.3f},"
                     f"{int(agl_gate_open)},{float(agl_hysteresis_m):.3f},"
@@ -769,6 +1163,9 @@ class VPSRunner:
         state_speed_val = float(state_speed_m_s) if state_speed_m_s is not None else float("nan")
         if not np.isfinite(state_speed_val):
             state_speed_val = float("nan")
+        objective_mode = str(objective).lower()
+        if objective_mode == "":
+            objective_mode = "accuracy" if bool(self.config.accuracy_mode) else "stability"
         alt_min_dynamic = float(self.config.min_altitude)
         alt_max_dynamic = float(self.config.max_altitude)
         agl_hyst = max(0.0, float(self.config.altitude_gate_hysteresis_m))
@@ -780,6 +1177,10 @@ class VPSRunner:
                 alt_min_dynamic = min(alt_min_dynamic, float(self.config.min_altitude_low_speed))
             if np.isfinite(state_speed_val) and state_speed_val >= float(self.config.high_speed_threshold_m_s):
                 alt_min_dynamic = min(alt_min_dynamic, float(self.config.min_altitude_high_speed))
+            if not np.isfinite(state_speed_val):
+                alt_min_dynamic = min(alt_min_dynamic, float(self.config.min_altitude_unknown_speed))
+            if str(objective_mode).lower() == "accuracy" or bool(self.config.accuracy_mode):
+                alt_min_dynamic = min(alt_min_dynamic, float(self.config.min_altitude_accuracy_mode))
             if int(getattr(self, "_no_coverage_streak", 0)) >= int(self.config.reloc_no_coverage_recovery_streak):
                 alt_min_dynamic = min(alt_min_dynamic, float(self.config.min_altitude_high_speed))
             alt_min_dynamic = max(float(self.config.min_altitude_floor), alt_min_dynamic)
@@ -818,6 +1219,12 @@ class VPSRunner:
             self.stats["evaluated_candidates_samples"] = int(
                 self.stats.get("evaluated_candidates_samples", 0)
             ) + 1
+            self.stats["budget_escalation_level_sum"] = float(
+                self.stats.get("budget_escalation_level_sum", 0.0)
+            ) + float(max(0, int(getattr(self, "_budget_escalation_level", 0))))
+            self.stats["budget_escalation_level_samples"] = int(
+                self.stats.get("budget_escalation_level_samples", 0)
+            ) + 1
             if stopped_by_time_budget:
                 self.stats["time_budget_stops"] = int(self.stats.get("time_budget_stops", 0)) + 1
             if stopped_by_candidate_budget:
@@ -828,31 +1235,40 @@ class VPSRunner:
         def _attempt_wall_ms() -> float:
             return float((time.time() - t_start) * 1000.0)
 
-        def _activate_global_backoff(backoff_sec: float, reason_tag: str):
-            if backoff_sec <= 0.0:
-                return
-            now_t = float(t_cam)
-            new_until = now_t + float(backoff_sec)
-            if new_until > float(self._global_backoff_until_t):
-                self._global_backoff_until_t = float(new_until)
-                self._global_backoff_trigger_count = int(self._global_backoff_trigger_count) + 1
-                self.stats["global_backoff_triggers"] = int(self._global_backoff_trigger_count)
-                self._runtime_log(
-                    "vps_global_backoff",
-                    "[VPS] global-search backoff "
-                    f"reason={reason_tag}, duration={backoff_sec:.1f}s, "
-                    f"fail_streak={int(self._fail_streak)}, until={self._global_backoff_until_t:.2f}",
-                )
-
         def _maybe_backoff_after_failure(reason_tag: str):
             threshold = int(self.config.reloc_global_backoff_fail_streak)
             if reason_tag == "no_coverage":
                 threshold = max(threshold + 2, int(self.config.reloc_no_coverage_recovery_streak) + 2)
             elif reason_tag in ("time_budget_stop", "candidate_budget_stop"):
-                threshold = max(threshold + 2, 8)
+                threshold = max(threshold + 3, 10)
+                # Budget-stop is often a throughput symptom rather than geometry failure.
+                # When we had a recent VPS success, avoid entering global backoff lockout.
+                recent_success_guard = max(
+                    2.0,
+                    0.35 * float(self.config.reloc_stale_success_sec),
+                )
+                recovery_guard = max(1, int(self.config.reloc_no_coverage_recovery_streak))
+                if (
+                    np.isfinite(since_success_sec)
+                    and float(since_success_sec) <= float(recent_success_guard)
+                    and int(self._no_coverage_streak) < recovery_guard
+                ):
+                    return
             if threshold <= 0:
                 return
             if int(self._fail_streak) < threshold:
+                return
+            # Avoid perpetual extension of global-backoff by refreshing only near expiry.
+            refresh_guard = max(
+                0.0,
+                float(self.config.reloc_backoff_refresh_min_sec),
+            )
+            if reason_tag == "no_coverage":
+                refresh_guard = max(
+                    refresh_guard,
+                    float(self.config.reloc_no_coverage_backoff_refresh_min_sec),
+                )
+            if float(self._global_backoff_until_t) > (float(t_cam) + refresh_guard):
                 return
             if reason_tag in {
                 "no_coverage",
@@ -865,154 +1281,28 @@ class VPSRunner:
                 "pose_estimation_failed",
                 "pose_estimation_exception",
             }:
-                _activate_global_backoff(
-                    float(self.config.reloc_global_backoff_sec),
+                self._activate_global_backoff(
+                    t_cam=float(t_cam),
+                    backoff_sec=float(self.config.reloc_global_backoff_sec),
                     reason_tag=f"fail_streak_{reason_tag}",
                 )
-
-        if force_local:
-            self._force_local_streak = int(self._force_local_streak) + 1
-        else:
-            self._force_local_streak = 0
-        if (
-            int(self.config.reloc_busy_backoff_force_local_streak) > 0
-            and int(self._force_local_streak) >= int(self.config.reloc_busy_backoff_force_local_streak)
-        ):
-            _activate_global_backoff(
-                float(self.config.reloc_busy_backoff_sec),
-                reason_tag="busy_force_local_streak",
-            )
-
-        force_global_requested = bool(force_global)
-        objective_mode = str(objective).lower()
-        if objective_mode == "":
-            objective_mode = "accuracy" if bool(self.config.accuracy_mode) else "stability"
-
-        since_global_sec = float(t_cam - self._last_global_search_time) if np.isfinite(self._last_global_search_time) else float("inf")
-        global_mode, trigger_reason = should_force_global_relocalization(
+        reloc_plan = self._resolve_relocalization_plan(
+            t_cam=float(t_cam),
+            est_lat=float(est_lat),
+            est_lon=float(est_lon),
+            objective_mode=str(objective_mode),
             force_global=bool(force_global),
-            accuracy_mode=bool(self.config.accuracy_mode),
-            objective=objective_mode,
-            reloc_enabled=bool(self.config.reloc_enabled),
-            fail_streak=int(self._fail_streak),
-            fail_streak_trigger=int(self.config.reloc_fail_streak_trigger),
-            since_success_sec=since_success_sec,
-            stale_success_sec=float(self.config.reloc_stale_success_sec),
-            since_global_sec=since_global_sec,
-            global_interval_sec=float(self.config.reloc_global_interval_sec),
+            force_local=bool(force_local),
             est_cov_xy=est_cov_xy,
-            xy_sigma_trigger_m=float(self.config.reloc_xy_sigma_trigger_m),
             phase=phase,
-            force_global_on_warning_phase=bool(self.config.reloc_force_global_on_warning_phase),
+            since_success_sec=float(since_success_sec),
         )
-        global_backoff_active = bool(float(t_cam) < float(self._global_backoff_until_t))
-        allow_probe_from_no_coverage = bool(
-            bool(self.config.reloc_global_probe_on_no_coverage)
-            and int(self._no_coverage_streak) >= int(self.config.reloc_global_probe_no_coverage_streak)
-        )
-        if global_backoff_active and (global_mode or allow_probe_from_no_coverage):
-            probe_every = int(self.config.reloc_global_backoff_probe_every_attempts)
-            probe_min_interval = float(self.config.reloc_global_backoff_probe_min_interval_sec)
-            attempts_since_probe = int(self.stats.get("total_attempts", 0)) - int(self._last_backoff_probe_attempt)
-            time_since_probe = float(t_cam - self._last_backoff_probe_time)
-            if (
-                probe_every > 0
-                and attempts_since_probe >= probe_every
-                and time_since_probe >= max(0.0, probe_min_interval)
-            ):
-                global_probe_allowed = True
-                if global_mode:
-                    trigger_reason = "global_backoff_probe"
-                else:
-                    trigger_reason = "global_backoff_probe_recovery"
-                    global_mode = True
-                self._last_backoff_probe_attempt = int(self.stats.get("total_attempts", 0))
-                self._last_backoff_probe_time = float(t_cam)
-                self._global_backoff_probe_count = int(self._global_backoff_probe_count) + 1
-                self.stats["global_backoff_probes"] = int(self._global_backoff_probe_count)
-                self._runtime_log(
-                    "vps_global_probe",
-                    "[VPS] global-search probe allowed during backoff "
-                    f"(attempts_since_probe={attempts_since_probe}, fail_streak={int(self._fail_streak)})",
-                )
-            elif global_mode:
-                global_mode = False
-                trigger_reason = "global_backoff_active"
-        if force_local and global_mode:
-            global_mode = False
-            trigger_reason = "force_local_busy_guard"
-
-        has_last_success_center = bool(
-            np.isfinite(self._last_success_center_lat) and np.isfinite(self._last_success_center_lon)
-        )
-        has_last_coverage_center = bool(
-            np.isfinite(self._last_coverage_center_lat) and np.isfinite(self._last_coverage_center_lon)
-        )
-        use_coverage_recovery = bool(
-            int(self._no_coverage_streak) >= int(self.config.reloc_no_coverage_recovery_streak)
-            and (
-                (bool(self.config.reloc_no_coverage_use_last_success) and has_last_success_center)
-                or (bool(self.config.reloc_no_coverage_use_last_coverage) and has_last_coverage_center)
-            )
-        )
-        recovery_source = "none"
-        if use_coverage_recovery and bool(self.config.reloc_no_coverage_use_last_success) and has_last_success_center:
-            search_base_lat = float(self._last_success_center_lat)
-            search_base_lon = float(self._last_success_center_lon)
-            recovery_source = "last_success"
-        elif use_coverage_recovery and bool(self.config.reloc_no_coverage_use_last_coverage) and has_last_coverage_center:
-            search_base_lat = float(self._last_coverage_center_lat)
-            search_base_lon = float(self._last_coverage_center_lon)
-            recovery_source = "last_coverage"
-        else:
-            search_base_lat = float(est_lat)
-            search_base_lon = float(est_lon)
-
-        if global_mode:
-            search_centers = build_relocalization_centers(
-                est_lat=search_base_lat,
-                est_lon=search_base_lon,
-                max_centers=int(self.config.reloc_max_centers),
-                ring_radius_m=list(self.config.reloc_ring_radius_m),
-                ring_samples=int(self.config.reloc_ring_samples),
-            )
-            if use_coverage_recovery:
-                coverage_recovery_active = True
-                trigger_reason = (
-                    f"coverage_recovery_{recovery_source}_global"
-                    if trigger_reason in ("", "global_interval", "global_fail_streak")
-                    else f"{trigger_reason}+coverage_recovery"
-                )
-                self.stats["coverage_recovery_used"] = int(self.stats.get("coverage_recovery_used", 0)) + 1
-        else:
-            if use_coverage_recovery:
-                coverage_recovery_active = True
-                self.stats["coverage_recovery_used"] = int(self.stats.get("coverage_recovery_used", 0)) + 1
-                rec_centers = build_relocalization_centers(
-                    est_lat=search_base_lat,
-                    est_lon=search_base_lon,
-                    max_centers=max(1, int(self.config.reloc_no_coverage_max_centers)),
-                    ring_radius_m=list(self.config.reloc_no_coverage_radius_m),
-                    ring_samples=max(1, int(self.config.reloc_no_coverage_samples)),
-                )
-                search_centers = []
-                seen = set()
-                for lat_c, lon_c in rec_centers:
-                    key = (round(float(lat_c), 7), round(float(lon_c), 7))
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    search_centers.append((float(lat_c), float(lon_c)))
-                est_key = (round(float(est_lat), 7), round(float(est_lon), 7))
-                if est_key not in seen:
-                    search_centers.append((float(est_lat), float(est_lon)))
-                trigger_reason = (
-                    f"coverage_recovery_{recovery_source}"
-                    if trigger_reason in ("", "local_default", "none")
-                    else f"{trigger_reason}+coverage_recovery"
-                )
-            else:
-                search_centers = [(float(est_lat), float(est_lon))]
+        global_mode = bool(reloc_plan.global_mode)
+        trigger_reason = str(reloc_plan.trigger_reason)
+        search_centers = list(reloc_plan.search_centers)
+        coverage_recovery_active = bool(reloc_plan.coverage_recovery_active)
+        global_probe_allowed = bool(reloc_plan.global_probe_allowed)
+        force_global_requested = bool(reloc_plan.force_global_requested)
         if global_mode:
             self.stats['global_search'] += 1
             self._last_global_search_time = float(t_cam)
@@ -1121,6 +1411,7 @@ class VPSRunner:
                 stopped_by_time_budget=bool(stopped_by_time_budget),
                 stopped_by_candidate_budget=bool(stopped_by_candidate_budget),
                 fail_streak=int(self._fail_streak),
+                budget_escalation_level=int(getattr(self, "_budget_escalation_level", 0)),
                 global_backoff_active=bool(float(t_cam) < float(self._global_backoff_until_t)),
                 global_backoff_until_t=float(self._global_backoff_until_t),
                 global_probe_allowed=bool(global_probe_allowed),
@@ -1152,7 +1443,12 @@ class VPSRunner:
             if (
                 pos_first_bypass
                 and np.isfinite(est_alt_f)
-                and float(self.config.position_first_altitude_bypass_min_m) <= est_alt_f <= float(self.config.position_first_altitude_bypass_max_m)
+                and max(
+                    float(self.config.position_first_altitude_bypass_min_m),
+                    float(self.config.min_altitude_floor) - float(self.config.position_first_altitude_bypass_below_floor_m),
+                )
+                <= est_alt_f
+                <= float(self.config.position_first_altitude_bypass_max_m)
             ):
                 altitude_ok = True
                 self._altitude_gate_open = True
@@ -1172,6 +1468,9 @@ class VPSRunner:
         if img is None or getattr(img, "size", 0) == 0:
             self.stats['fail_match'] += 1
             self._fail_streak += 1
+            self._budget_stop_streak = 0
+            self._budget_escalation_stop_streak = 0
+            self._budget_escalator_note_nonbudget_failure()
             _log_attempt_and_profile(False, "empty_input_image")
             _log_reloc(False, "empty_input_image")
             return None
@@ -1180,13 +1479,13 @@ class VPSRunner:
         camera_yaw_base = est_yaw + self.camera_yaw_offset_rad
         candidates = self._build_preprocess_candidates(global_mode=global_mode, objective=objective_mode)
         centers_total = int(len(search_centers))
-        raw_num_candidates = len(candidates) * max(1, centers_total)
-        num_candidates = _resolve_total_candidate_budget(
-            raw_num_candidates, int(self.config.max_total_candidates)
+        budget_plan = self._resolve_budget_plan(
+            raw_num_candidates=int(len(candidates) * max(1, centers_total)),
+            global_mode=bool(global_mode),
         )
-        frame_budget_ms = float(
-            self.config.max_frame_time_ms_global if global_mode else self.config.max_frame_time_ms_local
-        )
+        raw_num_candidates = int(budget_plan.raw_num_candidates)
+        num_candidates = int(budget_plan.budget_num_candidates)
+        frame_budget_ms = float(budget_plan.frame_budget_ms)
 
         for center_idx, (center_lat, center_lon) in enumerate(search_centers):
             if not self.tile_cache.is_position_in_cache(center_lat, center_lon):
@@ -1397,13 +1696,81 @@ class VPSRunner:
             else:
                 self.stats['fail_no_coverage'] += 1
                 self._no_coverage_streak = int(self._no_coverage_streak) + 1
-            self._fail_streak += 1
             if stopped_by_time_budget:
                 fail_reason = "time_budget_stop"
             elif stopped_by_candidate_budget:
                 fail_reason = "candidate_budget_stop"
             else:
                 fail_reason = "match_failed" if coverage_found else "no_coverage"
+            # Partial-progress path: if search stopped by budget but best candidate quality
+            # is already near fail-soft acceptance, treat as soft failure (no hard streak bump).
+            budget_partial_progress = False
+            if fail_reason in ("time_budget_stop", "candidate_budget_stop") and coverage_found:
+                partial_min_inliers = max(3, int(getattr(self.config, "failsoft_min_inliers", 5)))
+                partial_min_conf = max(0.02, 0.8 * float(getattr(self.config, "failsoft_min_confidence", 0.10)))
+                partial_max_reproj = max(
+                    1.0,
+                    float(getattr(self.config, "failsoft_max_reproj_error", 1.2)) * 1.3,
+                )
+                if (
+                    int(best_num_inliers) >= int(partial_min_inliers)
+                    and np.isfinite(best_conf)
+                    and float(best_conf) >= float(partial_min_conf)
+                    and np.isfinite(best_reproj)
+                    and float(best_reproj) <= float(partial_max_reproj)
+                ):
+                    budget_partial_progress = True
+
+            if budget_partial_progress:
+                self._budget_stop_streak = 0
+                self._budget_escalation_stop_streak = 0
+                self._budget_success_streak = 0
+                self._fail_streak = max(0, int(self._fail_streak) - 1)
+                self._runtime_log(
+                    "vps_budget_partial_progress",
+                    "[VPS] budget-stop partial progress: "
+                    f"reason={fail_reason}, inliers={int(best_num_inliers)}, "
+                    f"conf={float(best_conf):.3f}, reproj={float(best_reproj):.2f}px, "
+                    f"fail_streak={int(self._fail_streak)}",
+                )
+                _log_attempt_and_profile(False, f"{fail_reason}_partial_progress")
+                _log_reloc(False, f"{fail_reason}_partial_progress")
+                return None
+            if fail_reason in ("time_budget_stop", "candidate_budget_stop"):
+                # Budget stops are partial failures; accumulate before bumping fail-streak.
+                self._budget_stop_streak = int(self._budget_stop_streak) + 1
+                self._budget_success_streak = 0
+                budget_accumulate = max(1, int(self.config.reloc_budget_stop_fail_accumulate))
+                recent_success_guard = max(
+                    4.0,
+                    0.60 * float(self.config.reloc_stale_success_sec),
+                )
+                recovery_guard = max(1, int(self.config.reloc_no_coverage_recovery_streak))
+                can_escalate_budget_stop = (
+                    (not np.isfinite(since_success_sec))
+                    or float(since_success_sec) > float(recent_success_guard)
+                    or int(self._no_coverage_streak) >= recovery_guard
+                )
+                if can_escalate_budget_stop:
+                    self._budget_escalator_note_budget_stop(
+                        t_cam=float(t_cam),
+                        reason_tag=str(fail_reason),
+                    )
+                if can_escalate_budget_stop and int(self._budget_stop_streak) >= budget_accumulate:
+                    self._fail_streak += 1
+                    self._budget_stop_streak = 0
+            else:
+                self._budget_stop_streak = 0
+                self._budget_escalation_stop_streak = 0
+                self._budget_escalator_note_nonbudget_failure()
+                if coverage_found:
+                    self._fail_streak += 1
+                else:
+                    no_cov_cap = int(self.config.reloc_no_coverage_fail_streak_cap)
+                    if no_cov_cap > 0:
+                        self._fail_streak = min(no_cov_cap, int(self._fail_streak) + 1)
+                    else:
+                        self._fail_streak += 1
             _maybe_backoff_after_failure(fail_reason)
             _log_attempt_and_profile(False, fail_reason)
             _log_reloc(False, fail_reason)
@@ -1415,6 +1782,9 @@ class VPSRunner:
         if selected_reason == "match_failed":
             self.stats['fail_match'] += 1
             self._no_coverage_streak = 0
+            self._budget_stop_streak = 0
+            self._budget_escalation_stop_streak = 0
+            self._budget_escalator_note_nonbudget_failure()
             self._fail_streak += 1
             _maybe_backoff_after_failure("match_failed")
             _save_match_visualization("match_failed", preprocess_result, map_patch, match_result)
@@ -1426,6 +1796,9 @@ class VPSRunner:
         if selected_reason != "matched_failsoft" and match_result.num_inliers < self.config.min_inliers:
             self.stats['fail_quality'] += 1
             self._no_coverage_streak = 0
+            self._budget_stop_streak = 0
+            self._budget_escalation_stop_streak = 0
+            self._budget_escalator_note_nonbudget_failure()
             self._fail_streak += 1
             _maybe_backoff_after_failure("quality_inliers")
             _save_match_visualization("quality_inliers", preprocess_result, map_patch, match_result)
@@ -1436,6 +1809,9 @@ class VPSRunner:
         if selected_reason != "matched_failsoft" and match_result.reproj_error > self.config.max_reproj_error:
             self.stats['fail_quality'] += 1
             self._no_coverage_streak = 0
+            self._budget_stop_streak = 0
+            self._budget_escalation_stop_streak = 0
+            self._budget_escalator_note_nonbudget_failure()
             self._fail_streak += 1
             _maybe_backoff_after_failure("quality_reproj")
             _save_match_visualization("quality_reproj", preprocess_result, map_patch, match_result)
@@ -1446,6 +1822,9 @@ class VPSRunner:
         if selected_reason != "matched_failsoft" and match_result.confidence < self.config.min_confidence:
             self.stats['fail_quality'] += 1
             self._no_coverage_streak = 0
+            self._budget_stop_streak = 0
+            self._budget_escalation_stop_streak = 0
+            self._budget_escalator_note_nonbudget_failure()
             self._fail_streak += 1
             _maybe_backoff_after_failure("quality_confidence")
             _save_match_visualization("quality_confidence", preprocess_result, map_patch, match_result)
@@ -1466,6 +1845,9 @@ class VPSRunner:
         except Exception:
             self.stats['fail_match'] += 1
             self._no_coverage_streak = 0
+            self._budget_stop_streak = 0
+            self._budget_escalation_stop_streak = 0
+            self._budget_escalator_note_nonbudget_failure()
             self._fail_streak += 1
             _maybe_backoff_after_failure("pose_estimation_exception")
             _log_attempt_and_profile(False, "pose_estimation_exception")
@@ -1476,6 +1858,9 @@ class VPSRunner:
         if vps_measurement is None:
             self.stats['fail_match'] += 1
             self._no_coverage_streak = 0
+            self._budget_stop_streak = 0
+            self._budget_escalation_stop_streak = 0
+            self._budget_escalator_note_nonbudget_failure()
             self._fail_streak += 1
             _maybe_backoff_after_failure("pose_estimation_failed")
             _save_match_visualization("pose_failed", preprocess_result, map_patch, match_result)
@@ -1492,11 +1877,23 @@ class VPSRunner:
         self.stats['success'] += 1
         self._fail_streak = 0
         self._no_coverage_streak = 0
+        self._budget_stop_streak = 0
+        self._budget_escalator_note_success()
         self.last_update_time = t_cam
         self._last_success_time = float(t_cam)
         self._last_success_center_lat = float(selected_center_lat)
         self._last_success_center_lon = float(selected_center_lon)
         self.last_result = vps_measurement
+
+        # Optional metadata for downstream position/yaw arbitration.
+        # Keep this lightweight and deterministic so VIO can choose
+        # strict/failsoft/direct lanes without re-deriving matcher intent.
+        success_reason = "matched_failsoft" if selected_reason == "matched_failsoft" else "matched"
+        try:
+            setattr(vps_measurement, "match_reason", str(success_reason))
+            setattr(vps_measurement, "match_is_failsoft", bool(success_reason == "matched_failsoft"))
+        except Exception:
+            pass
 
         # Optional yaw hint metadata for backend factor-lite.
         # This is a weak hint (not direct EKF apply) and must be quality-gated upstream.
@@ -1519,7 +1916,6 @@ class VPSRunner:
             pass
         
         # Log processing time
-        success_reason = "matched_failsoft" if selected_reason == "matched_failsoft" else "matched"
         processing_time_ms = _log_attempt_and_profile(True, success_reason)
         
         # Debug logging
@@ -1580,6 +1976,8 @@ class VPSRunner:
         wall_vals = wall_vals[np.isfinite(wall_vals)]
         eval_samples = int(self.stats.get("evaluated_candidates_samples", 0))
         eval_total = int(self.stats.get("evaluated_candidates_total", 0))
+        esc_samples = int(self.stats.get("budget_escalation_level_samples", 0))
+        esc_sum = float(self.stats.get("budget_escalation_level_sum", 0.0))
         return {
             "attempt_ms_p50": float(np.percentile(wall_vals, 50.0)) if wall_vals.size > 0 else float("nan"),
             "attempt_ms_p95": float(np.percentile(wall_vals, 95.0)) if wall_vals.size > 0 else float("nan"),
@@ -1589,7 +1987,48 @@ class VPSRunner:
             "evaluated_candidates_mean": (
                 float(eval_total / max(1, eval_samples)) if eval_samples > 0 else float("nan")
             ),
+            "budget_escalation_level_mean": (
+                float(esc_sum / max(1, esc_samples)) if esc_samples > 0 else float("nan")
+            ),
         }
+
+    def compact_runtime_caches(
+        self,
+        *,
+        max_cached_tiles: Optional[int] = None,
+        keep_attempt_wall_samples: int = 1200,
+    ) -> Dict[str, float]:
+        """
+        Compact VPS runtime caches during long runs.
+
+        Returns compact stats for observability.
+        """
+        comp: Dict[str, float] = {
+            "tile_before": float("nan"),
+            "tile_after": float("nan"),
+            "tile_dropped": 0.0,
+            "wall_before": float("nan"),
+            "wall_after": float("nan"),
+        }
+        try:
+            tile_stats = self.tile_cache.compact_cache(max_cached_tiles=max_cached_tiles)
+            comp["tile_before"] = float(tile_stats.get("before", 0))
+            comp["tile_after"] = float(tile_stats.get("after", 0))
+            comp["tile_dropped"] = float(tile_stats.get("dropped", 0))
+        except Exception:
+            pass
+        vals = self.stats.get("attempt_wall_ms", [])
+        if isinstance(vals, list):
+            comp["wall_before"] = float(len(vals))
+            keep_n = max(100, int(keep_attempt_wall_samples))
+            if len(vals) > keep_n:
+                del vals[: len(vals) - keep_n]
+            comp["wall_after"] = float(len(vals))
+        try:
+            self.matcher.clear_device_cache()
+        except Exception:
+            pass
+        return comp
     
     def print_statistics(self):
         """Print statistics summary."""
@@ -1606,7 +2045,8 @@ class VPSRunner:
             f" p50={runtime['attempt_ms_p50']:.1f}ms,"
             f" p95={runtime['attempt_ms_p95']:.1f}ms,"
             f" budget_stops={int(runtime['time_budget_stops'])},"
-            f" cand_mean={runtime['evaluated_candidates_mean']:.2f}"
+            f" cand_mean={runtime['evaluated_candidates_mean']:.2f},"
+            f" esc_lvl={runtime['budget_escalation_level_mean']:.2f}"
         )
     
     def set_logger(self, logger):
@@ -1636,7 +2076,8 @@ class VPSRunner:
                 f"attempt_p95={runtime['attempt_ms_p95']:.1f}ms, "
                 f"time_budget_stops={int(runtime['time_budget_stops'])}, "
                 f"candidate_budget_stops={int(runtime['candidate_budget_stops'])}, "
-                f"eval_cand_mean={runtime['evaluated_candidates_mean']:.2f}"
+                f"eval_cand_mean={runtime['evaluated_candidates_mean']:.2f}, "
+                f"budget_escalation_mean={runtime['budget_escalation_level_mean']:.2f}"
             )
         except Exception:
             pass

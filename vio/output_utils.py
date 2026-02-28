@@ -468,7 +468,15 @@ def append_benchmark_health_summary(summary_csv: Optional[str],
                                     vps_attempt_ms_p50: float = float("nan"),
                                     vps_attempt_ms_p95: float = float("nan"),
                                     vps_time_budget_stops: float = float("nan"),
+                                    vps_candidate_budget_stops: float = float("nan"),
                                     vps_evaluated_candidates_mean: float = float("nan"),
+                                    vps_budget_escalation_level_mean: float = float("nan"),
+                                    vps_failsoft_matched_count: float = float("nan"),
+                                    vps_failsoft_applied_count: float = float("nan"),
+                                    vps_failsoft_apply_ratio: float = float("nan"),
+                                    vps_direct_xy_apply_count: float = float("nan"),
+                                    vps_direct_xy_reject_consensus_count: float = float("nan"),
+                                    vps_direct_xy_reject_budget_count: float = float("nan"),
                                     policy_conflict_count: float = float("nan"),
                                     heading_owner_switch_count: float = float("nan"),
                                     heading_owner_mag_ratio: float = float("nan"),
@@ -486,6 +494,11 @@ def append_benchmark_health_summary(summary_csv: Optional[str],
                                     backend_snap_reject_count: float = float("nan"),
                                     backend_apply_latency_ms_p95: float = float("nan"),
                                     backend_contract_violation_count: float = float("nan"),
+                                    memory_peak_rss_mb: float = float("nan"),
+                                    memory_peak_vms_mb: float = float("nan"),
+                                    memory_peak_uss_mb: float = float("nan"),
+                                    memory_compact_count: float = float("nan"),
+                                    memory_pressure_events: float = float("nan"),
                                     rtf_proc_sim: float = float("nan")):
     """Append one benchmark-health summary row."""
     if summary_csv is None:
@@ -508,7 +521,13 @@ def append_benchmark_health_summary(summary_csv: Optional[str],
                 f"{backend_poll_count:.6f},{vps_attempt_count:.6f},"
                 f"{vps_worker_busy_skips:.6f},{vps_attempt_ms_p50:.6f},"
                 f"{vps_attempt_ms_p95:.6f},{vps_time_budget_stops:.6f},"
-                f"{vps_evaluated_candidates_mean:.6f},{policy_conflict_count:.6f},"
+                f"{vps_candidate_budget_stops:.6f},{vps_evaluated_candidates_mean:.6f},"
+                f"{vps_budget_escalation_level_mean:.6f},"
+                f"{vps_failsoft_matched_count:.6f},{vps_failsoft_applied_count:.6f},"
+                f"{vps_failsoft_apply_ratio:.6f},"
+                f"{vps_direct_xy_apply_count:.6f},{vps_direct_xy_reject_consensus_count:.6f},"
+                f"{vps_direct_xy_reject_budget_count:.6f},"
+                f"{policy_conflict_count:.6f},"
                 f"{heading_owner_switch_count:.6f},{heading_owner_mag_ratio:.6f},"
                 f"{heading_owner_loop_ratio:.6f},{heading_owner_backend_ratio:.6f},"
                 f"{heading_owner_hold_ratio:.6f},"
@@ -518,6 +537,8 @@ def append_benchmark_health_summary(summary_csv: Optional[str],
                 f"{backend_stale_ratio:.6f},{backend_emit_to_apply_ratio:.6f},"
                 f"{backend_apply_quality_p50:.6f},{backend_snap_reject_count:.6f},"
                 f"{backend_apply_latency_ms_p95:.6f},{backend_contract_violation_count:.6f},"
+                f"{memory_peak_rss_mb:.6f},{memory_peak_vms_mb:.6f},{memory_peak_uss_mb:.6f},"
+                f"{memory_compact_count:.6f},{memory_pressure_events:.6f},"
                 f"{rtf_proc_sim:.6f}\n"
             )
     except Exception:
@@ -1471,12 +1492,21 @@ def init_output_csvs(output_dir: str, save_debug_data: bool = False) -> Dict[str
             "best_confidence,selected_yaw_deg,selected_scale,"
             "centers_total,centers_in_cache,centers_with_patch,coverage_found,"
             "raw_num_candidates,budget_num_candidates,evaluated_candidates,"
-            "stopped_by_time_budget,stopped_by_candidate_budget,fail_streak,"
+            "stopped_by_time_budget,stopped_by_candidate_budget,fail_streak,budget_escalation_level,"
             "global_backoff_active,global_backoff_until_t,global_probe_allowed,"
             "no_coverage_streak,coverage_recovery_active,state_speed_m_s,since_success_sec,"
             "agl_gate_open,agl_hysteresis_m,agl_gate_min_thresh,agl_gate_max_thresh,"
             "attempt_wall_ms,"
             "success,reason\n"
+        )
+
+    # VPS position controller trace (always-on lightweight diagnostics)
+    paths['vps_position_trace_csv'] = os.path.join(output_dir, "vps_position_trace.csv")
+    with open(paths['vps_position_trace_csv'], "w", newline="") as f:
+        f.write(
+            "t,frame,match_reason,quality_mode,allow_direct_xy_apply,"
+            "direct_xy_candidate,hint_quality,offset_m,inliers,confidence,reproj_error,"
+            "applied,reason_code,policy_note,hard_note,temporal_note,direct_note\n"
         )
 
     # Single-authority policy traces
@@ -1527,7 +1557,12 @@ def init_output_csvs(output_dir: str, save_debug_data: bool = False) -> Dict[str
             "backend_apply_count,backend_stale_drop_count,backend_emit_stale_drop_count,"
             "backend_overwrite_count,backend_poll_count,"
             "vps_attempt_count,vps_worker_busy_skips,vps_attempt_ms_p50,vps_attempt_ms_p95,"
-            "vps_time_budget_stops,vps_evaluated_candidates_mean,policy_conflict_count,"
+            "vps_time_budget_stops,vps_candidate_budget_stops,vps_evaluated_candidates_mean,"
+            "vps_budget_escalation_level_mean,"
+            "vps_failsoft_matched_count,vps_failsoft_applied_count,vps_failsoft_apply_ratio,"
+            "vps_direct_xy_apply_count,vps_direct_xy_reject_consensus_count,"
+            "vps_direct_xy_reject_budget_count,"
+            "policy_conflict_count,"
             "heading_owner_switch_count,heading_owner_mag_ratio,heading_owner_loop_ratio,"
             "heading_owner_backend_ratio,heading_owner_hold_ratio,"
             "yaw_owner_mag_block_count,yaw_owner_mag_block_ratio,"
@@ -1535,6 +1570,8 @@ def init_output_csvs(output_dir: str, save_debug_data: bool = False) -> Dict[str
             "msckf_quality_p50,msckf_quality_p10,"
             "backend_stale_ratio,backend_emit_to_apply_ratio,backend_apply_quality_p50,"
             "backend_snap_reject_count,backend_apply_latency_ms_p95,backend_contract_violation_count,"
+            "memory_peak_rss_mb,memory_peak_vms_mb,memory_peak_uss_mb,"
+            "memory_compact_count,memory_pressure_events,"
             "rtf_proc_sim\n"
         )
 

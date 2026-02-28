@@ -716,6 +716,18 @@ class OutputReportingService:
         vps_attempt_count = float(int(getattr(self.runner, "_vps_attempt_count", 0)))
         abs_corr_apply_count = float(int(getattr(self.runner, "_abs_corr_apply_count", 0)))
         abs_corr_soft_count = float(int(getattr(self.runner, "_abs_corr_soft_count", 0)))
+        vps_failsoft_matched_count = float(int(getattr(self.runner, "_vps_failsoft_matched_count", 0)))
+        vps_failsoft_applied_count = float(int(getattr(self.runner, "_vps_failsoft_applied_count", 0)))
+        vps_failsoft_apply_ratio = float("nan")
+        if vps_failsoft_matched_count > 0:
+            vps_failsoft_apply_ratio = float(vps_failsoft_applied_count / vps_failsoft_matched_count)
+        vps_direct_xy_apply_count = float(int(getattr(self.runner, "_vps_direct_xy_apply_count", 0)))
+        vps_direct_xy_reject_consensus_count = float(
+            int(getattr(self.runner, "_vps_direct_xy_reject_consensus_count", 0))
+        )
+        vps_direct_xy_reject_budget_count = float(
+            int(getattr(self.runner, "_vps_direct_xy_reject_budget_count", 0))
+        )
         backend_apply_count = float(int(getattr(self.runner, "_backend_apply_count", 0)))
         backend_stale_drop_count = float(int(getattr(self.runner, "_backend_stale_drop_count", 0)))
         backend_emit_stale_drop_count = float(int(getattr(self.runner, "_backend_emit_stale_drop_count", 0)))
@@ -726,7 +738,9 @@ class OutputReportingService:
         vps_attempt_ms_p50 = float("nan")
         vps_attempt_ms_p95 = float("nan")
         vps_time_budget_stops = float("nan")
+        vps_candidate_budget_stops = float("nan")
         vps_evaluated_candidates_mean = float("nan")
+        vps_budget_escalation_level_mean = float("nan")
         policy_conflict_count = float(int(getattr(self.runner, "_policy_conflict_count", 0)))
         heading_owner_switch_count = float("nan")
         heading_owner_mag_ratio = float("nan")
@@ -768,7 +782,11 @@ class OutputReportingService:
                 vps_attempt_ms_p50 = float(vps_rt.get("attempt_ms_p50", float("nan")))
                 vps_attempt_ms_p95 = float(vps_rt.get("attempt_ms_p95", float("nan")))
                 vps_time_budget_stops = float(vps_rt.get("time_budget_stops", float("nan")))
+                vps_candidate_budget_stops = float(vps_rt.get("candidate_budget_stops", float("nan")))
                 vps_evaluated_candidates_mean = float(vps_rt.get("evaluated_candidates_mean", float("nan")))
+                vps_budget_escalation_level_mean = float(
+                    vps_rt.get("budget_escalation_level_mean", float("nan"))
+                )
             except Exception:
                 pass
         if getattr(self.runner, "backend_optimizer", None) is not None:
@@ -800,6 +818,11 @@ class OutputReportingService:
         except Exception:
             pass
         backend_snap_reject_count = float(int(getattr(self.runner, "_backend_snap_reject_count", 0)))
+        memory_peak_rss_mb = float(self.runner._memory_peak_rss_mb) if np.isfinite(float(getattr(self.runner, "_memory_peak_rss_mb", float("nan")))) else float("nan")
+        memory_peak_vms_mb = float(self.runner._memory_peak_vms_mb) if np.isfinite(float(getattr(self.runner, "_memory_peak_vms_mb", float("nan")))) else float("nan")
+        memory_peak_uss_mb = float(self.runner._memory_peak_uss_mb) if np.isfinite(float(getattr(self.runner, "_memory_peak_uss_mb", float("nan")))) else float("nan")
+        memory_compact_count = float(int(getattr(self.runner, "_memory_compact_count", 0)))
+        memory_pressure_events = float(int(getattr(self.runner, "_memory_pressure_events", 0)))
         backend_apply_latency_ms_p95 = float("nan")
         try:
             lat_hist = np.asarray(getattr(self.runner, "_backend_apply_latency_ms_history", []), dtype=float)
@@ -859,7 +882,15 @@ class OutputReportingService:
             vps_attempt_ms_p50=vps_attempt_ms_p50,
             vps_attempt_ms_p95=vps_attempt_ms_p95,
             vps_time_budget_stops=vps_time_budget_stops,
+            vps_candidate_budget_stops=vps_candidate_budget_stops,
             vps_evaluated_candidates_mean=vps_evaluated_candidates_mean,
+            vps_budget_escalation_level_mean=vps_budget_escalation_level_mean,
+            vps_failsoft_matched_count=vps_failsoft_matched_count,
+            vps_failsoft_applied_count=vps_failsoft_applied_count,
+            vps_failsoft_apply_ratio=vps_failsoft_apply_ratio,
+            vps_direct_xy_apply_count=vps_direct_xy_apply_count,
+            vps_direct_xy_reject_consensus_count=vps_direct_xy_reject_consensus_count,
+            vps_direct_xy_reject_budget_count=vps_direct_xy_reject_budget_count,
             policy_conflict_count=policy_conflict_count,
             heading_owner_switch_count=heading_owner_switch_count,
             heading_owner_mag_ratio=heading_owner_mag_ratio,
@@ -877,6 +908,11 @@ class OutputReportingService:
             backend_snap_reject_count=backend_snap_reject_count,
             backend_apply_latency_ms_p95=backend_apply_latency_ms_p95,
             backend_contract_violation_count=backend_contract_violation_count,
+            memory_peak_rss_mb=memory_peak_rss_mb,
+            memory_peak_vms_mb=memory_peak_vms_mb,
+            memory_peak_uss_mb=memory_peak_uss_mb,
+            memory_compact_count=memory_compact_count,
+            memory_pressure_events=memory_pressure_events,
             rtf_proc_sim=rtf_proc_sim,
         )
         print(
@@ -899,6 +935,10 @@ class OutputReportingService:
             f"backend_stale_ratio={backend_stale_ratio:.3f}, "
             f"backend_emit_to_apply={backend_emit_to_apply_ratio:.3f}, "
             f"backend_q50={backend_apply_quality_p50:.3f}, "
+            f"mem_rss_peak={memory_peak_rss_mb/1024.0 if np.isfinite(memory_peak_rss_mb) else float('nan'):.2f}GB, "
+            f"mem_vms_peak={memory_peak_vms_mb/1024.0 if np.isfinite(memory_peak_vms_mb) else float('nan'):.2f}GB, "
+            f"mem_uss_peak={memory_peak_uss_mb/1024.0 if np.isfinite(memory_peak_uss_mb) else float('nan'):.2f}GB, "
+            f"mem_compact={memory_compact_count:.0f}, "
             f"rtf_proc_sim={rtf_proc_sim:.3f}"
         )
 

@@ -278,6 +278,10 @@ class SatelliteMatcher:
             return
         if (self._match_counter % self.mps_cache_clear_interval) != 0:
             return
+        self.clear_device_cache()
+
+    def clear_device_cache(self) -> None:
+        """Force-clear device cache (safe no-op when backend/device is unavailable)."""
         if torch is None:
             return
         try:

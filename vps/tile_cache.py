@@ -401,6 +401,37 @@ class TileCache:
         """Get total number of tiles in cache."""
         row = self._fetchone("SELECT COUNT(*) FROM tiles")
         return row[0] if row else 0
+
+    def compact_cache(self, max_cached_tiles: Optional[int] = None) -> Dict[str, int]:
+        """
+        Compact in-memory tile cache.
+
+        Args:
+            max_cached_tiles: Optional new cap for in-memory tiles.
+
+        Returns:
+            Dict with compact stats:
+                before, after, dropped, cap
+        """
+        if max_cached_tiles is not None:
+            try:
+                self._max_cached = max(8, int(max_cached_tiles))
+            except Exception:
+                pass
+        before = int(len(self._cache_order))
+        dropped = 0
+        while len(self._cache_order) > int(self._max_cached):
+            key = self._cache_order.pop(0)
+            if key in self._tile_cache:
+                del self._tile_cache[key]
+                dropped += 1
+        after = int(len(self._cache_order))
+        return {
+            "before": before,
+            "after": after,
+            "dropped": int(dropped),
+            "cap": int(self._max_cached),
+        }
     
     def close(self):
         """Close database connection."""

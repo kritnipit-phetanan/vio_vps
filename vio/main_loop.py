@@ -131,6 +131,7 @@ class VIORunner:
         self.mag_quality_csv = None
         self.sensor_time_audit_csv = None
         self.vps_reloc_summary_csv = None
+        self.vps_position_trace_csv = None
         self.policy_trace_csv = None
         self.policy_conflict_csv = None
         self.policy_owner_map_csv = None
@@ -174,6 +175,9 @@ class VIORunner:
         self._vps_last_accepted_offset_vec: Optional[np.ndarray] = None
         self._vps_pending_large_offset_vec: Optional[np.ndarray] = None
         self._vps_pending_large_offset_hits: int = 0
+        self._position_first_direct_last_t: float = -1e9
+        self._position_first_direct_xy_count: int = 0
+        self._position_first_direct_hint_hist: list[tuple[float, np.ndarray]] = []
         # Async VPS worker state (single-flight guard to avoid thread/memory pile-up)
         self._vps_inflight_thread = None
         self._vps_inflight_result = None
@@ -201,6 +205,14 @@ class VIORunner:
         self._backend_pending_steps_left: int = 0
         self._backend_last_poll_t: float = -1e9
         self._backend_last_poll_vio_frame: int = -1
+        self._vps_memory_pressure_until_t: float = -1e9
+        self._mem_last_check_t: float = -1e9
+        self._mem_last_compact_t: float = -1e9
+        self._memory_peak_rss_mb: float = 0.0
+        self._memory_peak_vms_mb: float = 0.0
+        self._memory_peak_uss_mb: float = 0.0
+        self._memory_compact_count: int = 0
+        self._memory_pressure_events: int = 0
         
         # Timestamp base tracking (for GT/error alignment)
         self.imu_time_col: Optional[str] = None

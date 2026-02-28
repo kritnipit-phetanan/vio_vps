@@ -60,6 +60,7 @@ class YawAuthorityService:
         self._mag_owner_block_samples: int = 0
         self._owner_dead_fallback_count: int = 0
         self._owner_dead_last_t: float = -1e9
+        self._last_loop_hold_reclaim_t: float = -1e9
 
     @staticmethod
     def _clamp(x: float, lo: float, hi: float) -> float:
@@ -259,45 +260,64 @@ class YawAuthorityService:
             t_now=float(t_now),
             window_sec=win_sec,
         )
-        if src == "BACKEND" and app_cnt < min_recent:
-            # Request-alive path: backend updates are sparse by nature.
-            # Permit ownership when backend requests stay active and confidence is adequate.
-            req_cnt = self._count_recent_events(
-                self._source_request_hist,
-                source=src,
-                t_now=float(t_now),
-                window_sec=max(
-                    win_sec,
-                    self._cfg("YAW_AUTH_BACKEND_REQUEST_ALIVE_WINDOW_SEC", win_sec),
-                ),
-            )
-            min_req = max(
-                1,
-                int(
-                    round(
-                        self._cfg(
-                            "YAW_AUTH_BACKEND_REQUEST_ALIVE_MIN_REQUESTS",
-                            self._cfg("YAW_AUTH_BACKEND_BOOTSTRAP_MIN_REQUESTS", 3.0),
-                        )
-                    )
-                ),
-            )
-            min_score = self._clamp(
-                self._cfg(
-                    "YAW_AUTH_BACKEND_REQUEST_ALIVE_MIN_SCORE",
-                    self._cfg("YAW_AUTH_BACKEND_BOOTSTRAP_MIN_SCORE", 0.28),
-                ),
-                0.0,
-                1.0,
-            )
-            back_score = self._clamp(self._source_score_ema.get("BACKEND", 0.0), 0.0, 1.0)
-            if (
-                self._cfg_bool("YAW_AUTH_BACKEND_REQUEST_ALIVE_ENABLE", True)
-                and req_cnt >= min_req
-                and back_score >= min_score
-            ):
-                return True
-        return bool(app_cnt >= min_recent)
+        if app_cnt >= min_recent:
+            return True
+
+        # Request-alive path for sparse/indirect sources.
+        # LOOP/BACKEND can legitimately have low "applied yaw" counts while still
+        # being active and high-confidence; do not force HOLD immediately in that case.
+        if src not in ("BACKEND", "LOOP"):
+            return False
+
+        if src == "BACKEND":
+            default_enable = self._cfg_bool("YAW_AUTH_BACKEND_REQUEST_ALIVE_ENABLE", True)
+        else:
+            default_enable = self._cfg_bool("YAW_AUTH_LOOP_REQUEST_ALIVE_ENABLE", True)
+        if not default_enable:
+            return False
+
+        req_win_default = self._cfg(
+            "YAW_AUTH_BACKEND_REQUEST_ALIVE_WINDOW_SEC" if src == "BACKEND" else "YAW_AUTH_LOOP_REQUEST_ALIVE_WINDOW_SEC",
+            win_sec,
+        )
+        req_win = max(
+            win_sec,
+            self._cfg_source("YAW_AUTH_REQUEST_ALIVE_WINDOW_SEC_MAP", src, req_win_default),
+        )
+        req_cnt = self._count_recent_events(
+            self._source_request_hist,
+            source=src,
+            t_now=float(t_now),
+            window_sec=float(req_win),
+        )
+
+        min_req_default = (
+            self._cfg("YAW_AUTH_BACKEND_REQUEST_ALIVE_MIN_REQUESTS", self._cfg("YAW_AUTH_BACKEND_BOOTSTRAP_MIN_REQUESTS", 3.0))
+            if src == "BACKEND"
+            else self._cfg("YAW_AUTH_LOOP_REQUEST_ALIVE_MIN_REQUESTS", 2.0)
+        )
+        min_req = max(
+            1,
+            int(round(self._cfg_source("YAW_AUTH_REQUEST_ALIVE_MIN_REQUESTS_MAP", src, min_req_default))),
+        )
+        min_score_default = (
+            self._cfg("YAW_AUTH_BACKEND_REQUEST_ALIVE_MIN_SCORE", self._cfg("YAW_AUTH_BACKEND_BOOTSTRAP_MIN_SCORE", 0.28))
+            if src == "BACKEND"
+            else self._cfg("YAW_AUTH_LOOP_REQUEST_ALIVE_MIN_SCORE", 0.24)
+        )
+        min_score = self._clamp(
+            self._cfg_source("YAW_AUTH_REQUEST_ALIVE_MIN_SCORE_MAP", src, min_score_default),
+            0.0,
+            1.0,
+        )
+        min_fresh = self._clamp(
+            self._cfg_source("YAW_AUTH_REQUEST_ALIVE_MIN_FRESHNESS_MAP", src, 0.10),
+            0.0,
+            1.0,
+        )
+        src_score = self._clamp(self._source_score_ema.get(src, 0.0), 0.0, 1.0)
+        src_fresh = self._source_freshness(src, t_now=float(t_now))
+        return bool(req_cnt >= min_req and src_score >= min_score and src_fresh >= min_fresh)
 
     def _mag_owner_eligible(self, t_now: float) -> bool:
         """Return True when MAG is eligible to own yaw (stage>=3 arbitration)."""
@@ -314,7 +334,11 @@ class YawAuthorityService:
             state = getattr(self.runner, "state", None)
             mag_updates = float(getattr(state, "mag_updates", 0.0))
             mag_rejects = float(getattr(state, "mag_rejects", 0.0))
-            mag_total = mag_updates + mag_rejects
+            # Owner-arbitration skips are tracked separately and should not demote
+            # MAG signal quality in the global accept-rate gate.
+            mag_owner_skips = float(getattr(state, "mag_owner_skips", 0.0))
+            eff_rejects = max(0.0, float(mag_rejects) - float(mag_owner_skips))
+            mag_total = mag_updates + eff_rejects
             min_total = max(1.0, self._cfg("YAW_AUTH_MAG_GLOBAL_MIN_SAMPLES", 80.0))
             min_rate = self._clamp(self._cfg("YAW_AUTH_MAG_GLOBAL_MIN_ACCEPT_RATE", 0.08), 0.0, 1.0)
             if mag_total >= min_total and (mag_updates / max(1.0, mag_total)) < min_rate:
@@ -710,7 +734,9 @@ class YawAuthorityService:
         )
         last_applied_t = float(self._source_last_applied_t.get(src, -1e9))
         last_seen_t = float(self._source_last_seen_t.get(src, -1e9))
-        last_activity_t = last_applied_t if last_applied_t > -1e8 else last_seen_t
+        # Use the most recent activity signal instead of preferring "applied" forever.
+        # Otherwise one old apply can make a currently-active source look stale.
+        last_activity_t = max(last_applied_t, last_seen_t)
         if not np.isfinite(last_activity_t) or last_activity_t < -1e8:
             return 0.0
         age = max(0.0, float(t_now) - float(last_activity_t))
@@ -910,6 +936,130 @@ class YawAuthorityService:
         if best_score >= (cur_score + switch_margin):
             self._set_owner(str(best_src), t_now)
 
+    def _try_loop_high_quality_reclaim(
+        self,
+        t_now: float,
+        loop_conf_raw: float,
+        loop_conf_ema: float,
+        speed_m_s: float,
+        current_dead_reason: str = "",
+    ) -> str:
+        """
+        Deterministic reclaim path: LOOP may reclaim owner from BACKEND when
+        LOOP quality is consistently high. This avoids backend-only yaw lock.
+        """
+        if self._stage() < 3:
+            return ""
+        if not self._cfg_bool("YAW_AUTH_LOOP_RECLAIM_ENABLE", False):
+            return ""
+        owner = str(self._owner).upper()
+        allow_from_hold = self._cfg_bool("YAW_AUTH_LOOP_RECLAIM_ALLOW_FROM_HOLD", False)
+        hold_require_backend_dead = self._cfg_bool(
+            "YAW_AUTH_LOOP_RECLAIM_HOLD_REQUIRE_BACKEND_DEAD", True
+        )
+        hold_allow_no_dead = self._cfg_bool(
+            "YAW_AUTH_LOOP_RECLAIM_HOLD_ALLOW_NO_DEAD", False
+        )
+        backend_dead_ctx = "owner_dead_timeout_backend" in str(current_dead_reason).lower()
+        if owner not in ("BACKEND", "HOLD"):
+            return ""
+        if owner == "HOLD":
+            if not allow_from_hold:
+                return ""
+            if hold_require_backend_dead and not backend_dead_ctx and not hold_allow_no_dead:
+                return ""
+            hold_min_sec = max(0.0, self._cfg("YAW_AUTH_LOOP_RECLAIM_HOLD_MIN_SEC", 0.35))
+            bypass_min_dt_on_backend_dead = self._cfg_bool(
+                "YAW_AUTH_LOOP_RECLAIM_BYPASS_MIN_INTERVAL_ON_BACKEND_DEAD",
+                True,
+            )
+            if not (backend_dead_ctx and bypass_min_dt_on_backend_dead):
+                if (float(t_now) - float(self._owner_switch_t)) < hold_min_sec:
+                    return ""
+            hold_cd_sec = max(0.0, self._cfg("YAW_AUTH_LOOP_RECLAIM_HOLD_COOLDOWN_SEC", 1.5))
+            if (float(t_now) - float(self._last_loop_hold_reclaim_t)) < hold_cd_sec:
+                return ""
+        if owner == "BACKEND":
+            # BACKEND-owner reclaim should remain deterministic and quality-led.
+            pass
+        if self._is_source_blocked("LOOP", t_now=float(t_now)):
+            return ""
+
+        min_dt = max(0.0, self._cfg("YAW_AUTH_LOOP_RECLAIM_MIN_INTERVAL_SEC", self._cfg("YAW_AUTH_SWITCH_MIN_INTERVAL_SEC", 0.75)))
+        bypass_min_dt_on_backend_dead = self._cfg_bool(
+            "YAW_AUTH_LOOP_RECLAIM_BYPASS_MIN_INTERVAL_ON_BACKEND_DEAD",
+            True,
+        )
+        if (
+            (float(t_now) - float(self._owner_switch_t)) < min_dt
+            and not (owner == "HOLD" and backend_dead_ctx and bypass_min_dt_on_backend_dead)
+        ):
+            return ""
+
+        win_sec = max(0.5, self._cfg("YAW_AUTH_LOOP_RECLAIM_WINDOW_SEC", 6.0))
+        min_req = max(1, int(round(self._cfg("YAW_AUTH_LOOP_RECLAIM_MIN_REQUESTS", 3.0))))
+        if owner == "HOLD" and backend_dead_ctx:
+            min_req = max(
+                1,
+                int(
+                    round(
+                        self._cfg(
+                            "YAW_AUTH_LOOP_RECLAIM_MIN_REQUESTS_ON_BACKEND_DEAD",
+                            1.0,
+                        )
+                    )
+                ),
+            )
+        req_cnt = self._count_recent_events(
+            self._source_request_hist,
+            source="LOOP",
+            t_now=float(t_now),
+            window_sec=win_sec,
+        )
+        if req_cnt < min_req:
+            return ""
+
+        loop_score = max(
+            self._clamp(float(loop_conf_raw), 0.0, 1.0),
+            self._clamp(float(loop_conf_ema), 0.0, 1.0),
+            self._clamp(float(self._source_score_ema.get("LOOP", loop_conf_ema)), 0.0, 1.0),
+        )
+        back_score = self._clamp(float(self._source_score_ema.get("BACKEND", 0.0)), 0.0, 1.0)
+        min_score = self._clamp(self._cfg("YAW_AUTH_LOOP_RECLAIM_MIN_SCORE", 0.62), 0.0, 1.0)
+        margin = self._clamp(self._cfg("YAW_AUTH_LOOP_RECLAIM_MARGIN", 0.05), 0.0, 0.8)
+        if owner == "HOLD" and backend_dead_ctx:
+            min_score = self._clamp(
+                self._cfg("YAW_AUTH_LOOP_RECLAIM_MIN_SCORE_ON_BACKEND_DEAD", min_score),
+                0.0,
+                1.0,
+            )
+            margin = self._clamp(
+                self._cfg("YAW_AUTH_LOOP_RECLAIM_MARGIN_ON_BACKEND_DEAD", margin),
+                0.0,
+                0.8,
+            )
+        min_fresh = self._clamp(self._cfg("YAW_AUTH_LOOP_RECLAIM_MIN_FRESHNESS", 0.10), 0.0, 1.0)
+        loop_fresh = self._source_freshness("LOOP", t_now=float(t_now))
+        if loop_score < min_score or loop_fresh < min_fresh:
+            return ""
+        if loop_score < (back_score + margin):
+            return ""
+
+        max_speed = max(0.0, self._cfg("YAW_AUTH_LOOP_RECLAIM_MAX_SPEED_M_S", 120.0))
+        if np.isfinite(speed_m_s) and float(speed_m_s) > float(max_speed):
+            return ""
+        min_eff_samples = max(0, int(round(self._cfg("YAW_AUTH_LOOP_RECLAIM_MIN_APPLY_SAMPLES", 0.0))))
+        min_eff = self._clamp(self._cfg("YAW_AUTH_LOOP_RECLAIM_MIN_APPLY_EFF", 0.0), 0.0, 1.0)
+        eff, req_cnt_eff = self._source_apply_efficiency("LOOP", t_now=float(t_now))
+        if min_eff_samples > 0 and req_cnt_eff >= min_eff_samples and float(eff) < float(min_eff):
+            return ""
+
+        self._set_owner("LOOP", float(t_now))
+        if owner == "HOLD":
+            self._last_loop_hold_reclaim_t = float(t_now)
+            return "loop_reclaim_high_quality_from_hold"
+        return "loop_reclaim_high_quality"
+
     def _state_unstable(
         self,
         health_state: str,
@@ -972,25 +1122,31 @@ class YawAuthorityService:
         t_now = float(timestamp)
         switched = False
         req_abs = max(0.0, self._finite_or(requested_abs_dyaw_deg, 0.0))
+        backend_min_req = max(0.0, self._cfg("YAW_AUTH_BACKEND_MIN_REQUEST_DYAW_DEG", 0.12))
+        backend_noop_req = bool(src == "BACKEND" and req_abs < backend_min_req)
         conf_raw = self._clamp(self._finite_or(confidence, 0.5), 0.0, 1.0)
         conf_in = self._modulate_confidence_by_msckf(src, conf_raw)
+        if backend_noop_req:
+            conf_in = min(conf_in, self._clamp(self._cfg("YAW_AUTH_BACKEND_NOOP_MAX_SCORE", 0.18), 0.0, 1.0))
         if src == "MAG":
             conf_in = float(conf_in) * self._mag_score_scale(float(t_now))
         conf = self._update_score_ema(src, conf_in)
-        self._source_last_seen_t[src] = float(t_now)
+        if not backend_noop_req:
+            self._source_last_seen_t[src] = float(t_now)
         self._decision_samples += 1
-        self._append_ts_event(
-            self._source_request_hist,
-            source=src,
-            timestamp=float(t_now),
-            max_keep=max(64, int(round(self._cfg("YAW_AUTH_ACTIVITY_WINDOW_SEC", 8.0) * 80.0))),
-        )
+        if not backend_noop_req:
+            self._append_ts_event(
+                self._source_request_hist,
+                source=src,
+                timestamp=float(t_now),
+                max_keep=max(64, int(round(self._cfg("YAW_AUTH_ACTIVITY_WINDOW_SEC", 8.0) * 80.0))),
+            )
         self._update_source_blocks(t_now=float(t_now))
         mag_blocked = self._is_source_blocked("MAG", t_now=float(t_now))
         if mag_blocked:
             self._mag_owner_block_samples += 1
 
-        if self._enabled() and self._stage() >= 3 and src == "MAG":
+        if self._enabled() and src == "MAG":
             if not self._mag_owner_eligible(float(t_now)):
                 if str(self._owner).upper() == "MAG":
                     self._set_owner("HOLD", float(t_now))
@@ -1058,9 +1214,35 @@ class YawAuthorityService:
         if str(self._owner).upper() != prev_owner:
             switched = True
 
+        if src == "LOOP":
+            reclaim_reason = self._try_loop_high_quality_reclaim(
+                t_now=float(t_now),
+                loop_conf_raw=float(conf_raw),
+                loop_conf_ema=float(conf),
+                speed_m_s=float(speed_m_s),
+            )
+            if reclaim_reason:
+                claim_reason = f"{claim_reason}|{reclaim_reason}" if claim_reason else reclaim_reason
+                switched = True
+
         dead_reason = self._apply_dead_owner_fallback(float(t_now))
         if dead_reason:
             switched = True
+            if src == "LOOP":
+                reclaim_reason = self._try_loop_high_quality_reclaim(
+                    t_now=float(t_now),
+                    loop_conf_raw=float(conf_raw),
+                    loop_conf_ema=float(conf),
+                    speed_m_s=float(speed_m_s),
+                    current_dead_reason=str(dead_reason),
+                )
+                if reclaim_reason:
+                    switched = True
+                    self._hold_until_t = min(float(self._hold_until_t), float(t_now))
+                    claim_reason = (
+                        f"{claim_reason}|{reclaim_reason}" if claim_reason else reclaim_reason
+                    )
+                    dead_reason = f"{dead_reason}|{reclaim_reason}"
             # Avoid sticky HOLD after dead-owner fallback: allow the currently requesting
             # source to reclaim ownership immediately when eligible.
             if (

@@ -687,6 +687,34 @@ def load_config(config_path: str) -> VIOConfig:
     result['YAW_AUTH_BACKEND_REQUEST_ALIVE_MIN_SCORE'] = float(
         yaw_auth.get('backend_request_alive_min_score', yaw_auth.get('backend_bootstrap_min_score', 0.28))
     )
+    result['YAW_AUTH_LOOP_REQUEST_ALIVE_ENABLE'] = bool(
+        yaw_auth.get('loop_request_alive_enable', True)
+    )
+    result['YAW_AUTH_LOOP_REQUEST_ALIVE_WINDOW_SEC'] = float(
+        yaw_auth.get('loop_request_alive_window_sec', yaw_auth.get('owner_apply_recent_window_sec', 8.0))
+    )
+    result['YAW_AUTH_LOOP_REQUEST_ALIVE_MIN_REQUESTS'] = int(
+        yaw_auth.get('loop_request_alive_min_requests', 2)
+    )
+    result['YAW_AUTH_LOOP_REQUEST_ALIVE_MIN_SCORE'] = float(
+        yaw_auth.get('loop_request_alive_min_score', 0.24)
+    )
+    result['YAW_AUTH_REQUEST_ALIVE_WINDOW_SEC_MAP'] = yaw_auth.get(
+        'request_alive_window_sec_map',
+        {},
+    )
+    result['YAW_AUTH_REQUEST_ALIVE_MIN_REQUESTS_MAP'] = yaw_auth.get(
+        'request_alive_min_requests_map',
+        {},
+    )
+    result['YAW_AUTH_REQUEST_ALIVE_MIN_SCORE_MAP'] = yaw_auth.get(
+        'request_alive_min_score_map',
+        {},
+    )
+    result['YAW_AUTH_REQUEST_ALIVE_MIN_FRESHNESS_MAP'] = yaw_auth.get(
+        'request_alive_min_freshness_map',
+        {},
+    )
     result['YAW_AUTH_YAW_BUDGET_WINDOW_SEC'] = float(
         yaw_auth.get('yaw_budget_window_sec', 8.0)
     )
@@ -761,6 +789,12 @@ def load_config(config_path: str) -> VIOConfig:
         'stage12_claim_sources',
         ['LOOP', 'BACKEND'],
     )
+    result['YAW_AUTH_BACKEND_MIN_REQUEST_DYAW_DEG'] = float(
+        yaw_auth.get('backend_min_request_dyaw_deg', 0.12)
+    )
+    result['YAW_AUTH_BACKEND_NOOP_MAX_SCORE'] = float(
+        yaw_auth.get('backend_noop_max_score', 0.18)
+    )
     result['YAW_AUTH_MAG_OWNER_MIN_ACCEPT_RATE'] = float(
         yaw_auth.get('mag_owner_min_accept_rate', 0.15)
     )
@@ -811,6 +845,9 @@ def load_config(config_path: str) -> VIOConfig:
     )
     result['YAW_AUTH_MAG_LOW_ACCEPT_MAX_DYAW_DEG'] = float(
         yaw_auth.get('mag_low_accept_max_dyaw_deg', 0.35)
+    )
+    result['YAW_AUTH_MAG_COUNT_OWNER_SKIP_AS_REJECT'] = bool(
+        yaw_auth.get('mag_count_owner_skip_as_reject', False)
     )
     result['YAW_AUTH_POSITION_FIRST_DISABLE_MAG_OWNER'] = bool(
         yaw_auth.get('position_first_disable_mag_owner', True)
@@ -893,6 +930,63 @@ def load_config(config_path: str) -> VIOConfig:
     result['YAW_AUTH_STRICT_HOLD_RECLAIM_MIN_FRESHNESS'] = float(
         yaw_auth.get('strict_hold_reclaim_min_freshness', 0.15)
     )
+    result['YAW_AUTH_LOOP_RECLAIM_ENABLE'] = bool(
+        yaw_auth.get('loop_reclaim_enable', False)
+    )
+    result['YAW_AUTH_LOOP_RECLAIM_ALLOW_FROM_HOLD'] = bool(
+        yaw_auth.get('loop_reclaim_allow_from_hold', False)
+    )
+    result['YAW_AUTH_LOOP_RECLAIM_HOLD_REQUIRE_BACKEND_DEAD'] = bool(
+        yaw_auth.get('loop_reclaim_hold_require_backend_dead', True)
+    )
+    result['YAW_AUTH_LOOP_RECLAIM_HOLD_ALLOW_NO_DEAD'] = bool(
+        yaw_auth.get('loop_reclaim_hold_allow_no_dead', False)
+    )
+    result['YAW_AUTH_LOOP_RECLAIM_HOLD_MIN_SEC'] = float(
+        yaw_auth.get('loop_reclaim_hold_min_sec', 0.35)
+    )
+    result['YAW_AUTH_LOOP_RECLAIM_HOLD_COOLDOWN_SEC'] = float(
+        yaw_auth.get('loop_reclaim_hold_cooldown_sec', 1.5)
+    )
+    result['YAW_AUTH_LOOP_RECLAIM_BYPASS_MIN_INTERVAL_ON_BACKEND_DEAD'] = bool(
+        yaw_auth.get('loop_reclaim_bypass_min_interval_on_backend_dead', True)
+    )
+    result['YAW_AUTH_LOOP_RECLAIM_MIN_INTERVAL_SEC'] = float(
+        yaw_auth.get('loop_reclaim_min_interval_sec', yaw_auth.get('switch_min_interval_sec', 0.75))
+    )
+    result['YAW_AUTH_LOOP_RECLAIM_WINDOW_SEC'] = float(
+        yaw_auth.get('loop_reclaim_window_sec', 6.0)
+    )
+    result['YAW_AUTH_LOOP_RECLAIM_MIN_REQUESTS'] = int(
+        yaw_auth.get('loop_reclaim_min_requests', 3)
+    )
+    result['YAW_AUTH_LOOP_RECLAIM_MIN_REQUESTS_ON_BACKEND_DEAD'] = int(
+        yaw_auth.get('loop_reclaim_min_requests_on_backend_dead', 1)
+    )
+    result['YAW_AUTH_LOOP_RECLAIM_MIN_SCORE'] = float(
+        yaw_auth.get('loop_reclaim_min_score', 0.62)
+    )
+    result['YAW_AUTH_LOOP_RECLAIM_MIN_SCORE_ON_BACKEND_DEAD'] = float(
+        yaw_auth.get('loop_reclaim_min_score_on_backend_dead', yaw_auth.get('loop_reclaim_min_score', 0.62))
+    )
+    result['YAW_AUTH_LOOP_RECLAIM_MARGIN'] = float(
+        yaw_auth.get('loop_reclaim_margin', 0.05)
+    )
+    result['YAW_AUTH_LOOP_RECLAIM_MARGIN_ON_BACKEND_DEAD'] = float(
+        yaw_auth.get('loop_reclaim_margin_on_backend_dead', yaw_auth.get('loop_reclaim_margin', 0.05))
+    )
+    result['YAW_AUTH_LOOP_RECLAIM_MIN_FRESHNESS'] = float(
+        yaw_auth.get('loop_reclaim_min_freshness', 0.10)
+    )
+    result['YAW_AUTH_LOOP_RECLAIM_MAX_SPEED_M_S'] = float(
+        yaw_auth.get('loop_reclaim_max_speed_m_s', 120.0)
+    )
+    result['YAW_AUTH_LOOP_RECLAIM_MIN_APPLY_EFF'] = float(
+        yaw_auth.get('loop_reclaim_min_apply_eff', 0.0)
+    )
+    result['YAW_AUTH_LOOP_RECLAIM_MIN_APPLY_SAMPLES'] = int(
+        yaw_auth.get('loop_reclaim_min_apply_samples', 0)
+    )
     
     # Process noise
     pn = config['process_noise']
@@ -929,6 +1023,9 @@ def load_config(config_path: str) -> VIOConfig:
     msckf_cfg = vio.get('msckf', {})
     result['MSCKF_MAX_CLONE_SIZE'] = msckf_cfg.get('max_clone_size', 11)
     result['MSCKF_MIN_TRACK_LENGTH'] = msckf_cfg.get('min_track_length', 4)
+    fe_cfg = vio.get('frontend', {}) if isinstance(vio.get('frontend', {}), dict) else {}
+    result['VIO_FRONTEND_MAX_TRACK_HISTORY'] = int(fe_cfg.get('max_track_history', 90))
+    result['VIO_FRONTEND_MAX_TOTAL_TRACKS'] = int(fe_cfg.get('max_total_tracks', 5000))
     result['MSCKF_PHASE_CHI2_SCALE'] = msckf_cfg.get(
         'phase_chi2_scale',
         {'0': 1.20, '1': 1.08, '2': 1.00}
@@ -1124,6 +1221,7 @@ def load_config(config_path: str) -> VIOConfig:
         result['LOOP_MIN_KEYFRAME_DIST'] = lc.get('min_keyframe_dist', 15.0)
         result['LOOP_MIN_KEYFRAME_YAW'] = lc.get('min_keyframe_yaw', 20.0)
         result['LOOP_MIN_FRAME_GAP'] = lc.get('min_frame_gap', 50)
+        result['LOOP_MAX_KEYFRAMES'] = int(lc.get('max_keyframes', 220))
         result['LOOP_MIN_MATCH_RATIO'] = lc.get('min_match_ratio', 0.12)
         result['LOOP_MIN_INLIERS'] = lc.get('min_inliers', 15)
         qg = lc.get('quality_gate', {})
@@ -1223,12 +1321,37 @@ def load_config(config_path: str) -> VIOConfig:
         result['LOOP_BURST_WINDOW_SEC'] = float(temporal_apply.get('burst_window_sec', 12.0))
         result['LOOP_BURST_MAX_CORRECTIONS'] = int(temporal_apply.get('burst_max_corrections', 2))
         result['LOOP_BURST_COOLDOWN_SEC'] = float(temporal_apply.get('burst_cooldown_sec', 6.0))
+        result['LOOP_BURST_ABS_YAW_BUDGET_DEG'] = float(
+            temporal_apply.get('burst_abs_yaw_budget_deg', 8.0)
+        )
+        result['LOOP_BURST_RATE_WINDOW_SEC'] = float(
+            temporal_apply.get('burst_rate_window_sec', 1.0)
+        )
+        result['LOOP_BURST_RATE_MAX_DEG_PER_SEC'] = float(
+            temporal_apply.get('burst_rate_max_deg_per_sec', 2.4)
+        )
+        result['LOOP_BURST_MIN_APPLY_DEG'] = float(
+            temporal_apply.get('burst_min_apply_deg', 0.18)
+        )
+        result['LOOP_HIGH_SPEED_SOFT_APPLY_ENABLE'] = bool(
+            temporal_apply.get('high_speed_soft_apply_enable', True)
+        )
+        result['LOOP_HIGH_SPEED_SOFT_CAP_DEG'] = float(
+            temporal_apply.get('high_speed_soft_cap_deg', 0.9)
+        )
+        result['LOOP_HIGH_SPEED_SOFT_R_MULT'] = float(
+            temporal_apply.get('high_speed_soft_r_mult', 3.0)
+        )
+        result['LOOP_HIGH_SPEED_SOFT_EXTRA_CONFIRM_HITS'] = int(
+            temporal_apply.get('high_speed_soft_extra_confirm_hits', 1)
+        )
     else:
         result['USE_LOOP_CLOSURE'] = True
         result['LOOP_POSITION_THRESHOLD'] = 30.0
         result['LOOP_MIN_KEYFRAME_DIST'] = 15.0
         result['LOOP_MIN_KEYFRAME_YAW'] = 20.0
         result['LOOP_MIN_FRAME_GAP'] = 50
+        result['LOOP_MAX_KEYFRAMES'] = 220
         result['LOOP_MIN_MATCH_RATIO'] = 0.12
         result['LOOP_MIN_INLIERS'] = 15
         result['LOOP_MIN_INLIERS_HARD'] = 35
@@ -1278,6 +1401,14 @@ def load_config(config_path: str) -> VIOConfig:
         result['LOOP_BURST_WINDOW_SEC'] = 12.0
         result['LOOP_BURST_MAX_CORRECTIONS'] = 2
         result['LOOP_BURST_COOLDOWN_SEC'] = 6.0
+        result['LOOP_BURST_ABS_YAW_BUDGET_DEG'] = 8.0
+        result['LOOP_BURST_RATE_WINDOW_SEC'] = 1.0
+        result['LOOP_BURST_RATE_MAX_DEG_PER_SEC'] = 2.4
+        result['LOOP_BURST_MIN_APPLY_DEG'] = 0.18
+        result['LOOP_HIGH_SPEED_SOFT_APPLY_ENABLE'] = True
+        result['LOOP_HIGH_SPEED_SOFT_CAP_DEG'] = 0.9
+        result['LOOP_HIGH_SPEED_SOFT_R_MULT'] = 3.0
+        result['LOOP_HIGH_SPEED_SOFT_EXTRA_CONFIRM_HITS'] = 1
 
     # =========================================================================
     # Kinematic consistency guard
@@ -1370,6 +1501,8 @@ def load_config(config_path: str) -> VIOConfig:
     result['VPS_MAX_TOTAL_CANDIDATES'] = int(vps_cfg.get('max_total_candidates', 0))
     result['VPS_MAX_FRAME_TIME_MS_LOCAL'] = float(vps_cfg.get('max_frame_time_ms_local', 0.0))
     result['VPS_MAX_FRAME_TIME_MS_GLOBAL'] = float(vps_cfg.get('max_frame_time_ms_global', 0.0))
+    result['VPS_TILE_CACHE_MAX_TILES'] = int(vps_cfg.get('tile_cache_max_tiles', 50))
+    result['VPS_MPS_CACHE_CLEAR_INTERVAL'] = int(vps_cfg.get('mps_cache_clear_interval', 8))
     result['VPS_APPLY_MIN_INLIERS'] = int(vps_cfg.get('apply_min_inliers', 8))
     result['VPS_APPLY_MIN_CONFIDENCE'] = float(vps_cfg.get('apply_min_confidence', 0.18))
     result['VPS_APPLY_MAX_REPROJ_ERROR'] = float(vps_cfg.get('apply_max_reproj_error', 1.2))
@@ -1402,6 +1535,24 @@ def load_config(config_path: str) -> VIOConfig:
     result['VPS_APPLY_FAILSOFT_MAX_DIR_CHANGE_DEG'] = float(
         vps_cfg.get('apply_failsoft_max_dir_change_deg', 60.0)
     )
+    result['VPS_APPLY_FAILSOFT_DIR_GATE_MAX_SPEED_M_S'] = float(
+        vps_cfg.get('apply_failsoft_dir_gate_max_speed_m_s', 12.0)
+    )
+    result['VPS_APPLY_FAILSOFT_DIR_GATE_MAX_YAW_RATE_DEG_S'] = float(
+        vps_cfg.get('apply_failsoft_dir_gate_max_yaw_rate_deg_s', 25.0)
+    )
+    result['VPS_APPLY_FAILSOFT_DIR_GATE_RELAX_MULT_SPEED'] = float(
+        vps_cfg.get('apply_failsoft_dir_gate_relax_mult_speed', 1.6)
+    )
+    result['VPS_APPLY_FAILSOFT_DIR_GATE_RELAX_MULT_YAW_RATE'] = float(
+        vps_cfg.get('apply_failsoft_dir_gate_relax_mult_yaw_rate', 1.6)
+    )
+    result['VPS_APPLY_FAILSOFT_DIR_GATE_DISABLE_SPEED_M_S'] = float(
+        vps_cfg.get('apply_failsoft_dir_gate_disable_speed_m_s', 24.0)
+    )
+    result['VPS_APPLY_FAILSOFT_DIR_GATE_DISABLE_YAW_RATE_DEG_S'] = float(
+        vps_cfg.get('apply_failsoft_dir_gate_disable_yaw_rate_deg_s', 45.0)
+    )
     result['VPS_APPLY_FAILSOFT_LARGE_OFFSET_CONFIRM_M'] = float(
         vps_cfg.get('apply_failsoft_large_offset_confirm_m', 80.0)
     )
@@ -1422,6 +1573,9 @@ def load_config(config_path: str) -> VIOConfig:
     )
     result['VPS_ABS_HARD_REJECT_DIR_CHANGE_MAX_SPEED_M_S'] = float(
         vps_cfg.get('abs_hard_reject_dir_change_max_speed_m_s', 12.0)
+    )
+    result['VPS_ABS_HARD_REJECT_DIR_CHANGE_MAX_YAW_RATE_DEG_S'] = float(
+        vps_cfg.get('abs_hard_reject_dir_change_max_yaw_rate_deg_s', 25.0)
     )
     result['VPS_ABS_HARD_REJECT_DIR_CHANGE_MIN_ACCEPTS'] = int(
         vps_cfg.get('abs_hard_reject_dir_change_min_accepts', 3)
@@ -1510,6 +1664,232 @@ def load_config(config_path: str) -> VIOConfig:
     result['VPS_POSITION_FIRST_SOFT_HINT_QUALITY_SCALE'] = float(
         vps_cfg.get('position_first_soft_hint_quality_scale', 0.85)
     )
+    vps_pos_ctrl = vps_cfg.get("position_controller", {})
+    if not isinstance(vps_pos_ctrl, dict):
+        vps_pos_ctrl = {}
+    result['VPS_POSITION_CONTROLLER_ENABLE'] = bool(
+        vps_pos_ctrl.get('enable', vps_cfg.get('position_first_direct_xy_enable', True))
+    )
+    result['VPS_POSITION_CONTROLLER_CONSENSUS_WINDOW_SEC'] = float(
+        vps_pos_ctrl.get('consensus_window_sec', vps_cfg.get('position_first_direct_xy_consensus_window_sec', 4.0))
+    )
+    result['VPS_POSITION_CONTROLLER_MIN_SAMPLES'] = int(
+        vps_pos_ctrl.get('min_samples', vps_cfg.get('position_first_direct_xy_consensus_min_samples', 3))
+    )
+    result['VPS_POSITION_CONTROLLER_MAX_APPLY_STEP_M'] = float(
+        vps_pos_ctrl.get('max_apply_step_m', vps_cfg.get('position_first_direct_xy_max_apply_dp_xy_m', 32.0))
+    )
+    result['VPS_POSITION_CONTROLLER_WINDOW_BUDGET_M'] = float(
+        vps_pos_ctrl.get('window_budget_m', vps_cfg.get('position_first_direct_xy_budget_max_total_dp_xy_m', 22.0))
+    )
+    result['VPS_POSITION_CONTROLLER_FORCE_FAILSOFT_ON_REJECT'] = bool(
+        vps_pos_ctrl.get('force_failsoft_on_reject', vps_cfg.get('position_first_direct_xy_force_failsoft_on_reject', True))
+    )
+    result['VPS_POSITION_CONTROLLER_HIGH_SPEED_SOFT_CLAMP_ENABLE'] = bool(
+        vps_pos_ctrl.get('high_speed_soft_clamp_enable', True)
+    )
+    result['VPS_POSITION_FIRST_DIRECT_XY_ENABLE'] = bool(
+        vps_cfg.get('position_first_direct_xy_enable', True)
+    )
+    result['VPS_POSITION_FIRST_DIRECT_XY_MIN_INTERVAL_SEC'] = float(
+        vps_cfg.get('position_first_direct_xy_min_interval_sec', 0.8)
+    )
+    result['VPS_POSITION_FIRST_DIRECT_XY_MAX_APPLY_DP_XY_M'] = float(
+        vps_cfg.get(
+            'position_first_direct_xy_max_apply_dp_xy_m',
+            vps_cfg.get('position_first_soft_max_apply_dp_xy_m', 80.0),
+        )
+    )
+    result['VPS_POSITION_FIRST_DIRECT_XY_QUALITY_SCALE'] = float(
+        vps_cfg.get('position_first_direct_xy_quality_scale', 0.90)
+    )
+    result['VPS_POSITION_FIRST_DIRECT_XY_FALLBACK_ON_APPLY_FAIL'] = bool(
+        vps_cfg.get('position_first_direct_xy_fallback_on_apply_fail', True)
+    )
+    result['VPS_POSITION_FIRST_DIRECT_XY_FORCE_FAILSOFT_ON_REJECT'] = bool(
+        vps_cfg.get('position_first_direct_xy_force_failsoft_on_reject', True)
+    )
+    result['VPS_POSITION_FIRST_DIRECT_XY_FORCE_FAILSOFT_MAX_OFFSET_M'] = float(
+        vps_cfg.get('position_first_direct_xy_force_failsoft_max_offset_m', 180.0)
+    )
+    result['VPS_POSITION_FIRST_DIRECT_XY_FORCE_FAILSOFT_MIN_INLIERS'] = int(
+        vps_cfg.get('position_first_direct_xy_force_failsoft_min_inliers', 5)
+    )
+    result['VPS_POSITION_FIRST_DIRECT_XY_FORCE_FAILSOFT_MAX_REPROJ_ERROR'] = float(
+        vps_cfg.get('position_first_direct_xy_force_failsoft_max_reproj_error', 1.4)
+    )
+    result['VPS_POSITION_FIRST_DIRECT_XY_FORCE_FAILSOFT_MAX_SPEED_M_S'] = float(
+        vps_cfg.get('position_first_direct_xy_force_failsoft_max_speed_m_s', 95.0)
+    )
+    result['VPS_POSITION_FIRST_DIRECT_ONLY_FAILSOFT'] = bool(
+        vps_cfg.get('position_first_direct_only_failsoft', True)
+    )
+    result['VPS_POSITION_FIRST_DIRECT_XY_MIN_OFFSET_M'] = float(
+        vps_cfg.get('position_first_direct_xy_min_offset_m', 8.0)
+    )
+    result['VPS_POSITION_FIRST_DIRECT_XY_MAX_OFFSET_M'] = float(
+        vps_cfg.get('position_first_direct_xy_max_offset_m', vps_cfg.get('xy_drift_recovery_max_offset_m', 1800.0))
+    )
+    result['VPS_POSITION_FIRST_DIRECT_XY_MIN_INLIERS'] = int(
+        vps_cfg.get('position_first_direct_xy_min_inliers', 3)
+    )
+    result['VPS_POSITION_FIRST_DIRECT_XY_MIN_CONFIDENCE'] = float(
+        vps_cfg.get('position_first_direct_xy_min_confidence', 0.02)
+    )
+    result['VPS_POSITION_FIRST_DIRECT_XY_MAX_REPROJ_ERROR'] = float(
+        vps_cfg.get('position_first_direct_xy_max_reproj_error', 4.0)
+    )
+    result['VPS_POSITION_FIRST_DIRECT_XY_MAX_SPEED_M_S'] = float(
+        vps_cfg.get('position_first_direct_xy_max_speed_m_s', 120.0)
+    )
+    result['VPS_POSITION_FIRST_DIRECT_XY_HIGH_SPEED_TH_M_S'] = float(
+        vps_cfg.get('position_first_direct_xy_high_speed_th_m_s', 18.0)
+    )
+    result['VPS_POSITION_FIRST_DIRECT_XY_MIN_INLIERS_HIGH_SPEED'] = int(
+        vps_cfg.get('position_first_direct_xy_min_inliers_high_speed', 6)
+    )
+    result['VPS_POSITION_FIRST_DIRECT_XY_MAX_REPROJ_HIGH_SPEED'] = float(
+        vps_cfg.get('position_first_direct_xy_max_reproj_high_speed', 1.2)
+    )
+    result['VPS_POSITION_FIRST_DIRECT_XY_MAX_OFFSET_HIGH_SPEED_M'] = float(
+        vps_cfg.get('position_first_direct_xy_max_offset_high_speed_m', 140.0)
+    )
+    result['VPS_POSITION_FIRST_DIRECT_XY_IGNORE_POLICY_HOLD'] = bool(
+        vps_cfg.get('position_first_direct_xy_ignore_policy_hold', False)
+    )
+    result['VPS_POSITION_FIRST_DIRECT_XY_IGNORE_HARD_REJECT'] = bool(
+        vps_cfg.get('position_first_direct_xy_ignore_hard_reject', False)
+    )
+    result['VPS_POSITION_FIRST_DIRECT_XY_ALLOW_HARD_REJECT_WITH_CONSENSUS'] = bool(
+        vps_cfg.get('position_first_direct_xy_allow_hard_reject_with_consensus', True)
+    )
+    result['VPS_POSITION_FIRST_DIRECT_XY_CONSENSUS_ENABLE'] = bool(
+        vps_cfg.get('position_first_direct_xy_consensus_enable', True)
+    )
+    result['VPS_POSITION_FIRST_DIRECT_XY_CONSENSUS_WINDOW_SEC'] = float(
+        vps_cfg.get('position_first_direct_xy_consensus_window_sec', 4.0)
+    )
+    result['VPS_POSITION_FIRST_DIRECT_XY_CONSENSUS_MIN_SAMPLES'] = int(
+        vps_cfg.get('position_first_direct_xy_consensus_min_samples', 3)
+    )
+    result['VPS_POSITION_FIRST_DIRECT_XY_CONSENSUS_MAX_DEV_M'] = float(
+        vps_cfg.get('position_first_direct_xy_consensus_max_dev_m', 30.0)
+    )
+    result['VPS_POSITION_FIRST_DIRECT_XY_CONSENSUS_MAX_DIR_DEG'] = float(
+        vps_cfg.get('position_first_direct_xy_consensus_max_dir_deg', 70.0)
+    )
+    result['VPS_POSITION_FIRST_DIRECT_XY_CONSENSUS_MAX_KEEP'] = int(
+        vps_cfg.get('position_first_direct_xy_consensus_max_keep', 24)
+    )
+    result['VPS_POSITION_FIRST_DIRECT_XY_USE_CONSENSUS_VECTOR'] = bool(
+        vps_cfg.get('position_first_direct_xy_use_consensus_vector', True)
+    )
+    result['VPS_POSITION_FIRST_DIRECT_XY_QUALITY_CAP_MIN_M'] = float(
+        vps_cfg.get('position_first_direct_xy_quality_cap_min_m', 6.0)
+    )
+    result['VPS_POSITION_FIRST_DIRECT_XY_BUDGET_WINDOW_SEC'] = float(
+        vps_cfg.get('position_first_direct_xy_budget_window_sec', 5.0)
+    )
+    result['VPS_POSITION_FIRST_DIRECT_XY_BUDGET_MAX_TOTAL_DP_XY_M'] = float(
+        vps_cfg.get('position_first_direct_xy_budget_max_total_dp_xy_m', 35.0)
+    )
+    result['VPS_POSITION_FIRST_DIRECT_XY_RECOVERY_MIN_OFFSET_M'] = float(
+        vps_cfg.get('position_first_direct_xy_recovery_min_offset_m', 120.0)
+    )
+    result['VPS_POSITION_FIRST_DIRECT_XY_RECOVERY_MIN_NO_APPLY_SEC'] = float(
+        vps_cfg.get('position_first_direct_xy_recovery_min_no_apply_sec', 6.0)
+    )
+    result['VPS_POSITION_FIRST_DIRECT_XY_RECOVERY_MAX_SPEED_M_S'] = float(
+        vps_cfg.get('position_first_direct_xy_recovery_max_speed_m_s', 14.0)
+    )
+    result['VPS_POSITION_FIRST_DIRECT_XY_RECOVERY_MIN_INLIERS'] = int(
+        vps_cfg.get('position_first_direct_xy_recovery_min_inliers', 7)
+    )
+    result['VPS_POSITION_FIRST_DIRECT_XY_RECOVERY_MAX_REPROJ_ERROR'] = float(
+        vps_cfg.get('position_first_direct_xy_recovery_max_reproj_error', 0.9)
+    )
+    result['VPS_POSITION_FIRST_DIRECT_XY_RECOVERY_MAX_DP_MULT'] = float(
+        vps_cfg.get('position_first_direct_xy_recovery_max_dp_mult', 1.8)
+    )
+    result['VPS_POSITION_FIRST_DIRECT_XY_RECOVERY_MAX_DP_CAP_M'] = float(
+        vps_cfg.get('position_first_direct_xy_recovery_max_dp_cap_m', 90.0)
+    )
+    result['VPS_POSITION_FIRST_DIRECT_XY_RECOVERY_BUDGET_MULT'] = float(
+        vps_cfg.get('position_first_direct_xy_recovery_budget_mult', 2.5)
+    )
+    result['VPS_POSITION_FIRST_DIRECT_XY_RECOVERY_BUDGET_CAP_M'] = float(
+        vps_cfg.get('position_first_direct_xy_recovery_budget_cap_m', 120.0)
+    )
+    result['VPS_POSITION_FIRST_DIRECT_XY_GUARD_ENABLE'] = bool(
+        vps_cfg.get('position_first_direct_xy_guard_enable', True)
+    )
+    result['VPS_POSITION_FIRST_DIRECT_XY_GUARD_FAIL_STREAK_TH'] = int(
+        vps_cfg.get('position_first_direct_xy_guard_fail_streak_th', 18)
+    )
+    result['VPS_POSITION_FIRST_DIRECT_XY_GUARD_NO_COVERAGE_STREAK_TH'] = int(
+        vps_cfg.get('position_first_direct_xy_guard_no_coverage_streak_th', 6)
+    )
+    result['VPS_POSITION_FIRST_DIRECT_XY_GUARD_MAX_APPLY_DP_XY_M'] = float(
+        vps_cfg.get('position_first_direct_xy_guard_max_apply_dp_xy_m', 14.0)
+    )
+    result['VPS_POSITION_FIRST_DIRECT_XY_GUARD_BUDGET_MAX_TOTAL_DP_XY_M'] = float(
+        vps_cfg.get('position_first_direct_xy_guard_budget_max_total_dp_xy_m', 18.0)
+    )
+    result['VPS_POSITION_FIRST_DIRECT_XY_GUARD_QUALITY_MULT'] = float(
+        vps_cfg.get('position_first_direct_xy_guard_quality_mult', 0.78)
+    )
+    result['VPS_POSITION_FIRST_DIRECT_XY_GUARD_MIN_QUALITY'] = float(
+        vps_cfg.get('position_first_direct_xy_guard_min_quality', 0.28)
+    )
+    result['VPS_POSITION_FIRST_DIRECT_XY_GUARD_EXTRA_CONFIRM_HITS'] = int(
+        vps_cfg.get('position_first_direct_xy_guard_extra_confirm_hits', 1)
+    )
+    result['VPS_POSITION_FIRST_DIRECT_XY_GUARD_MAX_DIR_CHANGE_DEG'] = float(
+        vps_cfg.get('position_first_direct_xy_guard_max_dir_change_deg', 55.0)
+    )
+    result['VPS_POSITION_FIRST_DIRECT_XY_GUARD_MIN_DIR_CHECK_M'] = float(
+        vps_cfg.get('position_first_direct_xy_guard_min_dir_check_m', 8.0)
+    )
+    result['VPS_POSITION_FIRST_DIRECT_XY_FAILSOFT_RECOVERY_MIN_INLIERS'] = int(
+        vps_cfg.get('position_first_direct_xy_failsoft_recovery_min_inliers', 5)
+    )
+    result['VPS_POSITION_FIRST_DIRECT_XY_FAILSOFT_RECOVERY_MAX_REPROJ_ERROR'] = float(
+        vps_cfg.get('position_first_direct_xy_failsoft_recovery_max_reproj_error', 1.3)
+    )
+    result['VPS_POSITION_FIRST_DIRECT_XY_FAILSOFT_GUARD_LOWQ_ENABLE'] = bool(
+        vps_cfg.get('position_first_direct_xy_failsoft_guard_lowq_enable', True)
+    )
+    result['VPS_POSITION_FIRST_DIRECT_XY_FAILSOFT_GUARD_LOWQ_MIN_INLIERS'] = int(
+        vps_cfg.get('position_first_direct_xy_failsoft_guard_lowq_min_inliers', 4)
+    )
+    result['VPS_POSITION_FIRST_DIRECT_XY_FAILSOFT_GUARD_LOWQ_MAX_REPROJ_ERROR'] = float(
+        vps_cfg.get('position_first_direct_xy_failsoft_guard_lowq_max_reproj_error', 1.6)
+    )
+    result['VPS_POSITION_FIRST_DIRECT_XY_FAILSOFT_GUARD_LOWQ_MAX_APPLY_DP_XY_M'] = float(
+        vps_cfg.get('position_first_direct_xy_failsoft_guard_lowq_max_apply_dp_xy_m', 7.0)
+    )
+    # Position-controller aliases (accuracy-first branch):
+    # keep legacy keys synchronized so existing apply path stays deterministic.
+    if len(vps_pos_ctrl) > 0:
+        result['VPS_POSITION_FIRST_DIRECT_XY_ENABLE'] = bool(result['VPS_POSITION_CONTROLLER_ENABLE'])
+        result['VPS_POSITION_FIRST_DIRECT_XY_CONSENSUS_WINDOW_SEC'] = float(
+            result['VPS_POSITION_CONTROLLER_CONSENSUS_WINDOW_SEC']
+        )
+        result['VPS_POSITION_FIRST_DIRECT_XY_CONSENSUS_MIN_SAMPLES'] = int(
+            result['VPS_POSITION_CONTROLLER_MIN_SAMPLES']
+        )
+        result['VPS_POSITION_FIRST_DIRECT_XY_MAX_APPLY_DP_XY_M'] = float(
+            result['VPS_POSITION_CONTROLLER_MAX_APPLY_STEP_M']
+        )
+        result['VPS_POSITION_FIRST_DIRECT_XY_BUDGET_MAX_TOTAL_DP_XY_M'] = float(
+            result['VPS_POSITION_CONTROLLER_WINDOW_BUDGET_M']
+        )
+        result['VPS_POSITION_FIRST_DIRECT_XY_FORCE_FAILSOFT_ON_REJECT'] = bool(
+            result['VPS_POSITION_CONTROLLER_FORCE_FAILSOFT_ON_REJECT']
+        )
+        result['VPS_POSITION_FIRST_DIRECT_XY_HIGH_SPEED_SOFT_CLAMP_ENABLE'] = bool(
+            result['VPS_POSITION_CONTROLLER_HIGH_SPEED_SOFT_CLAMP_ENABLE']
+        )
     result['VPS_WORKER_BUSY_FORCE_LOCAL_STREAK'] = int(
         vps_cfg.get('worker_busy_force_local_streak', 120)
     )
@@ -1525,6 +1905,31 @@ def load_config(config_path: str) -> VIOConfig:
     result['VPS_WORKER_BUSY_BACKPRESSURE_STEP'] = int(
         vps_cfg.get('worker_busy_backpressure_step', 30)
     )
+
+    # =========================================================================
+    # Runtime memory watchdog / compaction
+    # =========================================================================
+    mem_cfg = config.get('memory', {}) if isinstance(config.get('memory', {}), dict) else {}
+    result['MEMORY_WATCHDOG_ENABLE'] = bool(mem_cfg.get('watchdog_enable', True))
+    result['MEMORY_CHECK_INTERVAL_SEC'] = float(mem_cfg.get('check_interval_sec', 1.0))
+    result['MEMORY_SOFT_LIMIT_GB'] = float(mem_cfg.get('soft_limit_gb', 16.0))
+    result['MEMORY_HARD_LIMIT_GB'] = float(mem_cfg.get('hard_limit_gb', 24.0))
+    result['MEMORY_COMPACT_COOLDOWN_SEC'] = float(mem_cfg.get('compact_cooldown_sec', 2.0))
+    result['MEMORY_PERIODIC_COMPACT_SEC'] = float(mem_cfg.get('periodic_compact_sec', 10.0))
+    result['MEMORY_VPS_PAUSE_SEC'] = float(mem_cfg.get('vps_pause_sec', 4.0))
+    result['MEMORY_COMPACT_FRONTEND_TRACK_LEN'] = int(
+        mem_cfg.get('compact_frontend_track_len', result.get('VIO_FRONTEND_MAX_TRACK_HISTORY', 90))
+    )
+    result['MEMORY_COMPACT_FRONTEND_MAX_TRACKS'] = int(
+        mem_cfg.get('compact_frontend_max_tracks', result.get('VIO_FRONTEND_MAX_TOTAL_TRACKS', 5000))
+    )
+    result['MEMORY_COMPACT_LOOP_MAX_KEYFRAMES'] = int(
+        mem_cfg.get('compact_loop_max_keyframes', result.get('LOOP_MAX_KEYFRAMES', 220))
+    )
+    result['MEMORY_COMPACT_VPS_TILE_CACHE_MAX'] = int(
+        mem_cfg.get('compact_vps_tile_cache_max', result.get('VPS_TILE_CACHE_MAX_TILES', 50))
+    )
+    result['MEMORY_COMPACT_VPS_WALL_SAMPLES'] = int(mem_cfg.get('compact_vps_wall_samples', 1200))
 
     # =========================================================================
     # Async backend optimizer (fixed-lag, non-blocking frontend)
@@ -1638,6 +2043,27 @@ def load_config(config_path: str) -> VIOConfig:
     result['BACKEND_POSITION_FIRST_BLEND_STEPS'] = int(
         backend_cfg.get('position_first_blend_steps', backend_cfg.get('blend_steps', 3))
     )
+    result['BACKEND_POSITION_FIRST_DIRECT_XY_MAX_APPLY_DP_XY_M'] = float(
+        backend_cfg.get(
+            'position_first_direct_xy_max_apply_dp_xy_m',
+            min(
+                float(backend_cfg.get('position_first_max_apply_dp_xy_m', backend_cfg.get('max_apply_dp_xy_m', 25.0))),
+                28.0,
+            ),
+        )
+    )
+    result['BACKEND_POSITION_FIRST_DIRECT_XY_CORR_WEIGHT'] = float(
+        backend_cfg.get(
+            'position_first_direct_xy_corr_weight',
+            min(
+                float(backend_cfg.get('position_first_corr_weight', backend_cfg.get('correction_weight', 1.0))),
+                0.72,
+            ),
+        )
+    )
+    result['BACKEND_POSITION_FIRST_DIRECT_XY_MIN_BLEND_STEPS'] = int(
+        backend_cfg.get('position_first_direct_xy_min_blend_steps', 3)
+    )
     result['BACKEND_XY_PRIORITY_ENABLE'] = bool(
         backend_cfg.get('xy_priority_enable', True)
     )
@@ -1658,6 +2084,15 @@ def load_config(config_path: str) -> VIOConfig:
     )
     result['BACKEND_XY_PRIORITY_LOWQ_MAX_DYAW_DEG'] = float(
         backend_cfg.get('xy_priority_lowq_max_dyaw_deg', 0.15)
+    )
+    result['BACKEND_YAW_AUTH_MIN_REQUEST_DEG'] = float(
+        backend_cfg.get('yaw_auth_min_request_deg', 0.05)
+    )
+    result['BACKEND_YAW_AUTH_ZERO_REQUEST_DEADBAND_DEG'] = float(
+        backend_cfg.get('yaw_auth_zero_request_deadband_deg', 0.02)
+    )
+    result['BACKEND_YAW_AUTH_ZERO_DYAW_AS_REQUEST'] = bool(
+        backend_cfg.get('yaw_auth_zero_dyaw_as_request', False)
     )
 
     # =========================================================================

@@ -420,6 +420,21 @@ def read_err3d_mean(run_dir: Path | None) -> float:
         return float("nan")
 
 
+def read_err3d_final(run_dir: Path | None) -> float:
+    if run_dir is None:
+        return float("nan")
+    p = run_dir / "accuracy_first_summary.csv"
+    if not p.is_file():
+        return float("nan")
+    try:
+        df = pd.read_csv(p)
+        if len(df) == 0:
+            return float("nan")
+        return float(pd.to_numeric(df.iloc[-1].get("err3d_final"), errors="coerce"))
+    except Exception:
+        return float("nan")
+
+
 def read_health_row(run_dir: Path | None) -> pd.Series | None:
     if run_dir is None:
         return None
@@ -628,9 +643,14 @@ def evaluate_lock_profile(run_dir: Path | None, profile_name: str) -> tuple[bool
     heading_spike = float(heading_metrics.get("spike_rate_abs_err_gt30_deg", float("nan")))
     vps_jump_reject_count = _to_float(row, "vps_jump_reject_count")
     vps_attempt_count = _to_float(row, "vps_attempt_count")
+    abs_corr_apply_count = _to_float(row, "abs_corr_apply_count")
+    failsoft_apply_ratio = _to_float(row, "vps_failsoft_apply_ratio")
+    backend_contract_violation_count = _to_float(row, "backend_contract_violation_count")
     backend_stale_drop_count = _to_float(row, "backend_stale_drop_count")
     backend_poll_count = _to_float(row, "backend_poll_count")
     policy_conflict_count = _to_float(row, "policy_conflict_count")
+    err3d_mean = read_err3d_mean(run_dir)
+    err3d_final = read_err3d_final(run_dir)
 
     jump_ratio = float("nan")
     if np.isfinite(vps_jump_reject_count) and np.isfinite(vps_attempt_count) and vps_attempt_count > 0:
@@ -663,7 +683,44 @@ def evaluate_lock_profile(run_dir: Path | None, profile_name: str) -> tuple[bool
     ))
 
     profile = str(profile_name).strip().lower()
-    if profile == "pre_backend":
+    if profile == "accuracy_position":
+        checks.extend([
+            (
+                "err3d_mean is finite",
+                bool(np.isfinite(err3d_mean)),
+                f"value={err3d_mean:.6f}" if np.isfinite(err3d_mean) else "value=nan",
+            ),
+            (
+                "err3d_final is finite",
+                bool(np.isfinite(err3d_final)),
+                f"value={err3d_final:.6f}" if np.isfinite(err3d_final) else "value=nan",
+            ),
+            (
+                "VPS used >= 20",
+                bool(np.isfinite(vps_used) and vps_used >= 20.0),
+                f"value={vps_used:.0f}" if np.isfinite(vps_used) else "value=nan",
+            ),
+            (
+                "abs_corr_apply_count >= 20",
+                bool(np.isfinite(abs_corr_apply_count) and abs_corr_apply_count >= 20.0),
+                f"value={abs_corr_apply_count:.0f}" if np.isfinite(abs_corr_apply_count) else "value=nan",
+            ),
+            (
+                "backend_contract_violation_count == 0",
+                bool(np.isfinite(backend_contract_violation_count) and abs(backend_contract_violation_count) <= 1e-12),
+                (
+                    f"value={backend_contract_violation_count:.0f}"
+                    if np.isfinite(backend_contract_violation_count)
+                    else "value=nan"
+                ),
+            ),
+            (
+                "vps_failsoft_apply_ratio >= 0.25",
+                bool(np.isfinite(failsoft_apply_ratio) and failsoft_apply_ratio >= 0.25),
+                f"value={failsoft_apply_ratio:.4f}" if np.isfinite(failsoft_apply_ratio) else "value=nan",
+            ),
+        ])
+    elif profile == "pre_backend":
         checks.extend([
             (
                 "mag_cholfail_rate <= 0.10",
@@ -765,8 +822,13 @@ def evaluate_lock_profile(run_dir: Path | None, profile_name: str) -> tuple[bool
         "heading_mae_deg": heading_mae,
         "heading_p95_abs_deg": heading_p95,
         "spike_rate_abs_err_gt30_deg": heading_spike,
+        "err3d_mean": err3d_mean,
+        "err3d_final": err3d_final,
+        "abs_corr_apply_count": abs_corr_apply_count,
+        "vps_failsoft_apply_ratio": failsoft_apply_ratio,
         "vps_jump_reject_ratio": jump_ratio,
         "backend_stale_drop_ratio": stale_ratio,
+        "backend_contract_violation_count": backend_contract_violation_count,
         "policy_conflict_count": policy_conflict_count,
         "overflow_hits": len(over),
         "rtf_proc_sim": _to_float(row, "rtf_proc_sim"),
@@ -1059,6 +1121,8 @@ def snapshot_path_for_profile(repo_dir: Path, profile_name: str) -> Path:
     profile = str(profile_name).lower()
     if profile == "pre_backend":
         return (repo_dir / "configs" / "config_bell412_dataset3_backend_stage1.yaml").resolve()
+    if profile == "accuracy_position":
+        return (repo_dir / "configs" / "config_bell412_dataset3_stageG_base.yaml").resolve()
     if profile in ("backend", "near_rt_backend"):
         return (repo_dir / "configs" / "config_bell412_dataset3_backend_stage2.yaml").resolve()
     return (repo_dir / "configs" / "config_bell412_dataset3_accuracy_stage2.yaml").resolve()
@@ -1077,7 +1141,11 @@ def main() -> int:
         default="",
         help="Optional heading-recovery baseline run dir used for compare-focused H1/H2/H3 checks",
     )
-    parser.add_argument("--lock_profile", default="pre_backend", choices=["pre_backend", "backend", "near_rt_backend"])
+    parser.add_argument(
+        "--lock_profile",
+        default="pre_backend",
+        choices=["pre_backend", "backend", "near_rt_backend", "accuracy_position"],
+    )
     parser.add_argument("--max_regress_pct", type=float, default=15.0)
     parser.add_argument(
         "--h_compare_focused",

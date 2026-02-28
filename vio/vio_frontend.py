@@ -96,6 +96,7 @@ class VIOFrontEnd:
         self.min_tracked_ratio = 0.6
         self.min_parallax_threshold = 30.0
         self.max_track_length = 100
+        self.max_total_tracks = 5000
         self.min_track_length = 4  # Will be overridden by config
         
         # Track quality scoring
@@ -333,6 +334,23 @@ class VIOFrontEnd:
         
         for fid in to_remove:
             del self.tracks[fid]
+        self._enforce_track_cap()
+
+    def _enforce_track_cap(self):
+        """Hard-cap total number of tracks to avoid unbounded memory growth."""
+        try:
+            track_cap = max(128, int(self.max_total_tracks))
+        except Exception:
+            track_cap = 5000
+        if len(self.tracks) <= track_cap:
+            return
+        items = sorted(
+            self.tracks.items(),
+            key=lambda kv: kv[1][-1].get("frame", -1) if kv[1] else -1,
+        )
+        drop_n = len(self.tracks) - track_cap
+        for fid, _ in items[:drop_n]:
+            self.tracks.pop(fid, None)
 
     def bootstrap(self, img_gray: np.ndarray, t: float):
         """Initialize front-end with first frame."""
@@ -350,10 +368,13 @@ class VIOFrontEnd:
                 
                 fids = []
                 for p in features:
+                    if len(self.tracks) >= int(self.max_total_tracks):
+                        break
                     fid = self.next_fid
                     self.next_fid += 1
                     self.tracks[fid] = [{'frame': self.frame_idx, 'pt': (float(p[0]), float(p[1])), 'quality': 1.0}]
                     fids.append(fid)
+                self._enforce_track_cap()
                 
                 self.last_fids_for_klt = np.array(fids, dtype=np.int64)
                 print(f"[VIO][BOOTSTRAP] Initialized {len(features)} grid-based features")
@@ -472,8 +493,7 @@ class VIOFrontEnd:
             print(f"[VIO] KLT tracking exception: {e}")
         
         # Prune old tracks
-        if self.frame_idx % 5 == 0:
-            self._prune_old_tracks()
+        self._prune_old_tracks()
         
         # Pose estimation
         # NOTE: dt_img must be based on consecutive camera timestamps, even when
@@ -646,6 +666,12 @@ class VIOFrontEnd:
             new_features = self._extract_grid_features(img_gray)
             
             if len(new_features) > 0:
+                slots = max(0, int(self.max_total_tracks) - len(self.tracks))
+                if slots <= 0:
+                    self._enforce_track_cap()
+                    return
+                if len(new_features) > slots:
+                    new_features = new_features[:slots]
                 new_fids = []
                 for p in new_features:
                     fid = self.next_fid
@@ -656,6 +682,7 @@ class VIOFrontEnd:
                 self.last_pts_for_klt = new_features.astype(np.float32)
                 self.last_fids_for_klt = np.array(new_fids, dtype=np.int64)
                 self.last_gray_for_klt = img_gray.copy()
+                self._enforce_track_cap()
                 self._runtime_log(
                     "track_emergency_replenish_added",
                     f"[VIO][EMERGENCY_REPLENISH] Added {len(new_features)} new features",
@@ -677,6 +704,12 @@ class VIOFrontEnd:
                 new_features = self._extract_grid_features(img_gray)
                 
                 if len(new_features) > 0:
+                    slots = max(0, int(self.max_total_tracks) - len(self.tracks))
+                    if slots <= 0:
+                        self._enforce_track_cap()
+                        return
+                    if len(new_features) > slots:
+                        new_features = new_features[:slots]
                     existing_pts = np.array([hist[-1]['pt'] for hist in self.tracks.values() 
                                             if hist and hist[-1]['frame'] == self.frame_idx])
                     
@@ -718,6 +751,7 @@ class VIOFrontEnd:
                         self.next_fid += 1
                         self.tracks[fid] = [{'frame': self.frame_idx, 'pt': (float(p[0]), float(p[1])), 'quality': 1.0}]
                         new_fids.append(fid)
+                    self._enforce_track_cap()
                     
                     pts_all = []
                     fids_all = []
@@ -793,3 +827,33 @@ class VIOFrontEnd:
                     })
                     break
         return observations
+
+    def compact_memory(self, max_track_length: Optional[int] = None, max_total_tracks: Optional[int] = None):
+        """Aggressively compact track storage to keep runtime memory bounded."""
+        if max_track_length is not None:
+            try:
+                self.max_track_length = max(8, int(max_track_length))
+            except Exception:
+                pass
+        # Hard trim per-track history.
+        trim_len = max(8, int(self.max_track_length))
+        for fid, hist in list(self.tracks.items()):
+            if not hist:
+                self.tracks.pop(fid, None)
+                continue
+            if len(hist) > trim_len:
+                self.tracks[fid] = hist[-trim_len:]
+        # Optional global cap on number of tracks (drop stalest first).
+        if max_total_tracks is not None:
+            try:
+                track_cap = max(128, int(max_total_tracks))
+            except Exception:
+                track_cap = 1024
+            if len(self.tracks) > track_cap:
+                items = sorted(
+                    self.tracks.items(),
+                    key=lambda kv: kv[1][-1].get("frame", -1) if kv[1] else -1
+                )
+                drop_n = len(self.tracks) - track_cap
+                for fid, _ in items[:drop_n]:
+                    self.tracks.pop(fid, None)

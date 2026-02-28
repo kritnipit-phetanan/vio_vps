@@ -7,8 +7,16 @@ Separated from main_loop.py for modularity.
 Author: VIO project
 """
 import time
+import gc
+import sys
 import numpy as np
 from scipy.spatial.transform import Rotation as R_scipy
+import resource
+
+try:
+    import psutil  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    psutil = None
 
 from .imu_preintegration import IMUPreintegration
 from .propagation import (
@@ -35,6 +43,119 @@ def _backend_poll_due(global_config, t_now: float, last_poll_t: float, cam_tick:
         return (float(t_now) - float(last_poll_t)) >= max(0.05, float(min_interval))
     poll_interval_sec = float(global_config.get("BACKEND_POLL_INTERVAL_SEC", 0.5))
     return (float(t_now) - float(last_poll_t)) >= max(0.01, float(poll_interval_sec))
+
+
+def _process_memory_mb() -> tuple[float, float, float]:
+    """Best-effort current process memory: (rss_mb, vms_mb, uss_mb)."""
+    rss_mb = float("nan")
+    vms_mb = float("nan")
+    uss_mb = float("nan")
+    if psutil is not None:
+        try:
+            proc = psutil.Process()
+            mi = proc.memory_info()
+            rss_mb = float(mi.rss / (1024.0 * 1024.0))
+            vms_mb = float(mi.vms / (1024.0 * 1024.0))
+            try:
+                mfi = proc.memory_full_info()
+                uss = getattr(mfi, "uss", None)
+                if uss is not None:
+                    uss_mb = float(float(uss) / (1024.0 * 1024.0))
+            except Exception:
+                pass
+            return rss_mb, vms_mb, uss_mb
+        except Exception:
+            pass
+    try:
+        ru = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        if sys.platform == "darwin":
+            rss_mb = float(ru / (1024.0 * 1024.0))
+        else:
+            rss_mb = float(ru / 1024.0)
+    except Exception:
+        pass
+    return rss_mb, vms_mb, uss_mb
+
+
+def _memory_watchdog_tick(runner, t_now: float) -> None:
+    """Runtime memory guard with cache compaction + temporary VPS backpressure."""
+    cfg = runner.global_config if isinstance(runner.global_config, dict) else {}
+    if not bool(cfg.get("MEMORY_WATCHDOG_ENABLE", True)):
+        return
+    check_interval = max(0.25, float(cfg.get("MEMORY_CHECK_INTERVAL_SEC", 1.0)))
+    if float(t_now) - float(getattr(runner, "_mem_last_check_t", -1e9)) < check_interval:
+        return
+    runner._mem_last_check_t = float(t_now)
+
+    rss_mb, vms_mb, uss_mb = _process_memory_mb()
+    if not np.isfinite(rss_mb):
+        return
+    runner._memory_peak_rss_mb = float(max(float(getattr(runner, "_memory_peak_rss_mb", 0.0)), float(rss_mb)))
+    if np.isfinite(vms_mb):
+        runner._memory_peak_vms_mb = float(
+            max(float(getattr(runner, "_memory_peak_vms_mb", 0.0)), float(vms_mb))
+        )
+    if np.isfinite(uss_mb):
+        runner._memory_peak_uss_mb = float(
+            max(float(getattr(runner, "_memory_peak_uss_mb", 0.0)), float(uss_mb))
+        )
+    soft_mb = max(512.0, float(cfg.get("MEMORY_SOFT_LIMIT_GB", 16.0)) * 1024.0)
+    hard_mb = max(soft_mb + 512.0, float(cfg.get("MEMORY_HARD_LIMIT_GB", 24.0)) * 1024.0)
+    compact_cd = max(0.25, float(cfg.get("MEMORY_COMPACT_COOLDOWN_SEC", 2.0)))
+    periodic_compact_sec = max(0.0, float(cfg.get("MEMORY_PERIODIC_COMPACT_SEC", 10.0)))
+    periodic_due = bool(
+        periodic_compact_sec > 0.0
+        and (float(t_now) - float(getattr(runner, "_mem_last_periodic_compact_t", -1e9))) >= periodic_compact_sec
+    )
+    pressure_due = bool(rss_mb >= soft_mb)
+    need_compact = bool(periodic_due or pressure_due)
+
+    if need_compact and (float(t_now) - float(getattr(runner, "_mem_last_compact_t", -1e9))) >= compact_cd:
+        try:
+            if runner.vio_fe is not None:
+                runner.vio_fe.compact_memory(
+                    max_track_length=int(cfg.get("MEMORY_COMPACT_FRONTEND_TRACK_LEN", 90)),
+                    max_total_tracks=int(cfg.get("MEMORY_COMPACT_FRONTEND_MAX_TRACKS", 5000)),
+                )
+        except Exception:
+            pass
+        try:
+            if getattr(runner, "loop_detector", None) is not None:
+                runner.loop_detector.compact_memory(
+                    max_keyframes=int(cfg.get("MEMORY_COMPACT_LOOP_MAX_KEYFRAMES", 220))
+                )
+        except Exception:
+            pass
+        try:
+            if getattr(runner, "vps_runner", None) is not None:
+                runner.vps_runner.compact_runtime_caches(
+                    max_cached_tiles=int(cfg.get("MEMORY_COMPACT_VPS_TILE_CACHE_MAX", 50)),
+                    keep_attempt_wall_samples=int(cfg.get("MEMORY_COMPACT_VPS_WALL_SAMPLES", 1200)),
+                )
+        except Exception:
+            pass
+        gc.collect()
+        runner._mem_last_compact_t = float(t_now)
+        if periodic_due:
+            runner._mem_last_periodic_compact_t = float(t_now)
+        runner._memory_compact_count = int(getattr(runner, "_memory_compact_count", 0)) + 1
+
+    if rss_mb >= hard_mb:
+        pause_sec = max(0.5, float(cfg.get("MEMORY_VPS_PAUSE_SEC", 4.0)))
+        runner._vps_memory_pressure_until_t = max(
+            float(getattr(runner, "_vps_memory_pressure_until_t", -1e9)),
+            float(t_now) + float(pause_sec),
+        )
+        runner._memory_pressure_events = int(getattr(runner, "_memory_pressure_events", 0)) + 1
+        last_warn = float(getattr(runner, "_mem_last_warn_t", -1e9))
+        if (float(t_now) - last_warn) > 2.0:
+            if bool(getattr(runner.config, "save_debug_data", False)):
+                print(
+                    "[MEM] pressure: "
+                    f"rss={rss_mb/1024.0:.2f}GB (soft={soft_mb/1024.0:.1f}, hard={hard_mb/1024.0:.1f}), "
+                    f"pause_vps={pause_sec:.1f}s"
+                )
+            runner._mem_last_warn_t = float(t_now)
 
 
 def run_imu_driven_loop(runner):
@@ -407,6 +528,9 @@ def run_imu_driven_loop(runner):
             # - poll is gated by camera/fallback timing
             # - apply of already scheduled correction runs every IMU tick
             runner.vio_service.apply_pending_backend_blend(float(t))
+
+        # Runtime memory watchdog (prevents long-run RAM ballooning).
+        _memory_watchdog_tick(runner, float(t))
 
         # Log error vs ground truth (every sample, like vio_vps.py)
         runner.output_reporting.log_error(t)

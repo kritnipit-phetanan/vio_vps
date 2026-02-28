@@ -45,7 +45,9 @@ HEALTH_COLUMNS = [
     "vps_attempt_ms_p50",
     "vps_attempt_ms_p95",
     "vps_time_budget_stops",
+    "vps_candidate_budget_stops",
     "vps_evaluated_candidates_mean",
+    "vps_budget_escalation_level_mean",
     "policy_conflict_count",
     "heading_owner_switch_count",
     "heading_owner_mag_ratio",
@@ -59,6 +61,12 @@ HEALTH_COLUMNS = [
     "backend_snap_reject_count",
     "backend_apply_latency_ms_p95",
     "backend_contract_violation_count",
+    "vps_failsoft_matched_count",
+    "vps_failsoft_applied_count",
+    "vps_failsoft_apply_ratio",
+    "vps_direct_xy_apply_count",
+    "vps_direct_xy_reject_consensus_count",
+    "vps_direct_xy_reject_budget_count",
     "rtf_proc_sim",
 ]
 
@@ -375,6 +383,28 @@ def _load_heading_metrics(output_dir: Path) -> dict[str, float]:
     return metrics
 
 
+def _load_accuracy_metrics(output_dir: Path) -> dict[str, float]:
+    out = {
+        "err3d_mean": float("nan"),
+        "err3d_final": float("nan"),
+        "vps_used": float("nan"),
+    }
+    p = output_dir / "accuracy_first_summary.csv"
+    if not p.is_file():
+        return out
+    try:
+        df = pd.read_csv(p)
+    except Exception:
+        return out
+    if len(df) == 0:
+        return out
+    row = df.iloc[-1]
+    out["err3d_mean"] = _to_float(row.get("err3d_mean"))
+    out["err3d_final"] = _to_float(row.get("err3d_final"))
+    out["vps_used"] = _to_float(row.get("vps_used"))
+    return out
+
+
 def evaluate_locks(
     current_row: pd.Series,
     output_dir: Path,
@@ -390,7 +420,13 @@ def evaluate_locks(
     backend_poll_count = _to_float(current_row.get("backend_poll_count"))
     policy_conflict_count = _to_float(current_row.get("policy_conflict_count"))
     vps_used = _to_float(current_row.get("vps_used"))
+    abs_corr_apply_count = _to_float(current_row.get("abs_corr_apply_count"))
+    backend_contract_violation_count = _to_float(current_row.get("backend_contract_violation_count"))
+    failsoft_apply_ratio = _to_float(current_row.get("vps_failsoft_apply_ratio"))
     heading_metrics = _load_heading_metrics(output_dir)
+    accuracy_metrics = _load_accuracy_metrics(output_dir)
+    err3d_mean = float(accuracy_metrics.get("err3d_mean", float("nan")))
+    err3d_final = float(accuracy_metrics.get("err3d_final", float("nan")))
     heading_final_abs_deg = float(heading_metrics.get("heading_final_abs_deg", float("nan")))
     heading_mae_deg = float(heading_metrics.get("heading_mae_deg", float("nan")))
     heading_p95_abs_deg = float(heading_metrics.get("heading_p95_abs_deg", float("nan")))
@@ -403,6 +439,8 @@ def evaluate_locks(
             m = re.search(r"VPS used:\s*(\d+)", line)
             if m and not np.isfinite(vps_used):
                 vps_used = float(m.group(1))
+        if np.isfinite(accuracy_metrics.get("vps_used", np.nan)) and not np.isfinite(vps_used):
+            vps_used = float(accuracy_metrics["vps_used"])
 
         warn_patterns = ("overflow", "non-finite", "contains inf/nan", "runtimewarning")
         for line in lines:
@@ -443,7 +481,55 @@ def evaluate_locks(
     ]
 
     profile = str(profile_name).strip().lower()
-    if profile == "pre_backend":
+    if profile == "accuracy_position":
+        checks.extend(
+            [
+                (
+                    "err3d_mean is finite",
+                    np.isfinite(err3d_mean),
+                    f"value={err3d_mean:.6f}" if np.isfinite(err3d_mean) else "value=nan",
+                ),
+                (
+                    "err3d_final is finite",
+                    np.isfinite(err3d_final),
+                    f"value={err3d_final:.6f}" if np.isfinite(err3d_final) else "value=nan",
+                ),
+                (
+                    "VPS used >= 20",
+                    np.isfinite(vps_used) and vps_used >= 20.0,
+                    f"value={vps_used:.0f}" if np.isfinite(vps_used) else "value=nan",
+                ),
+                (
+                    "abs_corr_apply_count >= 20",
+                    np.isfinite(abs_corr_apply_count) and abs_corr_apply_count >= 20.0,
+                    (
+                        f"value={abs_corr_apply_count:.0f}"
+                        if np.isfinite(abs_corr_apply_count)
+                        else "value=nan"
+                    ),
+                ),
+                (
+                    "backend_contract_violation_count == 0",
+                    np.isfinite(backend_contract_violation_count)
+                    and abs(backend_contract_violation_count) <= 1e-12,
+                    (
+                        f"value={backend_contract_violation_count:.0f}"
+                        if np.isfinite(backend_contract_violation_count)
+                        else "value=nan"
+                    ),
+                ),
+                (
+                    "vps_failsoft_apply_ratio >= 0.25",
+                    np.isfinite(failsoft_apply_ratio) and failsoft_apply_ratio >= 0.25,
+                    (
+                        f"value={failsoft_apply_ratio:.4f}"
+                        if np.isfinite(failsoft_apply_ratio)
+                        else "value=nan"
+                    ),
+                ),
+            ]
+        )
+    elif profile == "pre_backend":
         checks.extend(
             [
                 (
@@ -552,7 +638,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Compare benchmark output with baseline and check locks.")
     parser.add_argument("--output_dir", required=True, help="Current run output directory")
     parser.add_argument("--baseline_run", default="", help="Optional baseline run directory")
-    parser.add_argument("--lock_profile", default="backend", choices=["pre_backend", "backend", "near_rt_backend"])
+    parser.add_argument(
+        "--lock_profile",
+        default="backend",
+        choices=["pre_backend", "backend", "near_rt_backend", "accuracy_position"],
+    )
     parser.add_argument("--enforce_locks", action="store_true", help="Return non-zero when any hard lock fails")
     args = parser.parse_args()
 
