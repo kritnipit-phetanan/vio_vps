@@ -352,7 +352,10 @@ def log_msckf_quality(msckf_quality_csv: Optional[str],
                       parallax_med_px: float,
                       reproj_p95_norm: float,
                       depth_positive_ratio: float,
-                      quality_score: float):
+                      quality_score: float,
+                      stable_geometry_flag: float = float("nan"),
+                      conditioning_risk: float = float("nan"),
+                      feature_track_health: float = float("nan")):
     """Log one MSCKF quality snapshot row."""
     if msckf_quality_csv is None:
         return
@@ -362,7 +365,8 @@ def log_msckf_quality(msckf_quality_csv: Optional[str],
                 f"{float(t):.6f},{int(track_count)},"
                 f"{float(inlier_ratio):.6f},{float(parallax_med_px):.6f},"
                 f"{float(reproj_p95_norm):.6f},{float(depth_positive_ratio):.6f},"
-                f"{float(quality_score):.6f}\n"
+                f"{float(quality_score):.6f},{float(stable_geometry_flag):.6f},"
+                f"{float(conditioning_risk):.6f},{float(feature_track_health):.6f}\n"
             )
     except Exception:
         pass
@@ -474,6 +478,9 @@ def append_benchmark_health_summary(summary_csv: Optional[str],
                                     vps_failsoft_matched_count: float = float("nan"),
                                     vps_failsoft_applied_count: float = float("nan"),
                                     vps_failsoft_apply_ratio: float = float("nan"),
+                                    vps_hint_only_count: float = float("nan"),
+                                    vps_apply_score_p50: float = float("nan"),
+                                    vps_apply_score_p10: float = float("nan"),
                                     vps_direct_xy_apply_count: float = float("nan"),
                                     vps_direct_xy_reject_consensus_count: float = float("nan"),
                                     vps_direct_xy_reject_budget_count: float = float("nan"),
@@ -488,6 +495,7 @@ def append_benchmark_health_summary(summary_csv: Optional[str],
                                     yaw_owner_dead_fallback_count: float = float("nan"),
                                     msckf_quality_p50: float = float("nan"),
                                     msckf_quality_p10: float = float("nan"),
+                                    msckf_stable_geometry_ratio: float = float("nan"),
                                     backend_stale_ratio: float = float("nan"),
                                     backend_emit_to_apply_ratio: float = float("nan"),
                                     backend_apply_quality_p50: float = float("nan"),
@@ -525,6 +533,7 @@ def append_benchmark_health_summary(summary_csv: Optional[str],
                 f"{vps_budget_escalation_level_mean:.6f},"
                 f"{vps_failsoft_matched_count:.6f},{vps_failsoft_applied_count:.6f},"
                 f"{vps_failsoft_apply_ratio:.6f},"
+                f"{vps_hint_only_count:.6f},{vps_apply_score_p50:.6f},{vps_apply_score_p10:.6f},"
                 f"{vps_direct_xy_apply_count:.6f},{vps_direct_xy_reject_consensus_count:.6f},"
                 f"{vps_direct_xy_reject_budget_count:.6f},"
                 f"{policy_conflict_count:.6f},"
@@ -533,7 +542,7 @@ def append_benchmark_health_summary(summary_csv: Optional[str],
                 f"{heading_owner_hold_ratio:.6f},"
                 f"{yaw_owner_mag_block_count:.6f},{yaw_owner_mag_block_ratio:.6f},"
                 f"{yaw_owner_dead_fallback_count:.6f},"
-                f"{msckf_quality_p50:.6f},{msckf_quality_p10:.6f},"
+                f"{msckf_quality_p50:.6f},{msckf_quality_p10:.6f},{msckf_stable_geometry_ratio:.6f},"
                 f"{backend_stale_ratio:.6f},{backend_emit_to_apply_ratio:.6f},"
                 f"{backend_apply_quality_p50:.6f},{backend_snap_reject_count:.6f},"
                 f"{backend_apply_latency_ms_p95:.6f},{backend_contract_violation_count:.6f},"
@@ -1504,7 +1513,8 @@ def init_output_csvs(output_dir: str, save_debug_data: bool = False) -> Dict[str
     paths['vps_position_trace_csv'] = os.path.join(output_dir, "vps_position_trace.csv")
     with open(paths['vps_position_trace_csv'], "w", newline="") as f:
         f.write(
-            "t,frame,match_reason,quality_mode,allow_direct_xy_apply,"
+            "t,frame,match_reason,quality_mode,decision_lane,force_hint_only,"
+            "apply_score,consensus_score,geometry_score,motion_score,allow_direct_xy_apply,"
             "direct_xy_candidate,hint_quality,offset_m,inliers,confidence,reproj_error,"
             "applied,reason_code,policy_note,hard_note,temporal_note,direct_note\n"
         )
@@ -1534,7 +1544,8 @@ def init_output_csvs(output_dir: str, save_debug_data: bool = False) -> Dict[str
     paths['msckf_quality_csv'] = os.path.join(output_dir, "msckf_quality.csv")
     with open(paths['msckf_quality_csv'], "w", newline="") as f:
         f.write(
-            "t,track_count,inlier_ratio,parallax_med_px,reproj_p95_norm,depth_positive_ratio,quality_score\n"
+            "t,track_count,inlier_ratio,parallax_med_px,reproj_p95_norm,depth_positive_ratio,"
+            "quality_score,stable_geometry_flag,conditioning_risk,feature_track_health\n"
         )
 
     # Conditioning events (trigger-only log for covariance repairs)
@@ -1560,6 +1571,7 @@ def init_output_csvs(output_dir: str, save_debug_data: bool = False) -> Dict[str
             "vps_time_budget_stops,vps_candidate_budget_stops,vps_evaluated_candidates_mean,"
             "vps_budget_escalation_level_mean,"
             "vps_failsoft_matched_count,vps_failsoft_applied_count,vps_failsoft_apply_ratio,"
+            "vps_hint_only_count,vps_apply_score_p50,vps_apply_score_p10,"
             "vps_direct_xy_apply_count,vps_direct_xy_reject_consensus_count,"
             "vps_direct_xy_reject_budget_count,"
             "policy_conflict_count,"
@@ -1567,7 +1579,7 @@ def init_output_csvs(output_dir: str, save_debug_data: bool = False) -> Dict[str
             "heading_owner_backend_ratio,heading_owner_hold_ratio,"
             "yaw_owner_mag_block_count,yaw_owner_mag_block_ratio,"
             "yaw_owner_dead_fallback_count,"
-            "msckf_quality_p50,msckf_quality_p10,"
+            "msckf_quality_p50,msckf_quality_p10,msckf_stable_geometry_ratio,"
             "backend_stale_ratio,backend_emit_to_apply_ratio,backend_apply_quality_p50,"
             "backend_snap_reject_count,backend_apply_latency_ms_p95,backend_contract_violation_count,"
             "memory_peak_rss_mb,memory_peak_vms_mb,memory_peak_uss_mb,"

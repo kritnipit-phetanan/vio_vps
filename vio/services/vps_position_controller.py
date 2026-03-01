@@ -35,7 +35,13 @@ class VpsMatchEvidence:
 class VpsPositionDecision:
     """Single decision output for VPS position apply chain."""
 
+    decision_lane: str
     quality_mode: str
+    force_hint_only: bool
+    apply_score: float
+    consensus_score: float
+    geometry_score: float
+    motion_score: float
     policy_reject_note: str
     hard_reject_note: str
     temporal_reject_note: str
@@ -53,9 +59,96 @@ class VpsPositionDecision:
 class VPSPositionController:
     """Central controller for VPS failsoft/direct-XY conversion."""
 
+    DECISION_STRICT_APPLY = "STRICT_APPLY"
+    DECISION_FAILSOFT_APPLY = "FAILSOFT_APPLY"
+    DECISION_BOUNDED_SOFT_APPLY = "BOUNDED_SOFT_APPLY"
+    DECISION_HINT_ONLY = "HINT_ONLY"
+    DECISION_REJECT = "REJECT"
+
+    SOFT_ACCEPT_REASONS = {
+        "soft_accept",
+        "abs_corr_soft_apply",
+        "bounded_soft_apply",
+        "xy_drift_recovery_apply",
+        "position_first_soft_apply",
+        "position_first_direct_xy_apply",
+    }
+    SOFT_REJECT_REASONS = {
+        "soft_reject",
+        "abs_corr_temporal_wait",
+    }
+
     def __init__(self, runner: Any, vio_service: Any):
         self.runner = runner
         self.vio_service = vio_service
+
+    @classmethod
+    def is_soft_accept_reason(cls, reason_code: str) -> bool:
+        return str(reason_code) in cls.SOFT_ACCEPT_REASONS
+
+    @classmethod
+    def is_soft_reject_reason(cls, reason_code: str) -> bool:
+        reason = str(reason_code)
+        return reason in cls.SOFT_REJECT_REASONS or reason.startswith("soft_reject")
+
+    @staticmethod
+    def resolve_reason_code(
+        *,
+        vps_applied: bool,
+        quality_mode: str,
+        vps_status: str,
+        position_first_direct_xy_applied: bool,
+        drift_recovery_active: bool,
+        position_first_soft_active: bool,
+    ) -> str:
+        """Classify VPS decision reason from deterministic decision+status inputs."""
+        if bool(drift_recovery_active) and bool(vps_applied):
+            reason_code = "xy_drift_recovery_apply"
+        elif bool(position_first_soft_active) and bool(vps_applied):
+            reason_code = "position_first_soft_apply"
+        elif bool(position_first_direct_xy_applied):
+            reason_code = "position_first_direct_xy_apply"
+        elif str(quality_mode) == "failsoft" and bool(vps_applied):
+            reason_code = "soft_accept"
+        else:
+            reason_code = "normal_accept" if bool(vps_applied) else "hard_reject"
+
+        status_lower = str(vps_status or "").lower()
+        if not status_lower:
+            return reason_code
+        if "clone" in status_lower:
+            return "skip_missing_clone"
+        if "position_first_soft" in status_lower and "applied" in status_lower:
+            return "position_first_soft_apply"
+        if "position_first_direct_xy_applied" in status_lower:
+            return "position_first_direct_xy_apply"
+        if "bounded_soft_apply" in status_lower:
+            return "bounded_soft_apply"
+        if "xy_drift_recovery_hint_only" in status_lower:
+            return "xy_drift_recovery_hint_only"
+        if "xy_drift_recovery" in status_lower and "applied" in status_lower:
+            return "xy_drift_recovery_apply"
+        if "skipped_quality" in status_lower:
+            if "soft_reject" in status_lower:
+                return "soft_reject"
+            return "skip_low_quality"
+        if "hard_reject" in status_lower:
+            return "abs_corr_hard_reject"
+        if "policy_mode_" in status_lower:
+            return "policy_hold"
+        if "large_offset_pending" in status_lower:
+            return "abs_corr_temporal_wait"
+        if str(quality_mode) == "failsoft" and "gated" in status_lower:
+            return "soft_reject"
+        if "gated" in status_lower:
+            return "gated"
+        if "failed" in status_lower:
+            return "soft_reject" if str(quality_mode) == "failsoft" else "hard_reject"
+        if "clamped" in status_lower:
+            return "abs_corr_clamped_apply"
+        if "applied" in status_lower:
+            return "abs_corr_soft_apply" if str(quality_mode) == "failsoft" else "normal_accept"
+        return reason_code
 
     def _compute_hint_quality(
         self,
@@ -108,47 +201,6 @@ class VPSPositionController:
                 )
             )
         return float(hint_quality)
-
-    def _allow_force_failsoft_direct(self, evidence: VpsMatchEvidence, policy_reject_note: str) -> tuple[bool, str]:
-        if not (
-            bool(evidence.vps_match_failsoft)
-            and bool(self.runner.global_config.get("POSITION_FIRST_LANE", False))
-            and bool(
-                self.runner.global_config.get(
-                    "VPS_POSITION_FIRST_DIRECT_XY_FORCE_FAILSOFT_ON_REJECT",
-                    True,
-                )
-            )
-            and not bool(policy_reject_note)
-        ):
-            return False, ""
-
-        fs_force_max_offset = float(
-            self.runner.global_config.get("VPS_POSITION_FIRST_DIRECT_XY_FORCE_FAILSOFT_MAX_OFFSET_M", 180.0)
-        )
-        fs_force_min_inliers = int(
-            round(
-                self.runner.global_config.get("VPS_POSITION_FIRST_DIRECT_XY_FORCE_FAILSOFT_MIN_INLIERS", 5)
-            )
-        )
-        fs_force_max_reproj = float(
-            self.runner.global_config.get("VPS_POSITION_FIRST_DIRECT_XY_FORCE_FAILSOFT_MAX_REPROJ_ERROR", 1.4)
-        )
-        fs_force_max_speed = float(
-            self.runner.global_config.get("VPS_POSITION_FIRST_DIRECT_XY_FORCE_FAILSOFT_MAX_SPEED_M_S", 95.0)
-        )
-        allow = bool(
-            np.isfinite(float(evidence.abs_offset_m))
-            and float(evidence.abs_offset_m) <= float(fs_force_max_offset)
-            and int(evidence.vps_num_inliers) >= max(1, int(fs_force_min_inliers))
-            and np.isfinite(float(evidence.vps_reproj))
-            and float(evidence.vps_reproj) <= float(fs_force_max_reproj)
-            and (
-                (not np.isfinite(float(evidence.speed_m_s)))
-                or float(evidence.speed_m_s) <= float(fs_force_max_speed)
-            )
-        )
-        return allow, "position_first_direct_xy_force_failsoft" if allow else ""
 
     def _allow_failsoft_consensus_fallback(
         self,
@@ -228,7 +280,122 @@ class VPSPositionController:
             return False, ""
         return True, f"failsoft_consensus_soft_fallback:{note_l}"
 
-    def decide(self, evidence: VpsMatchEvidence) -> VpsPositionDecision:
+    def _score_apply_lane(
+        self,
+        *,
+        evidence: VpsMatchEvidence,
+        strict_quality_ok: bool,
+        failsoft_quality_ok: bool,
+        position_first_direct_xy_candidate: bool,
+        policy_reject_note: str,
+        hard_reject_note: str,
+        temporal_reject_note: str,
+        position_first_direct_xy_note: str,
+    ) -> tuple[float, float, float, float, str]:
+        cfg = self.runner.global_config
+        strict_th = float(cfg.get("VPS_APPLY_GATE_STRICT_SCORE_TH", 0.74))
+        failsoft_th = float(cfg.get("VPS_APPLY_GATE_FAILSOFT_SCORE_TH", 0.54))
+        hint_th = float(cfg.get("VPS_APPLY_GATE_HINT_SCORE_TH", 0.32))
+        bounded_soft_th = float(cfg.get("VPS_APPLY_GATE_BOUNDED_SOFT_SCORE_TH", hint_th))
+        bounded_soft_enable = bool(cfg.get("VPS_APPLY_GATE_BOUNDED_SOFT_ENABLE", True))
+        w_cons = float(cfg.get("VPS_APPLY_GATE_CONSENSUS_WEIGHT", 0.35))
+        w_geom = float(cfg.get("VPS_APPLY_GATE_GEOMETRY_WEIGHT", 0.45))
+        w_motion = float(cfg.get("VPS_APPLY_GATE_MOTION_WEIGHT", 0.20))
+
+        fs_min_inliers = max(1, int(evidence.fs_min_inliers))
+        fs_min_conf = max(1e-3, float(evidence.fs_min_conf))
+        fs_max_reproj = max(0.05, float(evidence.fs_max_reproj))
+        fs_max_offset = max(
+            1.0,
+            float(cfg.get("VPS_APPLY_FAILSOFT_MAX_OFFSET_M", 180.0)),
+        )
+
+        inlier_score = float(np.clip(float(evidence.vps_num_inliers) / float(max(2 * fs_min_inliers, 6)), 0.0, 1.0))
+        conf_score = float(np.clip(float(evidence.vps_conf) / float(max(fs_min_conf * 1.8, 0.12)), 0.0, 1.0))
+        reproj_score = float(np.clip(fs_max_reproj / max(float(evidence.vps_reproj), 0.05), 0.0, 1.0))
+        geometry_score = float(np.clip(0.45 * inlier_score + 0.30 * conf_score + 0.25 * reproj_score, 0.0, 1.0))
+        if bool(strict_quality_ok):
+            geometry_score = float(np.clip(geometry_score + 0.12, 0.0, 1.0))
+        elif not bool(failsoft_quality_ok):
+            geometry_score = float(np.clip(geometry_score * 0.70, 0.0, 1.0))
+
+        offset_score = float(np.clip(1.0 - (float(evidence.abs_offset_m) / fs_max_offset), 0.0, 1.0))
+        consensus_score = float(offset_score)
+        if bool(position_first_direct_xy_candidate):
+            consensus_score = float(np.clip(consensus_score + 0.20, 0.0, 1.0))
+        note_l = str(position_first_direct_xy_note).lower()
+        if "consensus_warmup" in note_l:
+            consensus_score = min(consensus_score, 0.40)
+        elif "consensus_dev" in note_l:
+            consensus_score = min(consensus_score, 0.30)
+        elif "consensus_dir" in note_l:
+            consensus_score = min(consensus_score, 0.24)
+
+        speed_ref = max(1.0, float(cfg.get("VPS_APPLY_GATE_MOTION_HIGH_SPEED_M_S", 45.0)))
+        yaw_ref = max(1.0, float(cfg.get("VPS_APPLY_GATE_MOTION_HIGH_YAWRATE_DEG_S", 55.0)))
+        speed_norm = (
+            float(np.clip(float(evidence.speed_m_s) / speed_ref, 0.0, 1.0))
+            if np.isfinite(float(evidence.speed_m_s))
+            else 0.0
+        )
+        yaw_norm = (
+            float(np.clip(abs(float(evidence.yaw_rate_deg_s)) / yaw_ref, 0.0, 1.0))
+            if np.isfinite(float(evidence.yaw_rate_deg_s))
+            else 0.0
+        )
+        motion_score = float(np.clip(1.0 - (0.72 * speed_norm + 0.28 * yaw_norm), 0.0, 1.0))
+
+        weight_sum = max(1e-6, w_cons + w_geom + w_motion)
+        apply_score = float(
+            np.clip(
+                (w_cons * consensus_score + w_geom * geometry_score + w_motion * motion_score) / weight_sum,
+                0.0,
+                1.0,
+            )
+        )
+
+        if bool(policy_reject_note) or bool(hard_reject_note) or bool(temporal_reject_note):
+            # Policy/hard/temporal rejections are not converted to apply lanes.
+            return (
+                apply_score,
+                consensus_score,
+                geometry_score,
+                motion_score,
+                self.DECISION_REJECT,
+            )
+
+        if apply_score >= strict_th and bool(strict_quality_ok):
+            lane = self.DECISION_STRICT_APPLY
+        elif apply_score >= failsoft_th and (bool(failsoft_quality_ok) or bool(position_first_direct_xy_candidate)):
+            lane = self.DECISION_FAILSOFT_APPLY
+        elif apply_score >= (
+            bounded_soft_th if bool(bounded_soft_enable) else hint_th
+        ) and (bool(failsoft_quality_ok) or bool(position_first_direct_xy_candidate)):
+            lane = (
+                self.DECISION_BOUNDED_SOFT_APPLY
+                if bool(bounded_soft_enable)
+                else self.DECISION_HINT_ONLY
+            )
+        else:
+            lane = self.DECISION_REJECT
+
+        # Accuracy branch default: fail-soft is not apply-default.
+        failsoft_default_hint_only = bool(
+            cfg.get("VPS_APPLY_GATE_FAILSOFT_DEFAULT_HINT_ONLY", True)
+        )
+        if (
+            lane == self.DECISION_FAILSOFT_APPLY
+            and failsoft_default_hint_only
+            and not bool(strict_quality_ok)
+        ):
+            lane = (
+                self.DECISION_BOUNDED_SOFT_APPLY
+                if bool(bounded_soft_enable)
+                else self.DECISION_HINT_ONLY
+            )
+        return apply_score, consensus_score, geometry_score, motion_score, lane
+
+    def decide_and_classify(self, evidence: VpsMatchEvidence) -> VpsPositionDecision:
         runner = self.runner
         if bool(evidence.vps_match_failsoft):
             runner._vps_failsoft_matched_count = int(getattr(runner, "_vps_failsoft_matched_count", 0)) + 1
@@ -365,26 +532,166 @@ class VPSPositionController:
                 position_first_direct_xy_candidate=bool(position_first_direct_xy_candidate),
             )
 
-        allow_direct_xy_apply = False
-        if quality_mode == "reject":
-            if bool(position_first_direct_xy_candidate):
-                allow_direct_xy_apply = True
-            else:
-                force_allow, forced_note = self._allow_force_failsoft_direct(
-                    evidence=evidence, policy_reject_note=policy_reject_note
+        (
+            apply_score,
+            consensus_score,
+            geometry_score,
+            motion_score,
+            decision_lane,
+        ) = self._score_apply_lane(
+            evidence=evidence,
+            strict_quality_ok=bool(evidence.strict_quality_ok),
+            failsoft_quality_ok=bool(evidence.failsoft_quality_ok),
+            position_first_direct_xy_candidate=bool(position_first_direct_xy_candidate),
+            policy_reject_note=str(policy_reject_note),
+            hard_reject_note=str(hard_reject_note),
+            temporal_reject_note=str(temporal_reject_note),
+            position_first_direct_xy_note=str(position_first_direct_xy_note),
+        )
+
+        # Deterministic hold-bypass for accuracy branch:
+        # allow bounded soft-apply when policy HOLD persists and match quality is adequate.
+        if (
+            decision_lane == self.DECISION_REJECT
+            and str(policy_reject_note).startswith("policy_mode_hold")
+            and not bool(hard_reject_note)
+            and not bool(temporal_reject_note)
+            and bool(runner.global_config.get("VPS_APPLY_GATE_BOUNDED_SOFT_ENABLE", True))
+            and bool(
+                runner.global_config.get(
+                    "VPS_APPLY_GATE_BOUNDED_SOFT_POLICY_HOLD_BYPASS_ENABLE",
+                    True,
                 )
-                if force_allow:
-                    allow_direct_xy_apply = True
-                    position_first_direct_xy_note = (
-                        f"{position_first_direct_xy_note}|{forced_note}"
-                        if str(position_first_direct_xy_note).strip()
-                        else forced_note
+            )
+        ):
+            hold_bypass_min_no_apply_sec = max(
+                0.0,
+                float(
+                    runner.global_config.get(
+                        "VPS_APPLY_GATE_BOUNDED_SOFT_POLICY_HOLD_BYPASS_MIN_NO_APPLY_SEC",
+                        3.0,
                     )
-                elif bool(position_first_soft_active or drift_recovery_candidate):
-                    allow_direct_xy_apply = ((not bool(policy_reject_note)) and (not bool(hard_reject_note)))
+                ),
+            )
+            hold_bypass_min_score = float(
+                runner.global_config.get(
+                    "VPS_APPLY_GATE_BOUNDED_SOFT_POLICY_HOLD_BYPASS_MIN_SCORE_TH",
+                    max(0.36, float(runner.global_config.get("VPS_APPLY_GATE_BOUNDED_SOFT_SCORE_TH", 0.36))),
+                )
+            )
+            hold_bypass_max_speed = float(
+                runner.global_config.get(
+                    "VPS_APPLY_GATE_BOUNDED_SOFT_POLICY_HOLD_BYPASS_MAX_SPEED_M_S",
+                    95.0,
+                )
+            )
+            hold_bypass_max_offset = float(
+                runner.global_config.get(
+                    "VPS_APPLY_GATE_BOUNDED_SOFT_POLICY_HOLD_BYPASS_MAX_OFFSET_M",
+                    float(runner.global_config.get("VPS_APPLY_FAILSOFT_MAX_OFFSET_M", 180.0)),
+                )
+            )
+            hold_bypass_min_inliers = max(
+                1,
+                int(
+                    round(
+                        float(
+                            runner.global_config.get(
+                                "VPS_APPLY_GATE_BOUNDED_SOFT_POLICY_HOLD_BYPASS_MIN_INLIERS",
+                                evidence.fs_min_inliers,
+                            )
+                        )
+                    )
+                ),
+            )
+            hold_bypass_min_conf = float(
+                runner.global_config.get(
+                    "VPS_APPLY_GATE_BOUNDED_SOFT_POLICY_HOLD_BYPASS_MIN_CONFIDENCE",
+                    evidence.fs_min_conf,
+                )
+            )
+            hold_bypass_max_reproj = float(
+                runner.global_config.get(
+                    "VPS_APPLY_GATE_BOUNDED_SOFT_POLICY_HOLD_BYPASS_MAX_REPROJ_ERROR",
+                    evidence.fs_max_reproj,
+                )
+            )
+            last_apply_t = float(getattr(runner, "last_vps_update_time", -1e9))
+            since_last_apply = float(evidence.t_cam) - float(last_apply_t)
+            hold_bypass_ok = bool(
+                np.isfinite(float(since_last_apply))
+                and float(since_last_apply) >= float(hold_bypass_min_no_apply_sec)
+                and np.isfinite(float(apply_score))
+                and float(apply_score) >= float(hold_bypass_min_score)
+                and np.isfinite(float(evidence.abs_offset_m))
+                and float(evidence.abs_offset_m) <= float(hold_bypass_max_offset)
+                and int(evidence.vps_num_inliers) >= int(hold_bypass_min_inliers)
+                and np.isfinite(float(evidence.vps_conf))
+                and float(evidence.vps_conf) >= float(hold_bypass_min_conf)
+                and np.isfinite(float(evidence.vps_reproj))
+                and float(evidence.vps_reproj) <= float(hold_bypass_max_reproj)
+                and (
+                    (not np.isfinite(float(evidence.speed_m_s)))
+                    or float(evidence.speed_m_s) <= float(hold_bypass_max_speed)
+                )
+            )
+            if bool(hold_bypass_ok):
+                decision_lane = self.DECISION_BOUNDED_SOFT_APPLY
+                policy_reject_note = "policy_mode_hold_bypass_bounded_soft"
+                runner._vps_bounded_soft_hold_bypass_count = int(
+                    getattr(runner, "_vps_bounded_soft_hold_bypass_count", 0)
+                ) + 1
+
+        if decision_lane == self.DECISION_BOUNDED_SOFT_APPLY:
+            min_interval = max(
+                0.0,
+                float(
+                    runner.global_config.get(
+                        "VPS_APPLY_GATE_BOUNDED_SOFT_MIN_INTERVAL_SEC",
+                        0.35,
+                    )
+                ),
+            )
+            if min_interval > 1e-6:
+                last_apply_t = float(getattr(runner, "_vps_bounded_soft_last_apply_time", -1e9))
+                if np.isfinite(last_apply_t):
+                    dt_apply = float(evidence.t_cam) - float(last_apply_t)
+                    if np.isfinite(dt_apply) and dt_apply < min_interval:
+                        decision_lane = self.DECISION_REJECT
+                        note = f"bounded_soft_min_interval:{dt_apply:.2f}<{min_interval:.2f}"
+                        temporal_reject_note = (
+                            f"{temporal_reject_note}|{note}"
+                            if str(temporal_reject_note).strip()
+                            else note
+                        )
+
+        force_hint_only = bool(decision_lane == self.DECISION_HINT_ONLY)
+        allow_direct_xy_apply = False
+        if decision_lane in (
+            self.DECISION_STRICT_APPLY,
+            self.DECISION_FAILSOFT_APPLY,
+            self.DECISION_BOUNDED_SOFT_APPLY,
+        ):
+            quality_mode = "strict" if bool(evidence.strict_quality_ok) else "failsoft"
+        elif decision_lane == self.DECISION_HINT_ONLY:
+            quality_mode = "reject"
+        else:
+            quality_mode = "reject"
+
+        if quality_mode == "reject" and not force_hint_only:
+            # In REJECT lane, keep only deterministic fallback path;
+            # APPLY/HINT lane conversions are handled in classifier above.
+            if bool(position_first_soft_active or drift_recovery_candidate):
+                allow_direct_xy_apply = ((not bool(policy_reject_note)) and (not bool(hard_reject_note)))
 
         return VpsPositionDecision(
+            decision_lane=str(decision_lane),
             quality_mode=str(quality_mode),
+            force_hint_only=bool(force_hint_only),
+            apply_score=float(apply_score),
+            consensus_score=float(consensus_score),
+            geometry_score=float(geometry_score),
+            motion_score=float(motion_score),
             policy_reject_note=str(policy_reject_note),
             hard_reject_note=str(hard_reject_note),
             temporal_reject_note=str(temporal_reject_note),
@@ -398,6 +705,10 @@ class VPSPositionController:
             allow_direct_xy_apply=bool(allow_direct_xy_apply),
             hint_quality=float(hint_quality),
         )
+
+    def decide(self, evidence: VpsMatchEvidence) -> VpsPositionDecision:
+        """Backward-compatible alias to the canonical classifier API."""
+        return self.decide_and_classify(evidence)
 
     def apply_direct_xy(self, evidence: VpsMatchEvidence, base_quality: float) -> tuple[bool, str]:
         direct_ok, note = self.vio_service._apply_position_first_direct_xy_correction(
@@ -434,7 +745,10 @@ class VPSPositionController:
             with open(csv_path, "a", newline="") as f:
                 f.write(
                     f"{float(evidence.t_cam):.6f},{int(evidence.frame_idx)},"
-                    f"{match_reason},{decision.quality_mode},{int(decision.allow_direct_xy_apply)},"
+                    f"{match_reason},{decision.quality_mode},{decision.decision_lane},"
+                    f"{int(decision.force_hint_only)},{float(decision.apply_score):.6f},"
+                    f"{float(decision.consensus_score):.6f},{float(decision.geometry_score):.6f},"
+                    f"{float(decision.motion_score):.6f},{int(decision.allow_direct_xy_apply)},"
                     f"{int(decision.position_first_direct_xy_candidate)},{float(decision.hint_quality):.6f},"
                     f"{float(evidence.abs_offset_m):.3f},{int(evidence.vps_num_inliers)},"
                     f"{float(evidence.vps_conf):.6f},{float(evidence.vps_reproj):.6f},"

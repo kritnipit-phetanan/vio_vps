@@ -137,6 +137,10 @@ class VPSConfig:
     reloc_no_coverage_backoff_refresh_min_sec: float = 2.5
     reloc_no_coverage_use_last_success: bool = True
     reloc_no_coverage_use_last_coverage: bool = True
+    reloc_accuracy_local_first_enable: bool = True
+    reloc_accuracy_local_first_recent_success_sec: float = 120.0
+    reloc_accuracy_local_first_fail_streak_max: int = 24
+    reloc_accuracy_local_first_require_anchor: bool = True
     reloc_no_coverage_radius_m: tuple = (25.0, 60.0)
     reloc_no_coverage_samples: int = 6
     reloc_no_coverage_max_centers: int = 6
@@ -437,6 +441,14 @@ class VPSRunner:
         has_last_coverage_center = bool(
             np.isfinite(self._last_coverage_center_lat) and np.isfinite(self._last_coverage_center_lon)
         )
+        est_in_cache = bool(self.tile_cache.is_position_in_cache(float(est_lat), float(est_lon)))
+        use_out_of_cache_recovery = bool(
+            (not est_in_cache)
+            and (
+                (bool(self.config.reloc_no_coverage_use_last_success) and has_last_success_center)
+                or (bool(self.config.reloc_no_coverage_use_last_coverage) and has_last_coverage_center)
+            )
+        )
         use_no_coverage_recovery = bool(
             int(self._no_coverage_streak) >= int(self.config.reloc_no_coverage_recovery_streak)
             and (
@@ -453,16 +465,48 @@ class VPSRunner:
                 or (bool(self.config.reloc_no_coverage_use_last_coverage) and has_last_coverage_center)
             )
         )
-        use_coverage_recovery = bool(use_no_coverage_recovery or use_match_recovery)
+        use_coverage_recovery = bool(
+            use_no_coverage_recovery or use_match_recovery or use_out_of_cache_recovery
+        )
+        accuracy_local_first_active = False
+        if (
+            bool(self.config.accuracy_mode)
+            and bool(self.config.reloc_accuracy_local_first_enable)
+            and (not bool(force_global_requested))
+        ):
+            has_anchor = bool(has_last_success_center or has_last_coverage_center)
+            require_anchor = bool(self.config.reloc_accuracy_local_first_require_anchor)
+            anchor_ok = bool(has_anchor or (not require_anchor))
+            recent_success_ok = bool(
+                np.isfinite(float(since_success_sec))
+                and float(since_success_sec)
+                <= max(0.0, float(self.config.reloc_accuracy_local_first_recent_success_sec))
+            )
+            fail_ok = bool(
+                int(self._fail_streak)
+                <= max(0, int(self.config.reloc_accuracy_local_first_fail_streak_max))
+            )
+            if bool(use_out_of_cache_recovery):
+                # Once estimate drifts out of tile bounds, force local anchor recovery first.
+                recent_success_ok = True
+                fail_ok = True
+            if anchor_ok and recent_success_ok and fail_ok and (
+                bool(use_coverage_recovery) or bool(use_out_of_cache_recovery)
+            ):
+                accuracy_local_first_active = True
+                if bool(global_mode) and (not bool(global_probe_allowed)):
+                    global_mode = False
+                    trigger_reason = "accuracy_local_first_anchor_recovery"
+
         recovery_source = "none"
         if use_coverage_recovery and bool(self.config.reloc_no_coverage_use_last_success) and has_last_success_center:
             search_base_lat = float(self._last_success_center_lat)
             search_base_lon = float(self._last_success_center_lon)
-            recovery_source = "last_success"
+            recovery_source = "last_success" if not use_out_of_cache_recovery else "out_of_cache_last_success"
         elif use_coverage_recovery and bool(self.config.reloc_no_coverage_use_last_coverage) and has_last_coverage_center:
             search_base_lat = float(self._last_coverage_center_lat)
             search_base_lon = float(self._last_coverage_center_lon)
-            recovery_source = "last_coverage"
+            recovery_source = "last_coverage" if not use_out_of_cache_recovery else "out_of_cache_last_coverage"
         else:
             search_base_lat = float(est_lat)
             search_base_lon = float(est_lon)
@@ -511,6 +555,8 @@ class VPSRunner:
                     if trigger_reason in ("", "local_default", "none")
                     else f"{trigger_reason}+coverage_recovery"
                 )
+                if bool(accuracy_local_first_active) and "accuracy_local_first" not in str(trigger_reason):
+                    trigger_reason = f"{trigger_reason}+accuracy_local_first"
             else:
                 search_centers = [(float(est_lat), float(est_lon))]
 
@@ -861,6 +907,18 @@ class VPSRunner:
                 ),
                 reloc_no_coverage_use_last_coverage=bool(
                     reloc_cfg.get("no_coverage_use_last_coverage", True)
+                ),
+                reloc_accuracy_local_first_enable=bool(
+                    reloc_cfg.get("accuracy_local_first_enable", True)
+                ),
+                reloc_accuracy_local_first_recent_success_sec=float(
+                    reloc_cfg.get("accuracy_local_first_recent_success_sec", 120.0)
+                ),
+                reloc_accuracy_local_first_fail_streak_max=int(
+                    reloc_cfg.get("accuracy_local_first_fail_streak_max", 24)
+                ),
+                reloc_accuracy_local_first_require_anchor=bool(
+                    reloc_cfg.get("accuracy_local_first_require_anchor", True)
                 ),
                 reloc_no_coverage_radius_m=(
                     reloc_no_cov_radius if len(reloc_no_cov_radius) > 0 else (25.0, 60.0)

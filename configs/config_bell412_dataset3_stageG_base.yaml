@@ -404,6 +404,11 @@ backend:
   contract:
     strict_require_source_mix: true
     strict_require_residual_summary: true
+  contract_v1:
+    strict_require_version: true
+    expected_version: v1
+    strict_require_source_mix: true
+    strict_require_residual_summary: true
   vps_yaw_hint_enable: true
   vps_yaw_hint_gain: 0.35
   vps_yaw_hint_max_abs_deg: 35.0
@@ -430,6 +435,8 @@ backend:
     use_dem: false
     use_vps_xy: true
     use_vps_yaw: true
+    vps_yaw_quality_floor: 0.45
+    vps_yaw_cap_deg: 1.5
     use_loop_yaw: false
     use_mag_yaw: false
 camera:
@@ -1049,6 +1056,12 @@ vio:
       quality_high_th: 0.75
       quality_low_th: 0.45
       warning_scale: 1.2
+    quality_gate:
+      track_min: 10
+      inlier_min: 0.30
+      parallax_min_px: 1.2
+      depth_positive_min: 0.62
+      reproj_p95_max: 0.06
   frontend:
     max_track_history: 80
     max_total_tracks: 4500
@@ -1134,14 +1147,39 @@ vps:
     min_samples: 3
     max_apply_step_m: 32.0
     window_budget_m: 22.0
-    force_failsoft_on_reject: true
+    force_failsoft_on_reject: false
     high_speed_soft_clamp_enable: true
+  apply_gate:
+    strict_score_th: 0.74
+    failsoft_score_th: 0.54
+    hint_score_th: 0.32
+    consensus_weight: 0.35
+    geometry_weight: 0.45
+    motion_weight: 0.20
+    motion_high_speed_m_s: 45.0
+    motion_high_yawrate_deg_s: 55.0
+    failsoft_default_hint_only: true
+    bounded_soft_enable: true
+    bounded_soft_r_mult: 2.6
+    bounded_soft_score_th: 0.38
+    bounded_soft_max_apply_dp_xy_m: 10.0
+    bounded_soft_min_interval_sec: 0.35
+    bounded_soft_high_speed_m_s: 18.0
+    bounded_soft_high_speed_max_apply_dp_xy_m: 5.0
+    bounded_soft_policy_hold_bypass_enable: true
+    bounded_soft_policy_hold_bypass_min_no_apply_sec: 2.5
+    bounded_soft_policy_hold_bypass_min_score_th: 0.40
+    bounded_soft_policy_hold_bypass_max_speed_m_s: 95.0
+    bounded_soft_policy_hold_bypass_max_offset_m: 180.0
+    bounded_soft_policy_hold_bypass_min_inliers: 5
+    bounded_soft_policy_hold_bypass_min_confidence: 0.12
+    bounded_soft_policy_hold_bypass_max_reproj_error: 1.2
   position_first_direct_xy_enable: true
   position_first_direct_xy_min_interval_sec: 0.8
   position_first_direct_xy_max_apply_dp_xy_m: 32.0
   position_first_direct_xy_quality_scale: 0.95
   position_first_direct_xy_fallback_on_apply_fail: true
-  position_first_direct_xy_force_failsoft_on_reject: true
+  position_first_direct_xy_force_failsoft_on_reject: false
   position_first_direct_xy_force_failsoft_max_offset_m: 180.0
   position_first_direct_xy_force_failsoft_min_inliers: 5
   position_first_direct_xy_force_failsoft_max_reproj_error: 1.4
@@ -1296,6 +1334,10 @@ vps:
     max_centers: 10
     no_coverage_use_last_success: true
     no_coverage_use_last_coverage: true
+    accuracy_local_first_enable: true
+    accuracy_local_first_recent_success_sec: 120.0
+    accuracy_local_first_fail_streak_max: 24
+    accuracy_local_first_require_anchor: true
     budget_escalator_enable: true
     budget_escalator_trigger_streak: 3
     budget_escalator_max_level: 3

@@ -235,6 +235,13 @@ class PolicyRuntimeService:
                 extras["msckf_reproj_p95_norm"] = float(getattr(msckf_q, "reproj_p95_norm", np.nan))
                 extras["msckf_depth_positive_ratio"] = float(getattr(msckf_q, "depth_positive_ratio", np.nan))
                 extras["msckf_parallax_med_px"] = float(getattr(msckf_q, "parallax_med_px", np.nan))
+                extras["msckf_stable_geometry_flag"] = (
+                    1.0 if bool(getattr(msckf_q, "stable_geometry_flag", False)) else 0.0
+                )
+                extras["msckf_conditioning_risk"] = float(getattr(msckf_q, "conditioning_risk", np.nan))
+                extras["msckf_feature_track_health"] = float(
+                    getattr(msckf_q, "feature_track_health", np.nan)
+                )
             except Exception:
                 pass
 
@@ -261,6 +268,9 @@ class PolicyRuntimeService:
             extras["reproj_p95_norm"] = float(extras.get("msckf_reproj_p95_norm", np.nan))
             extras["depth_positive_ratio"] = float(extras.get("msckf_depth_positive_ratio", np.nan))
             extras["parallax_med_px"] = float(extras.get("msckf_parallax_med_px", np.nan))
+            extras["stable_geometry_flag"] = float(extras.get("msckf_stable_geometry_flag", 0.0))
+            extras["conditioning_risk"] = float(extras.get("msckf_conditioning_risk", np.nan))
+            extras["feature_track_health"] = float(extras.get("msckf_feature_track_health", np.nan))
             phase_key = str(max(0, min(2, int(phase))))
             extras["phase_chi2_scale"] = float(cfg.get("MSCKF_PHASE_CHI2_SCALE", {}).get(phase_key, 1.0))
             extras["phase_reproj_scale"] = float(cfg.get("MSCKF_PHASE_REPROJ_SCALE", {}).get(phase_key, 1.0))

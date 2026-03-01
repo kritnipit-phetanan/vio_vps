@@ -246,6 +246,7 @@ def _summarize_msckf_quality(
     reproj_p95_norm: List[float],
     depth_positive_ratio: List[float],
     feature_quality: List[float],
+    global_config: Optional[dict] = None,
 ) -> MsckfQualitySnapshot:
     """Build compact MSCKF quality snapshot from per-feature aggregates."""
     tc = int(max(0, track_count))
@@ -270,6 +271,43 @@ def _summarize_msckf_quality(
             score_terms.append(float(np.clip(depth_ratio, 0.0, 1.0)))
         q_score = float(np.mean(score_terms)) if score_terms else float("nan")
 
+    cfg = global_config if isinstance(global_config, dict) else {}
+    tr_min = max(1, int(cfg.get("MSCKF_QUALITY_GATE_TRACK_MIN", 10)))
+    inlier_min = float(cfg.get("MSCKF_QUALITY_GATE_INLIER_MIN", 0.30))
+    parallax_min = float(cfg.get("MSCKF_QUALITY_GATE_PARALLAX_MIN_PX", 1.2))
+    depth_min = float(cfg.get("MSCKF_QUALITY_GATE_DEPTH_POSITIVE_MIN", 0.62))
+    reproj_max = float(cfg.get("MSCKF_QUALITY_GATE_REPROJ_P95_MAX", 0.06))
+
+    stable_geometry_flag = bool(
+        tc >= tr_min
+        and (np.isfinite(inlier_ratio) and float(inlier_ratio) >= inlier_min)
+        and (np.isfinite(parallax_med) and float(parallax_med) >= parallax_min)
+        and (np.isfinite(depth_ratio) and float(depth_ratio) >= depth_min)
+        and (np.isfinite(reproj_p95) and float(reproj_p95) <= reproj_max)
+    )
+
+    track_health = 0.0
+    track_terms: List[float] = []
+    if np.isfinite(inlier_ratio):
+        track_terms.append(float(np.clip((float(inlier_ratio) - inlier_min) / max(1e-6, 1.0 - inlier_min), 0.0, 1.0)))
+    if np.isfinite(parallax_med):
+        track_terms.append(float(np.clip(float(parallax_med) / max(1e-6, 2.0 * parallax_min), 0.0, 1.0)))
+    if np.isfinite(depth_ratio):
+        track_terms.append(float(np.clip((float(depth_ratio) - depth_min) / max(1e-6, 1.0 - depth_min), 0.0, 1.0)))
+    if tc > 0:
+        track_terms.append(float(np.clip(float(tc) / float(max(tr_min * 2, 1)), 0.0, 1.0)))
+    if track_terms:
+        track_health = float(np.clip(np.mean(track_terms), 0.0, 1.0))
+
+    risk_terms: List[float] = []
+    if np.isfinite(reproj_p95):
+        risk_terms.append(float(np.clip(float(reproj_p95) / max(1e-6, reproj_max), 0.0, 3.0)))
+    if np.isfinite(depth_ratio):
+        risk_terms.append(float(np.clip((depth_min - float(depth_ratio)) / max(1e-6, depth_min), 0.0, 3.0)))
+    if np.isfinite(parallax_med):
+        risk_terms.append(float(np.clip((parallax_min - float(parallax_med)) / max(1e-6, parallax_min), 0.0, 3.0)))
+    conditioning_risk = float(np.clip(np.mean(risk_terms) if risk_terms else np.nan, 0.0, 3.0))
+
     return MsckfQualitySnapshot(
         timestamp=float(t),
         track_count=tc,
@@ -278,6 +316,9 @@ def _summarize_msckf_quality(
         reproj_p95_norm=float(reproj_p95),
         depth_positive_ratio=float(depth_ratio),
         quality_score=float(q_score),
+        stable_geometry_flag=bool(stable_geometry_flag),
+        conditioning_risk=float(conditioning_risk),
+        feature_track_health=float(track_health),
     )
 
 
@@ -287,10 +328,11 @@ def _log_msckf_quality_csv(path: Optional[str], snap: MsckfQualitySnapshot) -> N
     try:
         with open(path, "a", newline="") as f:
             f.write(
-                f"{float(snap.timestamp):.6f},{int(snap.track_count)},"
-                f"{float(snap.inlier_ratio):.6f},{float(snap.parallax_med_px):.6f},"
-                f"{float(snap.reproj_p95_norm):.6f},{float(snap.depth_positive_ratio):.6f},"
-                f"{float(snap.quality_score):.6f}\n"
+            f"{float(snap.timestamp):.6f},{int(snap.track_count)},"
+            f"{float(snap.inlier_ratio):.6f},{float(snap.parallax_med_px):.6f},"
+            f"{float(snap.reproj_p95_norm):.6f},{float(snap.depth_positive_ratio):.6f},"
+            f"{float(snap.quality_score):.6f},{int(bool(snap.stable_geometry_flag))},"
+            f"{float(snap.conditioning_risk):.6f},{float(snap.feature_track_health):.6f}\n"
             )
     except Exception:
         pass
@@ -2246,6 +2288,7 @@ def perform_msckf_updates(vio_fe, cam_observations: List[dict],
         reproj_p95_norm=reproj_p95_samples,
         depth_positive_ratio=depth_ratio_samples,
         feature_quality=feature_quality_samples,
+        global_config=global_config,
     )
 
     if stats_out is not None:
@@ -2265,6 +2308,9 @@ def perform_msckf_updates(vio_fe, cam_observations: List[dict],
             "parallax_med_px": float(quality_snap.parallax_med_px),
             "reproj_p95_norm": float(quality_snap.reproj_p95_norm),
             "depth_positive_ratio": float(quality_snap.depth_positive_ratio),
+            "stable_geometry_flag": float(bool(quality_snap.stable_geometry_flag)),
+            "conditioning_risk": float(quality_snap.conditioning_risk),
+            "feature_track_health": float(quality_snap.feature_track_health),
         })
     if quality_out is not None:
         quality_out.clear()
@@ -2414,6 +2460,9 @@ def trigger_msckf_update(kf, cam_states: list, cam_observations: list,
                     reproj_p95_norm=float(quality_stats.get("reproj_p95_norm", np.nan)),
                     depth_positive_ratio=float(quality_stats.get("depth_positive_ratio", np.nan)),
                     quality_score=float(quality_stats.get("quality_score", np.nan)),
+                    stable_geometry_flag=bool(float(quality_stats.get("stable_geometry_flag", 0.0)) >= 0.5),
+                    conditioning_risk=float(quality_stats.get("conditioning_risk", np.nan)),
+                    feature_track_health=float(quality_stats.get("feature_track_health", np.nan)),
                 )
                 if runner is not None:
                     try:
@@ -2423,6 +2472,11 @@ def trigger_msckf_update(kf, cam_states: list, cam_observations: list,
                             hist.append(float(snap.quality_score))
                             if len(hist) > 20000:
                                 del hist[:-20000]
+                        st_hist = getattr(runner, "_msckf_stable_geometry_history", None)
+                        if isinstance(st_hist, list):
+                            st_hist.append(1.0 if bool(snap.stable_geometry_flag) else 0.0)
+                            if len(st_hist) > 20000:
+                                del st_hist[:-20000]
                         _log_msckf_quality_csv(getattr(runner, "msckf_quality_csv", None), snap)
                         if (
                             getattr(runner, "yaw_authority_service", None) is not None

@@ -523,6 +523,9 @@ class BootstrapService:
         runner.current_policy_snapshot = None
         runner._msckf_quality_snapshot = None
         runner._msckf_quality_history = []
+        runner._msckf_stable_geometry_history = []
+        runner._vps_apply_score_history = []
+        runner._vps_hint_only_count = 0
         if getattr(runner, "policy_runtime_service", None) is not None:
             try:
                 runner.policy_runtime_service._owner_map_written = False
@@ -727,6 +730,12 @@ class BootstrapService:
                 ),
                 hybrid_factor_lite_use_vps_yaw=bool(
                     runner.global_config.get("BACKEND_HYBRID_FACTOR_LITE_USE_VPS_YAW", True)
+                ),
+                hybrid_factor_lite_vps_yaw_quality_floor=float(
+                    runner.global_config.get("BACKEND_HYBRID_FACTOR_LITE_VPS_YAW_QUALITY_FLOOR", 0.30)
+                ),
+                hybrid_factor_lite_vps_yaw_cap_deg=float(
+                    runner.global_config.get("BACKEND_HYBRID_FACTOR_LITE_VPS_YAW_CAP_DEG", 4.0)
                 ),
                 hybrid_factor_lite_use_loop_yaw=bool(
                     runner.global_config.get("BACKEND_HYBRID_FACTOR_LITE_USE_LOOP_YAW", True)

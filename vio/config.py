@@ -1066,6 +1066,16 @@ def load_config(config_path: str) -> VIOConfig:
     result['MSCKF_REPROJ_FAILSOFT_MIN_QUALITY'] = float(
         reproj_state_aware.get('failsoft_min_quality', 0.35)
     )
+    msckf_quality_gate = msckf_cfg.get('quality_gate', {}) if isinstance(msckf_cfg.get('quality_gate', {}), dict) else {}
+    result['MSCKF_QUALITY_GATE_TRACK_MIN'] = int(msckf_quality_gate.get('track_min', 10))
+    result['MSCKF_QUALITY_GATE_INLIER_MIN'] = float(msckf_quality_gate.get('inlier_min', 0.30))
+    result['MSCKF_QUALITY_GATE_PARALLAX_MIN_PX'] = float(msckf_quality_gate.get('parallax_min_px', 1.2))
+    result['MSCKF_QUALITY_GATE_DEPTH_POSITIVE_MIN'] = float(
+        msckf_quality_gate.get('depth_positive_min', 0.62)
+    )
+    result['MSCKF_QUALITY_GATE_REPROJ_P95_MAX'] = float(
+        msckf_quality_gate.get('reproj_p95_max', 0.06)
+    )
     result['MSCKF_PHASE_RAY_SOFT_SCALE'] = msckf_cfg.get(
         'phase_ray_soft_scale',
         {'0': 1.12, '1': 1.06, '2': 1.00}
@@ -1664,232 +1674,195 @@ def load_config(config_path: str) -> VIOConfig:
     result['VPS_POSITION_FIRST_SOFT_HINT_QUALITY_SCALE'] = float(
         vps_cfg.get('position_first_soft_hint_quality_scale', 0.85)
     )
+    # Position-first VPS controller:
+    # Canonical source is vps.position_controller.* with legacy vps.position_first_direct_xy_* aliases.
     vps_pos_ctrl = vps_cfg.get("position_controller", {})
     if not isinstance(vps_pos_ctrl, dict):
         vps_pos_ctrl = {}
-    result['VPS_POSITION_CONTROLLER_ENABLE'] = bool(
-        vps_pos_ctrl.get('enable', vps_cfg.get('position_first_direct_xy_enable', True))
+
+    def _pc_alias_value(canonical_key: str, legacy_key: str, default: Any) -> Any:
+        if canonical_key in vps_pos_ctrl:
+            return vps_pos_ctrl.get(canonical_key, default)
+        return vps_cfg.get(legacy_key, default)
+
+    def _pc_alias_bool(canonical_key: str, legacy_key: str, default: bool) -> bool:
+        return bool(_pc_alias_value(canonical_key, legacy_key, default))
+
+    def _pc_alias_int(canonical_key: str, legacy_key: str, default: int) -> int:
+        return int(_pc_alias_value(canonical_key, legacy_key, default))
+
+    def _pc_alias_float(canonical_key: str, legacy_key: str, default: float) -> float:
+        return float(_pc_alias_value(canonical_key, legacy_key, default))
+
+    # Canonical controller knobs (exported for new code paths)
+    result['VPS_POSITION_CONTROLLER_ENABLE'] = _pc_alias_bool(
+        'enable', 'position_first_direct_xy_enable', True
     )
-    result['VPS_POSITION_CONTROLLER_CONSENSUS_WINDOW_SEC'] = float(
-        vps_pos_ctrl.get('consensus_window_sec', vps_cfg.get('position_first_direct_xy_consensus_window_sec', 4.0))
+    result['VPS_POSITION_CONTROLLER_CONSENSUS_WINDOW_SEC'] = _pc_alias_float(
+        'consensus_window_sec', 'position_first_direct_xy_consensus_window_sec', 4.0
     )
-    result['VPS_POSITION_CONTROLLER_MIN_SAMPLES'] = int(
-        vps_pos_ctrl.get('min_samples', vps_cfg.get('position_first_direct_xy_consensus_min_samples', 3))
+    result['VPS_POSITION_CONTROLLER_MIN_SAMPLES'] = _pc_alias_int(
+        'min_samples', 'position_first_direct_xy_consensus_min_samples', 3
     )
-    result['VPS_POSITION_CONTROLLER_MAX_APPLY_STEP_M'] = float(
-        vps_pos_ctrl.get('max_apply_step_m', vps_cfg.get('position_first_direct_xy_max_apply_dp_xy_m', 32.0))
+    result['VPS_POSITION_CONTROLLER_MAX_APPLY_STEP_M'] = _pc_alias_float(
+        'max_apply_step_m',
+        'position_first_direct_xy_max_apply_dp_xy_m',
+        float(vps_cfg.get('position_first_soft_max_apply_dp_xy_m', 80.0)),
     )
-    result['VPS_POSITION_CONTROLLER_WINDOW_BUDGET_M'] = float(
-        vps_pos_ctrl.get('window_budget_m', vps_cfg.get('position_first_direct_xy_budget_max_total_dp_xy_m', 22.0))
+    result['VPS_POSITION_CONTROLLER_WINDOW_BUDGET_M'] = _pc_alias_float(
+        'window_budget_m', 'position_first_direct_xy_budget_max_total_dp_xy_m', 22.0
     )
-    result['VPS_POSITION_CONTROLLER_FORCE_FAILSOFT_ON_REJECT'] = bool(
-        vps_pos_ctrl.get('force_failsoft_on_reject', vps_cfg.get('position_first_direct_xy_force_failsoft_on_reject', True))
+    result['VPS_POSITION_CONTROLLER_FORCE_FAILSOFT_ON_REJECT'] = _pc_alias_bool(
+        'force_failsoft_on_reject', 'position_first_direct_xy_force_failsoft_on_reject', False
     )
-    result['VPS_POSITION_CONTROLLER_HIGH_SPEED_SOFT_CLAMP_ENABLE'] = bool(
-        vps_pos_ctrl.get('high_speed_soft_clamp_enable', True)
+    result['VPS_POSITION_CONTROLLER_HIGH_SPEED_SOFT_CLAMP_ENABLE'] = _pc_alias_bool(
+        'high_speed_soft_clamp_enable',
+        'position_first_direct_xy_high_speed_soft_clamp_enable',
+        True,
     )
-    result['VPS_POSITION_FIRST_DIRECT_XY_ENABLE'] = bool(
-        vps_cfg.get('position_first_direct_xy_enable', True)
+    vps_apply_gate_cfg = vps_cfg.get("apply_gate", {}) if isinstance(vps_cfg.get("apply_gate", {}), dict) else {}
+    result['VPS_APPLY_GATE_STRICT_SCORE_TH'] = float(vps_apply_gate_cfg.get('strict_score_th', 0.74))
+    result['VPS_APPLY_GATE_FAILSOFT_SCORE_TH'] = float(vps_apply_gate_cfg.get('failsoft_score_th', 0.54))
+    result['VPS_APPLY_GATE_HINT_SCORE_TH'] = float(vps_apply_gate_cfg.get('hint_score_th', 0.32))
+    result['VPS_APPLY_GATE_CONSENSUS_WEIGHT'] = float(vps_apply_gate_cfg.get('consensus_weight', 0.35))
+    result['VPS_APPLY_GATE_GEOMETRY_WEIGHT'] = float(vps_apply_gate_cfg.get('geometry_weight', 0.45))
+    result['VPS_APPLY_GATE_MOTION_WEIGHT'] = float(vps_apply_gate_cfg.get('motion_weight', 0.20))
+    result['VPS_APPLY_GATE_MOTION_HIGH_SPEED_M_S'] = float(
+        vps_apply_gate_cfg.get('motion_high_speed_m_s', 45.0)
     )
-    result['VPS_POSITION_FIRST_DIRECT_XY_MIN_INTERVAL_SEC'] = float(
-        vps_cfg.get('position_first_direct_xy_min_interval_sec', 0.8)
+    result['VPS_APPLY_GATE_MOTION_HIGH_YAWRATE_DEG_S'] = float(
+        vps_apply_gate_cfg.get('motion_high_yawrate_deg_s', 55.0)
     )
-    result['VPS_POSITION_FIRST_DIRECT_XY_MAX_APPLY_DP_XY_M'] = float(
-        vps_cfg.get(
-            'position_first_direct_xy_max_apply_dp_xy_m',
-            vps_cfg.get('position_first_soft_max_apply_dp_xy_m', 80.0),
+    result['VPS_APPLY_GATE_FAILSOFT_DEFAULT_HINT_ONLY'] = bool(
+        vps_apply_gate_cfg.get(
+            'failsoft_default_hint_only',
+            vps_cfg.get('position_first_direct_only_failsoft', True),
         )
     )
-    result['VPS_POSITION_FIRST_DIRECT_XY_QUALITY_SCALE'] = float(
-        vps_cfg.get('position_first_direct_xy_quality_scale', 0.90)
+    result['VPS_APPLY_GATE_BOUNDED_SOFT_ENABLE'] = bool(
+        vps_apply_gate_cfg.get('bounded_soft_enable', True)
     )
-    result['VPS_POSITION_FIRST_DIRECT_XY_FALLBACK_ON_APPLY_FAIL'] = bool(
-        vps_cfg.get('position_first_direct_xy_fallback_on_apply_fail', True)
+    result['VPS_APPLY_GATE_BOUNDED_SOFT_R_MULT'] = float(
+        vps_apply_gate_cfg.get('bounded_soft_r_mult', 2.6)
     )
-    result['VPS_POSITION_FIRST_DIRECT_XY_FORCE_FAILSOFT_ON_REJECT'] = bool(
-        vps_cfg.get('position_first_direct_xy_force_failsoft_on_reject', True)
+    result['VPS_APPLY_GATE_BOUNDED_SOFT_MAX_APPLY_DP_XY_M'] = float(
+        vps_apply_gate_cfg.get('bounded_soft_max_apply_dp_xy_m', 12.0)
     )
-    result['VPS_POSITION_FIRST_DIRECT_XY_FORCE_FAILSOFT_MAX_OFFSET_M'] = float(
-        vps_cfg.get('position_first_direct_xy_force_failsoft_max_offset_m', 180.0)
+    result['VPS_APPLY_GATE_BOUNDED_SOFT_MIN_INTERVAL_SEC'] = float(
+        vps_apply_gate_cfg.get('bounded_soft_min_interval_sec', 0.35)
     )
-    result['VPS_POSITION_FIRST_DIRECT_XY_FORCE_FAILSOFT_MIN_INLIERS'] = int(
-        vps_cfg.get('position_first_direct_xy_force_failsoft_min_inliers', 5)
+    result['VPS_APPLY_GATE_BOUNDED_SOFT_HIGH_SPEED_M_S'] = float(
+        vps_apply_gate_cfg.get('bounded_soft_high_speed_m_s', 20.0)
     )
-    result['VPS_POSITION_FIRST_DIRECT_XY_FORCE_FAILSOFT_MAX_REPROJ_ERROR'] = float(
-        vps_cfg.get('position_first_direct_xy_force_failsoft_max_reproj_error', 1.4)
+    result['VPS_APPLY_GATE_BOUNDED_SOFT_HIGH_SPEED_MAX_APPLY_DP_XY_M'] = float(
+        vps_apply_gate_cfg.get('bounded_soft_high_speed_max_apply_dp_xy_m', 7.0)
     )
-    result['VPS_POSITION_FIRST_DIRECT_XY_FORCE_FAILSOFT_MAX_SPEED_M_S'] = float(
-        vps_cfg.get('position_first_direct_xy_force_failsoft_max_speed_m_s', 95.0)
+    result['VPS_APPLY_GATE_BOUNDED_SOFT_SCORE_TH'] = float(
+        vps_apply_gate_cfg.get('bounded_soft_score_th', vps_apply_gate_cfg.get('hint_score_th', 0.32))
     )
-    result['VPS_POSITION_FIRST_DIRECT_ONLY_FAILSOFT'] = bool(
-        vps_cfg.get('position_first_direct_only_failsoft', True)
+    result['VPS_APPLY_GATE_BOUNDED_SOFT_POLICY_HOLD_BYPASS_ENABLE'] = bool(
+        vps_apply_gate_cfg.get('bounded_soft_policy_hold_bypass_enable', True)
     )
-    result['VPS_POSITION_FIRST_DIRECT_XY_MIN_OFFSET_M'] = float(
-        vps_cfg.get('position_first_direct_xy_min_offset_m', 8.0)
+    result['VPS_APPLY_GATE_BOUNDED_SOFT_POLICY_HOLD_BYPASS_MIN_NO_APPLY_SEC'] = float(
+        vps_apply_gate_cfg.get('bounded_soft_policy_hold_bypass_min_no_apply_sec', 3.0)
     )
-    result['VPS_POSITION_FIRST_DIRECT_XY_MAX_OFFSET_M'] = float(
-        vps_cfg.get('position_first_direct_xy_max_offset_m', vps_cfg.get('xy_drift_recovery_max_offset_m', 1800.0))
+    result['VPS_APPLY_GATE_BOUNDED_SOFT_POLICY_HOLD_BYPASS_MIN_SCORE_TH'] = float(
+        vps_apply_gate_cfg.get('bounded_soft_policy_hold_bypass_min_score_th', 0.40)
     )
-    result['VPS_POSITION_FIRST_DIRECT_XY_MIN_INLIERS'] = int(
-        vps_cfg.get('position_first_direct_xy_min_inliers', 3)
+    result['VPS_APPLY_GATE_BOUNDED_SOFT_POLICY_HOLD_BYPASS_MAX_SPEED_M_S'] = float(
+        vps_apply_gate_cfg.get('bounded_soft_policy_hold_bypass_max_speed_m_s', 95.0)
     )
-    result['VPS_POSITION_FIRST_DIRECT_XY_MIN_CONFIDENCE'] = float(
-        vps_cfg.get('position_first_direct_xy_min_confidence', 0.02)
+    result['VPS_APPLY_GATE_BOUNDED_SOFT_POLICY_HOLD_BYPASS_MAX_OFFSET_M'] = float(
+        vps_apply_gate_cfg.get('bounded_soft_policy_hold_bypass_max_offset_m', 180.0)
     )
-    result['VPS_POSITION_FIRST_DIRECT_XY_MAX_REPROJ_ERROR'] = float(
-        vps_cfg.get('position_first_direct_xy_max_reproj_error', 4.0)
+    result['VPS_APPLY_GATE_BOUNDED_SOFT_POLICY_HOLD_BYPASS_MIN_INLIERS'] = int(
+        vps_apply_gate_cfg.get('bounded_soft_policy_hold_bypass_min_inliers', 5)
     )
-    result['VPS_POSITION_FIRST_DIRECT_XY_MAX_SPEED_M_S'] = float(
-        vps_cfg.get('position_first_direct_xy_max_speed_m_s', 120.0)
+    result['VPS_APPLY_GATE_BOUNDED_SOFT_POLICY_HOLD_BYPASS_MIN_CONFIDENCE'] = float(
+        vps_apply_gate_cfg.get('bounded_soft_policy_hold_bypass_min_confidence', 0.12)
     )
-    result['VPS_POSITION_FIRST_DIRECT_XY_HIGH_SPEED_TH_M_S'] = float(
-        vps_cfg.get('position_first_direct_xy_high_speed_th_m_s', 18.0)
+    result['VPS_APPLY_GATE_BOUNDED_SOFT_POLICY_HOLD_BYPASS_MAX_REPROJ_ERROR'] = float(
+        vps_apply_gate_cfg.get('bounded_soft_policy_hold_bypass_max_reproj_error', 1.2)
     )
-    result['VPS_POSITION_FIRST_DIRECT_XY_MIN_INLIERS_HIGH_SPEED'] = int(
-        vps_cfg.get('position_first_direct_xy_min_inliers_high_speed', 6)
-    )
-    result['VPS_POSITION_FIRST_DIRECT_XY_MAX_REPROJ_HIGH_SPEED'] = float(
-        vps_cfg.get('position_first_direct_xy_max_reproj_high_speed', 1.2)
-    )
-    result['VPS_POSITION_FIRST_DIRECT_XY_MAX_OFFSET_HIGH_SPEED_M'] = float(
-        vps_cfg.get('position_first_direct_xy_max_offset_high_speed_m', 140.0)
-    )
-    result['VPS_POSITION_FIRST_DIRECT_XY_IGNORE_POLICY_HOLD'] = bool(
-        vps_cfg.get('position_first_direct_xy_ignore_policy_hold', False)
-    )
-    result['VPS_POSITION_FIRST_DIRECT_XY_IGNORE_HARD_REJECT'] = bool(
-        vps_cfg.get('position_first_direct_xy_ignore_hard_reject', False)
-    )
-    result['VPS_POSITION_FIRST_DIRECT_XY_ALLOW_HARD_REJECT_WITH_CONSENSUS'] = bool(
-        vps_cfg.get('position_first_direct_xy_allow_hard_reject_with_consensus', True)
-    )
-    result['VPS_POSITION_FIRST_DIRECT_XY_CONSENSUS_ENABLE'] = bool(
-        vps_cfg.get('position_first_direct_xy_consensus_enable', True)
-    )
+
+    # Backward-compatible runtime keys (single alias chain via canonical source).
+    result['VPS_POSITION_FIRST_DIRECT_XY_ENABLE'] = bool(result['VPS_POSITION_CONTROLLER_ENABLE'])
     result['VPS_POSITION_FIRST_DIRECT_XY_CONSENSUS_WINDOW_SEC'] = float(
-        vps_cfg.get('position_first_direct_xy_consensus_window_sec', 4.0)
+        result['VPS_POSITION_CONTROLLER_CONSENSUS_WINDOW_SEC']
     )
     result['VPS_POSITION_FIRST_DIRECT_XY_CONSENSUS_MIN_SAMPLES'] = int(
-        vps_cfg.get('position_first_direct_xy_consensus_min_samples', 3)
+        result['VPS_POSITION_CONTROLLER_MIN_SAMPLES']
     )
-    result['VPS_POSITION_FIRST_DIRECT_XY_CONSENSUS_MAX_DEV_M'] = float(
-        vps_cfg.get('position_first_direct_xy_consensus_max_dev_m', 30.0)
-    )
-    result['VPS_POSITION_FIRST_DIRECT_XY_CONSENSUS_MAX_DIR_DEG'] = float(
-        vps_cfg.get('position_first_direct_xy_consensus_max_dir_deg', 70.0)
-    )
-    result['VPS_POSITION_FIRST_DIRECT_XY_CONSENSUS_MAX_KEEP'] = int(
-        vps_cfg.get('position_first_direct_xy_consensus_max_keep', 24)
-    )
-    result['VPS_POSITION_FIRST_DIRECT_XY_USE_CONSENSUS_VECTOR'] = bool(
-        vps_cfg.get('position_first_direct_xy_use_consensus_vector', True)
-    )
-    result['VPS_POSITION_FIRST_DIRECT_XY_QUALITY_CAP_MIN_M'] = float(
-        vps_cfg.get('position_first_direct_xy_quality_cap_min_m', 6.0)
-    )
-    result['VPS_POSITION_FIRST_DIRECT_XY_BUDGET_WINDOW_SEC'] = float(
-        vps_cfg.get('position_first_direct_xy_budget_window_sec', 5.0)
+    result['VPS_POSITION_FIRST_DIRECT_XY_MAX_APPLY_DP_XY_M'] = float(
+        result['VPS_POSITION_CONTROLLER_MAX_APPLY_STEP_M']
     )
     result['VPS_POSITION_FIRST_DIRECT_XY_BUDGET_MAX_TOTAL_DP_XY_M'] = float(
-        vps_cfg.get('position_first_direct_xy_budget_max_total_dp_xy_m', 35.0)
+        result['VPS_POSITION_CONTROLLER_WINDOW_BUDGET_M']
     )
-    result['VPS_POSITION_FIRST_DIRECT_XY_RECOVERY_MIN_OFFSET_M'] = float(
-        vps_cfg.get('position_first_direct_xy_recovery_min_offset_m', 120.0)
+    result['VPS_POSITION_FIRST_DIRECT_XY_FORCE_FAILSOFT_ON_REJECT'] = bool(
+        result['VPS_POSITION_CONTROLLER_FORCE_FAILSOFT_ON_REJECT']
     )
-    result['VPS_POSITION_FIRST_DIRECT_XY_RECOVERY_MIN_NO_APPLY_SEC'] = float(
-        vps_cfg.get('position_first_direct_xy_recovery_min_no_apply_sec', 6.0)
+    result['VPS_POSITION_FIRST_DIRECT_XY_HIGH_SPEED_SOFT_CLAMP_ENABLE'] = bool(
+        result['VPS_POSITION_CONTROLLER_HIGH_SPEED_SOFT_CLAMP_ENABLE']
     )
-    result['VPS_POSITION_FIRST_DIRECT_XY_RECOVERY_MAX_SPEED_M_S'] = float(
-        vps_cfg.get('position_first_direct_xy_recovery_max_speed_m_s', 14.0)
-    )
-    result['VPS_POSITION_FIRST_DIRECT_XY_RECOVERY_MIN_INLIERS'] = int(
-        vps_cfg.get('position_first_direct_xy_recovery_min_inliers', 7)
-    )
-    result['VPS_POSITION_FIRST_DIRECT_XY_RECOVERY_MAX_REPROJ_ERROR'] = float(
-        vps_cfg.get('position_first_direct_xy_recovery_max_reproj_error', 0.9)
-    )
-    result['VPS_POSITION_FIRST_DIRECT_XY_RECOVERY_MAX_DP_MULT'] = float(
-        vps_cfg.get('position_first_direct_xy_recovery_max_dp_mult', 1.8)
-    )
-    result['VPS_POSITION_FIRST_DIRECT_XY_RECOVERY_MAX_DP_CAP_M'] = float(
-        vps_cfg.get('position_first_direct_xy_recovery_max_dp_cap_m', 90.0)
-    )
-    result['VPS_POSITION_FIRST_DIRECT_XY_RECOVERY_BUDGET_MULT'] = float(
-        vps_cfg.get('position_first_direct_xy_recovery_budget_mult', 2.5)
-    )
-    result['VPS_POSITION_FIRST_DIRECT_XY_RECOVERY_BUDGET_CAP_M'] = float(
-        vps_cfg.get('position_first_direct_xy_recovery_budget_cap_m', 120.0)
-    )
-    result['VPS_POSITION_FIRST_DIRECT_XY_GUARD_ENABLE'] = bool(
-        vps_cfg.get('position_first_direct_xy_guard_enable', True)
-    )
-    result['VPS_POSITION_FIRST_DIRECT_XY_GUARD_FAIL_STREAK_TH'] = int(
-        vps_cfg.get('position_first_direct_xy_guard_fail_streak_th', 18)
-    )
-    result['VPS_POSITION_FIRST_DIRECT_XY_GUARD_NO_COVERAGE_STREAK_TH'] = int(
-        vps_cfg.get('position_first_direct_xy_guard_no_coverage_streak_th', 6)
-    )
-    result['VPS_POSITION_FIRST_DIRECT_XY_GUARD_MAX_APPLY_DP_XY_M'] = float(
-        vps_cfg.get('position_first_direct_xy_guard_max_apply_dp_xy_m', 14.0)
-    )
-    result['VPS_POSITION_FIRST_DIRECT_XY_GUARD_BUDGET_MAX_TOTAL_DP_XY_M'] = float(
-        vps_cfg.get('position_first_direct_xy_guard_budget_max_total_dp_xy_m', 18.0)
-    )
-    result['VPS_POSITION_FIRST_DIRECT_XY_GUARD_QUALITY_MULT'] = float(
-        vps_cfg.get('position_first_direct_xy_guard_quality_mult', 0.78)
-    )
-    result['VPS_POSITION_FIRST_DIRECT_XY_GUARD_MIN_QUALITY'] = float(
-        vps_cfg.get('position_first_direct_xy_guard_min_quality', 0.28)
-    )
-    result['VPS_POSITION_FIRST_DIRECT_XY_GUARD_EXTRA_CONFIRM_HITS'] = int(
-        vps_cfg.get('position_first_direct_xy_guard_extra_confirm_hits', 1)
-    )
-    result['VPS_POSITION_FIRST_DIRECT_XY_GUARD_MAX_DIR_CHANGE_DEG'] = float(
-        vps_cfg.get('position_first_direct_xy_guard_max_dir_change_deg', 55.0)
-    )
-    result['VPS_POSITION_FIRST_DIRECT_XY_GUARD_MIN_DIR_CHECK_M'] = float(
-        vps_cfg.get('position_first_direct_xy_guard_min_dir_check_m', 8.0)
-    )
-    result['VPS_POSITION_FIRST_DIRECT_XY_FAILSOFT_RECOVERY_MIN_INLIERS'] = int(
-        vps_cfg.get('position_first_direct_xy_failsoft_recovery_min_inliers', 5)
-    )
-    result['VPS_POSITION_FIRST_DIRECT_XY_FAILSOFT_RECOVERY_MAX_REPROJ_ERROR'] = float(
-        vps_cfg.get('position_first_direct_xy_failsoft_recovery_max_reproj_error', 1.3)
-    )
-    result['VPS_POSITION_FIRST_DIRECT_XY_FAILSOFT_GUARD_LOWQ_ENABLE'] = bool(
-        vps_cfg.get('position_first_direct_xy_failsoft_guard_lowq_enable', True)
-    )
-    result['VPS_POSITION_FIRST_DIRECT_XY_FAILSOFT_GUARD_LOWQ_MIN_INLIERS'] = int(
-        vps_cfg.get('position_first_direct_xy_failsoft_guard_lowq_min_inliers', 4)
-    )
-    result['VPS_POSITION_FIRST_DIRECT_XY_FAILSOFT_GUARD_LOWQ_MAX_REPROJ_ERROR'] = float(
-        vps_cfg.get('position_first_direct_xy_failsoft_guard_lowq_max_reproj_error', 1.6)
-    )
-    result['VPS_POSITION_FIRST_DIRECT_XY_FAILSOFT_GUARD_LOWQ_MAX_APPLY_DP_XY_M'] = float(
-        vps_cfg.get('position_first_direct_xy_failsoft_guard_lowq_max_apply_dp_xy_m', 7.0)
-    )
-    # Position-controller aliases (accuracy-first branch):
-    # keep legacy keys synchronized so existing apply path stays deterministic.
-    if len(vps_pos_ctrl) > 0:
-        result['VPS_POSITION_FIRST_DIRECT_XY_ENABLE'] = bool(result['VPS_POSITION_CONTROLLER_ENABLE'])
-        result['VPS_POSITION_FIRST_DIRECT_XY_CONSENSUS_WINDOW_SEC'] = float(
-            result['VPS_POSITION_CONTROLLER_CONSENSUS_WINDOW_SEC']
-        )
-        result['VPS_POSITION_FIRST_DIRECT_XY_CONSENSUS_MIN_SAMPLES'] = int(
-            result['VPS_POSITION_CONTROLLER_MIN_SAMPLES']
-        )
-        result['VPS_POSITION_FIRST_DIRECT_XY_MAX_APPLY_DP_XY_M'] = float(
-            result['VPS_POSITION_CONTROLLER_MAX_APPLY_STEP_M']
-        )
-        result['VPS_POSITION_FIRST_DIRECT_XY_BUDGET_MAX_TOTAL_DP_XY_M'] = float(
-            result['VPS_POSITION_CONTROLLER_WINDOW_BUDGET_M']
-        )
-        result['VPS_POSITION_FIRST_DIRECT_XY_FORCE_FAILSOFT_ON_REJECT'] = bool(
-            result['VPS_POSITION_CONTROLLER_FORCE_FAILSOFT_ON_REJECT']
-        )
-        result['VPS_POSITION_FIRST_DIRECT_XY_HIGH_SPEED_SOFT_CLAMP_ENABLE'] = bool(
-            result['VPS_POSITION_CONTROLLER_HIGH_SPEED_SOFT_CLAMP_ENABLE']
-        )
+
+    direct_alias_specs = [
+        ('VPS_POSITION_FIRST_DIRECT_XY_MIN_INTERVAL_SEC', 'min_interval_sec', 'position_first_direct_xy_min_interval_sec', 0.8, float),
+        ('VPS_POSITION_FIRST_DIRECT_XY_QUALITY_SCALE', 'quality_scale', 'position_first_direct_xy_quality_scale', 0.90, float),
+        ('VPS_POSITION_FIRST_DIRECT_XY_FALLBACK_ON_APPLY_FAIL', 'fallback_on_apply_fail', 'position_first_direct_xy_fallback_on_apply_fail', True, bool),
+        ('VPS_POSITION_FIRST_DIRECT_XY_FORCE_FAILSOFT_MAX_OFFSET_M', 'force_failsoft_max_offset_m', 'position_first_direct_xy_force_failsoft_max_offset_m', 180.0, float),
+        ('VPS_POSITION_FIRST_DIRECT_XY_FORCE_FAILSOFT_MIN_INLIERS', 'force_failsoft_min_inliers', 'position_first_direct_xy_force_failsoft_min_inliers', 5, int),
+        ('VPS_POSITION_FIRST_DIRECT_XY_FORCE_FAILSOFT_MAX_REPROJ_ERROR', 'force_failsoft_max_reproj_error', 'position_first_direct_xy_force_failsoft_max_reproj_error', 1.4, float),
+        ('VPS_POSITION_FIRST_DIRECT_XY_FORCE_FAILSOFT_MAX_SPEED_M_S', 'force_failsoft_max_speed_m_s', 'position_first_direct_xy_force_failsoft_max_speed_m_s', 95.0, float),
+        ('VPS_POSITION_FIRST_DIRECT_XY_MIN_OFFSET_M', 'min_offset_m', 'position_first_direct_xy_min_offset_m', 8.0, float),
+        ('VPS_POSITION_FIRST_DIRECT_XY_MAX_OFFSET_M', 'max_offset_m', 'position_first_direct_xy_max_offset_m', float(vps_cfg.get('xy_drift_recovery_max_offset_m', 1800.0)), float),
+        ('VPS_POSITION_FIRST_DIRECT_XY_MIN_INLIERS', 'min_inliers', 'position_first_direct_xy_min_inliers', 3, int),
+        ('VPS_POSITION_FIRST_DIRECT_XY_MIN_CONFIDENCE', 'min_confidence', 'position_first_direct_xy_min_confidence', 0.02, float),
+        ('VPS_POSITION_FIRST_DIRECT_XY_MAX_REPROJ_ERROR', 'max_reproj_error', 'position_first_direct_xy_max_reproj_error', 4.0, float),
+        ('VPS_POSITION_FIRST_DIRECT_XY_MAX_SPEED_M_S', 'max_speed_m_s', 'position_first_direct_xy_max_speed_m_s', 120.0, float),
+        ('VPS_POSITION_FIRST_DIRECT_XY_HIGH_SPEED_TH_M_S', 'high_speed_th_m_s', 'position_first_direct_xy_high_speed_th_m_s', 18.0, float),
+        ('VPS_POSITION_FIRST_DIRECT_XY_MIN_INLIERS_HIGH_SPEED', 'min_inliers_high_speed', 'position_first_direct_xy_min_inliers_high_speed', 6, int),
+        ('VPS_POSITION_FIRST_DIRECT_XY_MAX_REPROJ_HIGH_SPEED', 'max_reproj_high_speed', 'position_first_direct_xy_max_reproj_high_speed', 1.2, float),
+        ('VPS_POSITION_FIRST_DIRECT_XY_MAX_OFFSET_HIGH_SPEED_M', 'max_offset_high_speed_m', 'position_first_direct_xy_max_offset_high_speed_m', 140.0, float),
+        ('VPS_POSITION_FIRST_DIRECT_XY_IGNORE_POLICY_HOLD', 'ignore_policy_hold', 'position_first_direct_xy_ignore_policy_hold', False, bool),
+        ('VPS_POSITION_FIRST_DIRECT_XY_IGNORE_HARD_REJECT', 'ignore_hard_reject', 'position_first_direct_xy_ignore_hard_reject', False, bool),
+        ('VPS_POSITION_FIRST_DIRECT_XY_ALLOW_HARD_REJECT_WITH_CONSENSUS', 'allow_hard_reject_with_consensus', 'position_first_direct_xy_allow_hard_reject_with_consensus', True, bool),
+        ('VPS_POSITION_FIRST_DIRECT_XY_CONSENSUS_ENABLE', 'consensus_enable', 'position_first_direct_xy_consensus_enable', True, bool),
+        ('VPS_POSITION_FIRST_DIRECT_XY_CONSENSUS_MAX_DEV_M', 'consensus_max_dev_m', 'position_first_direct_xy_consensus_max_dev_m', 30.0, float),
+        ('VPS_POSITION_FIRST_DIRECT_XY_CONSENSUS_MAX_DIR_DEG', 'consensus_max_dir_deg', 'position_first_direct_xy_consensus_max_dir_deg', 70.0, float),
+        ('VPS_POSITION_FIRST_DIRECT_XY_CONSENSUS_MAX_KEEP', 'consensus_max_keep', 'position_first_direct_xy_consensus_max_keep', 24, int),
+        ('VPS_POSITION_FIRST_DIRECT_XY_USE_CONSENSUS_VECTOR', 'use_consensus_vector', 'position_first_direct_xy_use_consensus_vector', True, bool),
+        ('VPS_POSITION_FIRST_DIRECT_XY_QUALITY_CAP_MIN_M', 'quality_cap_min_m', 'position_first_direct_xy_quality_cap_min_m', 6.0, float),
+        ('VPS_POSITION_FIRST_DIRECT_XY_BUDGET_WINDOW_SEC', 'budget_window_sec', 'position_first_direct_xy_budget_window_sec', 5.0, float),
+        ('VPS_POSITION_FIRST_DIRECT_XY_RECOVERY_MIN_OFFSET_M', 'recovery_min_offset_m', 'position_first_direct_xy_recovery_min_offset_m', 120.0, float),
+        ('VPS_POSITION_FIRST_DIRECT_XY_RECOVERY_MIN_NO_APPLY_SEC', 'recovery_min_no_apply_sec', 'position_first_direct_xy_recovery_min_no_apply_sec', 6.0, float),
+        ('VPS_POSITION_FIRST_DIRECT_XY_RECOVERY_MAX_SPEED_M_S', 'recovery_max_speed_m_s', 'position_first_direct_xy_recovery_max_speed_m_s', 14.0, float),
+        ('VPS_POSITION_FIRST_DIRECT_XY_RECOVERY_MIN_INLIERS', 'recovery_min_inliers', 'position_first_direct_xy_recovery_min_inliers', 7, int),
+        ('VPS_POSITION_FIRST_DIRECT_XY_RECOVERY_MAX_REPROJ_ERROR', 'recovery_max_reproj_error', 'position_first_direct_xy_recovery_max_reproj_error', 0.9, float),
+        ('VPS_POSITION_FIRST_DIRECT_XY_RECOVERY_MAX_DP_MULT', 'recovery_max_dp_mult', 'position_first_direct_xy_recovery_max_dp_mult', 1.8, float),
+        ('VPS_POSITION_FIRST_DIRECT_XY_RECOVERY_MAX_DP_CAP_M', 'recovery_max_dp_cap_m', 'position_first_direct_xy_recovery_max_dp_cap_m', 90.0, float),
+        ('VPS_POSITION_FIRST_DIRECT_XY_RECOVERY_BUDGET_MULT', 'recovery_budget_mult', 'position_first_direct_xy_recovery_budget_mult', 2.5, float),
+        ('VPS_POSITION_FIRST_DIRECT_XY_RECOVERY_BUDGET_CAP_M', 'recovery_budget_cap_m', 'position_first_direct_xy_recovery_budget_cap_m', 120.0, float),
+        ('VPS_POSITION_FIRST_DIRECT_XY_GUARD_ENABLE', 'guard_enable', 'position_first_direct_xy_guard_enable', True, bool),
+        ('VPS_POSITION_FIRST_DIRECT_XY_GUARD_FAIL_STREAK_TH', 'guard_fail_streak_th', 'position_first_direct_xy_guard_fail_streak_th', 18, int),
+        ('VPS_POSITION_FIRST_DIRECT_XY_GUARD_NO_COVERAGE_STREAK_TH', 'guard_no_coverage_streak_th', 'position_first_direct_xy_guard_no_coverage_streak_th', 6, int),
+        ('VPS_POSITION_FIRST_DIRECT_XY_GUARD_MAX_APPLY_DP_XY_M', 'guard_max_apply_dp_xy_m', 'position_first_direct_xy_guard_max_apply_dp_xy_m', 14.0, float),
+        ('VPS_POSITION_FIRST_DIRECT_XY_GUARD_BUDGET_MAX_TOTAL_DP_XY_M', 'guard_budget_max_total_dp_xy_m', 'position_first_direct_xy_guard_budget_max_total_dp_xy_m', 18.0, float),
+        ('VPS_POSITION_FIRST_DIRECT_XY_GUARD_QUALITY_MULT', 'guard_quality_mult', 'position_first_direct_xy_guard_quality_mult', 0.78, float),
+        ('VPS_POSITION_FIRST_DIRECT_XY_GUARD_MIN_QUALITY', 'guard_min_quality', 'position_first_direct_xy_guard_min_quality', 0.28, float),
+        ('VPS_POSITION_FIRST_DIRECT_XY_GUARD_EXTRA_CONFIRM_HITS', 'guard_extra_confirm_hits', 'position_first_direct_xy_guard_extra_confirm_hits', 1, int),
+        ('VPS_POSITION_FIRST_DIRECT_XY_GUARD_MAX_DIR_CHANGE_DEG', 'guard_max_dir_change_deg', 'position_first_direct_xy_guard_max_dir_change_deg', 55.0, float),
+        ('VPS_POSITION_FIRST_DIRECT_XY_GUARD_MIN_DIR_CHECK_M', 'guard_min_dir_check_m', 'position_first_direct_xy_guard_min_dir_check_m', 8.0, float),
+        ('VPS_POSITION_FIRST_DIRECT_XY_FAILSOFT_RECOVERY_MIN_INLIERS', 'failsoft_recovery_min_inliers', 'position_first_direct_xy_failsoft_recovery_min_inliers', 5, int),
+        ('VPS_POSITION_FIRST_DIRECT_XY_FAILSOFT_RECOVERY_MAX_REPROJ_ERROR', 'failsoft_recovery_max_reproj_error', 'position_first_direct_xy_failsoft_recovery_max_reproj_error', 1.3, float),
+        ('VPS_POSITION_FIRST_DIRECT_XY_FAILSOFT_GUARD_LOWQ_ENABLE', 'failsoft_guard_lowq_enable', 'position_first_direct_xy_failsoft_guard_lowq_enable', True, bool),
+        ('VPS_POSITION_FIRST_DIRECT_XY_FAILSOFT_GUARD_LOWQ_MIN_INLIERS', 'failsoft_guard_lowq_min_inliers', 'position_first_direct_xy_failsoft_guard_lowq_min_inliers', 4, int),
+        ('VPS_POSITION_FIRST_DIRECT_XY_FAILSOFT_GUARD_LOWQ_MAX_REPROJ_ERROR', 'failsoft_guard_lowq_max_reproj_error', 'position_first_direct_xy_failsoft_guard_lowq_max_reproj_error', 1.6, float),
+        ('VPS_POSITION_FIRST_DIRECT_XY_FAILSOFT_GUARD_LOWQ_MAX_APPLY_DP_XY_M', 'failsoft_guard_lowq_max_apply_dp_xy_m', 'position_first_direct_xy_failsoft_guard_lowq_max_apply_dp_xy_m', 7.0, float),
+    ]
+    for out_key, canonical_key, legacy_key, default_value, cast_type in direct_alias_specs:
+        raw_value = _pc_alias_value(canonical_key, legacy_key, default_value)
+        result[out_key] = cast_type(raw_value)
     result['VPS_WORKER_BUSY_FORCE_LOCAL_STREAK'] = int(
         vps_cfg.get('worker_busy_force_local_streak', 120)
     )
@@ -1957,6 +1930,9 @@ def load_config(config_path: str) -> VIOConfig:
     factor_lite_cfg = backend_cfg.get('hybrid_factor_lite', {})
     transport_cfg = backend_cfg.get('transport', {})
     contract_cfg = backend_cfg.get('contract', {})
+    contract_v1_cfg = backend_cfg.get('contract_v1', {})
+    if not isinstance(contract_v1_cfg, dict):
+        contract_v1_cfg = {}
     result['BACKEND_ROBUST_YAW_ENABLE'] = bool(robust_yaw_cfg.get('enable', True))
     result['BACKEND_ROBUST_YAW_HUBER_DEG'] = float(robust_yaw_cfg.get('huber_deg', 6.0))
     result['BACKEND_SWITCHABLE_CONSTRAINTS_ENABLE'] = bool(switchable_cfg.get('enable', True))
@@ -1983,6 +1959,12 @@ def load_config(config_path: str) -> VIOConfig:
     result['BACKEND_HYBRID_FACTOR_LITE_USE_VPS_YAW'] = bool(
         factor_lite_cfg.get('use_vps_yaw', factor_lite_cfg.get('use_vps', True))
     )
+    result['BACKEND_HYBRID_FACTOR_LITE_VPS_YAW_QUALITY_FLOOR'] = float(
+        factor_lite_cfg.get('vps_yaw_quality_floor', 0.30)
+    )
+    result['BACKEND_HYBRID_FACTOR_LITE_VPS_YAW_CAP_DEG'] = float(
+        factor_lite_cfg.get('vps_yaw_cap_deg', backend_cfg.get('max_abs_dyaw_deg', 8.0))
+    )
     result['BACKEND_HYBRID_FACTOR_LITE_USE_LOOP_YAW'] = bool(
         factor_lite_cfg.get('use_loop_yaw', factor_lite_cfg.get('use_visual', True))
     )
@@ -2002,10 +1984,16 @@ def load_config(config_path: str) -> VIOConfig:
         transport_cfg.get('poll_min_interval_sec', backend_cfg.get('poll_interval_sec', 0.5))
     )
     result['BACKEND_CONTRACT_STRICT_REQUIRE_SOURCE_MIX'] = bool(
-        contract_cfg.get('strict_require_source_mix', True)
+        contract_v1_cfg.get('strict_require_source_mix', contract_cfg.get('strict_require_source_mix', True))
     )
     result['BACKEND_CONTRACT_STRICT_REQUIRE_RESIDUAL_SUMMARY'] = bool(
-        contract_cfg.get('strict_require_residual_summary', True)
+        contract_v1_cfg.get('strict_require_residual_summary', contract_cfg.get('strict_require_residual_summary', True))
+    )
+    result['BACKEND_CONTRACT_V1_STRICT_REQUIRE_VERSION'] = bool(
+        contract_v1_cfg.get('strict_require_version', True)
+    )
+    result['BACKEND_CONTRACT_V1_EXPECTED_VERSION'] = str(
+        contract_v1_cfg.get('expected_version', "v1")
     )
     result['BACKEND_VPS_YAW_HINT_ENABLE'] = bool(
         backend_cfg.get('vps_yaw_hint_enable', True)

@@ -169,9 +169,11 @@ class VIORunner:
         self._vps_skip_streak = 0
         self._vps_soft_accept_count: int = 0
         self._vps_soft_reject_count: int = 0
+        self._vps_hint_only_count: int = 0
         self._vps_jump_reject_count: int = 0
         self._vps_temporal_confirm_count: int = 0
         self._vps_attempt_count: int = 0
+        self._vps_apply_score_history: list[float] = []
         self._vps_last_accepted_offset_vec: Optional[np.ndarray] = None
         self._vps_pending_large_offset_vec: Optional[np.ndarray] = None
         self._vps_pending_large_offset_hits: int = 0
@@ -248,6 +250,7 @@ class VIORunner:
         self._vio_vel_accept_count: int = 0
         self._policy_conflict_count: int = 0
         self._msckf_quality_history: list[float] = []
+        self._msckf_stable_geometry_history: list[float] = []
         self._msckf_quality_snapshot = None
         self._yaw_auth_skip_count: int = 0
         self._kin_guard_samples: int = 0

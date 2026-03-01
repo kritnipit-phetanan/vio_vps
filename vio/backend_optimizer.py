@@ -18,7 +18,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Mapping, Optional
 
 import numpy as np
 
@@ -57,6 +57,124 @@ class BackendCorrection:
     quality_score: float
     source_mix: Optional[dict[str, float]] = None
     residual_summary: Optional[dict[str, float]] = None
+    contract_version: str = "v1"
+
+
+@dataclass(frozen=True)
+class BackendCorrectionContractV1:
+    """Strict, normalized correction contract consumed by frontend apply path."""
+
+    t_ref: float
+    age_sec: float
+    quality_score: float
+    dp_enu: np.ndarray
+    dyaw_deg: float
+    cov_scale: float
+    source_mix: dict[str, float]
+    residual_summary: dict[str, float]
+    contract_version: str = "v1"
+
+    @classmethod
+    def from_payload(
+        cls,
+        payload: Any,
+        *,
+        strict_version: bool = True,
+        expected_version: str = "v1",
+        require_source_mix: bool = True,
+        require_residual_summary: bool = True,
+    ) -> tuple[Optional["BackendCorrectionContractV1"], str]:
+        """Best-effort parse/validate correction payload into ContractV1."""
+
+        def _get(key: str, default: Any = None) -> Any:
+            if isinstance(payload, Mapping):
+                return payload.get(key, default)
+            return getattr(payload, key, default)
+
+        required = ("t_ref", "age_sec", "quality_score", "dp_enu", "dyaw_deg", "cov_scale")
+        for key in required:
+            if _get(key, None) is None:
+                return None, f"missing:{key}"
+
+        version = str(_get("contract_version", "") or "").strip()
+        if strict_version:
+            if not version:
+                return None, "missing:contract_version"
+            if version != str(expected_version):
+                return None, f"bad:contract_version={version}"
+        elif not version:
+            version = str(expected_version)
+
+        try:
+            t_ref = float(_get("t_ref"))
+            age_sec = float(_get("age_sec"))
+            quality_score = float(_get("quality_score"))
+            dyaw_deg = float(_get("dyaw_deg"))
+            cov_scale = float(_get("cov_scale"))
+        except Exception:
+            return None, "bad:scalar_cast"
+        if not np.isfinite(t_ref):
+            return None, "bad:t_ref_non_finite"
+        if (not np.isfinite(age_sec)) or age_sec < 0.0:
+            return None, "bad:age_sec"
+        if not np.isfinite(quality_score):
+            return None, "bad:quality_non_finite"
+        if not np.isfinite(dyaw_deg):
+            return None, "bad:dyaw_non_finite"
+        if (not np.isfinite(cov_scale)) or cov_scale <= 0.0:
+            return None, "bad:cov_scale"
+
+        try:
+            dp_enu = np.asarray(_get("dp_enu"), dtype=float).reshape(3,)
+        except Exception:
+            return None, "bad:dp_enu_shape"
+        if not np.all(np.isfinite(dp_enu)):
+            return None, "bad:dp_enu_non_finite"
+
+        source_mix_raw = _get("source_mix", None)
+        if require_source_mix and (not isinstance(source_mix_raw, Mapping) or len(source_mix_raw) == 0):
+            return None, "missing:source_mix"
+        source_mix: dict[str, float] = {}
+        if isinstance(source_mix_raw, Mapping):
+            for k, v in source_mix_raw.items():
+                try:
+                    fv = float(v)
+                except Exception:
+                    continue
+                if np.isfinite(fv):
+                    source_mix[str(k)] = float(fv)
+        if require_source_mix and len(source_mix) == 0:
+            return None, "bad:source_mix"
+
+        residual_raw = _get("residual_summary", None)
+        if require_residual_summary and (not isinstance(residual_raw, Mapping) or len(residual_raw) == 0):
+            return None, "missing:residual_summary"
+        residual_summary: dict[str, float] = {}
+        if isinstance(residual_raw, Mapping):
+            for k, v in residual_raw.items():
+                try:
+                    fv = float(v)
+                except Exception:
+                    continue
+                if np.isfinite(fv):
+                    residual_summary[str(k)] = float(fv)
+        if require_residual_summary and len(residual_summary) == 0:
+            return None, "bad:residual_summary"
+
+        return (
+            cls(
+                t_ref=float(t_ref),
+                age_sec=float(age_sec),
+                quality_score=float(quality_score),
+                dp_enu=np.asarray(dp_enu, dtype=float),
+                dyaw_deg=float(dyaw_deg),
+                cov_scale=float(cov_scale),
+                source_mix=source_mix,
+                residual_summary=residual_summary,
+                contract_version=str(version),
+            ),
+            "",
+        )
 
 
 @dataclass
@@ -119,6 +237,8 @@ class BackendOptimizer:
         hybrid_factor_lite_use_dem: bool = True,
         hybrid_factor_lite_use_vps_xy: bool = True,
         hybrid_factor_lite_use_vps_yaw: bool = True,
+        hybrid_factor_lite_vps_yaw_quality_floor: float = 0.30,
+        hybrid_factor_lite_vps_yaw_cap_deg: float = 4.0,
         hybrid_factor_lite_use_loop_yaw: bool = True,
         hybrid_factor_lite_use_mag_yaw: bool = True,
         latest_wins_enable: bool = True,
@@ -150,6 +270,12 @@ class BackendOptimizer:
         self.hybrid_factor_lite_use_dem = bool(hybrid_factor_lite_use_dem)
         self.hybrid_factor_lite_use_vps_xy = bool(hybrid_factor_lite_use_vps_xy)
         self.hybrid_factor_lite_use_vps_yaw = bool(hybrid_factor_lite_use_vps_yaw)
+        self.hybrid_factor_lite_vps_yaw_quality_floor = float(
+            np.clip(hybrid_factor_lite_vps_yaw_quality_floor, 0.0, 1.0)
+        )
+        self.hybrid_factor_lite_vps_yaw_cap_deg = float(
+            max(0.05, abs(float(hybrid_factor_lite_vps_yaw_cap_deg)))
+        )
         self.hybrid_factor_lite_use_loop_yaw = bool(hybrid_factor_lite_use_loop_yaw)
         self.hybrid_factor_lite_use_mag_yaw = bool(hybrid_factor_lite_use_mag_yaw)
         self.latest_wins_enable = bool(latest_wins_enable)
@@ -464,6 +590,7 @@ class BackendOptimizer:
             quality_score=q_est,
             source_mix=source_mix,
             residual_summary=residual_summary,
+            contract_version="v1",
         )
 
     def _build_factor_lite_graph(self, kf_tail: list[_Keyframe], win_hints: list[_AbsHint]) -> _FactorLiteGraph:
@@ -484,7 +611,11 @@ class BackendOptimizer:
             if src in ("VPS", "ABS"):
                 if self.hybrid_factor_lite_use_vps and self.hybrid_factor_lite_use_vps_xy:
                     abs_xyyaw += 1
-                if self.hybrid_factor_lite_use_vps and self.hybrid_factor_lite_use_vps_yaw:
+                if (
+                    self.hybrid_factor_lite_use_vps
+                    and self.hybrid_factor_lite_use_vps_yaw
+                    and float(h.quality) >= self.hybrid_factor_lite_vps_yaw_quality_floor
+                ):
                     yaw_only += 1
                 continue
             if src == "DEM":
@@ -533,8 +664,20 @@ class BackendOptimizer:
                     dyaw = float(h.dyaw_deg)
                     if not self.hybrid_factor_lite_use_vps_xy:
                         dp = np.zeros_like(dp)
-                    if not self.hybrid_factor_lite_use_vps_yaw:
+                    yaw_allowed = bool(
+                        self.hybrid_factor_lite_use_vps_yaw
+                        and float(h.quality) >= self.hybrid_factor_lite_vps_yaw_quality_floor
+                    )
+                    if not yaw_allowed:
                         dyaw = 0.0
+                    else:
+                        dyaw = float(
+                            np.clip(
+                                dyaw,
+                                -self.hybrid_factor_lite_vps_yaw_cap_deg,
+                                self.hybrid_factor_lite_vps_yaw_cap_deg,
+                            )
+                        )
                     out.append(
                         _AbsHint(
                             t=float(h.t),

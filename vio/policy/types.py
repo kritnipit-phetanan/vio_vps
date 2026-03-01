@@ -82,6 +82,9 @@ class MsckfQualitySnapshot:
     reproj_p95_norm: float
     depth_positive_ratio: float
     quality_score: float
+    stable_geometry_flag: bool = False
+    conditioning_risk: float = float("nan")
+    feature_track_health: float = float("nan")
 
     def as_dict(self) -> Dict[str, float]:
         return {
@@ -92,6 +95,9 @@ class MsckfQualitySnapshot:
             "reproj_p95_norm": float(self.reproj_p95_norm),
             "depth_positive_ratio": float(self.depth_positive_ratio),
             "quality_score": float(self.quality_score),
+            "stable_geometry_flag": float(bool(self.stable_geometry_flag)),
+            "conditioning_risk": float(self.conditioning_risk),
+            "feature_track_health": float(self.feature_track_health),
         }
 
 

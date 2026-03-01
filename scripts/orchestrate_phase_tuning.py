@@ -38,10 +38,11 @@ DEFAULT_PHASE_SEQUENCE_STAGE_G_CONT = ["G7_1_HALF", "G5_3"]
 DEFAULT_PHASE_SEQUENCE_STAGE_G_MAG = ["G5_MAG_SAFE", "G5_MAG_COND"]
 DEFAULT_PHASE_SEQUENCE_STAGE_YAW_AUTH = ["S1", "S2", "S3", "S4"]
 DEFAULT_PHASE_SEQUENCE_STAGE_H = ["H1", "H2", "H3", "G6_1", "G7_1", "G7_2"]
+DEFAULT_PHASE_SEQUENCE_STAGE_L = ["L1", "L2", "L3", "L4", "L5", "L6"]
 DEFAULT_PHASE_SEQUENCE = list(DEFAULT_PHASE_SEQUENCE_STAGE_A)
 # These phases may intentionally have no config delta but still must execute
 # to validate pass criteria against runtime outputs.
-FORCE_RUN_IF_NO_CHANGE = {"H1", "H2", "H3"}
+FORCE_RUN_IF_NO_CHANGE = {"H1", "H2", "H3", "L6"}
 H_COMPARE_PHASES = {"H1", "H2", "H3"}
 
 # One-knob assignments for Stage-A pre-backend tuning (Phase4-base roadmap).
@@ -242,6 +243,46 @@ PHASE_ASSIGNMENTS: dict[str, dict[str, Any]] = {
         "magnetometer.quality.norm_mad_thresh": 0.425,
         "magnetometer.quality.gyro_consistency_deg_s": 90.0,
         "magnetometer.quality.vision_consistency_deg": 110.0,
+    },
+    "L1": {
+        # Failsoft is not apply-default: deterministic scoring lanes.
+        "vps.apply_gate.strict_score_th": 0.74,
+        "vps.apply_gate.failsoft_score_th": 0.54,
+        "vps.apply_gate.hint_score_th": 0.32,
+        "vps.apply_gate.failsoft_default_hint_only": True,
+        "vps.position_controller.force_failsoft_on_reject": False,
+    },
+    "L2": {
+        # MSCKF quality-driven geometry gate.
+        "vio.msckf.quality_gate.track_min": 10,
+        "vio.msckf.quality_gate.inlier_min": 0.30,
+        "vio.msckf.quality_gate.parallax_min_px": 1.2,
+        "vio.msckf.quality_gate.depth_positive_min": 0.62,
+        "vio.msckf.quality_gate.reproj_p95_max": 0.06,
+    },
+    "L3": {
+        # X2.1 VPS XY-only factor-lite.
+        "backend.hybrid_factor_lite.enable": True,
+        "backend.hybrid_factor_lite.use_vps_xy": True,
+        "backend.hybrid_factor_lite.use_vps_yaw": False,
+        "backend.hybrid_factor_lite.use_loop_yaw": False,
+        "backend.hybrid_factor_lite.use_mag_yaw": False,
+    },
+    "L4": {
+        # X2.2 add VPS yaw factor (switchable).
+        "backend.hybrid_factor_lite.use_vps_yaw": True,
+        "backend.hybrid_factor_lite.vps_yaw_quality_floor": 0.45,
+        "backend.hybrid_factor_lite.vps_yaw_cap_deg": 1.5,
+    },
+    "L5": {
+        # X3 strict deterministic contract.
+        "backend.contract_v1.strict_require_version": True,
+        "backend.contract_v1.expected_version": "v1",
+        "backend.contract_v1.strict_require_source_mix": True,
+        "backend.contract_v1.strict_require_residual_summary": True,
+    },
+    "L6": {
+        # Cleanup check phase (logic-noise floor validation).
     },
 }
 
@@ -1158,7 +1199,7 @@ def main() -> int:
     parser.add_argument(
         "--phase_set",
         default="stageA",
-        choices=["stageA", "stageE", "stageF", "stageG", "stageG_cont", "stageG_mag", "stageYawAuth", "stageH", "custom"],
+        choices=["stageA", "stageE", "stageF", "stageG", "stageG_cont", "stageG_mag", "stageYawAuth", "stageH", "stageL", "custom"],
     )
     parser.add_argument("--phases", default="")
     parser.add_argument("--dry_run", action="store_true", help="Plan and emit phase table without running benchmarks")
@@ -1213,6 +1254,8 @@ def main() -> int:
         default_phases = DEFAULT_PHASE_SEQUENCE_STAGE_YAW_AUTH
     elif args.phase_set == "stageH":
         default_phases = DEFAULT_PHASE_SEQUENCE_STAGE_H
+    elif args.phase_set == "stageL":
+        default_phases = DEFAULT_PHASE_SEQUENCE_STAGE_L
     else:
         default_phases = DEFAULT_PHASE_SEQUENCE
     phases_raw = args.phases if str(args.phases).strip() else ",".join(default_phases)

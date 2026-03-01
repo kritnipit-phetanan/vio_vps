@@ -721,6 +721,17 @@ class OutputReportingService:
         vps_failsoft_apply_ratio = float("nan")
         if vps_failsoft_matched_count > 0:
             vps_failsoft_apply_ratio = float(vps_failsoft_applied_count / vps_failsoft_matched_count)
+        vps_hint_only_count = float(int(getattr(self.runner, "_vps_hint_only_count", 0)))
+        vps_apply_score_p50 = float("nan")
+        vps_apply_score_p10 = float("nan")
+        try:
+            s_hist = np.asarray(getattr(self.runner, "_vps_apply_score_history", []), dtype=float)
+            s_hist = s_hist[np.isfinite(s_hist)]
+            if s_hist.size > 0:
+                vps_apply_score_p50 = float(np.percentile(s_hist, 50))
+                vps_apply_score_p10 = float(np.percentile(s_hist, 10))
+        except Exception:
+            pass
         vps_direct_xy_apply_count = float(int(getattr(self.runner, "_vps_direct_xy_apply_count", 0)))
         vps_direct_xy_reject_consensus_count = float(
             int(getattr(self.runner, "_vps_direct_xy_reject_consensus_count", 0))
@@ -768,12 +779,17 @@ class OutputReportingService:
 
         msckf_quality_p50 = float("nan")
         msckf_quality_p10 = float("nan")
+        msckf_stable_geometry_ratio = float("nan")
         try:
             q_hist = np.asarray(getattr(self.runner, "_msckf_quality_history", []), dtype=float)
             q_hist = q_hist[np.isfinite(q_hist)]
             if q_hist.size > 0:
                 msckf_quality_p50 = float(np.percentile(q_hist, 50))
                 msckf_quality_p10 = float(np.percentile(q_hist, 10))
+            st_hist = np.asarray(getattr(self.runner, "_msckf_stable_geometry_history", []), dtype=float)
+            st_hist = st_hist[np.isfinite(st_hist)]
+            if st_hist.size > 0:
+                msckf_stable_geometry_ratio = float(np.mean(np.clip(st_hist, 0.0, 1.0)))
         except Exception:
             pass
         if getattr(self.runner, "vps_runner", None) is not None and hasattr(self.runner.vps_runner, "get_runtime_metrics"):
@@ -888,6 +904,9 @@ class OutputReportingService:
             vps_failsoft_matched_count=vps_failsoft_matched_count,
             vps_failsoft_applied_count=vps_failsoft_applied_count,
             vps_failsoft_apply_ratio=vps_failsoft_apply_ratio,
+            vps_hint_only_count=vps_hint_only_count,
+            vps_apply_score_p50=vps_apply_score_p50,
+            vps_apply_score_p10=vps_apply_score_p10,
             vps_direct_xy_apply_count=vps_direct_xy_apply_count,
             vps_direct_xy_reject_consensus_count=vps_direct_xy_reject_consensus_count,
             vps_direct_xy_reject_budget_count=vps_direct_xy_reject_budget_count,
@@ -902,6 +921,7 @@ class OutputReportingService:
             yaw_owner_dead_fallback_count=yaw_owner_dead_fallback_count,
             msckf_quality_p50=msckf_quality_p50,
             msckf_quality_p10=msckf_quality_p10,
+            msckf_stable_geometry_ratio=msckf_stable_geometry_ratio,
             backend_stale_ratio=backend_stale_ratio,
             backend_emit_to_apply_ratio=backend_emit_to_apply_ratio,
             backend_apply_quality_p50=backend_apply_quality_p50,
@@ -926,12 +946,14 @@ class OutputReportingService:
             f"speed_p99={speed_p99_m_s:.2f}m/s, "
             f"vps_busy_skips={vps_worker_busy_skips:.0f}, "
             f"vps_p95={vps_attempt_ms_p95:.1f}ms, "
+            f"vps_hint_only={vps_hint_only_count:.0f}, "
             f"policy_conflicts={policy_conflict_count:.0f}, "
             f"owner_sw={heading_owner_switch_count:.0f}, "
             f"owner_hold={heading_owner_hold_ratio:.3f}, "
             f"mag_blk={yaw_owner_mag_block_count:.0f}, "
             f"owner_dead={yaw_owner_dead_fallback_count:.0f}, "
             f"msckf_q50={msckf_quality_p50:.3f}, "
+            f"msckf_stable={msckf_stable_geometry_ratio:.3f}, "
             f"backend_stale_ratio={backend_stale_ratio:.3f}, "
             f"backend_emit_to_apply={backend_emit_to_apply_ratio:.3f}, "
             f"backend_q50={backend_apply_quality_p50:.3f}, "
