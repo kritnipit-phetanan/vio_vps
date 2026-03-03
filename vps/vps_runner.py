@@ -87,6 +87,7 @@ class VPSConfig:
     max_image_side: int = 1024
     mps_cache_clear_interval: int = 0
     max_cached_tiles: int = 50
+    image_forward_axis: str = "top"  # top|bottom (front direction in image)
 
     # Accuracy-first controls
     accuracy_mode: bool = False
@@ -765,14 +766,33 @@ class VPSRunner:
                     R00 = t_matrix[0][0]
                     R10 = t_matrix[1][0]
                     
-                    # Calculate yaw offset from rotation matrix
-                    # atan2(R10, R00) gives azimuth of Camera X-axis (Right)
-                    # Subtract 90° to get azimuth of Camera Up-axis (-Y)
+                    # Calculate yaw offset from rotation matrix.
+                    # atan2(R10, R00) gives azimuth of Camera X-axis (Right).
+                    # Forward image axis convention can be:
+                    # - top    => Camera -Y (legacy)
+                    # - bottom => Camera +Y
                     yaw_x_axis = math.atan2(R10, R00)
-                    camera_yaw_offset_rad = yaw_x_axis - math.radians(90)
-                    
-                    print(f"[VPSRunner] Extrinsics loaded: {camera_view} -> "
-                          f"yaw offset = {math.degrees(camera_yaw_offset_rad):.2f}°")
+                    image_forward_axis = str(
+                        vps_cfg.get(
+                            "image_forward_axis",
+                            vps_cfg.get("camera_forward_axis", "top"),
+                        )
+                    ).strip().lower()
+                    if image_forward_axis in ("bottom", "down", "+y", "positive_y", "front_bottom"):
+                        forward_axis_deg = 90.0
+                    else:
+                        if image_forward_axis not in ("top", "up", "-y", "negative_y", "front_top"):
+                            print(
+                                f"[VPSRunner] Warning: unknown image_forward_axis={image_forward_axis!r}, fallback='top'"
+                            )
+                        image_forward_axis = "top"
+                        forward_axis_deg = -90.0
+                    camera_yaw_offset_rad = yaw_x_axis + math.radians(float(forward_axis_deg))
+
+                    print(
+                        f"[VPSRunner] Extrinsics loaded: {camera_view}, image_forward_axis={image_forward_axis} -> "
+                        f"yaw offset = {math.degrees(camera_yaw_offset_rad):.2f}°"
+                    )
             except Exception as e:
                 print(f"[VPSRunner] Warning: Failed to load extrinsics: {e}")
         else:
@@ -828,6 +848,7 @@ class VPSRunner:
                 rescue_max_reproj_error=float(vps_cfg.get("rescue_max_reproj_error", 2.5)),
                 max_image_side=int(vps_cfg.get("max_image_side", 1024)),
                 mps_cache_clear_interval=int(vps_cfg.get("mps_cache_clear_interval", 8)),
+                image_forward_axis=str(vps_cfg.get("image_forward_axis", vps_cfg.get("camera_forward_axis", "top"))),
                 max_cached_tiles=int(vps_cfg.get("tile_cache_max_tiles", 50)),
                 yaw_hypotheses_deg=yaw_hyp if len(yaw_hyp) > 0 else (0.0, 180.0, 90.0, -90.0),
                 scale_hypotheses=scale_hyp if len(scale_hyp) > 0 else (1.0, 0.90, 1.10),

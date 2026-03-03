@@ -87,8 +87,10 @@ def summarize_accuracy_first(out_dir: Path) -> dict:
         "err3d_final": np.nan,
         "heading_final_abs_deg": np.nan,
         "vps_used": np.nan,
+        "msckf_total_attempt": np.nan,
         "msckf_fail_depth_sign": np.nan,
         "msckf_fail_reproj_error": np.nan,
+        "reproj_fail_rate_per_attempt": np.nan,
         "msckf_fail_nonlinear": np.nan,
     }
 
@@ -118,6 +120,9 @@ def summarize_accuracy_first(out_dir: Path) -> dict:
                     m = re.search(r"VPS used:\s*(\d+)", line)
                     if m:
                         result["vps_used"] = float(m.group(1))
+                    m = re.search(r"\[MSCKF-STATS\]\s*Total:\s*(\d+)", line)
+                    if m:
+                        result["msckf_total_attempt"] = float(m.group(1))
                     m = re.search(r"fail_depth_sign:\s*(\d+)", line)
                     if m:
                         result["msckf_fail_depth_sign"] = float(m.group(1))
@@ -129,6 +134,14 @@ def summarize_accuracy_first(out_dir: Path) -> dict:
                         result["msckf_fail_nonlinear"] = float(m.group(1))
         except Exception:
             pass
+    if (
+        np.isfinite(result["msckf_total_attempt"])
+        and result["msckf_total_attempt"] > 0.0
+        and np.isfinite(result["msckf_fail_reproj_error"])
+    ):
+        result["reproj_fail_rate_per_attempt"] = float(
+            result["msckf_fail_reproj_error"] / result["msckf_total_attempt"]
+        )
 
     out_csv = out_dir / "accuracy_first_summary.csv"
     pd.DataFrame([result]).to_csv(out_csv, index=False)
@@ -148,6 +161,12 @@ def summarize_accuracy_first(out_dir: Path) -> dict:
         f"depth_sign={int(result['msckf_fail_depth_sign']) if np.isfinite(result['msckf_fail_depth_sign']) else 'nan'}, "
         f"reproj={int(result['msckf_fail_reproj_error']) if np.isfinite(result['msckf_fail_reproj_error']) else 'nan'}, "
         f"nonlinear={int(result['msckf_fail_nonlinear']) if np.isfinite(result['msckf_fail_nonlinear']) else 'nan'}"
+    )
+    print(
+        "MSCKF reproj rate  : "
+        f"{result['reproj_fail_rate_per_attempt']:.6f} per attempt"
+        if np.isfinite(result["reproj_fail_rate_per_attempt"])
+        else "MSCKF reproj rate  : nan"
     )
     print(f"saved: {out_csv}")
     print("")

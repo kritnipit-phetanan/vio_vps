@@ -85,8 +85,9 @@ class MsckfQualitySnapshot:
     stable_geometry_flag: bool = False
     conditioning_risk: float = float("nan")
     feature_track_health: float = float("nan")
+    unstable_reason_code: str = "stable"
 
-    def as_dict(self) -> Dict[str, float]:
+    def as_dict(self) -> Dict[str, Any]:
         return {
             "timestamp": float(self.timestamp),
             "track_count": float(self.track_count),
@@ -98,6 +99,7 @@ class MsckfQualitySnapshot:
             "stable_geometry_flag": float(bool(self.stable_geometry_flag)),
             "conditioning_risk": float(self.conditioning_risk),
             "feature_track_health": float(self.feature_track_health),
+            "unstable_reason_code": str(self.unstable_reason_code),
         }
 
 

@@ -1066,6 +1066,73 @@ def load_config(config_path: str) -> VIOConfig:
     result['MSCKF_REPROJ_FAILSOFT_MIN_QUALITY'] = float(
         reproj_state_aware.get('failsoft_min_quality', 0.35)
     )
+    # Stable-geometry reprojection lane (deterministic per-feature-set cap/normalization)
+    stable_reproj_lane_cfg = msckf_cfg.get('stable_reproj_lane', {})
+    if not isinstance(stable_reproj_lane_cfg, dict):
+        stable_reproj_lane_cfg = {}
+    result['MSCKF_STABLE_REPROJ_LANE_ENABLE'] = bool(
+        stable_reproj_lane_cfg.get('enable', True)
+    )
+    result['MSCKF_STABLE_REPROJ_LANE_MIN_OBS'] = int(
+        stable_reproj_lane_cfg.get('min_obs', 8)
+    )
+    result['MSCKF_STABLE_REPROJ_LANE_CAP_PERCENTILE'] = float(
+        stable_reproj_lane_cfg.get('cap_percentile', 0.80)
+    )
+    result['MSCKF_STABLE_REPROJ_LANE_CAP_MAX_MULT'] = float(
+        stable_reproj_lane_cfg.get('cap_max_mult', 1.08)
+    )
+    result['MSCKF_STABLE_REPROJ_LANE_MAX_BORDERLINE_RATIO'] = float(
+        stable_reproj_lane_cfg.get('max_borderline_ratio', 0.35)
+    )
+    result['MSCKF_STABLE_REPROJ_LANE_MIN_VALID_OBS_RATIO'] = float(
+        stable_reproj_lane_cfg.get('min_valid_obs_ratio', 0.55)
+    )
+    result['MSCKF_STABLE_REPROJ_LANE_MAX_REDUCTION'] = float(
+        stable_reproj_lane_cfg.get('max_reduction', 0.08)
+    )
+    unstable_reproj_lane_cfg = msckf_cfg.get('unstable_reproj_lane', {})
+    if not isinstance(unstable_reproj_lane_cfg, dict):
+        unstable_reproj_lane_cfg = {}
+    result['MSCKF_UNSTABLE_REPROJ_LANE_ENABLE'] = bool(
+        unstable_reproj_lane_cfg.get('enable', True)
+    )
+    result['MSCKF_UNSTABLE_REPROJ_LANE_MIN_OBS'] = int(
+        unstable_reproj_lane_cfg.get('min_obs', 6)
+    )
+    result['MSCKF_UNSTABLE_REPROJ_LANE_CAP_PERCENTILE'] = float(
+        unstable_reproj_lane_cfg.get('cap_percentile', 0.68)
+    )
+    result['MSCKF_UNSTABLE_REPROJ_LANE_CAP_MAX_MULT'] = float(
+        unstable_reproj_lane_cfg.get('cap_max_mult', 1.04)
+    )
+    result['MSCKF_UNSTABLE_REPROJ_LANE_MAX_BORDERLINE_RATIO'] = float(
+        unstable_reproj_lane_cfg.get('max_borderline_ratio', 0.55)
+    )
+    result['MSCKF_UNSTABLE_REPROJ_LANE_MIN_VALID_OBS_RATIO'] = float(
+        unstable_reproj_lane_cfg.get('min_valid_obs_ratio', 0.45)
+    )
+    result['MSCKF_UNSTABLE_REPROJ_LANE_MAX_REDUCTION'] = float(
+        unstable_reproj_lane_cfg.get('max_reduction', 0.05)
+    )
+    result['MSCKF_UNSTABLE_REPROJ_EARLY_REJECT_ENABLE'] = bool(
+        unstable_reproj_lane_cfg.get('early_reject_on_unstable_geometry', False)
+    )
+    result['MSCKF_UNSTABLE_REPROJ_RECLASSIFY_ENABLE'] = bool(
+        unstable_reproj_lane_cfg.get('reclassify_near_threshold_enable', False)
+    )
+    result['MSCKF_UNSTABLE_REPROJ_RECLASSIFY_MULT'] = float(
+        unstable_reproj_lane_cfg.get('reclassify_near_threshold_mult', 1.0)
+    )
+    result['MSCKF_UNSTABLE_REPROJ_RECLASSIFY_MIN_OBS'] = int(
+        unstable_reproj_lane_cfg.get('reclassify_near_threshold_min_obs', 4)
+    )
+    result['MSCKF_UNSTABLE_REPROJ_PROVEN_TRACK_MAX_OBS'] = int(
+        unstable_reproj_lane_cfg.get('proven_track_max_obs', 5)
+    )
+    result['MSCKF_UNSTABLE_REPROJ_PROVEN_PARALLAX_MULT'] = float(
+        unstable_reproj_lane_cfg.get('proven_parallax_mult', 0.85)
+    )
     msckf_quality_gate = msckf_cfg.get('quality_gate', {}) if isinstance(msckf_cfg.get('quality_gate', {}), dict) else {}
     result['MSCKF_QUALITY_GATE_TRACK_MIN'] = int(msckf_quality_gate.get('track_min', 10))
     result['MSCKF_QUALITY_GATE_INLIER_MIN'] = float(msckf_quality_gate.get('inlier_min', 0.30))
@@ -1075,6 +1142,20 @@ def load_config(config_path: str) -> VIOConfig:
     )
     result['MSCKF_QUALITY_GATE_REPROJ_P95_MAX'] = float(
         msckf_quality_gate.get('reproj_p95_max', 0.06)
+    )
+    msckf_depth_gate = msckf_cfg.get('depthsign_gate', {}) if isinstance(msckf_cfg.get('depthsign_gate', {}), dict) else {}
+    result['MSCKF_DEPTHSIGN_UNSTABLE_ENABLE'] = bool(msckf_depth_gate.get('unstable_enable', True))
+    result['MSCKF_DEPTHSIGN_UNSTABLE_QUALITY_TH'] = float(msckf_depth_gate.get('unstable_quality_th', 0.38))
+    result['MSCKF_DEPTHSIGN_UNSTABLE_MIN_DEPTH_MULT'] = float(msckf_depth_gate.get('unstable_min_depth_mult', 0.35))
+    result['MSCKF_DEPTHSIGN_UNSTABLE_MIN_DEPTH_FLOOR_M'] = float(msckf_depth_gate.get('unstable_min_depth_floor_m', 0.015))
+    result['MSCKF_DEPTHSIGN_UNSTABLE_RELAX_MIN_DEPTH_ENABLE'] = bool(
+        msckf_depth_gate.get('unstable_relax_min_depth_enable', False)
+    )
+    result['MSCKF_DEPTHSIGN_UNSTABLE_RECLASSIFY_ENABLE'] = bool(
+        msckf_depth_gate.get('unstable_reclassify_enable', True)
+    )
+    result['MSCKF_DEPTHSIGN_UNSTABLE_RECLASSIFY_DOM_RATIO_TH'] = float(
+        msckf_depth_gate.get('unstable_reclassify_dom_ratio_th', 0.70)
     )
     result['MSCKF_PHASE_RAY_SOFT_SCALE'] = msckf_cfg.get(
         'phase_ray_soft_scale',
@@ -1199,6 +1280,79 @@ def load_config(config_path: str) -> VIOConfig:
     result["INFERENCE_LOG_FLUSH_STRIDE"] = int(
         max(1, runtime_logging.get("inference_log_flush_stride", 200))
     )
+    # Runtime deterministic controls (seed + cadence lock for reproducible runs)
+    runtime_control = config.get("runtime_control", {}) if isinstance(config.get("runtime_control", {}), dict) else {}
+    deterministic_cfg = runtime_control.get("deterministic", {}) if isinstance(runtime_control.get("deterministic", {}), dict) else {}
+    alignment_lock_cfg = runtime_control.get("alignment_lock", {}) if isinstance(runtime_control.get("alignment_lock", {}), dict) else {}
+    result["RUNTIME_DETERMINISTIC_ENABLE"] = bool(deterministic_cfg.get("enable", False))
+    result["RUNTIME_DETERMINISTIC_SEED"] = int(deterministic_cfg.get("seed", 20260303))
+    result["RUNTIME_DETERMINISTIC_CV_THREADS"] = int(max(1, deterministic_cfg.get("cv_threads", 1)))
+    result["RUNTIME_DETERMINISTIC_SYNC_VPS"] = bool(deterministic_cfg.get("sync_vps", False))
+    result["RUNTIME_DETERMINISTIC_LOCK_CADENCE"] = bool(deterministic_cfg.get("lock_cadence", True))
+    result["RUNTIME_DETERMINISTIC_DISABLE_VPS_BUDGET_ESCALATOR"] = bool(
+        deterministic_cfg.get("disable_vps_budget_escalator", True)
+    )
+    result["RUNTIME_DETERMINISTIC_DISABLE_VPS_TIME_BUDGET"] = bool(
+        deterministic_cfg.get("disable_vps_time_budget", True)
+    )
+    result["RUNTIME_DETERMINISTIC_FORCE_BACKEND_CAMERA_TICK_POLL"] = bool(
+        deterministic_cfg.get("force_backend_camera_tick_poll", True)
+    )
+    result["RUNTIME_DETERMINISTIC_TIMESTAMP_QUANTIZATION_US"] = int(
+        max(0, deterministic_cfg.get("timestamp_quantization_us", 0))
+    )
+    result["RUNTIME_DETERMINISTIC_WRITE_SIGNATURE"] = bool(
+        deterministic_cfg.get("write_signature", True)
+    )
+    result["ALIGNMENT_LOCK_ENABLE"] = bool(alignment_lock_cfg.get("enable", False))
+    result["ALIGNMENT_LOCK_WARN_ACTION"] = str(
+        alignment_lock_cfg.get("warn_action", "HINT_ONLY")
+    ).upper()
+    result["ALIGNMENT_LOCK_FAIL_ACTION"] = str(
+        alignment_lock_cfg.get("fail_action", "REJECT")
+    ).upper()
+    result["ALIGNMENT_LOCK_WARN_ESCALATE_ACTION"] = str(
+        alignment_lock_cfg.get("warn_escalate_action", "REJECT")
+    ).upper()
+    result["ALIGNMENT_LOCK_WARN_ESCALATE_COUNT"] = int(
+        max(1, alignment_lock_cfg.get("warn_escalate_count", 3))
+    )
+    result["ALIGNMENT_LOCK_HOLD_SEC"] = float(
+        max(0.0, alignment_lock_cfg.get("hold_sec", 1.0))
+    )
+    result["ALIGNMENT_LOCK_SCOPE"] = str(
+        alignment_lock_cfg.get("scope", "ALL")
+    ).upper()
+    result["ALIGNMENT_LOCK_WARN_ONLY_WARN_ACTION"] = str(
+        alignment_lock_cfg.get("warn_only_warn_action", "HINT_ONLY")
+    ).upper()
+    result["ALIGNMENT_LOCK_WARN_ONLY_FAIL_ACTION"] = str(
+        alignment_lock_cfg.get("warn_only_fail_action", "HINT_ONLY")
+    ).upper()
+    raw_allow = alignment_lock_cfg.get("sensor_allowlist", [])
+    if isinstance(raw_allow, str):
+        allow_tokens = [tok.strip().upper() for tok in raw_allow.split(",") if tok.strip()]
+    elif isinstance(raw_allow, (list, tuple)):
+        allow_tokens = [str(tok).strip().upper() for tok in raw_allow if str(tok).strip()]
+    else:
+        allow_tokens = []
+    result["ALIGNMENT_LOCK_SENSOR_ALLOWLIST"] = tuple(allow_tokens)
+    raw_warn_only = alignment_lock_cfg.get("warn_only_sensors", ["MAG"])
+    if isinstance(raw_warn_only, str):
+        warn_only_tokens = [tok.strip().upper() for tok in raw_warn_only.split(",") if tok.strip()]
+    elif isinstance(raw_warn_only, (list, tuple)):
+        warn_only_tokens = [str(tok).strip().upper() for tok in raw_warn_only if str(tok).strip()]
+    else:
+        warn_only_tokens = []
+    result["ALIGNMENT_LOCK_WARN_ONLY_SENSORS"] = tuple(warn_only_tokens)
+    raw_audit_only = alignment_lock_cfg.get("audit_only_sensors", ["KIN_GUARD"])
+    if isinstance(raw_audit_only, str):
+        audit_only_tokens = [tok.strip().upper() for tok in raw_audit_only.split(",") if tok.strip()]
+    elif isinstance(raw_audit_only, (list, tuple)):
+        audit_only_tokens = [str(tok).strip().upper() for tok in raw_audit_only if str(tok).strip()]
+    else:
+        audit_only_tokens = []
+    result["ALIGNMENT_LOCK_AUDIT_ONLY_SENSORS"] = tuple(audit_only_tokens)
     
     # IMU-GNSS Lever Arm (optional - defaults to zero if not specified)
     if 'imu_gnss_extrinsics' in config:
@@ -1733,6 +1887,36 @@ def load_config(config_path: str) -> VIOConfig:
     result['VPS_APPLY_GATE_MOTION_HIGH_YAWRATE_DEG_S'] = float(
         vps_apply_gate_cfg.get('motion_high_yawrate_deg_s', 55.0)
     )
+    result['VPS_APPLY_GATE_MOTION_CONSISTENCY_ENABLE'] = bool(
+        vps_apply_gate_cfg.get('motion_consistency_enable', True)
+    )
+    result['VPS_APPLY_GATE_MOTION_CONSISTENCY_BLOCK_TO_HINT_ONLY'] = bool(
+        vps_apply_gate_cfg.get('motion_consistency_block_to_hint_only', True)
+    )
+    result['VPS_APPLY_GATE_MOTION_CONSISTENCY_MIN_SPEED_M_S'] = float(
+        vps_apply_gate_cfg.get('motion_consistency_min_speed_m_s', 14.0)
+    )
+    result['VPS_APPLY_GATE_MOTION_CONSISTENCY_SPEED_FULL_M_S'] = float(
+        vps_apply_gate_cfg.get('motion_consistency_speed_full_m_s', 90.0)
+    )
+    result['VPS_APPLY_GATE_MOTION_CONSISTENCY_MIN_OFFSET_M'] = float(
+        vps_apply_gate_cfg.get('motion_consistency_min_offset_m', 10.0)
+    )
+    result['VPS_APPLY_GATE_MOTION_CONSISTENCY_REF_ALPHA'] = float(
+        vps_apply_gate_cfg.get('motion_consistency_ref_alpha', 0.30)
+    )
+    result['VPS_APPLY_GATE_MOTION_CONSISTENCY_MAX_OPPOSITION_DEG_LOW_SPEED'] = float(
+        vps_apply_gate_cfg.get('motion_consistency_max_opposition_deg_low_speed', 130.0)
+    )
+    result['VPS_APPLY_GATE_MOTION_CONSISTENCY_MAX_OPPOSITION_DEG_HIGH_SPEED'] = float(
+        vps_apply_gate_cfg.get('motion_consistency_max_opposition_deg_high_speed', 105.0)
+    )
+    result['VPS_APPLY_GATE_MOTION_CONSISTENCY_YAW_RELAX_START_DEG_S'] = float(
+        vps_apply_gate_cfg.get('motion_consistency_yaw_relax_start_deg_s', 35.0)
+    )
+    result['VPS_APPLY_GATE_MOTION_CONSISTENCY_YAW_RELAX_MAX_DEG'] = float(
+        vps_apply_gate_cfg.get('motion_consistency_yaw_relax_max_deg', 12.0)
+    )
     result['VPS_APPLY_GATE_FAILSOFT_DEFAULT_HINT_ONLY'] = bool(
         vps_apply_gate_cfg.get(
             'failsoft_default_hint_only',
@@ -1760,6 +1944,9 @@ def load_config(config_path: str) -> VIOConfig:
     result['VPS_APPLY_GATE_BOUNDED_SOFT_SCORE_TH'] = float(
         vps_apply_gate_cfg.get('bounded_soft_score_th', vps_apply_gate_cfg.get('hint_score_th', 0.32))
     )
+    result['VPS_APPLY_GATE_BOUNDED_SOFT_ALLOW_OFFSET_HARD_REJECT_IN_HOLD'] = bool(
+        vps_apply_gate_cfg.get('bounded_soft_allow_offset_hard_reject_in_hold', True)
+    )
     result['VPS_APPLY_GATE_BOUNDED_SOFT_POLICY_HOLD_BYPASS_ENABLE'] = bool(
         vps_apply_gate_cfg.get('bounded_soft_policy_hold_bypass_enable', True)
     )
@@ -1783,6 +1970,54 @@ def load_config(config_path: str) -> VIOConfig:
     )
     result['VPS_APPLY_GATE_BOUNDED_SOFT_POLICY_HOLD_BYPASS_MAX_REPROJ_ERROR'] = float(
         vps_apply_gate_cfg.get('bounded_soft_policy_hold_bypass_max_reproj_error', 1.2)
+    )
+    result['VPS_APPLY_GATE_BOUNDED_SOFT_POLICY_HOLD_RECLAIM_ENABLE'] = bool(
+        vps_apply_gate_cfg.get('bounded_soft_policy_hold_reclaim_enable', True)
+    )
+    result['VPS_APPLY_GATE_BOUNDED_SOFT_POLICY_HOLD_RECLAIM_MIN_NO_APPLY_SEC'] = float(
+        vps_apply_gate_cfg.get('bounded_soft_policy_hold_reclaim_min_no_apply_sec', 8.0)
+    )
+    result['VPS_APPLY_GATE_BOUNDED_SOFT_POLICY_HOLD_RECLAIM_MIN_SCORE_TH'] = float(
+        vps_apply_gate_cfg.get('bounded_soft_policy_hold_reclaim_min_score_th', 0.34)
+    )
+    result['VPS_APPLY_GATE_BOUNDED_SOFT_POLICY_HOLD_RECLAIM_MAX_SPEED_M_S'] = float(
+        vps_apply_gate_cfg.get('bounded_soft_policy_hold_reclaim_max_speed_m_s', 95.0)
+    )
+    result['VPS_APPLY_GATE_BOUNDED_SOFT_POLICY_HOLD_RECLAIM_MAX_OFFSET_M'] = float(
+        vps_apply_gate_cfg.get('bounded_soft_policy_hold_reclaim_max_offset_m', 220.0)
+    )
+    result['VPS_APPLY_GATE_BOUNDED_SOFT_POLICY_HOLD_RECLAIM_MIN_INLIERS'] = int(
+        vps_apply_gate_cfg.get('bounded_soft_policy_hold_reclaim_min_inliers', 4)
+    )
+    result['VPS_APPLY_GATE_BOUNDED_SOFT_POLICY_HOLD_RECLAIM_MIN_CONFIDENCE'] = float(
+        vps_apply_gate_cfg.get('bounded_soft_policy_hold_reclaim_min_confidence', 0.08)
+    )
+    result['VPS_APPLY_GATE_BOUNDED_SOFT_POLICY_HOLD_RECLAIM_MAX_REPROJ_ERROR'] = float(
+        vps_apply_gate_cfg.get('bounded_soft_policy_hold_reclaim_max_reproj_error', 1.6)
+    )
+    result['VPS_APPLY_GATE_BOUNDED_SOFT_POLICY_HOLD_RECLAIM_R_MULT'] = float(
+        vps_apply_gate_cfg.get('bounded_soft_policy_hold_reclaim_r_mult', 1.8)
+    )
+    result['VPS_APPLY_GATE_BOUNDED_SOFT_POLICY_HOLD_RECLAIM_MAX_APPLY_DP_XY_M'] = float(
+        vps_apply_gate_cfg.get('bounded_soft_policy_hold_reclaim_max_apply_dp_xy_m', 4.5)
+    )
+    result['VPS_APPLY_GATE_BOUNDED_SOFT_POLICY_HOLD_RECLAIM_HIGH_SPEED_MAX_APPLY_DP_XY_M'] = float(
+        vps_apply_gate_cfg.get('bounded_soft_policy_hold_reclaim_high_speed_max_apply_dp_xy_m', 3.0)
+    )
+    result['VPS_APPLY_GATE_BOUNDED_SOFT_MISSING_CLONE_DIRECT_FALLBACK_ENABLE'] = bool(
+        vps_apply_gate_cfg.get('bounded_soft_missing_clone_direct_fallback_enable', True)
+    )
+    result['VPS_APPLY_GATE_MSCKF_UNSTABLE_ENABLE'] = bool(
+        vps_apply_gate_cfg.get('msckf_unstable_enable', True)
+    )
+    result['VPS_APPLY_GATE_MSCKF_MIN_QUALITY'] = float(
+        vps_apply_gate_cfg.get('msckf_min_quality', 0.34)
+    )
+    result['VPS_APPLY_GATE_MSCKF_UNSTABLE_APPLY_PENALTY'] = float(
+        vps_apply_gate_cfg.get('msckf_unstable_apply_penalty', 0.06)
+    )
+    result['VPS_APPLY_GATE_MSCKF_UNSTABLE_FAILSOFT_TH'] = float(
+        vps_apply_gate_cfg.get('msckf_unstable_failsoft_th', 0.58)
     )
 
     # Backward-compatible runtime keys (single alias chain via canonical source).
@@ -1982,6 +2217,13 @@ def load_config(config_path: str) -> VIOConfig:
     )
     result['BACKEND_TRANSPORT_POLL_MIN_INTERVAL_SEC'] = float(
         transport_cfg.get('poll_min_interval_sec', backend_cfg.get('poll_interval_sec', 0.5))
+    )
+    result['BACKEND_TRANSPORT_DETERMINISTIC_INLINE'] = bool(
+        transport_cfg.get(
+            'deterministic_inline',
+            bool(result.get("RUNTIME_DETERMINISTIC_ENABLE", False))
+            and bool(result.get("RUNTIME_DETERMINISTIC_LOCK_CADENCE", True)),
+        )
     )
     result['BACKEND_CONTRACT_STRICT_REQUIRE_SOURCE_MIX'] = bool(
         contract_v1_cfg.get('strict_require_source_mix', contract_cfg.get('strict_require_source_mix', True))

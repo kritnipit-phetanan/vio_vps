@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import os
+import random
 from typing import Any
 
 import numpy as np
@@ -53,6 +55,7 @@ class BootstrapService:
         elif self.runner.config.config_yaml:
             self.load_config()
         self._apply_phase_detection_thresholds(self.runner.global_config)
+        self._apply_deterministic_runtime_controls(self.runner.global_config)
 
         print(f"\n[CONFIG] Algorithm settings (from YAML):")
         print(f"  config_yaml: {self.runner.config.config_yaml}")
@@ -63,6 +66,147 @@ class BootstrapService:
         print(f"  estimator_mode: {self.runner.config.estimator_mode}")
         print(f"  fast_mode: {self.runner.config.fast_mode}")
         print(f"  frame_skip: {self.runner.config.frame_skip}")
+
+    def _apply_deterministic_runtime_controls(self, cfg: dict) -> None:
+        """
+        Apply deterministic run controls (seed/cadence lock) from config.
+
+        This is intentionally centralized so one toggle controls reproducibility
+        across Python/OpenCV RNG and runtime cadence-sensitive toggles.
+        """
+        if not isinstance(cfg, dict):
+            return
+        if not bool(cfg.get("RUNTIME_DETERMINISTIC_ENABLE", False)):
+            return
+
+        seed = int(cfg.get("RUNTIME_DETERMINISTIC_SEED", 20260303))
+        cv_threads = int(max(1, cfg.get("RUNTIME_DETERMINISTIC_CV_THREADS", 1)))
+        lock_cadence = bool(cfg.get("RUNTIME_DETERMINISTIC_LOCK_CADENCE", True))
+
+        random.seed(seed)
+        np.random.seed(seed)
+        os.environ["PYTHONHASHSEED"] = str(seed)
+        # Lock linear algebra thread pools for reproducibility.
+        os.environ["OMP_NUM_THREADS"] = "1"
+        os.environ["OPENBLAS_NUM_THREADS"] = "1"
+        os.environ["MKL_NUM_THREADS"] = "1"
+        os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+        os.environ["NUMEXPR_NUM_THREADS"] = "1"
+
+        try:
+            import cv2  # type: ignore
+
+            cv2.setRNGSeed(int(seed))
+            cv2.setNumThreads(int(cv_threads))
+            if hasattr(cv2, "setUseOptimized"):
+                cv2.setUseOptimized(False)
+            if hasattr(cv2, "ocl"):
+                cv2.ocl.setUseOpenCL(False)
+        except Exception:
+            pass
+
+        if bool(cfg.get("RUNTIME_DETERMINISTIC_FORCE_BACKEND_CAMERA_TICK_POLL", True)):
+            cfg["BACKEND_TRANSPORT_POLL_ON_CAMERA_TICK_ONLY"] = True
+
+        if lock_cadence:
+            cfg["VPS_DETERMINISTIC_SYNC_ENABLE"] = bool(
+                cfg.get("RUNTIME_DETERMINISTIC_SYNC_VPS", True)
+            )
+            cfg["BACKEND_TRANSPORT_DETERMINISTIC_INLINE"] = bool(
+                cfg.get("BACKEND_TRANSPORT_DETERMINISTIC_INLINE", True)
+            )
+            if bool(cfg.get("RUNTIME_DETERMINISTIC_DISABLE_VPS_BUDGET_ESCALATOR", True)):
+                cfg["VPS_RELOC_BUDGET_ESCALATOR_ENABLE"] = False
+
+        self.runner._deterministic_signature = {
+            "enabled": 1,
+            "seed": int(seed),
+            "cv_threads": int(cv_threads),
+            "sync_vps": int(bool(cfg.get("VPS_DETERMINISTIC_SYNC_ENABLE", False))),
+            "lock_cadence": int(bool(lock_cadence)),
+            "disable_vps_budget_escalator": int(
+                bool(cfg.get("RUNTIME_DETERMINISTIC_DISABLE_VPS_BUDGET_ESCALATOR", True))
+            ),
+            "disable_vps_time_budget": int(
+                bool(cfg.get("RUNTIME_DETERMINISTIC_DISABLE_VPS_TIME_BUDGET", True))
+            ),
+            "force_backend_camera_tick_poll": int(
+                bool(cfg.get("BACKEND_TRANSPORT_POLL_ON_CAMERA_TICK_ONLY", True))
+            ),
+            "backend_deterministic_inline": int(
+                bool(cfg.get("BACKEND_TRANSPORT_DETERMINISTIC_INLINE", False))
+            ),
+            "timestamp_quantization_us": int(
+                max(0, cfg.get("RUNTIME_DETERMINISTIC_TIMESTAMP_QUANTIZATION_US", 0))
+            ),
+        }
+
+        print(
+            "[DETERMINISM] enabled "
+            f"(seed={seed}, cv_threads={cv_threads}, "
+            f"sync_vps={int(bool(cfg.get('VPS_DETERMINISTIC_SYNC_ENABLE', False)))}, "
+            f"lock_cadence={int(lock_cadence)})"
+        )
+
+    def _apply_timestamp_quantization(self, cfg: dict) -> None:
+        """Quantize sensor timestamps to deterministic grid (optional)."""
+        if not isinstance(cfg, dict):
+            return
+        quant_us = int(max(0, cfg.get("RUNTIME_DETERMINISTIC_TIMESTAMP_QUANTIZATION_US", 0)))
+        if quant_us <= 0:
+            return
+        q_sec = float(quant_us) * 1e-6
+        if q_sec <= 0.0:
+            return
+
+        def _q(t_val: float) -> float:
+            try:
+                v = float(t_val)
+                if not np.isfinite(v):
+                    return float(t_val)
+                return float(np.round(v / q_sec) * q_sec)
+            except Exception:
+                return float(t_val)
+
+        changed = 0
+        total = 0
+        for seq_name in ("imu", "imgs", "mag_list", "vps_list"):
+            seq = getattr(self.runner, seq_name, None)
+            if not isinstance(seq, list):
+                continue
+            for item in seq:
+                if not hasattr(item, "t"):
+                    continue
+                total += 1
+                old_t = float(getattr(item, "t"))
+                new_t = _q(old_t)
+                if abs(new_t - old_t) > 1e-12:
+                    changed += 1
+                    setattr(item, "t", new_t)
+        msl_interp = getattr(self.runner, "msl_interpolator", None)
+        if msl_interp is not None and hasattr(msl_interp, "times"):
+            try:
+                times = np.asarray(msl_interp.times, dtype=float)
+                if times.size > 0:
+                    quant = np.round(times / q_sec) * q_sec
+                    quant = np.maximum.accumulate(quant)
+                    changed += int(np.sum(np.abs(quant - times) > 1e-12))
+                    total += int(times.size)
+                    msl_interp.times = quant
+            except Exception:
+                pass
+        print(
+            f"[DETERMINISM] timestamp quantization={quant_us}us "
+            f"(changed={changed}/{total})"
+        )
+        try:
+            sig = getattr(self.runner, "_deterministic_signature", {})
+            if isinstance(sig, dict):
+                sig["timestamp_quant_changed"] = int(changed)
+                sig["timestamp_quant_total"] = int(total)
+                self.runner._deterministic_signature = sig
+        except Exception:
+            pass
 
     def _apply_phase_detection_thresholds(self, cfg: dict):
         """
@@ -167,6 +311,8 @@ class BootstrapService:
                     print(f"       (Log: {msl_log_start:.3f}m, GT: {runner.ppk_state.height:.3f}m)")
             else:
                 print(f"[INIT] Loaded Flight Log MSL (No Ground Truth for Alignment)")
+
+        self._apply_timestamp_quantization(runner.global_config)
 
         # Print summary
         print("=== Input check ===")
@@ -508,6 +654,7 @@ class BootstrapService:
         runner.time_sync_csv = csv_paths.get("time_sync_csv")
         runner.cov_health_csv = csv_paths.get("cov_health_csv")
         runner.convention_csv = csv_paths.get("convention_csv")
+        runner.alignment_audit_csv = csv_paths.get("alignment_audit_csv")
         runner.adaptive_debug_csv = csv_paths.get("adaptive_debug_csv")
         runner.sensor_health_csv = csv_paths.get("sensor_health_csv")
         runner.mag_quality_csv = csv_paths.get("mag_quality_csv")
@@ -533,6 +680,7 @@ class BootstrapService:
                 pass
         runner.conditioning_events_csv = csv_paths.get("conditioning_events_csv")
         runner.benchmark_health_summary_csv = csv_paths.get("benchmark_health_summary_csv")
+        runner.deterministic_signature_txt = csv_paths.get("deterministic_signature_txt")
         runner.inf_csv = csv_paths["inf_csv"]
         runner._inf_flush_stride = int(max(1, runner.global_config.get("INFERENCE_LOG_FLUSH_STRIDE", 200)))
         runner._inf_since_flush = 0
@@ -550,6 +698,17 @@ class BootstrapService:
             print(f"[WARN] Failed to open inference_log.csv for buffered writing: {exc}")
         runner.vo_dbg_csv = csv_paths.get("vo_dbg")
         runner.msckf_dbg_csv = csv_paths.get("msckf_dbg")
+
+        if bool(runner.global_config.get("RUNTIME_DETERMINISTIC_WRITE_SIGNATURE", True)):
+            sig_path = getattr(runner, "deterministic_signature_txt", None)
+            sig = getattr(runner, "_deterministic_signature", None)
+            if sig_path and isinstance(sig, dict) and len(sig) > 0:
+                try:
+                    with open(sig_path, "w", newline="") as f:
+                        f.write(json.dumps(sig, sort_keys=True))
+                        f.write("\n")
+                except Exception as exc:
+                    print(f"[WARN] failed to write deterministic signature: {exc}")
 
         if runner.kf is not None and hasattr(runner.kf, "enable_cov_health_logging") and runner.cov_health_csv:
             runner.kf.enable_cov_health_logging(runner.cov_health_csv)
@@ -620,6 +779,18 @@ class BootstrapService:
                         config_path=runner.config.config_yaml,
                         device=vps_cfg.get("device", "cpu"),
                     )
+                    if bool(runner.global_config.get("RUNTIME_DETERMINISTIC_ENABLE", False)):
+                        if bool(runner.global_config.get("RUNTIME_DETERMINISTIC_DISABLE_VPS_BUDGET_ESCALATOR", True)):
+                            runner.vps_runner.config.reloc_budget_escalator_enable = False
+                        if bool(runner.global_config.get("RUNTIME_DETERMINISTIC_DISABLE_VPS_TIME_BUDGET", True)):
+                            # Wall-clock budget checks create run-to-run jitter; disable in deterministic mode.
+                            runner.vps_runner.config.max_frame_time_ms_local = 0.0
+                            runner.vps_runner.config.max_frame_time_ms_global = 0.0
+                        if bool(runner.global_config.get("VPS_DETERMINISTIC_SYNC_ENABLE", False)):
+                            # Inline processing in VIOService removes thread timing jitter.
+                            print("[DETERMINISM] VPS async worker disabled (sync mode)")
+                        if bool(runner.global_config.get("RUNTIME_DETERMINISTIC_LOCK_CADENCE", True)):
+                            print("[DETERMINISM] VPS budget escalator disabled for cadence lock")
 
                     if runner.vps_logger is not None:
                         runner.vps_runner.set_logger(runner.vps_logger)
@@ -749,10 +920,16 @@ class BootstrapService:
                 drop_stale_on_emit=bool(
                     runner.global_config.get("BACKEND_TRANSPORT_DROP_STALE_ON_EMIT", True)
                 ),
+                deterministic_inline=bool(
+                    runner.global_config.get("BACKEND_TRANSPORT_DETERMINISTIC_INLINE", False)
+                ),
             )
             runner.backend_optimizer.start()
+            mode_label = "inline-deterministic" if bool(
+                runner.global_config.get("BACKEND_TRANSPORT_DETERMINISTIC_INLINE", False)
+            ) else "async"
             print(
-                "[BACKEND] Async fixed-lag optimizer enabled: "
+                f"[BACKEND] {mode_label} fixed-lag optimizer enabled: "
                 f"window={runner.global_config.get('BACKEND_FIXED_LAG_WINDOW', 10)}, "
                 f"rate={runner.global_config.get('BACKEND_OPTIMIZE_RATE_HZ', 2.0)}Hz"
             )

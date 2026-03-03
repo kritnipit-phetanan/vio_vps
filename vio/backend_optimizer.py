@@ -243,6 +243,7 @@ class BackendOptimizer:
         hybrid_factor_lite_use_mag_yaw: bool = True,
         latest_wins_enable: bool = True,
         drop_stale_on_emit: bool = True,
+        deterministic_inline: bool = False,
         min_emit_dp_xy_m: float = 0.5,
         min_emit_dyaw_deg: float = 0.2,
     ):
@@ -280,6 +281,7 @@ class BackendOptimizer:
         self.hybrid_factor_lite_use_mag_yaw = bool(hybrid_factor_lite_use_mag_yaw)
         self.latest_wins_enable = bool(latest_wins_enable)
         self.drop_stale_on_emit = bool(drop_stale_on_emit)
+        self.deterministic_inline = bool(deterministic_inline)
         self.min_emit_dp_xy_m = max(0.0, float(min_emit_dp_xy_m))
         self.min_emit_dyaw_deg = max(0.0, float(min_emit_dyaw_deg))
 
@@ -315,11 +317,16 @@ class BackendOptimizer:
             "corrections_polled": 0,
         }
         self.last_poll_stale_drops = 0
+        self._last_inline_iter_t = -1e9
 
     def start(self) -> None:
         if self._running:
             return
         self._running = True
+        if self.deterministic_inline:
+            # Deterministic mode: run optimization inline on poll cadence.
+            self._thread = None
+            return
         self._thread = threading.Thread(target=self._worker_loop, daemon=True)
         self._thread.start()
 
@@ -329,6 +336,26 @@ class BackendOptimizer:
         if t is not None:
             t.join(timeout=1.5)
         self._thread = None
+        self._last_inline_iter_t = -1e9
+
+    def _run_inline_iteration(self, now: float) -> None:
+        """Run one optimization iteration inline on deterministic poll cadence."""
+        if not self._running:
+            return
+        period = 1.0 / max(self.optimize_rate_hz, 1e-6)
+        if (now - float(self._last_inline_iter_t)) < period:
+            return
+        t0 = time.time()
+        corr = self._compute_correction()
+        iter_ms = (time.time() - t0) * 1000.0
+        emit_now_t = float(corr.t_ref) if corr is not None else float(now)
+        with self._lock:
+            self.stats["iterations"] = int(self.stats.get("iterations", 0)) + 1
+            self.stats["last_iter_ms"] = float(iter_ms)
+            if len(self._keyframes) > 0:
+                emit_now_t = float(self._keyframes[-1].t)
+            self._store_correction(corr, emit_now_t=emit_now_t)
+        self._last_inline_iter_t = float(now)
 
     def push_keyframe(self, t_ref: float, p_enu: np.ndarray, yaw_deg: float, quality_score: float = 1.0) -> None:
         """Push one frontend keyframe snapshot for fixed-lag context."""
@@ -369,6 +396,8 @@ class BackendOptimizer:
     def poll_correction(self, t_now: Optional[float] = None) -> Optional[BackendCorrection]:
         """Poll latest backend correction; drops stale corrections."""
         now = time.time() if t_now is None else float(t_now)
+        if self.deterministic_inline:
+            self._run_inline_iteration(now)
         dropped = 0
         with self._lock:
             if self.latest_wins_enable:

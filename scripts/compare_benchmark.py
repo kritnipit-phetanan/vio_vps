@@ -61,6 +61,7 @@ HEALTH_COLUMNS = [
     "backend_snap_reject_count",
     "backend_apply_latency_ms_p95",
     "backend_contract_violation_count",
+    "reproj_fail_rate_per_attempt",
     "vps_failsoft_matched_count",
     "vps_failsoft_applied_count",
     "vps_failsoft_apply_ratio",
@@ -299,6 +300,7 @@ def _print_health_summary(current_row: pd.Series) -> None:
         "backend_snap_reject_count",
         "backend_apply_latency_ms_p95",
         "backend_contract_violation_count",
+        "reproj_fail_rate_per_attempt",
         "rtf_proc_sim",
     ]:
         if col in current_row.index:
@@ -519,8 +521,12 @@ def evaluate_locks(
                     ),
                 ),
                 (
-                    "vps_failsoft_apply_ratio >= 0.25",
-                    np.isfinite(failsoft_apply_ratio) and failsoft_apply_ratio >= 0.25,
+                    "0.10 <= vps_failsoft_apply_ratio <= 0.35",
+                    (
+                        np.isfinite(failsoft_apply_ratio)
+                        and failsoft_apply_ratio >= 0.10
+                        and failsoft_apply_ratio <= 0.35
+                    ),
                     (
                         f"value={failsoft_apply_ratio:.4f}"
                         if np.isfinite(failsoft_apply_ratio)

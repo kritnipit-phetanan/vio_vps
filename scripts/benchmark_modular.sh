@@ -52,6 +52,9 @@ else
     echo "⚠️  Warning: .venv not found, using system Python"
 fi
 
+# Reproducibility guard for run-to-run comparisons.
+export PYTHONHASHSEED="${PYTHONHASHSEED:-0}"
+
 # Verify modular package imports work
 echo "=== Verifying VIO Module Imports ==="
 python3 << 'EOF'

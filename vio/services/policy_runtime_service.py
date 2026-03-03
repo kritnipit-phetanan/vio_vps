@@ -242,6 +242,9 @@ class PolicyRuntimeService:
                 extras["msckf_feature_track_health"] = float(
                     getattr(msckf_q, "feature_track_health", np.nan)
                 )
+                extras["msckf_unstable_reason_code"] = str(
+                    getattr(msckf_q, "unstable_reason_code", "stable")
+                )
             except Exception:
                 pass
 
@@ -271,6 +274,7 @@ class PolicyRuntimeService:
             extras["stable_geometry_flag"] = float(extras.get("msckf_stable_geometry_flag", 0.0))
             extras["conditioning_risk"] = float(extras.get("msckf_conditioning_risk", np.nan))
             extras["feature_track_health"] = float(extras.get("msckf_feature_track_health", np.nan))
+            extras["unstable_reason_code"] = str(extras.get("msckf_unstable_reason_code", "stable"))
             phase_key = str(max(0, min(2, int(phase))))
             extras["phase_chi2_scale"] = float(cfg.get("MSCKF_PHASE_CHI2_SCALE", {}).get(phase_key, 1.0))
             extras["phase_reproj_scale"] = float(cfg.get("MSCKF_PHASE_REPROJ_SCALE", {}).get(phase_key, 1.0))

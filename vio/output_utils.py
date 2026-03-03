@@ -355,7 +355,8 @@ def log_msckf_quality(msckf_quality_csv: Optional[str],
                       quality_score: float,
                       stable_geometry_flag: float = float("nan"),
                       conditioning_risk: float = float("nan"),
-                      feature_track_health: float = float("nan")):
+                      feature_track_health: float = float("nan"),
+                      unstable_reason_code: str = ""):
     """Log one MSCKF quality snapshot row."""
     if msckf_quality_csv is None:
         return
@@ -366,7 +367,8 @@ def log_msckf_quality(msckf_quality_csv: Optional[str],
                 f"{float(inlier_ratio):.6f},{float(parallax_med_px):.6f},"
                 f"{float(reproj_p95_norm):.6f},{float(depth_positive_ratio):.6f},"
                 f"{float(quality_score):.6f},{float(stable_geometry_flag):.6f},"
-                f"{float(conditioning_risk):.6f},{float(feature_track_health):.6f}\n"
+                f"{float(conditioning_risk):.6f},{float(feature_track_health):.6f},"
+                f"{str(unstable_reason_code).replace(',', ';')}\n"
             )
     except Exception:
         pass
@@ -431,6 +433,29 @@ def log_convention_event(convention_csv: Optional[str],
             f.write(
                 f"{float(t):.6f},{sensor},{check},{float(value):.6e},"
                 f"{float(threshold):.6e},{status},{note}\n"
+            )
+    except Exception:
+        pass
+
+
+def log_alignment_event(alignment_csv: Optional[str],
+                        t: float,
+                        sensor: str,
+                        check: str,
+                        value: float,
+                        threshold: float,
+                        status: str,
+                        action: str,
+                        note: str = ""):
+    """Log one alignment-lock audit row."""
+    if alignment_csv is None:
+        return
+    try:
+        note = str(note).replace(",", ";")
+        with open(alignment_csv, "a", newline="") as f:
+            f.write(
+                f"{float(t):.6f},{sensor},{check},{float(value):.6e},"
+                f"{float(threshold):.6e},{status},{str(action).upper()},{note}\n"
             )
     except Exception:
         pass
@@ -502,11 +527,15 @@ def append_benchmark_health_summary(summary_csv: Optional[str],
                                     backend_snap_reject_count: float = float("nan"),
                                     backend_apply_latency_ms_p95: float = float("nan"),
                                     backend_contract_violation_count: float = float("nan"),
+                                    alignment_lock_violation_count: float = float("nan"),
+                                    alignment_lock_hint_only_count: float = float("nan"),
+                                    alignment_lock_reject_count: float = float("nan"),
                                     memory_peak_rss_mb: float = float("nan"),
                                     memory_peak_vms_mb: float = float("nan"),
                                     memory_peak_uss_mb: float = float("nan"),
                                     memory_compact_count: float = float("nan"),
                                     memory_pressure_events: float = float("nan"),
+                                    reproj_fail_rate_per_attempt: float = float("nan"),
                                     rtf_proc_sim: float = float("nan")):
     """Append one benchmark-health summary row."""
     if summary_csv is None:
@@ -546,8 +575,11 @@ def append_benchmark_health_summary(summary_csv: Optional[str],
                 f"{backend_stale_ratio:.6f},{backend_emit_to_apply_ratio:.6f},"
                 f"{backend_apply_quality_p50:.6f},{backend_snap_reject_count:.6f},"
                 f"{backend_apply_latency_ms_p95:.6f},{backend_contract_violation_count:.6f},"
+                f"{alignment_lock_violation_count:.6f},{alignment_lock_hint_only_count:.6f},"
+                f"{alignment_lock_reject_count:.6f},"
                 f"{memory_peak_rss_mb:.6f},{memory_peak_vms_mb:.6f},{memory_peak_uss_mb:.6f},"
                 f"{memory_compact_count:.6f},{memory_pressure_events:.6f},"
+                f"{reproj_fail_rate_per_attempt:.6f},"
                 f"{rtf_proc_sim:.6f}\n"
             )
     except Exception:
@@ -1491,6 +1523,11 @@ def init_output_csvs(output_dir: str, save_debug_data: bool = False) -> Dict[str
             "in_range_frac,nn_dt_mean_s,nn_dt_p95_s,nn_dt_max_s,warn\n"
         )
 
+    # Alignment lock audit (always-on lightweight)
+    paths['alignment_audit_csv'] = os.path.join(output_dir, "alignment_audit.csv")
+    with open(paths['alignment_audit_csv'], "w", newline="") as f:
+        f.write("t,sensor,check,value,threshold,status,action,note\n")
+
     # VPS relocalization summary (local/global attempts)
     paths['vps_reloc_summary_csv'] = os.path.join(output_dir, "vps_reloc_summary.csv")
     with open(paths['vps_reloc_summary_csv'], "w", newline="") as f:
@@ -1514,7 +1551,7 @@ def init_output_csvs(output_dir: str, save_debug_data: bool = False) -> Dict[str
     with open(paths['vps_position_trace_csv'], "w", newline="") as f:
         f.write(
             "t,frame,match_reason,quality_mode,decision_lane,force_hint_only,"
-            "apply_score,consensus_score,geometry_score,motion_score,allow_direct_xy_apply,"
+            "apply_score,consensus_score,geometry_score,motion_score,bounded_clamp_m,allow_direct_xy_apply,"
             "direct_xy_candidate,hint_quality,offset_m,inliers,confidence,reproj_error,"
             "applied,reason_code,policy_note,hard_note,temporal_note,direct_note\n"
         )
@@ -1545,7 +1582,7 @@ def init_output_csvs(output_dir: str, save_debug_data: bool = False) -> Dict[str
     with open(paths['msckf_quality_csv'], "w", newline="") as f:
         f.write(
             "t,track_count,inlier_ratio,parallax_med_px,reproj_p95_norm,depth_positive_ratio,"
-            "quality_score,stable_geometry_flag,conditioning_risk,feature_track_health\n"
+            "quality_score,stable_geometry_flag,conditioning_risk,feature_track_health,unstable_reason_code\n"
         )
 
     # Conditioning events (trigger-only log for covariance repairs)
@@ -1582,10 +1619,15 @@ def init_output_csvs(output_dir: str, save_debug_data: bool = False) -> Dict[str
             "msckf_quality_p50,msckf_quality_p10,msckf_stable_geometry_ratio,"
             "backend_stale_ratio,backend_emit_to_apply_ratio,backend_apply_quality_p50,"
             "backend_snap_reject_count,backend_apply_latency_ms_p95,backend_contract_violation_count,"
+            "alignment_lock_violation_count,alignment_lock_hint_only_count,alignment_lock_reject_count,"
             "memory_peak_rss_mb,memory_peak_vms_mb,memory_peak_uss_mb,"
             "memory_compact_count,memory_pressure_events,"
+            "reproj_fail_rate_per_attempt,"
             "rtf_proc_sim\n"
         )
+
+    # Deterministic runtime signature (one-line JSON-like metadata)
+    paths['deterministic_signature_txt'] = os.path.join(output_dir, "deterministic_signature.txt")
 
     # Heavy per-frame/per-feature debug logs are opt-in via --save_debug_data.
     paths['state_dbg_csv'] = None

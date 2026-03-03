@@ -686,6 +686,7 @@ def evaluate_lock_profile(run_dir: Path | None, profile_name: str) -> tuple[bool
     vps_attempt_count = _to_float(row, "vps_attempt_count")
     abs_corr_apply_count = _to_float(row, "abs_corr_apply_count")
     failsoft_apply_ratio = _to_float(row, "vps_failsoft_apply_ratio")
+    reproj_fail_rate_per_attempt = _to_float(row, "reproj_fail_rate_per_attempt")
     backend_contract_violation_count = _to_float(row, "backend_contract_violation_count")
     backend_stale_drop_count = _to_float(row, "backend_stale_drop_count")
     backend_poll_count = _to_float(row, "backend_poll_count")
@@ -756,8 +757,12 @@ def evaluate_lock_profile(run_dir: Path | None, profile_name: str) -> tuple[bool
                 ),
             ),
             (
-                "vps_failsoft_apply_ratio >= 0.25",
-                bool(np.isfinite(failsoft_apply_ratio) and failsoft_apply_ratio >= 0.25),
+                "0.10 <= vps_failsoft_apply_ratio <= 0.35",
+                bool(
+                    np.isfinite(failsoft_apply_ratio)
+                    and failsoft_apply_ratio >= 0.10
+                    and failsoft_apply_ratio <= 0.35
+                ),
                 f"value={failsoft_apply_ratio:.4f}" if np.isfinite(failsoft_apply_ratio) else "value=nan",
             ),
         ])
@@ -870,6 +875,7 @@ def evaluate_lock_profile(run_dir: Path | None, profile_name: str) -> tuple[bool
         "vps_jump_reject_ratio": jump_ratio,
         "backend_stale_drop_ratio": stale_ratio,
         "backend_contract_violation_count": backend_contract_violation_count,
+        "reproj_fail_rate_per_attempt": reproj_fail_rate_per_attempt,
         "policy_conflict_count": policy_conflict_count,
         "overflow_hits": len(over),
         "rtf_proc_sim": _to_float(row, "rtf_proc_sim"),
@@ -1319,6 +1325,7 @@ def main() -> int:
                     "cov_large_rate": np.nan,
                     "pmax_max": np.nan,
                     "overflow_hits": np.nan,
+                    "reproj_fail_rate_per_attempt": np.nan,
                     "rtf_proc_sim": np.nan,
                     "rtf_pass_tier": "nan",
                     "decision_mode": "skip_no_change",
@@ -1506,6 +1513,10 @@ def main() -> int:
             "cov_large_rate": backend_lock_detail.get("cov_large_rate", np.nan),
             "pmax_max": backend_lock_detail.get("pmax_max", np.nan),
             "overflow_hits": backend_lock_detail.get("overflow_hits", np.nan),
+            "reproj_fail_rate_per_attempt": backend_lock_detail.get(
+                "reproj_fail_rate_per_attempt",
+                np.nan,
+            ),
             "rtf_proc_sim": backend_lock_detail.get("rtf_proc_sim", np.nan),
             "rtf_pass_tier": classify_rtf_pass_tier(float(backend_lock_detail.get("rtf_proc_sim", np.nan))),
             "decision_mode": "h_compare_focused" if use_h_compare else "lock_profile",

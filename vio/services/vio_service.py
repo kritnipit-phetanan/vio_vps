@@ -1313,6 +1313,9 @@ class VIOService:
         # Check for fast rotation - skip VIO during aggressive maneuvers
         rotation_rate_deg_s = np.linalg.norm(rec.ang) * 180.0 / np.pi
         is_fast_rotation = rotation_rate_deg_s > 30.0
+        deterministic_vps_sync = bool(
+            runner.global_config.get("VPS_DETERMINISTIC_SYNC_ENABLE", False)
+        )
 
         def _collect_finished_vps_result():
             """
@@ -1368,22 +1371,31 @@ class VIOService:
             except Exception:
                 return str(default_health).upper()
 
+        def _merge_alignment_action(a: str, b: str) -> str:
+            rank = {"PASS": 0, "HINT_ONLY": 1, "REJECT": 2}
+            a_u = str(a or "PASS").upper()
+            b_u = str(b or "PASS").upper()
+            return a_u if rank.get(a_u, 0) >= rank.get(b_u, 0) else b_u
+
         # Process images up to current time
         while runner.state.img_idx < len(runner.imgs) and runner.imgs[runner.state.img_idx].t <= t:
             # Get camera timestamp (CRITICAL: use this instead of IMU time t)
             # Prevents timestamp mismatch when cloning/resetting preintegration
             t_cam = runner.imgs[runner.state.img_idx].t
+            frame_alignment_action = "PASS"
             cam_lag = abs(float(t) - float(t_cam))
             cam_sync_threshold = float(runner.global_config.get("CAM_TIME_SYNC_THRESHOLD_SEC", 0.10))
-            runner.output_reporting.log_convention_check(
+            cam_status = "PASS" if cam_lag <= cam_sync_threshold else "WARN"
+            cam_action = runner.output_reporting.log_convention_check(
                 t=float(t_cam),
                 sensor="CAM",
                 check="imu_cam_abs_dt",
                 value=float(cam_lag),
                 threshold=float(cam_sync_threshold),
-                status="PASS" if cam_lag <= cam_sync_threshold else "WARN",
+                status=cam_status,
                 note=f"t_imu={float(t):.6f}",
             )
+            frame_alignment_action = _merge_alignment_action(frame_alignment_action, cam_action)
 
             # FRAME SKIP (v2.9.9): Process every N frames for speedup
             # frame_skip=1 -> all frames, frame_skip=2 -> every other frame (50% faster)
@@ -1573,10 +1585,19 @@ class VIOService:
                         "frame_idx": frame_idx_for_vps,
                         "t_cam": float(t_cam),
                     }
-                    runner._vps_inflight_thread = threading.Thread(
-                        target=run_vps_in_thread, daemon=True
-                    )
-                    runner._vps_inflight_thread.start()
+                    if deterministic_vps_sync:
+                        # Deterministic cadence lock: run VPS inline on camera tick.
+                        run_vps_in_thread()
+                        vps_result = runner._vps_inflight_result
+                        vps_result_meta = dict(runner._vps_inflight_meta or {})
+                        runner._vps_inflight_thread = None
+                        runner._vps_inflight_result = None
+                        runner._vps_inflight_meta = None
+                    else:
+                        runner._vps_inflight_thread = threading.Thread(
+                            target=run_vps_in_thread, daemon=True
+                        )
+                        runner._vps_inflight_thread.start()
 
             # ================================================================
             # VIO Processing (continues immediately, parallel with VPS!)
@@ -1957,15 +1978,17 @@ class VIOService:
                     vps_sync_threshold = float(runner.global_config.get("VPS_TIME_SYNC_THRESHOLD_SEC", 0.25))
                     vps_t_ref = float(vps_result_meta.get("t_cam", getattr(vps_result, "t_measurement", t_cam)))
                     vps_dt = abs(float(getattr(vps_result, "t_measurement", vps_t_ref)) - float(vps_t_ref))
-                    runner.output_reporting.log_convention_check(
+                    vps_sync_status = "PASS" if vps_dt <= vps_sync_threshold else "WARN"
+                    vps_sync_action = runner.output_reporting.log_convention_check(
                         t=float(t_cam),
                         sensor="VPS",
                         check="cam_vps_abs_dt",
                         value=float(vps_dt),
                         threshold=float(vps_sync_threshold),
-                        status="PASS" if vps_dt <= vps_sync_threshold else "WARN",
+                        status=vps_sync_status,
                         note=f"vps_t={float(getattr(vps_result, 't_measurement', vps_t_ref)):.6f}",
                     )
+                    frame_alignment_action = _merge_alignment_action(frame_alignment_action, vps_sync_action)
 
                     # Create clone manager if not exists
                     if not hasattr(runner, "vps_clone_manager"):
@@ -2076,6 +2099,13 @@ class VIOService:
                         and speed_now <= fs_max_speed
                         and vps_offset_m <= fs_max_offset_m
                     )
+                    msckf_q_snap = getattr(runner, "_msckf_quality_snapshot", None)
+                    msckf_quality_score = float(
+                        getattr(msckf_q_snap, "quality_score", np.nan)
+                    ) if msckf_q_snap is not None else float("nan")
+                    msckf_stable_geometry_flag = bool(
+                        getattr(msckf_q_snap, "stable_geometry_flag", False)
+                    ) if msckf_q_snap is not None else False
                     r_scale_apply = float(vps_policy_scales.get("r_scale", 1.0))
                     position_first_direct_xy_applied = False
                     evidence = VpsMatchEvidence(
@@ -2096,6 +2126,8 @@ class VIOService:
                         fs_min_inliers=int(fs_min_inliers),
                         fs_min_conf=float(fs_min_conf),
                         fs_max_reproj=float(fs_max_reproj),
+                        msckf_quality_score=float(msckf_quality_score),
+                        msckf_stable_geometry_flag=bool(msckf_stable_geometry_flag),
                     )
                     pos_decision = self.vps_position_controller.decide_and_classify(evidence)
                     quality_mode = str(pos_decision.quality_mode)
@@ -2111,6 +2143,29 @@ class VIOService:
                     position_first_soft_note = str(pos_decision.position_first_soft_note)
                     position_first_direct_xy_candidate = bool(pos_decision.position_first_direct_xy_candidate)
                     position_first_direct_xy_note = str(pos_decision.position_first_direct_xy_note)
+                    late_reclaim_active = bool(getattr(pos_decision, "late_reclaim_active", False))
+                    late_reclaim_note = str(getattr(pos_decision, "late_reclaim_note", ""))
+                    alignment_action = str(frame_alignment_action).upper()
+                    if hasattr(runner.output_reporting, "current_alignment_action"):
+                        try:
+                            alignment_action = _merge_alignment_action(
+                                alignment_action,
+                                runner.output_reporting.current_alignment_action(float(t_cam)),
+                            )
+                        except Exception:
+                            alignment_action = str(frame_alignment_action).upper()
+                    if alignment_action == "REJECT":
+                        quality_mode = "reject"
+                        decision_lane = "REJECT"
+                        force_hint_only = False
+                        note = "alignment_lock_reject"
+                        policy_reject_note = f"{policy_reject_note}|{note}" if policy_reject_note else note
+                    elif alignment_action == "HINT_ONLY" and quality_mode != "reject":
+                        quality_mode = "reject"
+                        decision_lane = "HINT_ONLY"
+                        force_hint_only = True
+                        note = "alignment_lock_hint_only"
+                        policy_reject_note = f"{policy_reject_note}|{note}" if policy_reject_note else note
                     if str(decision_lane) == "HINT_ONLY":
                         runner._vps_hint_only_count = int(getattr(runner, "_vps_hint_only_count", 0)) + 1
                     if str(decision_lane) == "BOUNDED_SOFT_APPLY":
@@ -2214,6 +2269,13 @@ class VIOService:
                                 r_scale_apply *= float(
                                     runner.global_config.get("VPS_APPLY_GATE_BOUNDED_SOFT_R_MULT", 2.6)
                                 )
+                                if bool(late_reclaim_active):
+                                    r_scale_apply *= float(
+                                        runner.global_config.get(
+                                            "VPS_APPLY_GATE_BOUNDED_SOFT_POLICY_HOLD_RECLAIM_R_MULT",
+                                            1.8,
+                                        )
+                                    )
                         vps_lat_apply = float(vps_result.lat)
                         vps_lon_apply = float(vps_result.lon)
                         clamp_scale = 1.0
@@ -2260,6 +2322,29 @@ class VIOService:
                                                 )
                                             ),
                                         )
+                                if bool(late_reclaim_active):
+                                    reclaim_clamp = float(
+                                        runner.global_config.get(
+                                            "VPS_APPLY_GATE_BOUNDED_SOFT_POLICY_HOLD_RECLAIM_MAX_APPLY_DP_XY_M",
+                                            4.5,
+                                        )
+                                    )
+                                    if np.isfinite(speed_now):
+                                        reclaim_hs = float(
+                                            runner.global_config.get(
+                                                "VPS_APPLY_GATE_BOUNDED_SOFT_POLICY_HOLD_RECLAIM_HIGH_SPEED_MAX_APPLY_DP_XY_M",
+                                                3.0,
+                                            )
+                                        )
+                                        hs_th = float(
+                                            runner.global_config.get(
+                                                "VPS_APPLY_GATE_BOUNDED_SOFT_HIGH_SPEED_M_S",
+                                                20.0,
+                                            )
+                                        )
+                                        if speed_now >= hs_th:
+                                            reclaim_clamp = min(reclaim_clamp, reclaim_hs)
+                                    bounded_clamp = min(bounded_clamp, reclaim_clamp)
                                 if clamp_override is None:
                                     clamp_override = bounded_clamp
                                 else:
@@ -2290,6 +2375,18 @@ class VIOService:
                             vps_status = f"{vps_status} | POSITION_FIRST_SOFT"
                         if str(decision_lane) == "BOUNDED_SOFT_APPLY":
                             vps_status = f"{vps_status} | BOUNDED_SOFT_APPLY"
+                        if bool(late_reclaim_active) and str(late_reclaim_note).strip():
+                            vps_status = f"{vps_status} | {late_reclaim_note}"
+                        bounded_missing_clone_reclaim = bool(
+                            str(decision_lane) == "BOUNDED_SOFT_APPLY"
+                            and bool(
+                                runner.global_config.get(
+                                    "VPS_APPLY_GATE_BOUNDED_SOFT_MISSING_CLONE_DIRECT_FALLBACK_ENABLE",
+                                    True,
+                                )
+                            )
+                            and ("clone" in str(vps_status).lower())
+                        )
                         if (
                             not bool(vps_applied)
                             and bool(quality_mode == "failsoft")
@@ -2297,6 +2394,7 @@ class VIOService:
                                 bool(position_first_soft_active)
                                 or bool(drift_recovery_active)
                                 or bool(position_first_direct_xy_candidate)
+                                or bool(bounded_missing_clone_reclaim)
                             )
                             and bool(runner.global_config.get("VPS_POSITION_FIRST_DIRECT_XY_FALLBACK_ON_APPLY_FAIL", True))
                         ):
@@ -2443,7 +2541,11 @@ class VIOService:
                     ):
                         hold_bypass_apply = bool(
                             str(decision_lane) == "BOUNDED_SOFT_APPLY"
-                            and str(policy_reject_note) == "policy_mode_hold_bypass_bounded_soft"
+                            and str(policy_reject_note)
+                            in (
+                                "policy_mode_hold_bypass_bounded_soft",
+                                "policy_mode_hold_reclaim_bounded_soft",
+                            )
                         )
                         if bool(hold_bypass_apply):
                             runner._vps_hold_bypass_apply_count = int(

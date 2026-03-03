@@ -15,9 +15,10 @@ from scipy.spatial.transform import Rotation as R_scipy
 
 from ..data_loaders import interpolate_time_ref
 from ..math_utils import quaternion_to_yaw
-from ..msckf import print_msckf_stats
+from ..msckf import MSCKF_STATS, print_msckf_stats
 from ..output_utils import (
     append_benchmark_health_summary,
+    log_alignment_event,
     log_convention_event,
     print_error_statistics,
 )
@@ -140,7 +141,7 @@ class OutputReportingService:
                              threshold: float,
                              status: str,
                              note: str = ""):
-        """Soft-monitor for frame/time convention consistency (never fail-fast)."""
+        """Monitor frame/time convention and return deterministic alignment action."""
         log_convention_event(
             self.runner.convention_csv,
             t=float(t),
@@ -151,8 +152,25 @@ class OutputReportingService:
             status=str(status),
             note=str(note),
         )
+        action = self._alignment_lock_action(
+            t=float(t),
+            sensor=str(sensor),
+            status=str(status),
+            check=str(check),
+        )
+        log_alignment_event(
+            getattr(self.runner, "alignment_audit_csv", None),
+            t=float(t),
+            sensor=str(sensor),
+            check=str(check),
+            value=float(value),
+            threshold=float(threshold),
+            status=str(status),
+            action=str(action),
+            note=str(note),
+        )
         if str(status).upper() in ("FAIL", "WARN"):
-            key = f"{sensor}:{check}"
+            key = f"{str(sensor).upper()}:{str(check).upper()}"
             count = int(self.runner._convention_warn_counts.get(key, 0)) + 1
             self.runner._convention_warn_counts[key] = count
             if count <= 5 or count % 200 == 0:
@@ -160,6 +178,93 @@ class OutputReportingService:
                     f"[CONVENTION] {sensor}/{check} {status}: "
                     f"value={value:.6g}, threshold={threshold:.6g} {note}"
                 )
+        return str(action)
+
+    def _alignment_lock_action(self, t: float, sensor: str, status: str, check: str) -> str:
+        """Resolve deterministic lock action from convention check severity."""
+        cfg = self.runner.global_config if isinstance(self.runner.global_config, dict) else {}
+        if not bool(cfg.get("ALIGNMENT_LOCK_ENABLE", False)):
+            return "PASS"
+
+        scope = str(cfg.get("ALIGNMENT_LOCK_SCOPE", "ALL")).upper()
+        allow = cfg.get("ALIGNMENT_LOCK_SENSOR_ALLOWLIST", tuple())
+        allow_set = {str(s).upper() for s in allow} if isinstance(allow, (list, tuple, set)) else set()
+        sensor_u = str(sensor).upper()
+        if scope == "ALLOWLIST" and sensor_u not in allow_set:
+            return self.current_alignment_action(float(t))
+        if scope == "CRITICAL_ONLY" and sensor_u not in {"CAM", "VPS", "MAG", "MSCKF", "LOOP"}:
+            return self.current_alignment_action(float(t))
+
+        status_u = str(status).upper()
+        warn_action = str(cfg.get("ALIGNMENT_LOCK_WARN_ACTION", "HINT_ONLY")).upper()
+        fail_action = str(cfg.get("ALIGNMENT_LOCK_FAIL_ACTION", "REJECT")).upper()
+        warn_escalate_action = str(cfg.get("ALIGNMENT_LOCK_WARN_ESCALATE_ACTION", "REJECT")).upper()
+        warn_escalate_count = int(max(1, cfg.get("ALIGNMENT_LOCK_WARN_ESCALATE_COUNT", 3)))
+        warn_only_warn_action = str(cfg.get("ALIGNMENT_LOCK_WARN_ONLY_WARN_ACTION", "HINT_ONLY")).upper()
+        warn_only_fail_action = str(cfg.get("ALIGNMENT_LOCK_WARN_ONLY_FAIL_ACTION", "HINT_ONLY")).upper()
+        hold_sec = float(max(0.0, cfg.get("ALIGNMENT_LOCK_HOLD_SEC", 1.0)))
+        warn_only_sensors = cfg.get("ALIGNMENT_LOCK_WARN_ONLY_SENSORS", tuple())
+        audit_only_sensors = cfg.get("ALIGNMENT_LOCK_AUDIT_ONLY_SENSORS", tuple())
+        warn_only_set = {str(s).upper() for s in warn_only_sensors} if isinstance(
+            warn_only_sensors, (list, tuple, set)
+        ) else set()
+        audit_only_set = {str(s).upper() for s in audit_only_sensors} if isinstance(
+            audit_only_sensors, (list, tuple, set)
+        ) else set()
+        check_u = str(check).upper()
+
+        tier = "CRITICAL"
+        if sensor_u in audit_only_set:
+            tier = "AUDIT_ONLY"
+        elif sensor_u in warn_only_set:
+            tier = "WARN_ONLY"
+        elif sensor_u == "MAG" and "VISION_HEADING" in check_u:
+            tier = "WARN_ONLY"
+        if tier == "AUDIT_ONLY":
+            return self.current_alignment_action(float(t))
+
+        action = "PASS"
+        if tier == "WARN_ONLY":
+            if status_u == "FAIL":
+                action = warn_only_fail_action
+            elif status_u == "WARN":
+                action = warn_only_warn_action
+        else:
+            if status_u == "FAIL":
+                action = fail_action
+            elif status_u == "WARN":
+                action = warn_action
+                key = f"{sensor_u}:{str(check).upper()}"
+                warn_count = int(self.runner._convention_warn_counts.get(key, 0)) + 1
+                if warn_count >= warn_escalate_count:
+                    action = warn_escalate_action
+
+        t_now = float(t)
+        if action == "REJECT":
+            self.runner._alignment_lock_violation_count = int(getattr(self.runner, "_alignment_lock_violation_count", 0)) + 1
+            self.runner._alignment_lock_reject_count = int(getattr(self.runner, "_alignment_lock_reject_count", 0)) + 1
+            self.runner._alignment_lock_reject_until_t = max(
+                float(getattr(self.runner, "_alignment_lock_reject_until_t", -1e9)),
+                t_now + hold_sec,
+            )
+        elif action == "HINT_ONLY":
+            self.runner._alignment_lock_violation_count = int(getattr(self.runner, "_alignment_lock_violation_count", 0)) + 1
+            self.runner._alignment_lock_hint_only_count = int(getattr(self.runner, "_alignment_lock_hint_only_count", 0)) + 1
+            self.runner._alignment_lock_hint_until_t = max(
+                float(getattr(self.runner, "_alignment_lock_hint_until_t", -1e9)),
+                t_now + hold_sec,
+            )
+
+        return self.current_alignment_action(t_now)
+
+    def current_alignment_action(self, t: float) -> str:
+        """Current active alignment lock action at timestamp `t`."""
+        t_now = float(t)
+        if t_now <= float(getattr(self.runner, "_alignment_lock_reject_until_t", -1e9)):
+            return "REJECT"
+        if t_now <= float(getattr(self.runner, "_alignment_lock_hint_until_t", -1e9)):
+            return "HINT_ONLY"
+        return "PASS"
 
     def run_bootstrap_convention_checks(self):
         """One-shot frame/convention sanity checks after EKF init."""
@@ -780,6 +885,7 @@ class OutputReportingService:
         msckf_quality_p50 = float("nan")
         msckf_quality_p10 = float("nan")
         msckf_stable_geometry_ratio = float("nan")
+        reproj_fail_rate_per_attempt = float("nan")
         try:
             q_hist = np.asarray(getattr(self.runner, "_msckf_quality_history", []), dtype=float)
             q_hist = q_hist[np.isfinite(q_hist)]
@@ -790,6 +896,13 @@ class OutputReportingService:
             st_hist = st_hist[np.isfinite(st_hist)]
             if st_hist.size > 0:
                 msckf_stable_geometry_ratio = float(np.mean(np.clip(st_hist, 0.0, 1.0)))
+        except Exception:
+            pass
+        try:
+            msckf_total_attempt = float(MSCKF_STATS.get("total_attempt", np.nan))
+            msckf_fail_reproj = float(MSCKF_STATS.get("fail_reproj_error", np.nan))
+            if np.isfinite(msckf_total_attempt) and msckf_total_attempt > 0.0 and np.isfinite(msckf_fail_reproj):
+                reproj_fail_rate_per_attempt = float(msckf_fail_reproj / msckf_total_attempt)
         except Exception:
             pass
         if getattr(self.runner, "vps_runner", None) is not None and hasattr(self.runner.vps_runner, "get_runtime_metrics"):
@@ -848,6 +961,9 @@ class OutputReportingService:
         except Exception:
             pass
         backend_contract_violation_count = float(int(getattr(self.runner, "_backend_contract_violation_count", 0)))
+        alignment_lock_violation_count = float(int(getattr(self.runner, "_alignment_lock_violation_count", 0)))
+        alignment_lock_hint_only_count = float(int(getattr(self.runner, "_alignment_lock_hint_only_count", 0)))
+        alignment_lock_reject_count = float(int(getattr(self.runner, "_alignment_lock_reject_count", 0)))
         mag_accept_rate = float("nan")
         mag_total = int(getattr(self.runner.state, "mag_updates", 0)) + int(getattr(self.runner.state, "mag_rejects", 0))
         if mag_total > 0:
@@ -928,11 +1044,15 @@ class OutputReportingService:
             backend_snap_reject_count=backend_snap_reject_count,
             backend_apply_latency_ms_p95=backend_apply_latency_ms_p95,
             backend_contract_violation_count=backend_contract_violation_count,
+            alignment_lock_violation_count=alignment_lock_violation_count,
+            alignment_lock_hint_only_count=alignment_lock_hint_only_count,
+            alignment_lock_reject_count=alignment_lock_reject_count,
             memory_peak_rss_mb=memory_peak_rss_mb,
             memory_peak_vms_mb=memory_peak_vms_mb,
             memory_peak_uss_mb=memory_peak_uss_mb,
             memory_compact_count=memory_compact_count,
             memory_pressure_events=memory_pressure_events,
+            reproj_fail_rate_per_attempt=reproj_fail_rate_per_attempt,
             rtf_proc_sim=rtf_proc_sim,
         )
         print(
@@ -957,6 +1077,7 @@ class OutputReportingService:
             f"backend_stale_ratio={backend_stale_ratio:.3f}, "
             f"backend_emit_to_apply={backend_emit_to_apply_ratio:.3f}, "
             f"backend_q50={backend_apply_quality_p50:.3f}, "
+            f"align_vio={alignment_lock_violation_count:.0f}, "
             f"mem_rss_peak={memory_peak_rss_mb/1024.0 if np.isfinite(memory_peak_rss_mb) else float('nan'):.2f}GB, "
             f"mem_vms_peak={memory_peak_vms_mb/1024.0 if np.isfinite(memory_peak_vms_mb) else float('nan'):.2f}GB, "
             f"mem_uss_peak={memory_peak_uss_mb/1024.0 if np.isfinite(memory_peak_uss_mb) else float('nan'):.2f}GB, "

@@ -126,6 +126,7 @@ class VIORunner:
         self.time_sync_csv = None
         self.cov_health_csv = None
         self.convention_csv = None
+        self.alignment_audit_csv = None
         self.adaptive_debug_csv = None
         self.sensor_health_csv = None
         self.mag_quality_csv = None
@@ -139,6 +140,7 @@ class VIORunner:
         self.msckf_quality_csv = None
         self.conditioning_events_csv = None
         self.benchmark_health_summary_csv = None
+        self.deterministic_signature_txt = None
         
         # Fisheye rectifier (optional)
         self.rectifier: Optional[FisheyeRectifier] = None
@@ -244,6 +246,12 @@ class VIORunner:
         self._vision_yaw_last_t: Optional[float] = None
         self._vision_heading_quality: float = 0.0
         self._convention_warn_counts: Dict[str, int] = {}
+        self._alignment_lock_violation_count: int = 0
+        self._alignment_lock_hint_only_count: int = 0
+        self._alignment_lock_reject_count: int = 0
+        self._alignment_lock_hint_until_t: float = -1e9
+        self._alignment_lock_reject_until_t: float = -1e9
+        self._deterministic_signature: Dict[str, Any] = {}
         self._cam_frames_processed: int = 0
         self._cam_frames_inlier_nonzero: int = 0
         self._vio_vel_attempt_count: int = 0
