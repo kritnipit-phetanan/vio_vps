@@ -885,6 +885,10 @@ class OutputReportingService:
         msckf_quality_p50 = float("nan")
         msckf_quality_p10 = float("nan")
         msckf_stable_geometry_ratio = float("nan")
+        msckf_reclass_to_geometry_count = float("nan")
+        msckf_unstable_lane_count = float("nan")
+        msckf_stable_lane_used_count = float("nan")
+        msckf_preagg_parallax_low_entered_count = float("nan")
         reproj_fail_rate_per_attempt = float("nan")
         try:
             q_hist = np.asarray(getattr(self.runner, "_msckf_quality_history", []), dtype=float)
@@ -903,6 +907,18 @@ class OutputReportingService:
             msckf_fail_reproj = float(MSCKF_STATS.get("fail_reproj_error", np.nan))
             if np.isfinite(msckf_total_attempt) and msckf_total_attempt > 0.0 and np.isfinite(msckf_fail_reproj):
                 reproj_fail_rate_per_attempt = float(msckf_fail_reproj / msckf_total_attempt)
+            msckf_reclass_to_geometry_count = float(
+                MSCKF_STATS.get("reclass_to_geometry_count", np.nan)
+            )
+            msckf_unstable_lane_count = float(
+                MSCKF_STATS.get("unstable_lane_count", np.nan)
+            )
+            msckf_stable_lane_used_count = float(
+                MSCKF_STATS.get("stable_lane_used_count", np.nan)
+            )
+            msckf_preagg_parallax_low_entered_count = float(
+                MSCKF_STATS.get("preagg_parallax_low_entered_count", np.nan)
+            )
         except Exception:
             pass
         if getattr(self.runner, "vps_runner", None) is not None and hasattr(self.runner.vps_runner, "get_runtime_metrics"):
@@ -1038,6 +1054,10 @@ class OutputReportingService:
             msckf_quality_p50=msckf_quality_p50,
             msckf_quality_p10=msckf_quality_p10,
             msckf_stable_geometry_ratio=msckf_stable_geometry_ratio,
+            msckf_reclass_to_geometry_count=msckf_reclass_to_geometry_count,
+            msckf_unstable_lane_count=msckf_unstable_lane_count,
+            msckf_stable_lane_used_count=msckf_stable_lane_used_count,
+            msckf_preagg_parallax_low_entered_count=msckf_preagg_parallax_low_entered_count,
             backend_stale_ratio=backend_stale_ratio,
             backend_emit_to_apply_ratio=backend_emit_to_apply_ratio,
             backend_apply_quality_p50=backend_apply_quality_p50,
@@ -1074,6 +1094,9 @@ class OutputReportingService:
             f"owner_dead={yaw_owner_dead_fallback_count:.0f}, "
             f"msckf_q50={msckf_quality_p50:.3f}, "
             f"msckf_stable={msckf_stable_geometry_ratio:.3f}, "
+            f"msckf_reclass={msckf_reclass_to_geometry_count:.0f}, "
+            f"msckf_unstable_lane={msckf_unstable_lane_count:.0f}, "
+            f"msckf_preagg_parallax={msckf_preagg_parallax_low_entered_count:.0f}, "
             f"backend_stale_ratio={backend_stale_ratio:.3f}, "
             f"backend_emit_to_apply={backend_emit_to_apply_ratio:.3f}, "
             f"backend_q50={backend_apply_quality_p50:.3f}, "

@@ -183,10 +183,43 @@ MSCKF_STATS = {
     'fail_depth_sign_init': 0,
     'fail_depth_sign_post_refine': 0,
     'fail_depth_large': 0,
+    'reproj_eval_attempt': 0,
     'fail_reproj_error': 0,
+    'fail_reproj_sparse': 0,
+    'fail_reproj_sparse_recoverable': 0,
     'fail_reproj_pixel': 0,
     'fail_reproj_normalized': 0,
     'fail_geometry_borderline': 0,
+    'fail_geometry_insufficient_pretri': 0,
+    'fail_geometry_insufficient_posttri': 0,
+    'reclass_to_geometry_count': 0,
+    'geometry_preagg_rebucket_count': 0,
+    'preagg_callsite_dense_candidate_count': 0,
+    'preagg_callsite_dense_failsoft_skip_count': 0,
+    'preagg_callsite_dense_reclass_skip_count': 0,
+    'preagg_callsite_dense_invoked_count': 0,
+    'preagg_precond_called_count': 0,
+    'preagg_precond_pass_count': 0,
+    'preagg_precond_fail_invalid_input_count': 0,
+    'preagg_precond_fail_avg_err_nan_count': 0,
+    'preagg_precond_fail_avg_gate_nan_count': 0,
+    'preagg_precond_fail_avg_gate_nonpos_count': 0,
+    'preagg_precond_fail_avg_err_le_gate_count': 0,
+    'preagg_precond_fail_reproj_bound_count': 0,
+    'preagg_precond_fail_err_arr_too_small_count': 0,
+    'preagg_predicate_eval_count': 0,
+    'preagg_predicate_median_good_count': 0,
+    'preagg_predicate_high_tail_count': 0,
+    'preagg_predicate_enough_signal_count': 0,
+    'preagg_predicate_quality_ok_count': 0,
+    'preagg_predicate_all_true_count': 0,
+    'retry_lane_defer_count': 0,
+    'posttri_retry_defer_count': 0,
+    'posttri_retry_recover_defer_count': 0,
+    'posttri_retry_recover_exhausted_count': 0,
+    'posttri_retry_recover_success_count': 0,
+    'unstable_lane_count': 0,
+    'stable_lane_used_count': 0,
     'fail_nonlinear': 0,
     'fail_chi2': 0,
     'fail_solver': 0,
@@ -220,6 +253,64 @@ def print_msckf_stats():
     for key, val in MSCKF_STATS.items():
         if key.startswith('fail_') and (val > 0 or key in critical_fail_keys):
             print(f"  {key}: {val} ({100*val/total:.1f}%)")
+    depth_total_fail = int(
+        MSCKF_STATS.get("fail_depth_sign_init", 0)
+        + MSCKF_STATS.get("fail_depth_sign_post_refine", 0)
+        + MSCKF_STATS.get("fail_depth_large", 0)
+    )
+    reproj_eval_attempt = int(MSCKF_STATS.get("reproj_eval_attempt", 0))
+    reproj_fail = int(MSCKF_STATS.get("fail_reproj_error", 0))
+    reproj_rate_eval = (
+        float(reproj_fail) / float(max(1, reproj_eval_attempt))
+        if reproj_eval_attempt > 0
+        else float("nan")
+    )
+    print(f"  depth_total_fail: {depth_total_fail} ({100*depth_total_fail/total:.1f}%)")
+    print(
+        "  reproj_eval:"
+        f" attempt={reproj_eval_attempt},"
+        f" fail={reproj_fail},"
+        f" rate={reproj_rate_eval:.6f} per eval"
+    )
+    print(
+        "  sparse_recover:"
+        f" recoverable={int(MSCKF_STATS.get('fail_reproj_sparse_recoverable', 0))},"
+        f" defer={int(MSCKF_STATS.get('posttri_retry_recover_defer_count', 0))},"
+        f" exhausted={int(MSCKF_STATS.get('posttri_retry_recover_exhausted_count', 0))},"
+        f" recovered={int(MSCKF_STATS.get('posttri_retry_recover_success_count', 0))}"
+    )
+    print(
+        "  preagg lanes:"
+        f" geometry_preagg_rebucket_count={int(MSCKF_STATS.get('geometry_preagg_rebucket_count', 0))}"
+    )
+    print(
+        "  preagg callsites:"
+        f" dense_candidate={int(MSCKF_STATS.get('preagg_callsite_dense_candidate_count', 0))},"
+        f" dense_failsoft_skip={int(MSCKF_STATS.get('preagg_callsite_dense_failsoft_skip_count', 0))},"
+        f" dense_reclass_skip={int(MSCKF_STATS.get('preagg_callsite_dense_reclass_skip_count', 0))},"
+        f" dense_invoked={int(MSCKF_STATS.get('preagg_callsite_dense_invoked_count', 0))}"
+    )
+    print(
+        "  preagg preconditions:"
+        f" called={int(MSCKF_STATS.get('preagg_precond_called_count', 0))},"
+        f" pass={int(MSCKF_STATS.get('preagg_precond_pass_count', 0))},"
+        f" fail_invalid={int(MSCKF_STATS.get('preagg_precond_fail_invalid_input_count', 0))},"
+        f" fail_avg_err_nan={int(MSCKF_STATS.get('preagg_precond_fail_avg_err_nan_count', 0))},"
+        f" fail_avg_gate_nan={int(MSCKF_STATS.get('preagg_precond_fail_avg_gate_nan_count', 0))},"
+        f" fail_gate_nonpos={int(MSCKF_STATS.get('preagg_precond_fail_avg_gate_nonpos_count', 0))},"
+        f" fail_avg_le_gate={int(MSCKF_STATS.get('preagg_precond_fail_avg_err_le_gate_count', 0))},"
+        f" fail_reproj_bound={int(MSCKF_STATS.get('preagg_precond_fail_reproj_bound_count', 0))},"
+        f" fail_err_small={int(MSCKF_STATS.get('preagg_precond_fail_err_arr_too_small_count', 0))}"
+    )
+    print(
+        "  preagg predicates:"
+        f" eval={int(MSCKF_STATS.get('preagg_predicate_eval_count', 0))},"
+        f" median_good={int(MSCKF_STATS.get('preagg_predicate_median_good_count', 0))},"
+        f" high_tail={int(MSCKF_STATS.get('preagg_predicate_high_tail_count', 0))},"
+        f" enough_signal={int(MSCKF_STATS.get('preagg_predicate_enough_signal_count', 0))},"
+        f" quality_ok={int(MSCKF_STATS.get('preagg_predicate_quality_ok_count', 0))},"
+        f" all_true={int(MSCKF_STATS.get('preagg_predicate_all_true_count', 0))}"
+    )
 
 
 def _pairwise_parallax_med_px(obs_list: List[dict], norm_scale_px: float) -> float:
@@ -245,6 +336,50 @@ def _pairwise_parallax_med_px(obs_list: List[dict], norm_scale_px: float) -> flo
         return float("nan")
     scale = float(norm_scale_px if np.isfinite(norm_scale_px) and norm_scale_px > 1e-6 else 120.0)
     return float(np.median(np.asarray(dists, dtype=float)) * scale)
+
+
+def _classify_unstable_reason_code(
+    *,
+    track_count: int,
+    track_min: int,
+    inlier_ratio: Optional[float] = None,
+    inlier_min: Optional[float] = None,
+    parallax_med: Optional[float] = None,
+    parallax_min: Optional[float] = None,
+    depth_ratio: Optional[float] = None,
+    depth_min: Optional[float] = None,
+    reproj_p95: Optional[float] = None,
+    reproj_max: Optional[float] = None,
+    unstable_depth_gate: Optional[bool] = None,
+    use_inlier_gate: bool = True,
+    use_reproj_gate: bool = True,
+) -> str:
+    """Single-source unstable reason mapping used by quality snapshot and triangulation lanes."""
+    if int(track_count) < max(1, int(track_min)):
+        return "track_count_low"
+
+    if bool(use_inlier_gate):
+        if inlier_min is not None:
+            if (inlier_ratio is None) or (not np.isfinite(inlier_ratio)) or (float(inlier_ratio) < float(inlier_min)):
+                return "inlier_ratio_low"
+
+    if parallax_min is not None:
+        if (parallax_med is None) or (not np.isfinite(parallax_med)) or (float(parallax_med) < float(parallax_min)):
+            return "parallax_low"
+
+    if unstable_depth_gate is None:
+        if depth_min is not None:
+            if (depth_ratio is None) or (not np.isfinite(depth_ratio)) or (float(depth_ratio) < float(depth_min)):
+                return "depth_sign_low"
+    elif bool(unstable_depth_gate):
+        return "depth_sign_low"
+
+    if bool(use_reproj_gate):
+        if reproj_max is not None:
+            if (reproj_p95 is None) or (not np.isfinite(reproj_p95)) or (float(reproj_p95) > float(reproj_max)):
+                return "reproj_high"
+
+    return "stable"
 
 
 def _summarize_msckf_quality(
@@ -286,28 +421,74 @@ def _summarize_msckf_quality(
     parallax_min = float(cfg.get("MSCKF_QUALITY_GATE_PARALLAX_MIN_PX", 1.2))
     depth_min = float(cfg.get("MSCKF_QUALITY_GATE_DEPTH_POSITIVE_MIN", 0.62))
     reproj_max = float(cfg.get("MSCKF_QUALITY_GATE_REPROJ_P95_MAX", 0.06))
-
-    stable_geometry_flag = bool(
-        tc >= tr_min
-        and (np.isfinite(inlier_ratio) and float(inlier_ratio) >= inlier_min)
-        and (np.isfinite(parallax_med) and float(parallax_med) >= parallax_min)
-        and (np.isfinite(depth_ratio) and float(depth_ratio) >= depth_min)
-        and (np.isfinite(reproj_p95) and float(reproj_p95) <= reproj_max)
+    camera_view = str(cfg.get("DEFAULT_CAMERA_VIEW", "nadir")).strip().lower()
+    depth_floor_nadir = float(cfg.get("MSCKF_QUALITY_GATE_DEPTH_POSITIVE_MIN_FLOOR_NADIR", 0.30))
+    depth_track_relax_gain = float(cfg.get("MSCKF_QUALITY_GATE_DEPTH_POSITIVE_TRACK_RELAX_GAIN", 0.20))
+    depth_parallax_relax_gain = float(cfg.get("MSCKF_QUALITY_GATE_DEPTH_POSITIVE_PARALLAX_RELAX_GAIN", 0.14))
+    depth_parallax_relax_cap_ratio = float(
+        cfg.get("MSCKF_QUALITY_GATE_DEPTH_POSITIVE_PARALLAX_RELAX_CAP_RATIO", 2.0)
     )
-    unstable_reason_code = "stable"
-    if not stable_geometry_flag:
-        if tc < tr_min:
-            unstable_reason_code = "track_count_low"
-        elif (not np.isfinite(inlier_ratio)) or (float(inlier_ratio) < inlier_min):
-            unstable_reason_code = "inlier_ratio_low"
-        elif (not np.isfinite(parallax_med)) or (float(parallax_med) < parallax_min):
-            unstable_reason_code = "parallax_low"
-        elif (not np.isfinite(depth_ratio)) or (float(depth_ratio) < depth_min):
-            unstable_reason_code = "depth_sign_low"
-        elif (not np.isfinite(reproj_p95)) or (float(reproj_p95) > reproj_max):
-            unstable_reason_code = "reproj_high"
-        else:
-            unstable_reason_code = "unstable_unknown"
+    adaptive_depth_min = float(depth_min)
+    if camera_view == "nadir":
+        # Nadir relaxation must stay evidence-driven: relax only when track/parallax
+        # already indicate usable geometry, never when track support is weak.
+        has_track_support = bool(tc >= tr_min)
+        has_parallax_support = bool(np.isfinite(parallax_med) and float(parallax_med) >= parallax_min)
+
+        track_relax = 0.0
+        if has_track_support:
+            track_surplus_ratio = float(
+                np.clip(
+                    (float(tc) - float(tr_min)) / float(max(1, tr_min)),
+                    0.0,
+                    1.0,
+                )
+            )
+            track_relax = float(
+                np.clip(
+                    track_surplus_ratio * max(0.0, depth_track_relax_gain),
+                    0.0,
+                    max(0.0, depth_track_relax_gain),
+                )
+            )
+
+        parallax_relax = 0.0
+        if has_parallax_support and parallax_min > 1e-6:
+            parallax_ratio = float(parallax_med) / float(parallax_min)
+            parallax_ratio = float(np.clip(parallax_ratio, 1.0, max(1.0, depth_parallax_relax_cap_ratio)))
+            parallax_surplus = max(0.0, parallax_ratio - 1.0)
+            parallax_relax = float(
+                np.clip(
+                    parallax_surplus * max(0.0, depth_parallax_relax_gain),
+                    0.0,
+                    max(0.0, depth_parallax_relax_gain),
+                )
+            )
+
+        if has_track_support or has_parallax_support:
+            adaptive_depth_min = float(
+                np.clip(
+                    float(depth_min) - track_relax - parallax_relax,
+                    min(float(depth_floor_nadir), float(depth_min)),
+                    max(float(depth_floor_nadir), float(depth_min)),
+                )
+            )
+
+    unstable_reason_code = _classify_unstable_reason_code(
+        track_count=tc,
+        track_min=tr_min,
+        inlier_ratio=inlier_ratio,
+        inlier_min=inlier_min,
+        parallax_med=parallax_med,
+        parallax_min=parallax_min,
+        depth_ratio=depth_ratio,
+        depth_min=adaptive_depth_min,
+        reproj_p95=reproj_p95,
+        reproj_max=reproj_max,
+        use_inlier_gate=True,
+        use_reproj_gate=True,
+    )
+    stable_geometry_flag = bool(unstable_reason_code == "stable")
 
     track_health = 0.0
     track_terms: List[float] = []
@@ -316,7 +497,15 @@ def _summarize_msckf_quality(
     if np.isfinite(parallax_med):
         track_terms.append(float(np.clip(float(parallax_med) / max(1e-6, 2.0 * parallax_min), 0.0, 1.0)))
     if np.isfinite(depth_ratio):
-        track_terms.append(float(np.clip((float(depth_ratio) - depth_min) / max(1e-6, 1.0 - depth_min), 0.0, 1.0)))
+        track_terms.append(
+            float(
+                np.clip(
+                    (float(depth_ratio) - adaptive_depth_min) / max(1e-6, 1.0 - adaptive_depth_min),
+                    0.0,
+                    1.0,
+                )
+            )
+        )
     if tc > 0:
         track_terms.append(float(np.clip(float(tc) / float(max(tr_min * 2, 1)), 0.0, 1.0)))
     if track_terms:
@@ -326,7 +515,15 @@ def _summarize_msckf_quality(
     if np.isfinite(reproj_p95):
         risk_terms.append(float(np.clip(float(reproj_p95) / max(1e-6, reproj_max), 0.0, 3.0)))
     if np.isfinite(depth_ratio):
-        risk_terms.append(float(np.clip((depth_min - float(depth_ratio)) / max(1e-6, depth_min), 0.0, 3.0)))
+        risk_terms.append(
+            float(
+                np.clip(
+                    (adaptive_depth_min - float(depth_ratio)) / max(1e-6, adaptive_depth_min),
+                    0.0,
+                    3.0,
+                )
+            )
+        )
     if np.isfinite(parallax_med):
         risk_terms.append(float(np.clip((parallax_min - float(parallax_med)) / max(1e-6, parallax_min), 0.0, 3.0)))
     conditioning_risk = float(np.clip(np.mean(risk_terms) if risk_terms else np.nan, 0.0, 3.0))
@@ -490,8 +687,10 @@ def get_feature_multi_view_observations(fid: int, cam_observations: List[dict]) 
     return sorted(by_cam.values(), key=lambda o: (float(o.get('t', 0.0)), int(o.get('cam_id', -1))))
 
 
-def find_mature_features_for_msckf(vio_fe, cam_observations: List[dict], 
-                                   min_observations: int = 3) -> List[int]:
+def find_mature_features_for_msckf(vio_fe, cam_observations: List[dict],
+                                   min_observations: int = 3,
+                                   global_config: Optional[dict] = None,
+                                   max_features: int = 0) -> List[int]:
     """
     Find features ready for MSCKF update.
     
@@ -505,13 +704,55 @@ def find_mature_features_for_msckf(vio_fe, cam_observations: List[dict],
     if vio_fe is None:
         return []
     
-    mature_tracks = vio_fe.get_mature_tracks()
+    cfg = global_config if isinstance(global_config, dict) else {}
+    track_pack_enable = bool(cfg.get("MSCKF_TRACK_PACK_ENABLE", True))
+    track_pack_min_inlier = float(cfg.get("MSCKF_TRACK_PACK_MIN_INLIER_RATIO", 0.60))
+    track_pack_min_quality = float(cfg.get("MSCKF_TRACK_PACK_MIN_QUALITY_MEDIAN", 0.34))
+    track_pack_recent_window = int(cfg.get("MSCKF_TRACK_PACK_RECENT_WINDOW", 6))
+    track_pack_recent_inlier = float(cfg.get("MSCKF_TRACK_PACK_MIN_RECENT_INLIER_RATIO", 0.55))
+    track_pack_max_tracks = int(cfg.get("MSCKF_TRACK_PACK_MAX_TRACKS", 0))
+    track_pack_min_parallax_px = float(cfg.get("MSCKF_TRACK_PACK_MIN_PARALLAX_PX", 0.95))
+    track_pack_min_time_span_sec = float(cfg.get("MSCKF_TRACK_PACK_MIN_TIME_SPAN_SEC", 0.10))
+    effective_max_tracks = int(max(0, max_features))
+    if track_pack_max_tracks > 0 and (effective_max_tracks <= 0 or track_pack_max_tracks < effective_max_tracks):
+        effective_max_tracks = int(track_pack_max_tracks)
+
+    mature_tracks: Dict[int, List[dict]]
+    if track_pack_enable:
+        mature_tracks = vio_fe.get_mature_tracks(
+            min_inlier_ratio=float(track_pack_min_inlier),
+            min_quality_median=float(track_pack_min_quality),
+            min_recent_inlier_ratio=float(track_pack_recent_inlier),
+            recent_window=int(track_pack_recent_window),
+            max_tracks=int(effective_max_tracks),
+        )
+    else:
+        mature_tracks = vio_fe.get_mature_tracks()
     mature_features = []
     
     for fid in mature_tracks.keys():
         obs = get_feature_multi_view_observations(fid, cam_observations)
         if len(obs) >= min_observations:
+            if track_pack_enable and len(obs) >= 2:
+                parallax_px = _pairwise_parallax_med_px(obs, 120.0)
+                t_arr = np.asarray([float(o.get("t", np.nan)) for o in obs], dtype=float)
+                if t_arr.size > 1 and np.isfinite(t_arr).any():
+                    t_span = float(np.nanmax(t_arr) - np.nanmin(t_arr))
+                else:
+                    t_span = float("nan")
+                low_parallax = bool(
+                    np.isfinite(parallax_px)
+                    and float(parallax_px) < float(max(0.1, track_pack_min_parallax_px))
+                )
+                short_span = bool(
+                    (not np.isfinite(t_span))
+                    or float(t_span) < float(max(1e-3, track_pack_min_time_span_sec))
+                )
+                if low_parallax and short_span:
+                    continue
             mature_features.append(fid)
+    if effective_max_tracks > 0 and len(mature_features) > effective_max_tracks:
+        mature_features = mature_features[:effective_max_tracks]
     
     return mature_features
 
@@ -914,49 +1155,41 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
         (global_config or {}).get("MSCKF_DEPTHSIGN_STRICT_MIN_QUALITY", 0.45)
         if isinstance(global_config, dict) else 0.45
     )
-    stable_norm_enable = bool(
-        (global_config or {}).get("MSCKF_REPROJ_STABLE_NORM_ENABLE", True)
-        if isinstance(global_config, dict) else True
-    )
-    stable_norm_min_obs = int(
-        (global_config or {}).get("MSCKF_REPROJ_STABLE_NORM_MIN_OBS", 8)
-        if isinstance(global_config, dict) else 8
-    )
-    stable_norm_min_quality = float(
-        (global_config or {}).get("MSCKF_REPROJ_STABLE_NORM_MIN_QUALITY", 0.55)
-        if isinstance(global_config, dict) else 0.55
-    )
-    stable_norm_trim_pct = float(
-        (global_config or {}).get("MSCKF_REPROJ_STABLE_NORM_TRIM_PCT", 0.10)
-        if isinstance(global_config, dict) else 0.10
-    )
-    stable_norm_max_relax = float(
-        (global_config or {}).get("MSCKF_REPROJ_STABLE_NORM_MAX_RELAX", 1.08)
-        if isinstance(global_config, dict) else 1.08
-    )
-    stable_norm_max_reduction = float(
-        (global_config or {}).get("MSCKF_REPROJ_STABLE_NORM_MAX_REDUCTION", 0.10)
-        if isinstance(global_config, dict) else 0.10
-    )
-    # Deterministic stable-geometry reproj lane.
-    # This is a bounded per-feature-set cap path (not global gate relaxation).
+    # Deterministic stable-geometry reproj lane (single canonical lane).
+    # Legacy stable_norm keys are kept as fallback aliases for backward compatibility.
     stable_lane_enable = bool(
-        (global_config or {}).get("MSCKF_STABLE_REPROJ_LANE_ENABLE", True)
+        (global_config or {}).get(
+            "MSCKF_STABLE_REPROJ_LANE_ENABLE",
+            (global_config or {}).get("MSCKF_REPROJ_STABLE_NORM_ENABLE", True),
+        )
         if isinstance(global_config, dict) else True
     )
     stable_lane_min_obs = int(
         (global_config or {}).get(
             "MSCKF_STABLE_REPROJ_LANE_MIN_OBS",
-            max(6, int(stable_norm_min_obs)),
+            (global_config or {}).get("MSCKF_REPROJ_STABLE_NORM_MIN_OBS", 8),
         )
-        if isinstance(global_config, dict) else max(6, int(stable_norm_min_obs))
+        if isinstance(global_config, dict) else 8
+    )
+    stable_lane_min_quality = float(
+        (global_config or {}).get(
+            "MSCKF_STABLE_REPROJ_LANE_MIN_QUALITY",
+            (global_config or {}).get("MSCKF_REPROJ_STABLE_NORM_MIN_QUALITY", 0.55),
+        )
+        if isinstance(global_config, dict) else 0.55
     )
     stable_lane_cap_percentile = float(
-        (global_config or {}).get("MSCKF_STABLE_REPROJ_LANE_CAP_PERCENTILE", 0.80)
+        (global_config or {}).get(
+            "MSCKF_STABLE_REPROJ_LANE_CAP_PERCENTILE",
+            (global_config or {}).get("MSCKF_REPROJ_STABLE_NORM_CAP_PERCENTILE", 0.80),
+        )
         if isinstance(global_config, dict) else 0.80
     )
     stable_lane_cap_max_mult = float(
-        (global_config or {}).get("MSCKF_STABLE_REPROJ_LANE_CAP_MAX_MULT", 1.08)
+        (global_config or {}).get(
+            "MSCKF_STABLE_REPROJ_LANE_CAP_MAX_MULT",
+            (global_config or {}).get("MSCKF_REPROJ_STABLE_NORM_CAP_MAX_MULT", 1.08),
+        )
         if isinstance(global_config, dict) else 1.08
     )
     stable_lane_max_borderline_ratio = float(
@@ -968,7 +1201,10 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
         if isinstance(global_config, dict) else 0.55
     )
     stable_lane_max_reduction = float(
-        (global_config or {}).get("MSCKF_STABLE_REPROJ_LANE_MAX_REDUCTION", 0.08)
+        (global_config or {}).get(
+            "MSCKF_STABLE_REPROJ_LANE_MAX_REDUCTION",
+            (global_config or {}).get("MSCKF_REPROJ_STABLE_NORM_MAX_REDUCTION", 0.08),
+        )
         if isinstance(global_config, dict) else 0.08
     )
     unstable_lane_enable = bool(
@@ -999,13 +1235,110 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
         (global_config or {}).get("MSCKF_UNSTABLE_REPROJ_LANE_MAX_REDUCTION", 0.05)
         if isinstance(global_config, dict) else 0.05
     )
+    sparse_reproj_recover_enable = bool(
+        (global_config or {}).get("MSCKF_RETRY_LANE_POSTTRI_RECOVER_ENABLE", True)
+        if isinstance(global_config, dict) else True
+    )
+    sparse_reproj_recover_min_obs = int(
+        (global_config or {}).get("MSCKF_RETRY_LANE_POSTTRI_RECOVER_MIN_OBS", 5)
+        if isinstance(global_config, dict) else 5
+    )
+    sparse_reproj_recover_min_parallax_px = float(
+        (global_config or {}).get(
+            "MSCKF_RETRY_LANE_POSTTRI_RECOVER_MIN_PARALLAX_PX",
+            max(1.0, float(depth_gate_parallax_min_px)),
+        )
+        if isinstance(global_config, dict) else max(1.0, float(depth_gate_parallax_min_px))
+    )
+    sparse_reproj_recover_min_quality = float(
+        (global_config or {}).get("MSCKF_RETRY_LANE_POSTTRI_RECOVER_MIN_QUALITY", 0.34)
+        if isinstance(global_config, dict) else 0.34
+    )
+    sparse_reproj_recover_max_depth_dom_ratio = float(
+        (global_config or {}).get("MSCKF_RETRY_LANE_POSTTRI_RECOVER_MAX_DEPTH_DOM_RATIO", 0.45)
+        if isinstance(global_config, dict) else 0.45
+    )
 
     # Use lightweight signals available before triangulation succeeds.
+    pretri_gate_enable = bool(
+        (global_config or {}).get("MSCKF_PRETRI_GEOMETRY_GATE_ENABLE", True)
+        if isinstance(global_config, dict) else True
+    )
+    pretri_min_obs = int(
+        (global_config or {}).get("MSCKF_PRETRI_GEOMETRY_MIN_OBS", 6)
+        if isinstance(global_config, dict) else 6
+    )
+    pretri_min_parallax_px = float(
+        (global_config or {}).get(
+            "MSCKF_PRETRI_GEOMETRY_MIN_PARALLAX_PX",
+            max(0.8, float(depth_gate_parallax_min_px) * 0.9),
+        )
+        if isinstance(global_config, dict) else max(0.8, float(depth_gate_parallax_min_px) * 0.9)
+    )
+    pretri_min_time_span_sec = float(
+        (global_config or {}).get("MSCKF_PRETRI_GEOMETRY_MIN_TIME_SPAN_SEC", 0.10)
+        if isinstance(global_config, dict) else 0.10
+    )
+    pretri_min_quality = float(
+        (global_config or {}).get("MSCKF_PRETRI_GEOMETRY_MIN_QUALITY", 0.34)
+        if isinstance(global_config, dict) else 0.34
+    )
+    pretri_min_fail_signals = int(
+        (global_config or {}).get("MSCKF_PRETRI_GEOMETRY_MIN_FAIL_SIGNALS", 2)
+        if isinstance(global_config, dict) else 2
+    )
+    pretri_min_fail_signals = max(1, pretri_min_fail_signals)
+    pretri_hard_min_obs = int(
+        (global_config or {}).get(
+            "MSCKF_PRETRI_GEOMETRY_HARD_MIN_OBS",
+            max(3, int(pretri_min_obs) - 2),
+        )
+        if isinstance(global_config, dict) else max(3, int(pretri_min_obs) - 2)
+    )
+    pretri_hard_min_obs = max(2, pretri_hard_min_obs)
     parallax_med_px_init = _pairwise_parallax_med_px(obs_list, 120.0)
+    t_arr_init = np.asarray([float(o.get("t", np.nan)) for o in obs_list], dtype=float)
+    q_arr_init = np.asarray([float(o.get("quality", np.nan)) for o in obs_list], dtype=float)
+    t_span_init = (
+        float(np.nanmax(t_arr_init) - np.nanmin(t_arr_init))
+        if (t_arr_init.size > 1 and np.isfinite(t_arr_init).any())
+        else float("nan")
+    )
+    q_med_init = float(np.nanmedian(q_arr_init)) if (q_arr_init.size > 0 and np.isfinite(q_arr_init).any()) else float("nan")
     unstable_geometry_init = bool(depth_gate_enable and (
         len(obs_list) < max(2, int(depth_gate_track_min))
         or (np.isfinite(parallax_med_px_init) and float(parallax_med_px_init) < float(depth_gate_parallax_min_px))
     ))
+    if pretri_gate_enable:
+        low_obs = bool(len(obs_list) < max(2, int(pretri_min_obs)))
+        low_parallax = bool(
+            np.isfinite(parallax_med_px_init)
+            and float(parallax_med_px_init) < float(max(0.1, pretri_min_parallax_px))
+        )
+        short_span = bool(
+            (not np.isfinite(t_span_init))
+            or float(t_span_init) < float(max(1e-3, pretri_min_time_span_sec))
+        )
+        low_quality = bool(
+            np.isfinite(q_med_init)
+            and float(q_med_init) < float(np.clip(pretri_min_quality, 0.0, 1.0))
+        )
+        fail_signal_count = int(low_obs) + int(low_parallax) + int(short_span) + int(low_quality)
+        geometry_insufficient_pretri = bool(
+            len(obs_list) < int(pretri_hard_min_obs)
+            or (
+                fail_signal_count >= int(pretri_min_fail_signals)
+                and (
+                    (low_parallax and (short_span or low_quality))
+                    or (low_obs and low_parallax)
+                )
+            )
+        )
+        if geometry_insufficient_pretri:
+            MSCKF_STATS['fail_geometry_insufficient_pretri'] += 1
+            MSCKF_STATS['fail_geometry_borderline'] += 1
+            MSCKF_STATS['reclass_to_geometry_count'] += 1
+            return None
 
     for obs_idx0, obs_idx1 in candidate_pairs:
         obs0 = obs_list[obs_idx0]
@@ -1107,6 +1440,7 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
             MSCKF_STATS['fail_depth_large'] += 1
             if bool(unstable_geometry_init) and bool(depth_reclass_enable):
                 MSCKF_STATS['fail_geometry_borderline'] += 1
+                MSCKF_STATS['reclass_to_geometry_count'] += 1
         elif fail_counts["parallax"] > 0:
             MSCKF_STATS['fail_parallax'] += 1
         elif fail_counts["baseline"] > 0:
@@ -1218,6 +1552,8 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
             or (np.isfinite(feature_quality) and float(feature_quality) < float(depth_gate_quality_th))
         )
     )
+    if bool(unstable_geometry_depth_gate):
+        MSCKF_STATS['unstable_lane_count'] += 1
 
     # Compute reprojection error (ENHANCED with pixel-level validation)
     # v2.9.10.0: Adaptive threshold based on filter convergence (Priority 2)
@@ -1331,6 +1667,37 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
         (global_config or {}).get("MSCKF_UNSTABLE_REPROJ_PROVEN_PARALLAX_MULT", 0.85)
         if isinstance(global_config, dict) else 0.85
     )
+    geometry_insuff_reclass_enable = bool(
+        (global_config or {}).get("MSCKF_GEOMETRY_INSUFF_RECLASSIFY_ENABLE", True)
+        if isinstance(global_config, dict) else True
+    )
+    geometry_insuff_reclass_mult = float(
+        (global_config or {}).get("MSCKF_GEOMETRY_INSUFF_RECLASSIFY_MULT", 1.25)
+        if isinstance(global_config, dict) else 1.25
+    )
+    geometry_insuff_max_valid_ratio = float(
+        (global_config or {}).get("MSCKF_GEOMETRY_INSUFF_MAX_VALID_RATIO", 0.45)
+        if isinstance(global_config, dict) else 0.45
+    )
+    geometry_insuff_max_track_obs = int(
+        (global_config or {}).get("MSCKF_GEOMETRY_INSUFF_MAX_TRACK_OBS", 8)
+        if isinstance(global_config, dict) else 8
+    )
+    geometry_insuff_parallax_mult = float(
+        (global_config or {}).get("MSCKF_GEOMETRY_INSUFF_PARALLAX_MULT", 1.10)
+        if isinstance(global_config, dict) else 1.10
+    )
+    preagg_min_track_obs = int(
+        (global_config or {}).get(
+            "MSCKF_GEOMETRY_PREAGG_MIN_TRACK_OBS",
+            max(4, int(depth_gate_track_min) - 2),
+        )
+        if isinstance(global_config, dict) else max(4, int(depth_gate_track_min) - 2)
+    )
+    preagg_reproj_high_max_mult = float(
+        (global_config or {}).get("MSCKF_GEOMETRY_PREAGG_REPROJ_HIGH_MAX_MULT", 1.08)
+        if isinstance(global_config, dict) else 1.08
+    )
     if bool(unstable_reproj_early_reject_enable) and bool(unstable_geometry_depth_gate):
         track_obs_cap = max(2, int(unstable_reproj_proven_track_max_obs))
         parallax_proven_mult = float(np.clip(unstable_reproj_proven_parallax_mult, 0.2, 1.2))
@@ -1344,6 +1711,8 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
             # reject early as geometry-borderline to avoid counting these cases as
             # reprojection failures when the dominant issue is observability.
             MSCKF_STATS['fail_geometry_borderline'] += 1
+            MSCKF_STATS['fail_geometry_insufficient_pretri'] += 1
+            MSCKF_STATS['reclass_to_geometry_count'] += 1
             return None
 
     for obs in obs_list:
@@ -1430,6 +1799,77 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
         obs_error_norm_values.append(float(obs_error_metric))
         valid_obs.append(obs)
 
+    obs_reproj_p95_norm = (
+        float(np.percentile(np.asarray(obs_error_norm_values, dtype=float), 95))
+        if len(obs_error_norm_values) > 0
+        else float("nan")
+    )
+    valid_obs_ratio_now = float(len(valid_obs)) / float(max(1, len(obs_list)))
+    def _use_geometry_borderline_preagg(avg_gate: float, avg_err: Optional[float]) -> bool:
+        # Deterministic pre-aggregation lane:
+        # when residuals are heavy-tailed (spread high) but central tendency is good,
+        # classify as geometry-borderline before hard reproj fail.
+        MSCKF_STATS['preagg_precond_called_count'] += 1
+        if avg_err is None or (not np.isfinite(avg_err)):
+            MSCKF_STATS['preagg_precond_fail_invalid_input_count'] += 1
+            MSCKF_STATS['preagg_precond_fail_avg_err_nan_count'] += 1
+            return False
+        if not np.isfinite(avg_gate):
+            MSCKF_STATS['preagg_precond_fail_invalid_input_count'] += 1
+            MSCKF_STATS['preagg_precond_fail_avg_gate_nan_count'] += 1
+            return False
+        if avg_gate <= 1e-9:
+            MSCKF_STATS['preagg_precond_fail_invalid_input_count'] += 1
+            MSCKF_STATS['preagg_precond_fail_avg_gate_nonpos_count'] += 1
+            return False
+        if float(avg_err) <= float(avg_gate):
+            MSCKF_STATS['preagg_precond_fail_avg_err_le_gate_count'] += 1
+            return False
+        if float(avg_err) > float(avg_gate) * float(max(1.0, preagg_reproj_high_max_mult)):
+            MSCKF_STATS['preagg_precond_fail_reproj_bound_count'] += 1
+            return False
+
+        err_arr = np.asarray(obs_error_norm_values, dtype=float)
+        err_arr = err_arr[np.isfinite(err_arr)]
+        if err_arr.size < max(4, int(preagg_min_track_obs) // 2):
+            MSCKF_STATS['preagg_precond_fail_err_arr_too_small_count'] += 1
+            return False
+
+        MSCKF_STATS['preagg_precond_pass_count'] += 1
+        MSCKF_STATS['preagg_predicate_eval_count'] += 1
+
+        med = float(np.median(err_arr))
+        p95 = float(np.percentile(err_arr, 95))
+        spread_ratio = p95 / max(1e-9, med)
+        median_good = bool(med <= (float(avg_gate) * 0.92))
+        high_tail_gate_mult = 1.05
+        high_tail_spread_min = 1.55
+        high_tail = bool(
+            p95 > (float(avg_gate) * float(high_tail_gate_mult))
+            and spread_ratio >= float(high_tail_spread_min)
+        )
+        enough_signal = bool(
+            float(valid_obs_ratio_now) >= 0.30
+            and (borderline_rejects > 0 or norm_rejects > 0 or pixel_rejects > 0)
+        )
+        quality_ok = bool(
+            (not np.isfinite(feature_quality))
+            or float(feature_quality) >= float(np.clip(depth_gate_quality_th, 0.05, 1.0))
+        )
+        if median_good:
+            MSCKF_STATS['preagg_predicate_median_good_count'] += 1
+        if high_tail:
+            MSCKF_STATS['preagg_predicate_high_tail_count'] += 1
+        if enough_signal:
+            MSCKF_STATS['preagg_predicate_enough_signal_count'] += 1
+        if quality_ok:
+            MSCKF_STATS['preagg_predicate_quality_ok_count'] += 1
+
+        all_true = bool(median_good and high_tail and enough_signal and quality_ok)
+        if all_true:
+            MSCKF_STATS['preagg_predicate_all_true_count'] += 1
+        return all_true
+
     if bool(depth_state_gate_enable) and bool(unstable_geometry_depth_gate):
         total_obs = max(1, int(len(obs_list)))
         valid_obs_n = int(len(valid_obs))
@@ -1447,6 +1887,7 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
             if bool(depth_reclass_enable):
                 MSCKF_STATS['fail_geometry_borderline'] += 1
                 MSCKF_STATS['fail_depth_large'] += 1
+                MSCKF_STATS['reclass_to_geometry_count'] += 1
             else:
                 MSCKF_STATS['fail_depth_sign_post_refine'] += 1
                 MSCKF_STATS['fail_depth_sign'] += 1
@@ -1454,9 +1895,24 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
 
     if len(valid_obs) < 2:
         total_rejects = max(1, int(depth_rejects + reproj_rejects))
+        valid_obs_ratio = float(len(valid_obs)) / float(max(1, len(obs_list)))
+        low_track_geometry = bool(len(obs_list) <= int(max(2, geometry_insuff_max_track_obs)))
+        low_parallax_geometry = bool(
+            np.isfinite(parallax_med_px)
+            and float(parallax_med_px)
+            < float(max(0.1, depth_gate_parallax_min_px) * float(max(0.5, geometry_insuff_parallax_mult)))
+        )
+        if bool(geometry_insuff_reclass_enable) and bool(unstable_geometry_depth_gate):
+            if (
+                valid_obs_ratio <= float(np.clip(geometry_insuff_max_valid_ratio, 0.0, 1.0))
+                and (low_track_geometry or low_parallax_geometry)
+            ):
+                MSCKF_STATS['fail_geometry_insufficient_posttri'] += 1
+                MSCKF_STATS['fail_geometry_borderline'] += 1
+                MSCKF_STATS['reclass_to_geometry_count'] += 1
+                return None
         if depth_rejects >= reproj_rejects:
             depth_dom_ratio = float(depth_rejects) / float(total_rejects)
-            valid_obs_ratio = float(len(valid_obs)) / float(max(1, len(obs_list)))
             strict_depth_sign = bool(
                 (not bool(unstable_geometry_depth_gate))
                 and depth_dom_ratio >= float(np.clip(depth_sign_strict_dom_ratio_th, 0.5, 1.0))
@@ -1474,17 +1930,40 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
             if (not strict_depth_sign) and bool(depth_reclass_enable):
                 MSCKF_STATS['fail_geometry_borderline'] += 1
                 MSCKF_STATS['fail_depth_large'] += 1
+                MSCKF_STATS['reclass_to_geometry_count'] += 1
             else:
                 MSCKF_STATS['fail_depth_sign_post_refine'] += 1
                 MSCKF_STATS['fail_depth_sign'] += 1
         else:
-            MSCKF_STATS['fail_reproj_error'] += 1
-            if pixel_rejects >= norm_rejects:
-                MSCKF_STATS['fail_reproj_pixel'] += 1
+            # Sparse post-tri path (len(valid_obs)<2): route recoverable reproj-sparse
+            # cases to a retry lane before final rejection.
+            depth_dom_ratio = float(depth_rejects) / float(total_rejects)
+            reproj_dom_ratio = float(reproj_rejects) / float(total_rejects)
+            parallax_recover_ok = bool(
+                np.isfinite(parallax_med_px)
+                and float(parallax_med_px) >= float(max(0.1, sparse_reproj_recover_min_parallax_px))
+            )
+            quality_recover_ok = bool(
+                (not np.isfinite(feature_quality))
+                or float(feature_quality) >= float(np.clip(sparse_reproj_recover_min_quality, 0.0, 1.0))
+            )
+            recoverable_sparse = bool(
+                sparse_reproj_recover_enable
+                and len(obs_list) >= max(3, int(sparse_reproj_recover_min_obs))
+                and reproj_dom_ratio >= 0.50
+                and depth_dom_ratio
+                <= float(np.clip(sparse_reproj_recover_max_depth_dom_ratio, 0.0, 1.0))
+                and parallax_recover_ok
+                and quality_recover_ok
+            )
+            if recoverable_sparse:
+                MSCKF_STATS['fail_reproj_sparse_recoverable'] += 1
+                if borderline_rejects > 0:
+                    MSCKF_STATS['fail_geometry_borderline'] += 1
             else:
-                MSCKF_STATS['fail_reproj_normalized'] += 1
-            if borderline_rejects > 0:
-                MSCKF_STATS['fail_geometry_borderline'] += 1
+                MSCKF_STATS['fail_reproj_sparse'] += 1
+                if borderline_rejects > 0:
+                    MSCKF_STATS['fail_geometry_borderline'] += 1
         return None
 
     avg_error_raw = float(total_error / len(valid_obs))
@@ -1493,49 +1972,22 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
     stable_lane_cap = float("nan")
     stable_lane_borderline_ratio = float(borderline_rejects) / float(max(1, len(obs_list)))
     stable_lane_valid_obs_ratio = float(len(valid_obs)) / float(max(1, len(obs_list)))
-    # One-knob (L2): stable-geometry reprojection normalization.
-    # For well-constrained geometry, use trimmed residual statistics so a small
-    # set of edge/fisheye outliers does not dominate average reproj gate checks.
-    stable_geometry_for_norm = bool(
+    avg_reproj_gate = (avg_gate_factor * norm_threshold)
+    stable_geometry_for_lane = bool(
         (not bool(unstable_geometry_depth_gate))
-        and len(valid_obs) >= max(2, int(stable_norm_min_obs))
+        and len(valid_obs) >= max(2, int(stable_lane_min_obs))
         and (
             (not np.isfinite(parallax_med_px))
             or float(parallax_med_px) >= float(max(0.1, depth_sign_strict_min_parallax_px))
         )
         and (
             (not np.isfinite(feature_quality))
-            or float(feature_quality) >= float(np.clip(stable_norm_min_quality, 0.0, 1.0))
+            or float(feature_quality) >= float(np.clip(stable_lane_min_quality, 0.0, 1.0))
         )
     )
-    if bool(stable_norm_enable) and bool(stable_geometry_for_norm):
-        err_arr = np.asarray(obs_error_norm_values, dtype=float)
-        err_arr = err_arr[np.isfinite(err_arr)]
-        if err_arr.size >= max(4, int(stable_norm_min_obs)):
-            trim = float(np.clip(stable_norm_trim_pct, 0.0, 0.30))
-            if trim > 0.0 and trim < 0.5:
-                lo = float(np.quantile(err_arr, trim))
-                hi = float(np.quantile(err_arr, 1.0 - trim))
-                trimmed = err_arr[(err_arr >= lo) & (err_arr <= hi)]
-            else:
-                trimmed = err_arr
-            if trimmed.size >= 3:
-                robust_mean = float(np.mean(trimmed))
-                # Cap normalization amount to keep behavior deterministic and bounded.
-                iqr = float(np.percentile(trimmed, 75) - np.percentile(trimmed, 25)) if trimmed.size >= 4 else 0.0
-                disp_ref = max(1e-9, norm_threshold * 0.35)
-                relax = float(np.clip(1.0 + (iqr / disp_ref), 1.0, max(1.0, stable_norm_max_relax)))
-                bounded_candidate = float(robust_mean * relax)
-                # Stable-geometry normalization must not over-relax reproj gate:
-                # allow only bounded relative reduction from raw average error.
-                max_reduction = float(np.clip(stable_norm_max_reduction, 0.0, 0.35))
-                floor_error = float(avg_error_raw * (1.0 - max_reduction))
-                avg_error = float(min(avg_error_raw, max(floor_error, bounded_candidate)))
-
-    avg_reproj_gate = (avg_gate_factor * norm_threshold)
-    # Stable-geometry deterministic lane:
-    # apply per-feature-set capped residual aggregation without changing global gates.
-    if bool(stable_lane_enable) and bool(stable_geometry_for_norm):
+    # Deterministic stable lane (single path):
+    # bounded per-feature residual capping with reduction floor.
+    if bool(stable_lane_enable) and bool(stable_geometry_for_lane):
         err_arr = np.asarray(obs_error_norm_values, dtype=float)
         err_arr = err_arr[np.isfinite(err_arr)]
         pctl = float(np.clip(stable_lane_cap_percentile, 0.50, 0.99))
@@ -1562,6 +2014,7 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
             if lane_avg_error < avg_error:
                 avg_error = lane_avg_error
                 stable_lane_used = True
+                MSCKF_STATS['stable_lane_used_count'] += 1
     elif bool(unstable_lane_enable):
         # Deterministic unstable-geometry reproj lane:
         # apply conservative capped aggregation to reduce reject bursts without
@@ -1578,20 +2031,9 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
                 stable_lane_borderline_ratio <= max_borderline
                 and stable_lane_valid_obs_ratio >= min_valid_ratio
             )
-            fallback_lane_ok = bool(
-                stable_lane_borderline_ratio <= min(1.0, max_borderline + 0.20)
-                and stable_lane_valid_obs_ratio >= max(0.20, min_valid_ratio * 0.75)
-                and np.isfinite(feature_quality)
-                and float(feature_quality) >= 0.55
-                and np.isfinite(parallax_med_px)
-                and float(parallax_med_px) >= float(max(0.8, depth_sign_strict_min_parallax_px))
-            )
-            if not (strict_lane_ok or fallback_lane_ok):
-                strict_lane_ok = False
-                fallback_lane_ok = False
-            if strict_lane_ok or fallback_lane_ok:
-                reduction_scale = 1.0 if strict_lane_ok else 0.50
-                lane_cap_mult = cap_mult if strict_lane_ok else min(cap_mult, 1.02)
+            if strict_lane_ok:
+                reduction_scale = 1.0
+                lane_cap_mult = cap_mult
                 per_feature_cap = float(np.quantile(err_arr, pctl))
                 lane_cap = float(
                     min(
@@ -1608,6 +2050,7 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
 
     reproj_failsoft_applied = False
     reproj_quality_scale = 1.0
+    MSCKF_STATS['reproj_eval_attempt'] += 1
     if avg_error > avg_reproj_gate:
         unstable_reproj_reclass_enable = bool(
             (global_config or {}).get("MSCKF_UNSTABLE_REPROJ_RECLASSIFY_ENABLE", False)
@@ -1654,6 +2097,7 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
             )
         )
         if allow_failsoft:
+            MSCKF_STATS['preagg_callsite_dense_failsoft_skip_count'] += 1
             reproj_failsoft_applied = True
             reproj_quality_scale = float(np.clip(avg_reproj_gate / max(avg_error, 1e-9), 0.35, 0.92))
             if borderline_rejects > 0 or reproj_policy.get("quality_band", "mid") != "high":
@@ -1665,18 +2109,55 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
                     f"q_scale={reproj_quality_scale:.2f}"
                 )
         else:
+            MSCKF_STATS['preagg_callsite_dense_candidate_count'] += 1
+            valid_obs_ratio = float(len(valid_obs)) / float(max(1, len(obs_list)))
+            low_track_geometry = bool(len(obs_list) <= int(max(2, geometry_insuff_max_track_obs)))
+            low_parallax_geometry = bool(
+                np.isfinite(parallax_med_px)
+                and float(parallax_med_px)
+                < float(max(0.1, depth_gate_parallax_min_px) * float(max(0.5, geometry_insuff_parallax_mult)))
+            )
+            # C2 one-knob: allow near-threshold reproj re-bucket when geometry is
+            # unstable either by observability (track/parallax) or by low feature
+            # quality. This keeps the update behavior ("no update") unchanged while
+            # avoiding hard reproj over-counting for borderline unstable cases.
+            quality_unstable_for_reclass = bool(
+                np.isfinite(feature_quality)
+                and float(feature_quality) < float(np.clip(depth_gate_quality_th, 0.05, 1.0))
+            )
             unstable_near_threshold = bool(
-                unstable_geometry_depth_gate
-                and unstable_reproj_reclass_enable
+                unstable_reproj_reclass_enable
                 and len(valid_obs) >= max(2, unstable_reproj_reclass_min_obs)
                 and np.isfinite(avg_error)
                 and avg_error <= (avg_reproj_gate * max(1.0, unstable_reproj_reclass_mult))
+                and (unstable_geometry_depth_gate or quality_unstable_for_reclass)
             )
-            if unstable_near_threshold:
+            unstable_geometry_reclass = bool(
+                unstable_geometry_depth_gate
+                and bool(geometry_insuff_reclass_enable)
+                and valid_obs_ratio <= float(np.clip(geometry_insuff_max_valid_ratio, 0.0, 1.0))
+                and (low_track_geometry or low_parallax_geometry)
+                and np.isfinite(avg_error)
+                and avg_error <= (avg_reproj_gate * max(1.0, geometry_insuff_reclass_mult))
+            )
+            if unstable_near_threshold or unstable_geometry_reclass:
+                MSCKF_STATS['preagg_callsite_dense_reclass_skip_count'] += 1
                 # Deterministic unstable-lane reclassification:
                 # keep "no update" behavior but classify near-threshold unstable
                 # failures as borderline geometry, not hard reproj failures.
                 MSCKF_STATS['fail_geometry_borderline'] += 1
+                MSCKF_STATS['reclass_to_geometry_count'] += 1
+                if unstable_geometry_reclass:
+                    MSCKF_STATS['fail_geometry_insufficient_posttri'] += 1
+                return None
+            MSCKF_STATS['preagg_callsite_dense_invoked_count'] += 1
+            if _use_geometry_borderline_preagg(
+                avg_gate=float(avg_reproj_gate),
+                avg_err=float(avg_error),
+            ):
+                MSCKF_STATS['fail_geometry_borderline'] += 1
+                MSCKF_STATS['reclass_to_geometry_count'] += 1
+                MSCKF_STATS['geometry_preagg_rebucket_count'] += 1
                 return None
             MSCKF_STATS['fail_reproj_error'] += 1
             MSCKF_STATS['fail_reproj_normalized'] += 1
@@ -2592,7 +3073,13 @@ def perform_msckf_updates(vio_fe, cam_observations: List[dict],
     if vio_fe is None or len(cam_states) < 2:
         return 0
     
-    mature_fids = find_mature_features_for_msckf(vio_fe, cam_observations, min_observations)
+    mature_fids = find_mature_features_for_msckf(
+        vio_fe,
+        cam_observations,
+        min_observations,
+        global_config=global_config,
+        max_features=max_features,
+    )
     
     if len(mature_fids) == 0:
         return 0
@@ -2620,6 +3107,62 @@ def perform_msckf_updates(vio_fe, cam_observations: List[dict],
     prefilter_min_parallax_px = float(prefilter_cfg.get("MSCKF_L2_PREFILTER_MIN_PARALLAX_PX", 1.15))
     prefilter_min_time_span_sec = float(prefilter_cfg.get("MSCKF_L2_PREFILTER_MIN_TIME_SPAN_SEC", 0.085))
     prefilter_min_quality = float(prefilter_cfg.get("MSCKF_L2_PREFILTER_MIN_QUALITY", 0.32))
+    retry_lane_enable = bool(prefilter_cfg.get("MSCKF_RETRY_LANE_ENABLE", True))
+    retry_lane_max_cycles = int(max(0, prefilter_cfg.get("MSCKF_RETRY_LANE_MAX_CYCLES", 2)))
+    retry_lane_sparse_track_max_obs = int(
+        max(2, prefilter_cfg.get("MSCKF_RETRY_LANE_SPARSE_TRACK_MAX_OBS", max(4, int(min_observations) + 1)))
+    )
+    retry_lane_min_parallax_px = float(
+        prefilter_cfg.get("MSCKF_RETRY_LANE_MIN_PARALLAX_PX", prefilter_min_parallax_px)
+    )
+    retry_lane_min_time_span_sec = float(
+        prefilter_cfg.get("MSCKF_RETRY_LANE_MIN_TIME_SPAN_SEC", prefilter_min_time_span_sec)
+    )
+    posttri_retry_defer_enable = bool(
+        prefilter_cfg.get("MSCKF_RETRY_LANE_POSTTRI_DEFER_ENABLE", True)
+    )
+    posttri_retry_max_cycles = int(
+        max(
+            0,
+            prefilter_cfg.get(
+                "MSCKF_RETRY_LANE_POSTTRI_MAX_CYCLES",
+                min(1, int(retry_lane_max_cycles)),
+            ),
+        )
+    )
+    posttri_retry_recover_enable = bool(
+        prefilter_cfg.get("MSCKF_RETRY_LANE_POSTTRI_RECOVER_ENABLE", True)
+    )
+    posttri_retry_recover_max_cycles = int(
+        max(
+            0,
+            prefilter_cfg.get(
+                "MSCKF_RETRY_LANE_POSTTRI_RECOVER_MAX_CYCLES",
+                max(1, int(posttri_retry_max_cycles) + 1),
+            ),
+        )
+    )
+    retry_state: Dict[int, int] = {}
+    posttri_retry_state: Dict[int, int] = {}
+    if vio_fe is not None:
+        try:
+            retry_state = dict(getattr(vio_fe, "_msckf_retry_state", {}))
+        except Exception:
+            retry_state = {}
+        try:
+            posttri_retry_state = dict(getattr(vio_fe, "_msckf_posttri_retry_state", {}))
+        except Exception:
+            posttri_retry_state = {}
+    if retry_state:
+        valid_fid_set = {int(fid) for fid in mature_fids}
+        retry_state = {int(fid): int(cnt) for fid, cnt in retry_state.items() if int(fid) in valid_fid_set}
+    if posttri_retry_state:
+        valid_fid_set = {int(fid) for fid in mature_fids}
+        posttri_retry_state = {
+            int(fid): int(cnt)
+            for fid, cnt in posttri_retry_state.items()
+            if int(fid) in valid_fid_set
+        }
     
     # =========================================================================
     # Plane Detection (if enabled)
@@ -2658,23 +3201,45 @@ def perform_msckf_updates(vio_fe, cam_observations: List[dict],
     # MSCKF Updates with Optional Plane Constraints
     # =========================================================================
     for i, fid in enumerate(mature_fids):
+        quick_obs = get_feature_multi_view_observations(fid, cam_observations)
+        if len(quick_obs) == 0:
+            retry_state.pop(int(fid), None)
+            posttri_retry_state.pop(int(fid), None)
+            continue
+        quick_parallax = _pairwise_parallax_med_px(quick_obs, 120.0)
+        t_vals = [float(o.get("t", np.nan)) for o in quick_obs]
+        t_arr = np.asarray(t_vals, dtype=float)
+        time_span_sec = (
+            float(np.nanmax(t_arr) - np.nanmin(t_arr))
+            if (t_arr.size > 1 and np.isfinite(t_arr).any())
+            else float("nan")
+        )
+        sparse_short_track = bool(len(quick_obs) <= int(retry_lane_sparse_track_max_obs))
+        sparse_low_parallax = bool(
+            np.isfinite(quick_parallax)
+            and float(quick_parallax) < float(max(0.1, retry_lane_min_parallax_px))
+        )
+        sparse_short_span = bool(
+            (not np.isfinite(time_span_sec))
+            or float(time_span_sec) < float(max(1e-3, retry_lane_min_time_span_sec))
+        )
+        if retry_lane_enable and retry_lane_max_cycles > 0:
+            if sparse_short_track and (sparse_low_parallax or sparse_short_span):
+                cur_retry = int(retry_state.get(int(fid), 0))
+                if cur_retry < int(retry_lane_max_cycles):
+                    retry_state[int(fid)] = cur_retry + 1
+                    MSCKF_STATS['retry_lane_defer_count'] += 1
+                    continue
+            retry_state.pop(int(fid), None)
+
         # L2 (logic-first): prefilter weak geometry before triangulation so depth-sign
         # failures are concentrated to truly stable/strict cases only.
         if prefilter_enable:
-            quick_obs = get_feature_multi_view_observations(fid, cam_observations)
             if len(quick_obs) < max(2, prefilter_min_obs):
                 MSCKF_STATS['fail_prefilter_geometry'] += 1
                 continue
-            quick_parallax = _pairwise_parallax_med_px(quick_obs, 120.0)
-            t_vals = [float(o.get("t", np.nan)) for o in quick_obs]
             q_vals = [float(o.get("quality", np.nan)) for o in quick_obs]
-            t_arr = np.asarray(t_vals, dtype=float)
             q_arr = np.asarray(q_vals, dtype=float)
-            time_span_sec = (
-                float(np.nanmax(t_arr) - np.nanmin(t_arr))
-                if (t_arr.size > 1 and np.isfinite(t_arr).any())
-                else float("nan")
-            )
             q_med = float(np.nanmedian(q_arr)) if (q_arr.size > 0 and np.isfinite(q_arr).any()) else float("nan")
             weak_short_track = bool(
                 len(quick_obs) <= max(3, prefilter_min_obs)
@@ -2724,9 +3289,13 @@ def perform_msckf_updates(vio_fe, cam_observations: List[dict],
                 "fail_depth_sign_post_refine",
                 "fail_depth_sign",
                 "fail_prefilter_geometry",
+                "fail_geometry_insufficient_pretri",
+                "fail_geometry_insufficient_posttri",
                 "fail_reproj_pixel",
                 "fail_reproj_normalized",
                 "fail_reproj_error",
+                "fail_reproj_sparse",
+                "fail_reproj_sparse_recoverable",
                 "fail_geometry_borderline",
                 "fail_parallax",
                 "fail_baseline",
@@ -2737,6 +3306,51 @@ def perform_msckf_updates(vio_fe, cam_observations: List[dict],
                 if int(MSCKF_STATS.get(key, 0)) > int(stats_before.get(key, 0)):
                     fail_reason = key
                     break
+            if (
+                posttri_retry_defer_enable
+                and posttri_retry_recover_enable
+                and posttri_retry_recover_max_cycles > 0
+                and fail_reason == "fail_reproj_sparse_recoverable"
+            ):
+                cur_retry = abs(int(posttri_retry_state.get(int(fid), 0)))
+                if cur_retry < int(posttri_retry_recover_max_cycles):
+                    posttri_retry_state[int(fid)] = cur_retry + 1
+                    MSCKF_STATS['posttri_retry_recover_defer_count'] += 1
+                    if msckf_dbg_path:
+                        num_obs = sum(
+                            1 for cam_obs in cam_observations
+                            for obs in cam_obs.get('observations', [])
+                            if obs.get('fid') == fid
+                        )
+                        with open(msckf_dbg_path, "a", newline="") as mf:
+                            mf.write(
+                                f"{vio_fe.frame_idx},{fid},{num_obs},0,nan,nan,0,nan,posttri_retry_recover_defer\n"
+                            )
+                    continue
+                MSCKF_STATS['posttri_retry_recover_exhausted_count'] += 1
+            if (
+                posttri_retry_defer_enable
+                and posttri_retry_max_cycles > 0
+                and fail_reason == "fail_reproj_sparse"
+                and sparse_short_track
+                and (sparse_low_parallax or sparse_short_span)
+            ):
+                cur_retry = abs(int(posttri_retry_state.get(int(fid), 0)))
+                if cur_retry < int(posttri_retry_max_cycles):
+                    posttri_retry_state[int(fid)] = -(cur_retry + 1)
+                    MSCKF_STATS['posttri_retry_defer_count'] += 1
+                    if msckf_dbg_path:
+                        num_obs = sum(
+                            1 for cam_obs in cam_observations
+                            for obs in cam_obs.get('observations', [])
+                            if obs.get('fid') == fid
+                        )
+                        with open(msckf_dbg_path, "a", newline="") as mf:
+                            mf.write(
+                                f"{vio_fe.frame_idx},{fid},{num_obs},0,nan,nan,0,nan,posttri_retry_defer\n"
+                            )
+                    continue
+            posttri_retry_state.pop(int(fid), None)
             if msckf_dbg_path:
                 num_obs = sum(1 for cam_obs in cam_observations 
                              for obs in cam_obs.get('observations', []) 
@@ -2812,6 +3426,20 @@ def perform_msckf_updates(vio_fe, cam_observations: List[dict],
         
         if success:
             num_successful += 1
+            retry_state.pop(int(fid), None)
+            if int(posttri_retry_state.get(int(fid), 0)) > 0:
+                MSCKF_STATS['posttri_retry_recover_success_count'] += 1
+            posttri_retry_state.pop(int(fid), None)
+
+    if vio_fe is not None:
+        try:
+            setattr(vio_fe, "_msckf_retry_state", retry_state)
+        except Exception:
+            pass
+        try:
+            setattr(vio_fe, "_msckf_posttri_retry_state", posttri_retry_state)
+        except Exception:
+            pass
     
     if len(chi2_norm_samples) > 0:
         nis_norm = float(np.mean(chi2_norm_samples))

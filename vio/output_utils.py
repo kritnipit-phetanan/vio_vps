@@ -521,6 +521,10 @@ def append_benchmark_health_summary(summary_csv: Optional[str],
                                     msckf_quality_p50: float = float("nan"),
                                     msckf_quality_p10: float = float("nan"),
                                     msckf_stable_geometry_ratio: float = float("nan"),
+                                    msckf_reclass_to_geometry_count: float = float("nan"),
+                                    msckf_unstable_lane_count: float = float("nan"),
+                                    msckf_stable_lane_used_count: float = float("nan"),
+                                    msckf_preagg_parallax_low_entered_count: float = float("nan"),
                                     backend_stale_ratio: float = float("nan"),
                                     backend_emit_to_apply_ratio: float = float("nan"),
                                     backend_apply_quality_p50: float = float("nan"),
@@ -572,6 +576,8 @@ def append_benchmark_health_summary(summary_csv: Optional[str],
                 f"{yaw_owner_mag_block_count:.6f},{yaw_owner_mag_block_ratio:.6f},"
                 f"{yaw_owner_dead_fallback_count:.6f},"
                 f"{msckf_quality_p50:.6f},{msckf_quality_p10:.6f},{msckf_stable_geometry_ratio:.6f},"
+                f"{msckf_reclass_to_geometry_count:.6f},{msckf_unstable_lane_count:.6f},"
+                f"{msckf_stable_lane_used_count:.6f},{msckf_preagg_parallax_low_entered_count:.6f},"
                 f"{backend_stale_ratio:.6f},{backend_emit_to_apply_ratio:.6f},"
                 f"{backend_apply_quality_p50:.6f},{backend_snap_reject_count:.6f},"
                 f"{backend_apply_latency_ms_p95:.6f},{backend_contract_violation_count:.6f},"
@@ -1617,6 +1623,8 @@ def init_output_csvs(output_dir: str, save_debug_data: bool = False) -> Dict[str
             "yaw_owner_mag_block_count,yaw_owner_mag_block_ratio,"
             "yaw_owner_dead_fallback_count,"
             "msckf_quality_p50,msckf_quality_p10,msckf_stable_geometry_ratio,"
+            "msckf_reclass_to_geometry_count,msckf_unstable_lane_count,msckf_stable_lane_used_count,"
+            "msckf_preagg_parallax_low_entered_count,"
             "backend_stale_ratio,backend_emit_to_apply_ratio,backend_apply_quality_p50,"
             "backend_snap_reject_count,backend_apply_latency_ms_p95,backend_contract_violation_count,"
             "alignment_lock_violation_count,alignment_lock_hint_only_count,alignment_lock_reject_count,"

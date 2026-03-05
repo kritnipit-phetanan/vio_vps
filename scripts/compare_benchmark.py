@@ -202,7 +202,14 @@ def _print_accuracy_delta(cur_dir: Path, base_dir: Path) -> None:
         "heading_final_abs_deg",
         "vps_used",
         "msckf_fail_depth_sign",
+        "msckf_depth_total_fail",
         "msckf_fail_reproj_error",
+        "msckf_fail_reproj_sparse",
+        "msckf_fail_reproj_sparse_recoverable",
+        "msckf_posttri_retry_recover_defer_count",
+        "msckf_posttri_retry_recover_success_count",
+        "msckf_reproj_eval_attempt",
+        "reproj_fail_rate_per_eval",
         "msckf_fail_nonlinear",
     ]
     print(f"Baseline accuracy delta vs: {base_dir}")

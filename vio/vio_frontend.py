@@ -780,7 +780,12 @@ class VIOFrontEnd:
                 res.append((fid, hist[-1]['pt']))
         return res
     
-    def get_mature_tracks(self) -> Dict[int, List[dict]]:
+    def get_mature_tracks(self,
+                          min_inlier_ratio: float = 0.60,
+                          min_quality_median: float = 0.0,
+                          min_recent_inlier_ratio: float = 0.0,
+                          recent_window: int = 0,
+                          max_tracks: int = 0) -> Dict[int, List[dict]]:
         """Return tracks ready for MSCKF update (length >= min_track_length).
         
         FIX v3.9.3-C: Filter out tracks with inconsistent RANSAC inliers
@@ -788,6 +793,13 @@ class VIOFrontEnd:
         This prevents MSCKF from using features tracked by KLT but rejected by RANSAC
         """
         mature = {}
+        scored: List[Tuple[float, int, List[dict]]] = []
+        min_inlier_ratio = float(np.clip(min_inlier_ratio, 0.0, 1.0))
+        min_quality_median = float(np.clip(min_quality_median, 0.0, 1.0))
+        min_recent_inlier_ratio = float(np.clip(min_recent_inlier_ratio, 0.0, 1.0))
+        recent_window = int(max(0, recent_window))
+        max_tracks = int(max(0, max_tracks))
+
         for fid, hist in self.tracks.items():
             if len(hist) < self.min_track_length:
                 continue
@@ -797,9 +809,38 @@ class VIOFrontEnd:
             # This filters out features on moving objects or with poor geometry
             inlier_count = sum(1 for obs in hist if obs.get('is_inlier', False))
             inlier_ratio = inlier_count / len(hist)
+            if inlier_ratio < min_inlier_ratio:
+                continue
+
+            q_vals = np.asarray([float(obs.get('quality', np.nan)) for obs in hist], dtype=float)
+            q_vals = q_vals[np.isfinite(q_vals)]
+            quality_median = float(np.median(q_vals)) if q_vals.size > 0 else float("nan")
+            if np.isfinite(quality_median) and quality_median < min_quality_median:
+                continue
+
+            if recent_window > 0 and min_recent_inlier_ratio > 0.0:
+                recent = hist[-recent_window:]
+                if len(recent) > 0:
+                    recent_inlier = sum(1 for obs in recent if obs.get('is_inlier', False))
+                    recent_ratio = float(recent_inlier) / float(len(recent))
+                    if recent_ratio < min_recent_inlier_ratio:
+                        continue
             
-            if inlier_ratio >= 0.6:  # 60% threshold
-                mature[fid] = hist
+            # Score tracks so MSCKF sees geometry-strong pack first.
+            # We bias toward inlier consistency and quality, then track depth.
+            depth_term = float(np.clip(float(len(hist)) / 18.0, 0.0, 1.0))
+            q_term = float(np.clip(quality_median, 0.0, 1.0)) if np.isfinite(quality_median) else 0.0
+            score = (0.58 * float(inlier_ratio)) + (0.32 * q_term) + (0.10 * depth_term)
+            scored.append((score, int(fid), hist))
+
+        if len(scored) == 0:
+            return mature
+
+        scored.sort(key=lambda item: item[0], reverse=True)
+        if max_tracks > 0:
+            scored = scored[:max_tracks]
+        for _, fid, hist in scored:
+            mature[int(fid)] = hist
         
         return mature
     

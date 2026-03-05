@@ -1066,6 +1066,16 @@ def load_config(config_path: str) -> VIOConfig:
     result['MSCKF_REPROJ_FAILSOFT_MIN_QUALITY'] = float(
         reproj_state_aware.get('failsoft_min_quality', 0.35)
     )
+    result['MSCKF_UNSTABLE_POLICY_MODE'] = str(msckf_cfg.get('unstable_policy_mode', 'SOFT_APPLY')).upper()
+    stable_reproj_norm_cfg = msckf_cfg.get('stable_reproj_norm', {})
+    if not isinstance(stable_reproj_norm_cfg, dict):
+        stable_reproj_norm_cfg = {}
+    result['MSCKF_REPROJ_STABLE_NORM_CAP_PERCENTILE'] = float(
+        stable_reproj_norm_cfg.get('cap_percentile', 0.80)
+    )
+    result['MSCKF_REPROJ_STABLE_NORM_CAP_MAX_MULT'] = float(
+        stable_reproj_norm_cfg.get('cap_max_mult', 1.06)
+    )
     # Stable-geometry reprojection lane (deterministic per-feature-set cap/normalization)
     stable_reproj_lane_cfg = msckf_cfg.get('stable_reproj_lane', {})
     if not isinstance(stable_reproj_lane_cfg, dict):
@@ -1124,6 +1134,9 @@ def load_config(config_path: str) -> VIOConfig:
     result['MSCKF_UNSTABLE_REPROJ_RECLASSIFY_MULT'] = float(
         unstable_reproj_lane_cfg.get('reclassify_near_threshold_mult', 1.0)
     )
+    result['MSCKF_GEOMETRY_PREAGG_REPROJ_HIGH_MAX_MULT'] = float(
+        unstable_reproj_lane_cfg.get('preagg_reproj_high_max_mult', 1.08)
+    )
     result['MSCKF_UNSTABLE_REPROJ_RECLASSIFY_MIN_OBS'] = int(
         unstable_reproj_lane_cfg.get('reclassify_near_threshold_min_obs', 4)
     )
@@ -1133,6 +1146,58 @@ def load_config(config_path: str) -> VIOConfig:
     result['MSCKF_UNSTABLE_REPROJ_PROVEN_PARALLAX_MULT'] = float(
         unstable_reproj_lane_cfg.get('proven_parallax_mult', 0.85)
     )
+    msckf_track_pack_cfg = msckf_cfg.get('track_pack', {}) if isinstance(msckf_cfg.get('track_pack', {}), dict) else {}
+    result['MSCKF_TRACK_PACK_ENABLE'] = bool(msckf_track_pack_cfg.get('enable', True))
+    result['MSCKF_TRACK_PACK_MIN_INLIER_RATIO'] = float(msckf_track_pack_cfg.get('min_inlier_ratio', 0.60))
+    result['MSCKF_TRACK_PACK_MIN_QUALITY_MEDIAN'] = float(msckf_track_pack_cfg.get('min_quality_median', 0.34))
+    result['MSCKF_TRACK_PACK_RECENT_WINDOW'] = int(msckf_track_pack_cfg.get('recent_window', 6))
+    result['MSCKF_TRACK_PACK_MIN_RECENT_INLIER_RATIO'] = float(
+        msckf_track_pack_cfg.get('min_recent_inlier_ratio', 0.55)
+    )
+    result['MSCKF_TRACK_PACK_MAX_TRACKS'] = int(msckf_track_pack_cfg.get('max_tracks', 0))
+    result['MSCKF_TRACK_PACK_MIN_PARALLAX_PX'] = float(msckf_track_pack_cfg.get('min_parallax_px', 0.95))
+    result['MSCKF_TRACK_PACK_MIN_TIME_SPAN_SEC'] = float(
+        msckf_track_pack_cfg.get('min_time_span_sec', 0.10)
+    )
+    msckf_pretri_gate = msckf_cfg.get('pretri_geometry_gate', {}) if isinstance(msckf_cfg.get('pretri_geometry_gate', {}), dict) else {}
+    result['MSCKF_PRETRI_GEOMETRY_GATE_ENABLE'] = bool(msckf_pretri_gate.get('enable', True))
+    result['MSCKF_PRETRI_GEOMETRY_MIN_OBS'] = int(msckf_pretri_gate.get('min_obs', 6))
+    result['MSCKF_PRETRI_GEOMETRY_MIN_PARALLAX_PX'] = float(
+        msckf_pretri_gate.get('min_parallax_px', 0.95)
+    )
+    result['MSCKF_PRETRI_GEOMETRY_MIN_TIME_SPAN_SEC'] = float(
+        msckf_pretri_gate.get('min_time_span_sec', 0.10)
+    )
+    result['MSCKF_PRETRI_GEOMETRY_MIN_QUALITY'] = float(
+        msckf_pretri_gate.get('min_quality', 0.34)
+    )
+    result['MSCKF_PRETRI_GEOMETRY_MIN_FAIL_SIGNALS'] = int(
+        msckf_pretri_gate.get('min_fail_signals', 2)
+    )
+    result['MSCKF_PRETRI_GEOMETRY_HARD_MIN_OBS'] = int(
+        msckf_pretri_gate.get(
+            'hard_min_obs',
+            max(3, int(result['MSCKF_PRETRI_GEOMETRY_MIN_OBS']) - 2),
+        )
+    )
+    msckf_geom_reclass = msckf_cfg.get('geometry_insufficient_reclass', {}) if isinstance(
+        msckf_cfg.get('geometry_insufficient_reclass', {}), dict
+    ) else {}
+    result['MSCKF_GEOMETRY_INSUFF_RECLASSIFY_ENABLE'] = bool(
+        msckf_geom_reclass.get('enable', True)
+    )
+    result['MSCKF_GEOMETRY_INSUFF_RECLASSIFY_MULT'] = float(
+        msckf_geom_reclass.get('reclassify_mult', 1.25)
+    )
+    result['MSCKF_GEOMETRY_INSUFF_MAX_VALID_RATIO'] = float(
+        msckf_geom_reclass.get('max_valid_obs_ratio', 0.45)
+    )
+    result['MSCKF_GEOMETRY_INSUFF_MAX_TRACK_OBS'] = int(
+        msckf_geom_reclass.get('max_track_obs', 8)
+    )
+    result['MSCKF_GEOMETRY_INSUFF_PARALLAX_MULT'] = float(
+        msckf_geom_reclass.get('parallax_mult', 1.10)
+    )
     msckf_quality_gate = msckf_cfg.get('quality_gate', {}) if isinstance(msckf_cfg.get('quality_gate', {}), dict) else {}
     result['MSCKF_QUALITY_GATE_TRACK_MIN'] = int(msckf_quality_gate.get('track_min', 10))
     result['MSCKF_QUALITY_GATE_INLIER_MIN'] = float(msckf_quality_gate.get('inlier_min', 0.30))
@@ -1140,8 +1205,73 @@ def load_config(config_path: str) -> VIOConfig:
     result['MSCKF_QUALITY_GATE_DEPTH_POSITIVE_MIN'] = float(
         msckf_quality_gate.get('depth_positive_min', 0.62)
     )
+    result['MSCKF_QUALITY_GATE_DEPTH_POSITIVE_MIN_FLOOR_NADIR'] = float(
+        msckf_quality_gate.get('depth_positive_min_floor_nadir', 0.30)
+    )
+    result['MSCKF_QUALITY_GATE_DEPTH_POSITIVE_TRACK_RELAX_GAIN'] = float(
+        msckf_quality_gate.get('depth_positive_track_relax_gain', 0.20)
+    )
+    result['MSCKF_QUALITY_GATE_DEPTH_POSITIVE_PARALLAX_RELAX_GAIN'] = float(
+        msckf_quality_gate.get('depth_positive_parallax_relax_gain', 0.14)
+    )
+    result['MSCKF_QUALITY_GATE_DEPTH_POSITIVE_PARALLAX_RELAX_CAP_RATIO'] = float(
+        msckf_quality_gate.get('depth_positive_parallax_relax_cap_ratio', 2.0)
+    )
     result['MSCKF_QUALITY_GATE_REPROJ_P95_MAX'] = float(
         msckf_quality_gate.get('reproj_p95_max', 0.06)
+    )
+    msckf_semistable_lane = msckf_cfg.get('semistable_lane', {}) if isinstance(msckf_cfg.get('semistable_lane', {}), dict) else {}
+    result['MSCKF_SEMISTABLE_LANE_ENABLE'] = bool(msckf_semistable_lane.get('enable', True))
+    result['MSCKF_SEMISTABLE_MIN_PARALLAX_PX'] = float(
+        msckf_semistable_lane.get('min_parallax_px', 1.2)
+    )
+    result['MSCKF_SEMISTABLE_MAX_REPROJ_P95_NORM'] = float(
+        msckf_semistable_lane.get('max_reproj_p95_norm', 0.03)
+    )
+    result['MSCKF_SEMISTABLE_TRACK_MIN_OBS'] = int(
+        msckf_semistable_lane.get('track_min_obs', 8)
+    )
+    result['MSCKF_SEMISTABLE_MAX_VALID_OBS_RATIO'] = float(
+        msckf_semistable_lane.get('max_valid_obs_ratio', 0.45)
+    )
+    result['MSCKF_SEMISTABLE_MAX_REPROJ_TO_GATE_RATIO'] = float(
+        msckf_semistable_lane.get('max_reproj_to_gate_ratio', 1.12)
+    )
+    msckf_retry_lane = msckf_cfg.get('retry_lane', {}) if isinstance(msckf_cfg.get('retry_lane', {}), dict) else {}
+    result['MSCKF_RETRY_LANE_ENABLE'] = bool(msckf_retry_lane.get('enable', True))
+    result['MSCKF_RETRY_LANE_MAX_CYCLES'] = int(msckf_retry_lane.get('max_cycles', 2))
+    result['MSCKF_RETRY_LANE_SPARSE_TRACK_MAX_OBS'] = int(
+        msckf_retry_lane.get('sparse_track_max_obs', 6)
+    )
+    result['MSCKF_RETRY_LANE_MIN_PARALLAX_PX'] = float(
+        msckf_retry_lane.get('min_parallax_px', 1.15)
+    )
+    result['MSCKF_RETRY_LANE_MIN_TIME_SPAN_SEC'] = float(
+        msckf_retry_lane.get('min_time_span_sec', 0.10)
+    )
+    result['MSCKF_RETRY_LANE_POSTTRI_DEFER_ENABLE'] = bool(
+        msckf_retry_lane.get('posttri_defer_enable', True)
+    )
+    result['MSCKF_RETRY_LANE_POSTTRI_MAX_CYCLES'] = int(
+        msckf_retry_lane.get('posttri_max_cycles', 1)
+    )
+    result['MSCKF_RETRY_LANE_POSTTRI_RECOVER_ENABLE'] = bool(
+        msckf_retry_lane.get('posttri_recover_enable', True)
+    )
+    result['MSCKF_RETRY_LANE_POSTTRI_RECOVER_MAX_CYCLES'] = int(
+        msckf_retry_lane.get('posttri_recover_max_cycles', 2)
+    )
+    result['MSCKF_RETRY_LANE_POSTTRI_RECOVER_MIN_OBS'] = int(
+        msckf_retry_lane.get('posttri_recover_min_obs', 5)
+    )
+    result['MSCKF_RETRY_LANE_POSTTRI_RECOVER_MIN_PARALLAX_PX'] = float(
+        msckf_retry_lane.get('posttri_recover_min_parallax_px', 1.15)
+    )
+    result['MSCKF_RETRY_LANE_POSTTRI_RECOVER_MIN_QUALITY'] = float(
+        msckf_retry_lane.get('posttri_recover_min_quality', 0.34)
+    )
+    result['MSCKF_RETRY_LANE_POSTTRI_RECOVER_MAX_DEPTH_DOM_RATIO'] = float(
+        msckf_retry_lane.get('posttri_recover_max_depth_dom_ratio', 0.45)
     )
     msckf_depth_gate = msckf_cfg.get('depthsign_gate', {}) if isinstance(msckf_cfg.get('depthsign_gate', {}), dict) else {}
     result['MSCKF_DEPTHSIGN_UNSTABLE_ENABLE'] = bool(msckf_depth_gate.get('unstable_enable', True))

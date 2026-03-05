@@ -88,9 +88,19 @@ def summarize_accuracy_first(out_dir: Path) -> dict:
         "heading_final_abs_deg": np.nan,
         "vps_used": np.nan,
         "msckf_total_attempt": np.nan,
+        "msckf_reproj_eval_attempt": np.nan,
         "msckf_fail_depth_sign": np.nan,
+        "msckf_fail_depth_sign_init": np.nan,
+        "msckf_fail_depth_sign_post_refine": np.nan,
+        "msckf_fail_depth_large": np.nan,
+        "msckf_depth_total_fail": np.nan,
         "msckf_fail_reproj_error": np.nan,
+        "msckf_fail_reproj_sparse": np.nan,
+        "msckf_fail_reproj_sparse_recoverable": np.nan,
+        "msckf_posttri_retry_recover_defer_count": np.nan,
+        "msckf_posttri_retry_recover_success_count": np.nan,
         "reproj_fail_rate_per_attempt": np.nan,
+        "reproj_fail_rate_per_eval": np.nan,
         "msckf_fail_nonlinear": np.nan,
     }
 
@@ -126,14 +136,51 @@ def summarize_accuracy_first(out_dir: Path) -> dict:
                     m = re.search(r"fail_depth_sign:\s*(\d+)", line)
                     if m:
                         result["msckf_fail_depth_sign"] = float(m.group(1))
+                    m = re.search(r"fail_depth_sign_init:\s*(\d+)", line)
+                    if m:
+                        result["msckf_fail_depth_sign_init"] = float(m.group(1))
+                    m = re.search(r"fail_depth_sign_post_refine:\s*(\d+)", line)
+                    if m:
+                        result["msckf_fail_depth_sign_post_refine"] = float(m.group(1))
+                    m = re.search(r"fail_depth_large:\s*(\d+)", line)
+                    if m:
+                        result["msckf_fail_depth_large"] = float(m.group(1))
                     m = re.search(r"fail_reproj_error:\s*(\d+)", line)
                     if m:
                         result["msckf_fail_reproj_error"] = float(m.group(1))
+                    m = re.search(r"fail_reproj_sparse:\s*(\d+)", line)
+                    if m:
+                        result["msckf_fail_reproj_sparse"] = float(m.group(1))
+                    m = re.search(r"fail_reproj_sparse_recoverable:\s*(\d+)", line)
+                    if m:
+                        result["msckf_fail_reproj_sparse_recoverable"] = float(m.group(1))
+                    m = re.search(r"reproj_eval:\s*attempt=(\d+)", line)
+                    if m:
+                        result["msckf_reproj_eval_attempt"] = float(m.group(1))
+                    m = re.search(
+                        r"sparse_recover:\s*recoverable=\s*(\d+),\s*defer=\s*(\d+),\s*exhausted=\s*(\d+),\s*recovered=\s*(\d+)",
+                        line,
+                    )
+                    if m:
+                        result["msckf_posttri_retry_recover_defer_count"] = float(m.group(2))
+                        result["msckf_posttri_retry_recover_success_count"] = float(m.group(4))
                     m = re.search(r"fail_nonlinear:\s*(\d+)", line)
                     if m:
                         result["msckf_fail_nonlinear"] = float(m.group(1))
         except Exception:
             pass
+    if (
+        np.isfinite(result["msckf_fail_depth_sign_init"])
+        or np.isfinite(result["msckf_fail_depth_sign_post_refine"])
+        or np.isfinite(result["msckf_fail_depth_large"])
+    ):
+        result["msckf_depth_total_fail"] = float(
+            (result["msckf_fail_depth_sign_init"] if np.isfinite(result["msckf_fail_depth_sign_init"]) else 0.0)
+            + (result["msckf_fail_depth_sign_post_refine"] if np.isfinite(result["msckf_fail_depth_sign_post_refine"]) else 0.0)
+            + (result["msckf_fail_depth_large"] if np.isfinite(result["msckf_fail_depth_large"]) else 0.0)
+        )
+        # Backward-compatible alias: keep historical key but reflect full depth-fail burden.
+        result["msckf_fail_depth_sign"] = float(result["msckf_depth_total_fail"])
     if (
         np.isfinite(result["msckf_total_attempt"])
         and result["msckf_total_attempt"] > 0.0
@@ -141,6 +188,14 @@ def summarize_accuracy_first(out_dir: Path) -> dict:
     ):
         result["reproj_fail_rate_per_attempt"] = float(
             result["msckf_fail_reproj_error"] / result["msckf_total_attempt"]
+        )
+    if (
+        np.isfinite(result["msckf_reproj_eval_attempt"])
+        and result["msckf_reproj_eval_attempt"] > 0.0
+        and np.isfinite(result["msckf_fail_reproj_error"])
+    ):
+        result["reproj_fail_rate_per_eval"] = float(
+            result["msckf_fail_reproj_error"] / result["msckf_reproj_eval_attempt"]
         )
 
     out_csv = out_dir / "accuracy_first_summary.csv"
@@ -158,8 +213,10 @@ def summarize_accuracy_first(out_dir: Path) -> dict:
         print("VPS used           : nan")
     print(
         "MSCKF fails        : "
-        f"depth_sign={int(result['msckf_fail_depth_sign']) if np.isfinite(result['msckf_fail_depth_sign']) else 'nan'}, "
+        f"depth_total={int(result['msckf_depth_total_fail']) if np.isfinite(result['msckf_depth_total_fail']) else 'nan'}, "
         f"reproj={int(result['msckf_fail_reproj_error']) if np.isfinite(result['msckf_fail_reproj_error']) else 'nan'}, "
+        f"reproj_sparse={int(result['msckf_fail_reproj_sparse']) if np.isfinite(result['msckf_fail_reproj_sparse']) else 'nan'}, "
+        f"reproj_sparse_recoverable={int(result['msckf_fail_reproj_sparse_recoverable']) if np.isfinite(result['msckf_fail_reproj_sparse_recoverable']) else 'nan'}, "
         f"nonlinear={int(result['msckf_fail_nonlinear']) if np.isfinite(result['msckf_fail_nonlinear']) else 'nan'}"
     )
     print(
@@ -167,6 +224,12 @@ def summarize_accuracy_first(out_dir: Path) -> dict:
         f"{result['reproj_fail_rate_per_attempt']:.6f} per attempt"
         if np.isfinite(result["reproj_fail_rate_per_attempt"])
         else "MSCKF reproj rate  : nan"
+    )
+    print(
+        "MSCKF reproj eval  : "
+        f"{result['reproj_fail_rate_per_eval']:.6f} per eval"
+        if np.isfinite(result["reproj_fail_rate_per_eval"])
+        else "MSCKF reproj eval  : nan"
     )
     print(f"saved: {out_csv}")
     print("")

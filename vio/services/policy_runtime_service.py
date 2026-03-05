@@ -275,6 +275,16 @@ class PolicyRuntimeService:
             extras["conditioning_risk"] = float(extras.get("msckf_conditioning_risk", np.nan))
             extras["feature_track_health"] = float(extras.get("msckf_feature_track_health", np.nan))
             extras["unstable_reason_code"] = str(extras.get("msckf_unstable_reason_code", "stable"))
+            msckf_stable = bool(float(extras.get("stable_geometry_flag", 0.0)) >= 0.5)
+            unstable_reason = str(extras.get("unstable_reason_code", "stable"))
+            extras["msckf_geometry_bucket"] = "stable" if msckf_stable else "unstable"
+            extras["msckf_geometry_unstable_reason"] = unstable_reason
+            if not msckf_stable:
+                if unstable_reason and unstable_reason != "stable":
+                    reasons.append(f"msckf_unstable:{unstable_reason}")
+                unstable_mode = str(cfg.get("MSCKF_UNSTABLE_POLICY_MODE", "SOFT_APPLY")).upper()
+                if mode == "APPLY" and unstable_mode in ("SOFT_APPLY", "HOLD", "SKIP"):
+                    mode = unstable_mode
             phase_key = str(max(0, min(2, int(phase))))
             extras["phase_chi2_scale"] = float(cfg.get("MSCKF_PHASE_CHI2_SCALE", {}).get(phase_key, 1.0))
             extras["phase_reproj_scale"] = float(cfg.get("MSCKF_PHASE_REPROJ_SCALE", {}).get(phase_key, 1.0))

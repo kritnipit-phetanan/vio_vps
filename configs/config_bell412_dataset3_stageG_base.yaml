@@ -1019,6 +1019,7 @@ vio:
   min_parallax_px: 0.3
   min_tracked_features: 50
   msckf:
+    unstable_policy_mode: SOFT_APPLY
     avg_reproj_gate_factor: 2.2
     health_avg_reproj_gate_scale:
       DEGRADED: 1.15
@@ -1078,13 +1079,61 @@ vio:
       proven_parallax_mult: 0.85
       reclassify_near_threshold_enable: true
       reclassify_near_threshold_mult: 1.04
+      preagg_reproj_high_max_mult: 1.08
       reclassify_near_threshold_min_obs: 4
+    track_pack:
+      enable: true
+      min_inlier_ratio: 0.60
+      min_quality_median: 0.34
+      recent_window: 6
+      min_recent_inlier_ratio: 0.55
+      max_tracks: 0
+      min_parallax_px: 0.95
+      min_time_span_sec: 0.10
+    pretri_geometry_gate:
+      enable: true
+      min_obs: 6
+      min_parallax_px: 0.95
+      min_time_span_sec: 0.10
+      min_quality: 0.34
+      min_fail_signals: 3
+    geometry_insufficient_reclass:
+      enable: true
+      reclassify_mult: 1.25
+      max_valid_obs_ratio: 0.45
+      max_track_obs: 8
+      parallax_mult: 1.10
     quality_gate:
       track_min: 10
       inlier_min: 0.30
       parallax_min_px: 1.2
       depth_positive_min: 0.62
+      depth_positive_min_floor_nadir: 0.30
+      depth_positive_track_relax_gain: 0.20
+      depth_positive_parallax_relax_gain: 0.14
+      depth_positive_parallax_relax_cap_ratio: 2.0
       reproj_p95_max: 0.06
+    semistable_lane:
+      enable: true
+      min_parallax_px: 1.2
+      max_reproj_p95_norm: 0.03
+      track_min_obs: 8
+      max_valid_obs_ratio: 0.45
+      max_reproj_to_gate_ratio: 1.12
+    retry_lane:
+      enable: true
+      max_cycles: 2
+      sparse_track_max_obs: 6
+      min_parallax_px: 1.15
+      min_time_span_sec: 0.10
+      posttri_defer_enable: true
+      posttri_max_cycles: 1
+      posttri_recover_enable: true
+      posttri_recover_max_cycles: 2
+      posttri_recover_min_obs: 5
+      posttri_recover_min_parallax_px: 1.15
+      posttri_recover_min_quality: 0.34
+      posttri_recover_max_depth_dom_ratio: 0.45
     depthsign_gate:
       unstable_enable: true
       unstable_quality_th: 0.38
