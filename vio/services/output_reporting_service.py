@@ -904,9 +904,15 @@ class OutputReportingService:
             pass
         try:
             msckf_total_attempt = float(MSCKF_STATS.get("total_attempt", np.nan))
+            msckf_reproj_eval_attempt = float(MSCKF_STATS.get("reproj_eval_attempt", np.nan))
             msckf_fail_reproj = float(MSCKF_STATS.get("fail_reproj_error", np.nan))
-            if np.isfinite(msckf_total_attempt) and msckf_total_attempt > 0.0 and np.isfinite(msckf_fail_reproj):
-                reproj_fail_rate_per_attempt = float(msckf_fail_reproj / msckf_total_attempt)
+            denom_attempt = (
+                msckf_reproj_eval_attempt
+                if np.isfinite(msckf_reproj_eval_attempt) and msckf_reproj_eval_attempt > 0.0
+                else msckf_total_attempt
+            )
+            if np.isfinite(denom_attempt) and denom_attempt > 0.0 and np.isfinite(msckf_fail_reproj):
+                reproj_fail_rate_per_attempt = float(msckf_fail_reproj / denom_attempt)
             msckf_reclass_to_geometry_count = float(
                 MSCKF_STATS.get("reclass_to_geometry_count", np.nan)
             )

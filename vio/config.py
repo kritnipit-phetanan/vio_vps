@@ -1287,6 +1287,57 @@ def load_config(config_path: str) -> VIOConfig:
     result['MSCKF_DEPTHSIGN_UNSTABLE_RECLASSIFY_DOM_RATIO_TH'] = float(
         msckf_depth_gate.get('unstable_reclassify_dom_ratio_th', 0.70)
     )
+    result['MSCKF_DEPTH_INIT_RECOVER_ENABLE'] = bool(
+        msckf_depth_gate.get('init_recover_enable', False)
+    )
+    result['MSCKF_DEPTH_INIT_RECOVER_MIN_DEPTH_M'] = float(
+        msckf_depth_gate.get('init_recover_min_depth_m', 0.005)
+    )
+    result['MSCKF_DEPTH_INIT_RECOVER_MIN_PARALLAX_MULT'] = float(
+        msckf_depth_gate.get('init_recover_min_parallax_mult', 1.0)
+    )
+    result['MSCKF_DEPTH_INIT_RECOVER_MIN_QUALITY'] = float(
+        msckf_depth_gate.get('init_recover_min_quality', 0.30)
+    )
+    result['MSCKF_DEPTH_SUPPORT_RESCUE_ENABLE'] = bool(
+        msckf_depth_gate.get('support_rescue_enable', False)
+    )
+    result['MSCKF_DEPTH_SUPPORT_RESCUE_MIN_VALID_OBS'] = int(
+        msckf_depth_gate.get('support_rescue_min_valid_obs', 2)
+    )
+    result['MSCKF_DEPTH_SUPPORT_RESCUE_MIN_PARALLAX_PX'] = float(
+        msckf_depth_gate.get('support_rescue_min_parallax_px', 1.2)
+    )
+    result['MSCKF_DEPTH_SUPPORT_RESCUE_MIN_QUALITY'] = float(
+        msckf_depth_gate.get('support_rescue_min_quality', 0.34)
+    )
+    result['MSCKF_DEPTH_SUPPORT_RESCUE_MAX_REPROJ_TO_GATE'] = float(
+        msckf_depth_gate.get('support_rescue_max_reproj_to_gate', 1.02)
+    )
+    result['MSCKF_DEPTH_SPARSE_RECOVER_ENABLE'] = bool(
+        msckf_depth_gate.get('sparse_recover_enable', True)
+    )
+    result['MSCKF_DEPTH_SPARSE_RECOVER_MIN_OBS'] = int(
+        msckf_depth_gate.get(
+            'sparse_recover_min_obs',
+            msckf_retry_lane.get('posttri_recover_min_obs', 5),
+        )
+    )
+    result['MSCKF_DEPTH_SPARSE_RECOVER_MIN_PARALLAX_PX'] = float(
+        msckf_depth_gate.get(
+            'sparse_recover_min_parallax_px',
+            msckf_retry_lane.get('posttri_recover_min_parallax_px', 1.15),
+        )
+    )
+    result['MSCKF_DEPTH_SPARSE_RECOVER_MIN_QUALITY'] = float(
+        msckf_depth_gate.get(
+            'sparse_recover_min_quality',
+            msckf_retry_lane.get('posttri_recover_min_quality', 0.34),
+        )
+    )
+    result['MSCKF_DEPTH_SPARSE_RECOVER_MIN_DEPTH_DOM_RATIO'] = float(
+        msckf_depth_gate.get('sparse_recover_min_depth_dom_ratio', 0.55)
+    )
     result['MSCKF_PHASE_RAY_SOFT_SCALE'] = msckf_cfg.get(
         'phase_ray_soft_scale',
         {'0': 1.12, '1': 1.06, '2': 1.00}

@@ -1142,6 +1142,20 @@ vio:
       unstable_relax_min_depth_enable: false
       unstable_reclassify_enable: true
       unstable_reclassify_dom_ratio_th: 0.70
+      init_recover_enable: false
+      init_recover_min_depth_m: 0.005
+      init_recover_min_parallax_mult: 1.0
+      init_recover_min_quality: 0.30
+      support_rescue_enable: false
+      support_rescue_min_valid_obs: 2
+      support_rescue_min_parallax_px: 1.2
+      support_rescue_min_quality: 0.34
+      support_rescue_max_reproj_to_gate: 1.02
+      sparse_recover_enable: true
+      sparse_recover_min_obs: 5
+      sparse_recover_min_parallax_px: 1.15
+      sparse_recover_min_quality: 0.34
+      sparse_recover_min_depth_dom_ratio: 0.55
   frontend:
     max_track_history: 80
     max_total_tracks: 4500
