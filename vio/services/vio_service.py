@@ -2299,56 +2299,12 @@ class VIOService:
                                     )
                                 )
                             if str(decision_lane) == "BOUNDED_SOFT_APPLY":
-                                bounded_clamp = float(
-                                    runner.global_config.get(
-                                        "VPS_APPLY_GATE_BOUNDED_SOFT_MAX_APPLY_DP_XY_M",
-                                        12.0,
-                                    )
-                                )
-                                if np.isfinite(speed_now):
-                                    hs_th = float(
-                                        runner.global_config.get(
-                                            "VPS_APPLY_GATE_BOUNDED_SOFT_HIGH_SPEED_M_S",
-                                            20.0,
-                                        )
-                                    )
-                                    if speed_now >= hs_th:
-                                        bounded_clamp = min(
-                                            bounded_clamp,
-                                            float(
-                                                runner.global_config.get(
-                                                    "VPS_APPLY_GATE_BOUNDED_SOFT_HIGH_SPEED_MAX_APPLY_DP_XY_M",
-                                                    7.0,
-                                                )
-                                            ),
-                                        )
-                                if bool(late_reclaim_active):
-                                    reclaim_clamp = float(
-                                        runner.global_config.get(
-                                            "VPS_APPLY_GATE_BOUNDED_SOFT_POLICY_HOLD_RECLAIM_MAX_APPLY_DP_XY_M",
-                                            4.5,
-                                        )
-                                    )
-                                    if np.isfinite(speed_now):
-                                        reclaim_hs = float(
-                                            runner.global_config.get(
-                                                "VPS_APPLY_GATE_BOUNDED_SOFT_POLICY_HOLD_RECLAIM_HIGH_SPEED_MAX_APPLY_DP_XY_M",
-                                                3.0,
-                                            )
-                                        )
-                                        hs_th = float(
-                                            runner.global_config.get(
-                                                "VPS_APPLY_GATE_BOUNDED_SOFT_HIGH_SPEED_M_S",
-                                                20.0,
-                                            )
-                                        )
-                                        if speed_now >= hs_th:
-                                            reclaim_clamp = min(reclaim_clamp, reclaim_hs)
-                                    bounded_clamp = min(bounded_clamp, reclaim_clamp)
-                                if clamp_override is None:
-                                    clamp_override = bounded_clamp
-                                else:
-                                    clamp_override = min(float(clamp_override), float(bounded_clamp))
+                                bounded_clamp = float(getattr(pos_decision, "bounded_clamp_m", np.nan))
+                                if np.isfinite(bounded_clamp) and bounded_clamp > 0.0:
+                                    if clamp_override is None:
+                                        clamp_override = float(bounded_clamp)
+                                    else:
+                                        clamp_override = min(float(clamp_override), float(bounded_clamp))
                             vps_lat_apply, vps_lon_apply, clamp_scale = self._clamp_vps_latlon(
                                 current_xy=current_xy,
                                 vps_lat=vps_lat_apply,
@@ -2616,6 +2572,11 @@ class VIOService:
         contract, contract_note = self._validate_backend_contract_v1(corr)
         if contract is None:
             runner._backend_contract_violation_count = int(getattr(runner, "_backend_contract_violation_count", 0)) + 1
+            counts = getattr(runner, "_backend_reject_reason_counts", None)
+            if not isinstance(counts, dict):
+                counts = {}
+                runner._backend_reject_reason_counts = counts
+            counts["contract_violation"] = int(counts.get("contract_violation", 0)) + 1
             if bool(getattr(runner.config, "save_debug_data", False)):
                 print(f"[BACKEND] contract violation: correction rejected ({contract_note})")
             return
@@ -2628,6 +2589,12 @@ class VIOService:
         direct_xy_lane = bool(float(resid.get("direct_xy_lane", 0.0)) >= 0.5)
         corr_quality = float(np.clip(float(contract.quality_score), 0.0, 1.0))
         corr_age_sec = float(contract.age_sec)
+        residual_xy_metric = float(
+            resid.get(
+                "residual_xy_p50",
+                resid.get("residual_xy_mean", np.nan),
+            )
+        )
 
         position_first_lane = bool(runner.global_config.get("POSITION_FIRST_LANE", False))
         max_dp = float(runner.global_config.get("BACKEND_MAX_APPLY_DP_XY_M", 25.0))
@@ -2751,6 +2718,45 @@ class VIOService:
                     else:
                         yaw_auth_reason = f"apply:{auth_dec.reason}"
 
+        # Deterministic kinematic consistency gate (C5): block opposite-direction
+        # correction bursts during high-speed motion before they enter blend queue.
+        if bool(runner.global_config.get("BACKEND_KINEMATIC_CONSISTENCY_ENABLE", True)):
+            try:
+                vel_xy = np.asarray(runner.kf.x[3:5, 0], dtype=float).reshape(2,)
+            except Exception:
+                vel_xy = np.zeros(2, dtype=float)
+            speed_xy = float(np.linalg.norm(vel_xy))
+            dp_xy = np.asarray(dp[:2], dtype=float).reshape(2,)
+            dp_xy_norm = float(np.linalg.norm(dp_xy))
+            min_speed = float(runner.global_config.get("BACKEND_KINEMATIC_CONSISTENCY_MIN_SPEED_M_S", 8.0))
+            min_dp_xy = float(runner.global_config.get("BACKEND_KINEMATIC_CONSISTENCY_MIN_DP_XY_M", 4.0))
+            min_cos = float(runner.global_config.get("BACKEND_KINEMATIC_CONSISTENCY_MIN_COS", -0.25))
+            if (
+                np.isfinite(speed_xy)
+                and np.isfinite(dp_xy_norm)
+                and speed_xy >= max(0.0, min_speed)
+                and dp_xy_norm >= max(0.0, min_dp_xy)
+                and speed_xy > 1e-6
+                and dp_xy_norm > 1e-6
+            ):
+                cos_dir = float(np.dot(dp_xy, vel_xy) / (speed_xy * dp_xy_norm))
+                if np.isfinite(cos_dir) and cos_dir < float(min_cos):
+                    runner._backend_kinematic_reject_count = int(
+                        getattr(runner, "_backend_kinematic_reject_count", 0)
+                    ) + 1
+                    counts = getattr(runner, "_backend_reject_reason_counts", None)
+                    if not isinstance(counts, dict):
+                        counts = {}
+                        runner._backend_reject_reason_counts = counts
+                    counts["kinematic_reject"] = int(counts.get("kinematic_reject", 0)) + 1
+                    if bool(getattr(runner.config, "save_debug_data", False)):
+                        print(
+                            "[BACKEND] kinematic_reject:"
+                            f" cos={cos_dir:.3f}<min_cos={float(min_cos):.3f},"
+                            f" speed_xy={speed_xy:.2f}, dp_xy={dp_xy_norm:.2f}"
+                        )
+                    return
+
         corr_weight = float(runner.global_config.get("BACKEND_CORRECTION_WEIGHT", 1.0))
         if position_first_lane:
             corr_weight = float(runner.global_config.get("BACKEND_POSITION_FIRST_CORR_WEIGHT", corr_weight))
@@ -2802,6 +2808,11 @@ class VIOService:
             lat_hist.append(float(max(0.0, corr_age_sec) * 1000.0))
             if len(lat_hist) > 20000:
                 del lat_hist[:-20000]
+        resid_hist = getattr(runner, "_backend_apply_residual_xy_history", None)
+        if isinstance(resid_hist, list) and np.isfinite(residual_xy_metric):
+            resid_hist.append(float(residual_xy_metric))
+            if len(resid_hist) > 20000:
+                del resid_hist[:-20000]
         if abs(dyaw_deg) > 1e-9 and getattr(runner, "yaw_authority_service", None) is not None:
             try:
                 runner.yaw_authority_service.register_applied(
@@ -2878,6 +2889,13 @@ class VIOService:
         runner._backend_pending_dyaw_deg = dyaw_rem - step_dyaw_deg
         runner._backend_pending_steps_left = steps_left - 1
         runner._backend_apply_count = int(getattr(runner, "_backend_apply_count", 0)) + 1
+        dp_hist = getattr(runner, "_backend_apply_dp_xy_history", None)
+        if isinstance(dp_hist, list):
+            step_xy = float(np.linalg.norm(np.asarray(step_dp[:2], dtype=float)))
+            if np.isfinite(step_xy):
+                dp_hist.append(step_xy)
+                if len(dp_hist) > 20000:
+                    del dp_hist[:-20000]
 
         if int(runner._backend_pending_steps_left) <= 0:
             runner._backend_pending_dp_enu = None

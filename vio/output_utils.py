@@ -521,6 +521,39 @@ def append_benchmark_health_summary(summary_csv: Optional[str],
                                     msckf_quality_p50: float = float("nan"),
                                     msckf_quality_p10: float = float("nan"),
                                     msckf_stable_geometry_ratio: float = float("nan"),
+                                    msckf_depth_total_fail: float = float("nan"),
+                                    msckf_fail_depth_sign_init: float = float("nan"),
+                                    msckf_fail_depth_sign_post_refine: float = float("nan"),
+                                    msckf_fail_depth_large: float = float("nan"),
+                                    msckf_fail_depth_sparse_recoverable: float = float("nan"),
+                                    msckf_posttri_retry_recover_depth_defer_count: float = float("nan"),
+                                    msckf_posttri_retry_recover_depth_success_count: float = float("nan"),
+                                    msckf_depth_init_candidate_count: float = float("nan"),
+                                    msckf_depth_init_routed_count: float = float("nan"),
+                                    msckf_posttri_retry_recover_depth_gate_reject_count: float = float("nan"),
+                                    msckf_posttri_retry_recover_depth_soft_accept_count: float = float("nan"),
+                                    msckf_posttri_retry_recover_depth_retry_seen_count: float = float("nan"),
+                                    msckf_posttri_retry_recover_depth_same_cycle_attempt_count: float = float("nan"),
+                                    msckf_posttri_retry_recover_depth_same_cycle_success_count: float = float("nan"),
+                                    msckf_posttri_retry_recover_depth_same_cycle_entered_count: float = float("nan"),
+                                    msckf_posttri_retry_recover_depth_same_cycle_fail_depth_count: float = float("nan"),
+                                    msckf_posttri_retry_recover_depth_same_cycle_fail_reproj_count: float = float("nan"),
+                                    msckf_posttri_retry_recover_depth_same_cycle_fail_geometry_count: float = float("nan"),
+                                    msckf_posttri_retry_recover_depth_same_cycle_fail_nonlinear_count: float = float("nan"),
+                                    msckf_posttri_retry_recover_depth_same_cycle_fail_other_count: float = float("nan"),
+                                    msckf_posttri_retry_recover_depth_borderline_promote_count: float = float("nan"),
+                                    msckf_posttri_retry_recover_depth_protected_added_count: float = float("nan"),
+                                    msckf_posttri_retry_recover_depth_protected_carried_count: float = float("nan"),
+                                    msckf_posttri_retry_recover_depth_protected_truncated_count: float = float("nan"),
+                                    msckf_posttri_retry_recover_depth_protected_missing_clone_count: float = float("nan"),
+                                    msckf_posttri_retry_recover_depth_protected_source_missing_count: float = float("nan"),
+                                    msckf_posttri_retry_recover_depth_protected_depth_gate_again_count: float = float("nan"),
+                                    msckf_posttri_retry_recover_depth_relaxed_gate_used_count: float = float("nan"),
+                                    msckf_posttri_retry_recover_depth_fail_depth_count: float = float("nan"),
+                                    msckf_posttri_retry_recover_depth_fail_reproj_count: float = float("nan"),
+                                    msckf_posttri_retry_recover_depth_fail_geometry_count: float = float("nan"),
+                                    msckf_posttri_retry_recover_depth_fail_nonlinear_count: float = float("nan"),
+                                    msckf_posttri_retry_recover_depth_fail_other_count: float = float("nan"),
                                     msckf_reclass_to_geometry_count: float = float("nan"),
                                     msckf_unstable_lane_count: float = float("nan"),
                                     msckf_stable_lane_used_count: float = float("nan"),
@@ -528,6 +561,11 @@ def append_benchmark_health_summary(summary_csv: Optional[str],
                                     backend_stale_ratio: float = float("nan"),
                                     backend_emit_to_apply_ratio: float = float("nan"),
                                     backend_apply_quality_p50: float = float("nan"),
+                                    backend_kinematic_reject_count: float = float("nan"),
+                                    backend_apply_dp_xy_p50: float = float("nan"),
+                                    backend_apply_dp_xy_p95: float = float("nan"),
+                                    backend_apply_residual_xy_p50: float = float("nan"),
+                                    backend_apply_residual_xy_p95: float = float("nan"),
                                     backend_snap_reject_count: float = float("nan"),
                                     backend_apply_latency_ms_p95: float = float("nan"),
                                     backend_contract_violation_count: float = float("nan"),
@@ -576,10 +614,43 @@ def append_benchmark_health_summary(summary_csv: Optional[str],
                 f"{yaw_owner_mag_block_count:.6f},{yaw_owner_mag_block_ratio:.6f},"
                 f"{yaw_owner_dead_fallback_count:.6f},"
                 f"{msckf_quality_p50:.6f},{msckf_quality_p10:.6f},{msckf_stable_geometry_ratio:.6f},"
+                f"{msckf_depth_total_fail:.6f},{msckf_fail_depth_sign_init:.6f},"
+                f"{msckf_fail_depth_sign_post_refine:.6f},{msckf_fail_depth_large:.6f},"
+                f"{msckf_fail_depth_sparse_recoverable:.6f},"
+                f"{msckf_posttri_retry_recover_depth_defer_count:.6f},"
+                f"{msckf_posttri_retry_recover_depth_success_count:.6f},"
+                f"{msckf_depth_init_candidate_count:.6f},{msckf_depth_init_routed_count:.6f},"
+                f"{msckf_posttri_retry_recover_depth_gate_reject_count:.6f},"
+                f"{msckf_posttri_retry_recover_depth_soft_accept_count:.6f},"
+                f"{msckf_posttri_retry_recover_depth_retry_seen_count:.6f},"
+                f"{msckf_posttri_retry_recover_depth_same_cycle_attempt_count:.6f},"
+                f"{msckf_posttri_retry_recover_depth_same_cycle_success_count:.6f},"
+                f"{msckf_posttri_retry_recover_depth_same_cycle_entered_count:.6f},"
+                f"{msckf_posttri_retry_recover_depth_same_cycle_fail_depth_count:.6f},"
+                f"{msckf_posttri_retry_recover_depth_same_cycle_fail_reproj_count:.6f},"
+                f"{msckf_posttri_retry_recover_depth_same_cycle_fail_geometry_count:.6f},"
+                f"{msckf_posttri_retry_recover_depth_same_cycle_fail_nonlinear_count:.6f},"
+                f"{msckf_posttri_retry_recover_depth_same_cycle_fail_other_count:.6f},"
+                f"{msckf_posttri_retry_recover_depth_borderline_promote_count:.6f},"
+                f"{msckf_posttri_retry_recover_depth_protected_added_count:.6f},"
+                f"{msckf_posttri_retry_recover_depth_protected_carried_count:.6f},"
+                f"{msckf_posttri_retry_recover_depth_protected_truncated_count:.6f},"
+                f"{msckf_posttri_retry_recover_depth_protected_missing_clone_count:.6f},"
+                f"{msckf_posttri_retry_recover_depth_protected_source_missing_count:.6f},"
+                f"{msckf_posttri_retry_recover_depth_protected_depth_gate_again_count:.6f},"
+                f"{msckf_posttri_retry_recover_depth_relaxed_gate_used_count:.6f},"
+                f"{msckf_posttri_retry_recover_depth_fail_depth_count:.6f},"
+                f"{msckf_posttri_retry_recover_depth_fail_reproj_count:.6f},"
+                f"{msckf_posttri_retry_recover_depth_fail_geometry_count:.6f},"
+                f"{msckf_posttri_retry_recover_depth_fail_nonlinear_count:.6f},"
+                f"{msckf_posttri_retry_recover_depth_fail_other_count:.6f},"
                 f"{msckf_reclass_to_geometry_count:.6f},{msckf_unstable_lane_count:.6f},"
                 f"{msckf_stable_lane_used_count:.6f},{msckf_preagg_parallax_low_entered_count:.6f},"
                 f"{backend_stale_ratio:.6f},{backend_emit_to_apply_ratio:.6f},"
-                f"{backend_apply_quality_p50:.6f},{backend_snap_reject_count:.6f},"
+                f"{backend_apply_quality_p50:.6f},{backend_kinematic_reject_count:.6f},"
+                f"{backend_apply_dp_xy_p50:.6f},{backend_apply_dp_xy_p95:.6f},"
+                f"{backend_apply_residual_xy_p50:.6f},{backend_apply_residual_xy_p95:.6f},"
+                f"{backend_snap_reject_count:.6f},"
                 f"{backend_apply_latency_ms_p95:.6f},{backend_contract_violation_count:.6f},"
                 f"{alignment_lock_violation_count:.6f},{alignment_lock_hint_only_count:.6f},"
                 f"{alignment_lock_reject_count:.6f},"
@@ -1559,7 +1630,7 @@ def init_output_csvs(output_dir: str, save_debug_data: bool = False) -> Dict[str
             "t,frame,match_reason,quality_mode,decision_lane,force_hint_only,"
             "apply_score,consensus_score,geometry_score,motion_score,bounded_clamp_m,allow_direct_xy_apply,"
             "direct_xy_candidate,hint_quality,offset_m,inliers,confidence,reproj_error,"
-            "applied,reason_code,policy_note,hard_note,temporal_note,direct_note\n"
+            "applied,reason_code,reject_reason,residual_xy,applied_dp_xy,policy_note,hard_note,temporal_note,direct_note\n"
         )
 
     # Single-authority policy traces
@@ -1623,9 +1694,39 @@ def init_output_csvs(output_dir: str, save_debug_data: bool = False) -> Dict[str
             "yaw_owner_mag_block_count,yaw_owner_mag_block_ratio,"
             "yaw_owner_dead_fallback_count,"
             "msckf_quality_p50,msckf_quality_p10,msckf_stable_geometry_ratio,"
+            "msckf_depth_total_fail,msckf_fail_depth_sign_init,msckf_fail_depth_sign_post_refine,"
+            "msckf_fail_depth_large,msckf_fail_depth_sparse_recoverable,"
+            "msckf_posttri_retry_recover_depth_defer_count,msckf_posttri_retry_recover_depth_success_count,"
+            "msckf_depth_init_candidate_count,msckf_depth_init_routed_count,"
+            "msckf_posttri_retry_recover_depth_gate_reject_count,"
+            "msckf_posttri_retry_recover_depth_soft_accept_count,"
+            "msckf_posttri_retry_recover_depth_retry_seen_count,"
+            "msckf_posttri_retry_recover_depth_same_cycle_attempt_count,"
+            "msckf_posttri_retry_recover_depth_same_cycle_success_count,"
+            "msckf_posttri_retry_recover_depth_same_cycle_entered_count,"
+            "msckf_posttri_retry_recover_depth_same_cycle_fail_depth_count,"
+            "msckf_posttri_retry_recover_depth_same_cycle_fail_reproj_count,"
+            "msckf_posttri_retry_recover_depth_same_cycle_fail_geometry_count,"
+            "msckf_posttri_retry_recover_depth_same_cycle_fail_nonlinear_count,"
+            "msckf_posttri_retry_recover_depth_same_cycle_fail_other_count,"
+            "msckf_posttri_retry_recover_depth_borderline_promote_count,"
+            "msckf_posttri_retry_recover_depth_protected_added_count,"
+            "msckf_posttri_retry_recover_depth_protected_carried_count,"
+            "msckf_posttri_retry_recover_depth_protected_truncated_count,"
+            "msckf_posttri_retry_recover_depth_protected_missing_clone_count,"
+            "msckf_posttri_retry_recover_depth_protected_source_missing_count,"
+            "msckf_posttri_retry_recover_depth_protected_depth_gate_again_count,"
+            "msckf_posttri_retry_recover_depth_relaxed_gate_used_count,"
+            "msckf_posttri_retry_recover_depth_fail_depth_count,"
+            "msckf_posttri_retry_recover_depth_fail_reproj_count,"
+            "msckf_posttri_retry_recover_depth_fail_geometry_count,"
+            "msckf_posttri_retry_recover_depth_fail_nonlinear_count,"
+            "msckf_posttri_retry_recover_depth_fail_other_count,"
             "msckf_reclass_to_geometry_count,msckf_unstable_lane_count,msckf_stable_lane_used_count,"
             "msckf_preagg_parallax_low_entered_count,"
             "backend_stale_ratio,backend_emit_to_apply_ratio,backend_apply_quality_p50,"
+            "backend_kinematic_reject_count,backend_apply_dp_xy_p50,backend_apply_dp_xy_p95,"
+            "backend_apply_residual_xy_p50,backend_apply_residual_xy_p95,"
             "backend_snap_reject_count,backend_apply_latency_ms_p95,backend_contract_violation_count,"
             "alignment_lock_violation_count,alignment_lock_hint_only_count,alignment_lock_reject_count,"
             "memory_peak_rss_mb,memory_peak_vms_mb,memory_peak_uss_mb,"

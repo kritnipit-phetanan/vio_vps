@@ -1270,8 +1270,47 @@ def load_config(config_path: str) -> VIOConfig:
     result['MSCKF_RETRY_LANE_POSTTRI_RECOVER_MIN_QUALITY'] = float(
         msckf_retry_lane.get('posttri_recover_min_quality', 0.34)
     )
+    result['MSCKF_RETRY_LANE_POSTTRI_RECOVER_DEPTH_SAME_CYCLE_ENABLE'] = bool(
+        msckf_retry_lane.get('posttri_recover_depth_same_cycle_enable', False)
+    )
+    result['MSCKF_RETRY_LANE_POSTTRI_RECOVER_PROTECT_ENABLE'] = bool(
+        msckf_retry_lane.get('posttri_recover_protect_enable', False)
+    )
+    result['MSCKF_RETRY_LANE_POSTTRI_RECOVER_PROTECT_CYCLES'] = int(
+        msckf_retry_lane.get('posttri_recover_protect_cycles', 2)
+    )
     result['MSCKF_RETRY_LANE_POSTTRI_RECOVER_MAX_DEPTH_DOM_RATIO'] = float(
         msckf_retry_lane.get('posttri_recover_max_depth_dom_ratio', 0.45)
+    )
+    result['MSCKF_RETRY_LANE_POSTTRI_RECOVER_DEPTH_SOFT_ACCEPT_ENABLE'] = bool(
+        msckf_retry_lane.get('posttri_recover_depth_soft_accept_enable', True)
+    )
+    result['MSCKF_RETRY_LANE_POSTTRI_RECOVER_DEPTH_SOFT_DEPTH_RATIO'] = float(
+        msckf_retry_lane.get('posttri_recover_depth_soft_depth_ratio', 0.72)
+    )
+    result['MSCKF_RETRY_LANE_POSTTRI_RECOVER_DEPTH_SOFT_MAX_PROMOTE'] = int(
+        msckf_retry_lane.get('posttri_recover_depth_soft_max_promote', 2)
+    )
+    result['MSCKF_RETRY_LANE_POSTTRI_RECOVER_DEPTH_SOFT_ERROR_MULT'] = float(
+        msckf_retry_lane.get('posttri_recover_depth_soft_error_mult', 1.15)
+    )
+    result['MSCKF_RETRY_LANE_POSTTRI_RECOVER_DEPTH_FULL_RESCUE_ENABLE'] = bool(
+        msckf_retry_lane.get('posttri_recover_depth_full_rescue_enable', False)
+    )
+    result['MSCKF_RETRY_LANE_POSTTRI_RECOVER_DEPTH_BOUNDED_RELAX_ENABLE'] = bool(
+        msckf_retry_lane.get('posttri_recover_depth_bounded_relax_enable', False)
+    )
+    result['MSCKF_RETRY_LANE_POSTTRI_RECOVER_DEPTH_BOUNDED_RELAX_OBS_DELTA'] = int(
+        msckf_retry_lane.get('posttri_recover_depth_bounded_relax_obs_delta', 1)
+    )
+    result['MSCKF_RETRY_LANE_POSTTRI_RECOVER_DEPTH_BOUNDED_RELAX_PARALLAX_MULT'] = float(
+        msckf_retry_lane.get('posttri_recover_depth_bounded_relax_parallax_mult', 0.88)
+    )
+    result['MSCKF_RETRY_LANE_POSTTRI_RECOVER_DEPTH_BOUNDED_RELAX_QUALITY_DELTA'] = float(
+        msckf_retry_lane.get('posttri_recover_depth_bounded_relax_quality_delta', 0.03)
+    )
+    result['MSCKF_RETRY_LANE_POSTTRI_RECOVER_DEPTH_GATE_OVERRIDE_ENABLE'] = bool(
+        msckf_retry_lane.get('posttri_recover_depth_gate_override_enable', False)
     )
     msckf_depth_gate = msckf_cfg.get('depthsign_gate', {}) if isinstance(msckf_cfg.get('depthsign_gate', {}), dict) else {}
     result['MSCKF_DEPTHSIGN_UNSTABLE_ENABLE'] = bool(msckf_depth_gate.get('unstable_enable', True))
@@ -1287,33 +1326,8 @@ def load_config(config_path: str) -> VIOConfig:
     result['MSCKF_DEPTHSIGN_UNSTABLE_RECLASSIFY_DOM_RATIO_TH'] = float(
         msckf_depth_gate.get('unstable_reclassify_dom_ratio_th', 0.70)
     )
-    result['MSCKF_DEPTH_INIT_RECOVER_ENABLE'] = bool(
-        msckf_depth_gate.get('init_recover_enable', False)
-    )
-    result['MSCKF_DEPTH_INIT_RECOVER_MIN_DEPTH_M'] = float(
-        msckf_depth_gate.get('init_recover_min_depth_m', 0.005)
-    )
-    result['MSCKF_DEPTH_INIT_RECOVER_MIN_PARALLAX_MULT'] = float(
-        msckf_depth_gate.get('init_recover_min_parallax_mult', 1.0)
-    )
-    result['MSCKF_DEPTH_INIT_RECOVER_MIN_QUALITY'] = float(
-        msckf_depth_gate.get('init_recover_min_quality', 0.30)
-    )
-    result['MSCKF_DEPTH_SUPPORT_RESCUE_ENABLE'] = bool(
-        msckf_depth_gate.get('support_rescue_enable', False)
-    )
-    result['MSCKF_DEPTH_SUPPORT_RESCUE_MIN_VALID_OBS'] = int(
-        msckf_depth_gate.get('support_rescue_min_valid_obs', 2)
-    )
-    result['MSCKF_DEPTH_SUPPORT_RESCUE_MIN_PARALLAX_PX'] = float(
-        msckf_depth_gate.get('support_rescue_min_parallax_px', 1.2)
-    )
-    result['MSCKF_DEPTH_SUPPORT_RESCUE_MIN_QUALITY'] = float(
-        msckf_depth_gate.get('support_rescue_min_quality', 0.34)
-    )
-    result['MSCKF_DEPTH_SUPPORT_RESCUE_MAX_REPROJ_TO_GATE'] = float(
-        msckf_depth_gate.get('support_rescue_max_reproj_to_gate', 1.02)
-    )
+    # Deprecated (C2 cleanup): init_recover/support_rescue path removed from runtime.
+    # Keep YAML keys tolerated but do not compile into active runtime knobs.
     result['MSCKF_DEPTH_SPARSE_RECOVER_ENABLE'] = bool(
         msckf_depth_gate.get('sparse_recover_enable', True)
     )
@@ -1337,6 +1351,40 @@ def load_config(config_path: str) -> VIOConfig:
     )
     result['MSCKF_DEPTH_SPARSE_RECOVER_MIN_DEPTH_DOM_RATIO'] = float(
         msckf_depth_gate.get('sparse_recover_min_depth_dom_ratio', 0.55)
+    )
+    # C2-H hardening (init-depth deterministic recover routing)
+    result['MSCKF_DEPTH_INIT_RECOVER_ENABLE'] = bool(
+        msckf_depth_gate.get('init_recover_enable', True)
+    )
+    result['MSCKF_DEPTH_INIT_RECOVER_MIN_OBS'] = int(
+        msckf_depth_gate.get(
+            'init_recover_min_obs',
+            max(4, int(result['MSCKF_DEPTH_SPARSE_RECOVER_MIN_OBS'])),
+        )
+    )
+    result['MSCKF_DEPTH_INIT_RECOVER_MIN_PARALLAX_PX'] = float(
+        msckf_depth_gate.get(
+            'init_recover_min_parallax_px',
+            max(0.35, 0.65 * float(result['MSCKF_DEPTH_SPARSE_RECOVER_MIN_PARALLAX_PX'])),
+        )
+    )
+    result['MSCKF_DEPTH_INIT_RECOVER_MAX_PARALLAX_PX'] = float(
+        msckf_depth_gate.get(
+            'init_recover_max_parallax_px',
+            max(0.5, 1.05 * float(result['MSCKF_DEPTH_SPARSE_RECOVER_MIN_PARALLAX_PX'])),
+        )
+    )
+    result['MSCKF_DEPTH_INIT_RECOVER_MIN_QUALITY'] = float(
+        msckf_depth_gate.get(
+            'init_recover_min_quality',
+            max(0.0, float(result['MSCKF_DEPTH_SPARSE_RECOVER_MIN_QUALITY']) - 0.02),
+        )
+    )
+    result['MSCKF_DEPTH_INIT_RECOVER_MIN_DEPTH_FAIL_RATIO'] = float(
+        msckf_depth_gate.get('init_recover_min_depth_fail_ratio', 0.60)
+    )
+    result['MSCKF_RETRY_LANE_POSTTRI_RECOVER_DEPTH_GATE_ENABLE'] = bool(
+        msckf_retry_lane.get('posttri_recover_depth_gate_enable', True)
     )
     result['MSCKF_PHASE_RAY_SOFT_SCALE'] = msckf_cfg.get(
         'phase_ray_soft_scale',
@@ -2346,6 +2394,7 @@ def load_config(config_path: str) -> VIOConfig:
     factor_lite_cfg = backend_cfg.get('hybrid_factor_lite', {})
     transport_cfg = backend_cfg.get('transport', {})
     contract_cfg = backend_cfg.get('contract', {})
+    kinematic_cfg = backend_cfg.get('kinematic_consistency', {})
     contract_v1_cfg = backend_cfg.get('contract_v1', {})
     if not isinstance(contract_v1_cfg, dict):
         contract_v1_cfg = {}
@@ -2504,6 +2553,18 @@ def load_config(config_path: str) -> VIOConfig:
     )
     result['BACKEND_YAW_AUTH_ZERO_DYAW_AS_REQUEST'] = bool(
         backend_cfg.get('yaw_auth_zero_dyaw_as_request', False)
+    )
+    result['BACKEND_KINEMATIC_CONSISTENCY_ENABLE'] = bool(
+        kinematic_cfg.get('enable', True)
+    )
+    result['BACKEND_KINEMATIC_CONSISTENCY_MIN_SPEED_M_S'] = float(
+        kinematic_cfg.get('min_speed_m_s', 8.0)
+    )
+    result['BACKEND_KINEMATIC_CONSISTENCY_MIN_DP_XY_M'] = float(
+        kinematic_cfg.get('min_dp_xy_m', 4.0)
+    )
+    result['BACKEND_KINEMATIC_CONSISTENCY_MIN_COS'] = float(
+        kinematic_cfg.get('min_cos', -0.25)
     )
 
     # =========================================================================

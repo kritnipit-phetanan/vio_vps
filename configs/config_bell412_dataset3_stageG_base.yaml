@@ -360,7 +360,7 @@ backend:
   blend_steps: 3
   correction_blend:
     mode: exp
-    alpha: 0.50
+    alpha: 0.5
     max_step_dp_xy_m: 6.0
     max_step_dyaw_deg: 0.8
     quality_soft_scale: true
@@ -371,8 +371,8 @@ backend:
   max_apply_dp_xy_m: 25.0
   max_apply_dyaw_deg: 2.5
   xy_priority_enable: true
-  xy_priority_min_vps_mix: 0.70
-  xy_priority_max_loop_mix: 0.10
+  xy_priority_min_vps_mix: 0.7
+  xy_priority_max_loop_mix: 0.1
   xy_priority_max_mag_mix: 0.15
   xy_priority_quality_th: 0.55
   xy_priority_max_dyaw_deg: 0.35
@@ -405,6 +405,11 @@ backend:
   contract:
     strict_require_source_mix: true
     strict_require_residual_summary: true
+  kinematic_consistency:
+    enable: true
+    min_speed_m_s: 8.0
+    min_dp_xy_m: 4.0
+    min_cos: -0.25
   contract_v1:
     strict_require_version: true
     expected_version: v1
@@ -418,7 +423,7 @@ backend:
   vps_yaw_hint_max_reproj: 1.2
   vps_yaw_hint_max_apply_deg: 2.0
   position_first_force_xy_only: true
-  position_first_min_vps_mix: 0.30
+  position_first_min_vps_mix: 0.3
   position_first_max_apply_dp_xy_m: 90.0
   position_first_corr_weight: 1.0
   position_first_blend_steps: 1
@@ -618,11 +623,20 @@ loop_closure:
     fail_soft:
       speed_skip_m_s: 44.0
       speed_sigma_inflate_m_s: 32.0
-      speed_sigma_mult: 1.20
+      speed_sigma_mult: 1.2
   speed_yaw_cap:
-    breakpoints_m_s: [15.0, 25.0, 35.0]
-    normal_cap_deg: [3.0, 2.6, 2.2]
-    fail_soft_cap_deg: [2.8, 2.3, 1.8]
+    breakpoints_m_s:
+    - 15.0
+    - 25.0
+    - 35.0
+    normal_cap_deg:
+    - 3.0
+    - 2.6
+    - 2.2
+    fail_soft_cap_deg:
+    - 2.8
+    - 2.3
+    - 1.8
   temporal_apply:
     enable: true
     confirm_window_sec: 2.8
@@ -669,19 +683,28 @@ loop_closure:
   use_loop_closure: true
 magnetometer:
   calibration:
-    hard_iron: [0.24914, -0.261974, 0.317021]
+    hard_iron:
+    - 0.24914
+    - -0.261974
+    - 0.317021
     soft_iron:
-      - [0.753133, 0.0, 0.0]
-      - [0.0, 0.726562, 0.0]
-      - [0.0, 0.0, 3.379869]
+    - - 0.753133
+      - 0.0
+      - 0.0
+    - - 0.0
+      - 0.726562
+      - 0.0
+    - - 0.0
+      - 0.0
+      - 3.379869
   ablation:
-    mode: "weak"
+    mode: weak
     r_mult: 2.2
     max_dyaw_deg: 18.0
     max_update_dyaw_deg: 0.35
     weak_skip_hard_mismatch: false
   heading_arbitration:
-    enable: false  # global yaw_authority is canonical owner in stage G/H
+    enable: false
     hard_mismatch_deg: 95.0
     min_vision_quality: 0.55
     streak_to_hold: 6
@@ -697,11 +720,11 @@ magnetometer:
     score_state_good_deg: 24.0
     score_state_bad_deg: 95.0
     score_vis_weight: 0.45
-    score_gyro_weight: 0.30
+    score_gyro_weight: 0.3
     score_state_weight: 0.25
     yaw_budget_window_sec: 6.0
     yaw_budget_abs_deg: 12.0
-    yaw_budget_min_remaining_deg: 0.20
+    yaw_budget_min_remaining_deg: 0.2
     recover_confirm_hits: 1
     recover_min_score: 0.62
     recover_soft_r_mult: 1.8
@@ -810,13 +833,13 @@ magnetometer:
     warning_r_mult: 6.0
 yaw_authority:
   enable: true
-  activation_stage: 4  # stage4: add soft-only high-speed/unstable guard
+  activation_stage: 4
   use_msckf_confidence: true
   msckf_conf_blend:
-    MAG: 0.60
-    LOOP: 0.20
+    MAG: 0.6
+    LOOP: 0.2
     BACKEND: 0.05
-  mag_owner_min_accept_rate: 0.10
+  mag_owner_min_accept_rate: 0.1
   mag_owner_accept_window_sec: 8.0
   mag_owner_min_samples: 20
   mag_owner_ban_sec: 2.5
@@ -827,7 +850,7 @@ yaw_authority:
   mag_block_force_ban_sec: 10.0
   mag_score_accept_enable: true
   mag_score_accept_window_sec: 8.0
-  mag_score_accept_ref_rate: 0.20
+  mag_score_accept_ref_rate: 0.2
   mag_score_min_samples: 20
   mag_score_floor: 0.15
   mag_score_cold_start_scale: 0.55
@@ -858,12 +881,14 @@ yaw_authority:
     LOOP: 2.2
     MAG: 1.2
   strict_single_path_enable: true
-  strict_hold_reclaim_sources: ["BACKEND", "LOOP"]
+  strict_hold_reclaim_sources:
+  - BACKEND
+  - LOOP
   strict_hold_reclaim_min_confidence: 0.18
   strict_hold_reclaim_min_confidence_map:
     BACKEND: 0.16
     LOOP: 0.28
-  strict_hold_reclaim_min_freshness: 0.10
+  strict_hold_reclaim_min_freshness: 0.1
   loop_reclaim_enable: true
   loop_reclaim_allow_from_hold: true
   loop_reclaim_hold_require_backend_dead: true
@@ -903,18 +928,21 @@ yaw_authority:
   stage12_claim_enable: false
   stage12_min_switch_interval_sec: 1.2
   stage12_owner_timeout_sec: 1.0
-  stage12_claim_min_score: 0.40
+  stage12_claim_min_score: 0.4
   stage12_claim_margin: 0.02
   stage12_loop_force_claim_min_score: 0.85
   stage12_loop_force_claim_max_speed_m_s: 20.0
   stage12_allow_stale_reclaim_any: true
-  stage12_claim_sources: ["LOOP", "BACKEND"]
+  stage12_claim_sources:
+  - LOOP
+  - BACKEND
   backend_min_request_dyaw_deg: 0.15
   backend_noop_max_score: 0.12
   hold_score_threshold: 0.18
   hold_sec: 0.8
-  hold_reclaim_sources: ["BACKEND"]
-  hold_reclaim_min_confidence: 0.20
+  hold_reclaim_sources:
+  - BACKEND
+  hold_reclaim_min_confidence: 0.2
   hold_mag_anchor_enable: true
   hold_mag_anchor_min_confidence: 0.62
   hold_mag_anchor_require_alt_quiet: true
@@ -924,12 +952,13 @@ yaw_authority:
   hold_mag_anchor_max_dyaw_deg: 0.12
   hold_escape_min_score: 0.16
   hold_escape_min_sec: 0.35
-  hold_bypass_sources: ["BACKEND"]
+  hold_bypass_sources:
+  - BACKEND
   hold_bypass_min_confidence: 0.55
-  hold_bypass_min_freshness: 0.20
+  hold_bypass_min_freshness: 0.2
   hold_bypass_min_confidence_map:
     LOOP: 0.45
-    BACKEND: 0.40
+    BACKEND: 0.4
   owner_require_apply_recent_enable: true
   owner_apply_recent_window_sec: 8.0
   owner_min_apply_recent_map:
@@ -955,7 +984,7 @@ yaw_authority:
     BACKEND: 0.18
     LOOP: 0.24
   request_alive_min_freshness_map:
-    BACKEND: 0.10
+    BACKEND: 0.1
     LOOP: 0.08
   yaw_budget_window_sec: 8.0
   yaw_budget_abs_deg: 12.0
@@ -964,7 +993,9 @@ yaw_authority:
   soft_only_high_speed_m_s: 20.0
   soft_only_unstable_pmax: 1.0e6
   soft_only_unstable_pcond: 1.0e12
-  soft_only_unstable_health: ["WARNING", "DEGRADED"]
+  soft_only_unstable_health:
+  - WARNING
+  - DEGRADED
   soft_only_max_dyaw_deg: 0.8
   soft_only_r_mult: 1.8
   source_priority:
@@ -1054,16 +1085,16 @@ vio:
     reproj_state_aware:
       degraded_scale: 1.35
       low_quality_reject: true
-      mid_gate_mult: 1.20
+      mid_gate_mult: 1.2
       quality_high_th: 0.75
       quality_low_th: 0.45
       warning_scale: 1.2
     stable_reproj_lane:
       enable: true
       min_obs: 8
-      cap_percentile: 0.80
+      cap_percentile: 0.8
       cap_max_mult: 1.08
-      max_borderline_ratio: 0.30
+      max_borderline_ratio: 0.3
       min_valid_obs_ratio: 0.58
       max_reduction: 0.08
     unstable_reproj_lane:
@@ -1083,18 +1114,18 @@ vio:
       reclassify_near_threshold_min_obs: 4
     track_pack:
       enable: true
-      min_inlier_ratio: 0.60
+      min_inlier_ratio: 0.6
       min_quality_median: 0.34
       recent_window: 6
       min_recent_inlier_ratio: 0.55
       max_tracks: 0
       min_parallax_px: 0.95
-      min_time_span_sec: 0.10
+      min_time_span_sec: 0.1
     pretri_geometry_gate:
       enable: true
       min_obs: 6
       min_parallax_px: 0.95
-      min_time_span_sec: 0.10
+      min_time_span_sec: 0.1
       min_quality: 0.34
       min_fail_signals: 3
     geometry_insufficient_reclass:
@@ -1102,14 +1133,14 @@ vio:
       reclassify_mult: 1.25
       max_valid_obs_ratio: 0.45
       max_track_obs: 8
-      parallax_mult: 1.10
+      parallax_mult: 1.1
     quality_gate:
       track_min: 10
-      inlier_min: 0.30
+      inlier_min: 0.3
       parallax_min_px: 1.2
       depth_positive_min: 0.62
-      depth_positive_min_floor_nadir: 0.30
-      depth_positive_track_relax_gain: 0.20
+      depth_positive_min_floor_nadir: 0.3
+      depth_positive_track_relax_gain: 0.2
       depth_positive_parallax_relax_gain: 0.14
       depth_positive_parallax_relax_cap_ratio: 2.0
       reproj_p95_max: 0.06
@@ -1125,7 +1156,7 @@ vio:
       max_cycles: 2
       sparse_track_max_obs: 6
       min_parallax_px: 1.15
-      min_time_span_sec: 0.10
+      min_time_span_sec: 0.1
       posttri_defer_enable: true
       posttri_max_cycles: 1
       posttri_recover_enable: true
@@ -1133,7 +1164,21 @@ vio:
       posttri_recover_min_obs: 5
       posttri_recover_min_parallax_px: 1.15
       posttri_recover_min_quality: 0.34
+      posttri_recover_depth_same_cycle_enable: false
+      posttri_recover_protect_enable: false
+      posttri_recover_protect_cycles: 2
       posttri_recover_max_depth_dom_ratio: 0.45
+      posttri_recover_depth_gate_enable: true
+      posttri_recover_depth_soft_accept_enable: false
+      posttri_recover_depth_soft_depth_ratio: 0.72
+      posttri_recover_depth_soft_max_promote: 2
+      posttri_recover_depth_soft_error_mult: 1.15
+      posttri_recover_depth_full_rescue_enable: false
+      posttri_recover_depth_bounded_relax_enable: false
+      posttri_recover_depth_gate_override_enable: false
+      posttri_recover_depth_bounded_relax_obs_delta: 1
+      posttri_recover_depth_bounded_relax_parallax_mult: 0.88
+      posttri_recover_depth_bounded_relax_quality_delta: 0.03
     depthsign_gate:
       unstable_enable: true
       unstable_quality_th: 0.38
@@ -1141,21 +1186,18 @@ vio:
       unstable_min_depth_floor_m: 0.015
       unstable_relax_min_depth_enable: false
       unstable_reclassify_enable: true
-      unstable_reclassify_dom_ratio_th: 0.70
-      init_recover_enable: false
-      init_recover_min_depth_m: 0.005
-      init_recover_min_parallax_mult: 1.0
-      init_recover_min_quality: 0.30
-      support_rescue_enable: false
-      support_rescue_min_valid_obs: 2
-      support_rescue_min_parallax_px: 1.2
-      support_rescue_min_quality: 0.34
-      support_rescue_max_reproj_to_gate: 1.02
+      unstable_reclassify_dom_ratio_th: 0.7
       sparse_recover_enable: true
       sparse_recover_min_obs: 5
       sparse_recover_min_parallax_px: 1.15
       sparse_recover_min_quality: 0.34
       sparse_recover_min_depth_dom_ratio: 0.55
+      init_recover_enable: true
+      init_recover_min_obs: 5
+      init_recover_min_parallax_px: 0.8
+      init_recover_max_parallax_px: 1.2
+      init_recover_min_quality: 0.32
+      init_recover_min_depth_fail_ratio: 0.65
   frontend:
     max_track_history: 80
     max_total_tracks: 4500
@@ -1213,7 +1255,7 @@ vps:
   xy_drift_recovery_max_offset_m: 1800.0
   xy_drift_recovery_min_no_apply_sec: 5.0
   xy_drift_recovery_min_inliers: 6
-  xy_drift_recovery_min_confidence: 0.10
+  xy_drift_recovery_min_confidence: 0.1
   xy_drift_recovery_max_reproj_error: 1.6
   xy_drift_recovery_max_speed_m_s: 95.0
   xy_drift_recovery_r_mult: 2.8
@@ -1249,7 +1291,7 @@ vps:
     hint_score_th: 0.32
     consensus_weight: 0.35
     geometry_weight: 0.45
-    motion_weight: 0.20
+    motion_weight: 0.2
     motion_high_speed_m_s: 45.0
     motion_high_yawrate_deg_s: 55.0
     motion_consistency_enable: true
@@ -1257,7 +1299,7 @@ vps:
     motion_consistency_min_speed_m_s: 12.0
     motion_consistency_speed_full_m_s: 90.0
     motion_consistency_min_offset_m: 6.0
-    motion_consistency_ref_alpha: 0.30
+    motion_consistency_ref_alpha: 0.3
     motion_consistency_max_opposition_deg_low_speed: 120.0
     motion_consistency_max_opposition_deg_high_speed: 95.0
     motion_consistency_yaw_relax_start_deg_s: 35.0
@@ -1273,7 +1315,7 @@ vps:
     bounded_soft_high_speed_max_apply_dp_xy_m: 5.0
     bounded_soft_policy_hold_bypass_enable: true
     bounded_soft_policy_hold_bypass_min_no_apply_sec: 2.5
-    bounded_soft_policy_hold_bypass_min_score_th: 0.40
+    bounded_soft_policy_hold_bypass_min_score_th: 0.4
     bounded_soft_policy_hold_bypass_max_speed_m_s: 95.0
     bounded_soft_policy_hold_bypass_max_offset_m: 180.0
     bounded_soft_policy_hold_bypass_min_inliers: 5
@@ -1295,6 +1337,10 @@ vps:
     msckf_min_quality: 0.34
     msckf_unstable_apply_penalty: 0.06
     msckf_unstable_failsoft_th: 0.58
+    motion_consistency:
+      enable: true
+    bounded_soft:
+      enable: true
   position_first_direct_xy_enable: true
   position_first_direct_xy_min_interval_sec: 0.8
   position_first_direct_xy_max_apply_dp_xy_m: 32.0
@@ -1464,7 +1510,7 @@ vps:
     budget_escalator_trigger_streak: 3
     budget_escalator_max_level: 3
     budget_escalator_candidate_scale_step: 0.35
-    budget_escalator_time_scale_step: 0.40
+    budget_escalator_time_scale_step: 0.4
     budget_escalator_max_candidate_scale: 2.5
     budget_escalator_max_time_scale: 2.5
     budget_escalator_decay_successes: 2
@@ -1519,10 +1565,18 @@ runtime_control:
     warn_escalate_count: 3
     warn_only_warn_action: PASS
     warn_only_fail_action: PASS
-    warn_only_sensors: [MAG, FRAME]
-    audit_only_sensors: [KIN_GUARD]
+    warn_only_sensors:
+    - MAG
+    - FRAME
+    audit_only_sensors:
+    - KIN_GUARD
     hold_sec: 1.0
-    sensor_allowlist: [CAM, VPS, MAG, MSCKF, LOOP]
+    sensor_allowlist:
+    - CAM
+    - VPS
+    - MAG
+    - MSCKF
+    - LOOP
 memory:
   watchdog_enable: true
   check_interval_sec: 0.7

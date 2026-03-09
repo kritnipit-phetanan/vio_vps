@@ -39,11 +39,13 @@ DEFAULT_PHASE_SEQUENCE_STAGE_G_MAG = ["G5_MAG_SAFE", "G5_MAG_COND"]
 DEFAULT_PHASE_SEQUENCE_STAGE_YAW_AUTH = ["S1", "S2", "S3", "S4"]
 DEFAULT_PHASE_SEQUENCE_STAGE_H = ["H1", "H2", "H3", "G6_1", "G7_1", "G7_2"]
 DEFAULT_PHASE_SEQUENCE_STAGE_L = ["L1", "L2", "L3", "L4", "L5", "L6"]
+DEFAULT_PHASE_SEQUENCE_STAGE_C = ["C0", "C1", "C2", "C2H", "C3", "C4", "C5", "C6"]
 DEFAULT_PHASE_SEQUENCE = list(DEFAULT_PHASE_SEQUENCE_STAGE_A)
 # These phases may intentionally have no config delta but still must execute
 # to validate pass criteria against runtime outputs.
-FORCE_RUN_IF_NO_CHANGE = {"H1", "H2", "H3", "L6"}
+FORCE_RUN_IF_NO_CHANGE = {"H1", "H2", "H3", "L6", "C0", "C1", "C2", "C2H", "C6"}
 H_COMPARE_PHASES = {"H1", "H2", "H3"}
+C_COMPARE_PHASES = {"C3", "C4", "C4_2", "C4_3", "C5", "C6"}
 
 # One-knob assignments for Stage-A pre-backend tuning (Phase4-base roadmap).
 PHASE_ASSIGNMENTS: dict[str, dict[str, Any]] = {
@@ -283,6 +285,86 @@ PHASE_ASSIGNMENTS: dict[str, dict[str, Any]] = {
     },
     "L6": {
         # Cleanup check phase (logic-noise floor validation).
+    },
+    "C0": {
+        # Deterministic run control validation phase (no knob delta by design).
+    },
+    "C1": {
+        # Alignment lock validation phase (no knob delta by design).
+    },
+    "C2": {
+        # Core MSCKF stable/unstable deterministic lane (aligned with L2 defaults).
+        "vio.msckf.quality_gate.track_min": 10,
+        "vio.msckf.quality_gate.inlier_min": 0.30,
+        "vio.msckf.quality_gate.parallax_min_px": 1.2,
+        "vio.msckf.quality_gate.depth_positive_min": 0.62,
+        "vio.msckf.quality_gate.reproj_p95_max": 0.06,
+        "vio.msckf.retry_lane.posttri_recover_depth_same_cycle_enable": False,
+        "vio.msckf.retry_lane.posttri_recover_protect_enable": False,
+        "vio.msckf.retry_lane.posttri_recover_depth_soft_accept_enable": False,
+        "vio.msckf.retry_lane.posttri_recover_depth_full_rescue_enable": False,
+        "vio.msckf.retry_lane.posttri_recover_depth_bounded_relax_enable": False,
+        "vio.msckf.retry_lane.posttri_recover_depth_gate_override_enable": False,
+    },
+    "C2H": {
+        # C2 hardening: init-depth deterministic recover routing + bounded depth gate.
+        "vio.msckf.depthsign_gate.init_recover_enable": True,
+        "vio.msckf.depthsign_gate.init_recover_min_obs": 5,
+        "vio.msckf.depthsign_gate.init_recover_min_parallax_px": 0.80,
+        "vio.msckf.depthsign_gate.init_recover_max_parallax_px": 1.20,
+        "vio.msckf.depthsign_gate.init_recover_min_quality": 0.32,
+        "vio.msckf.depthsign_gate.init_recover_min_depth_fail_ratio": 0.65,
+        "vio.msckf.retry_lane.posttri_recover_depth_gate_enable": True,
+        "vio.msckf.retry_lane.posttri_recover_depth_same_cycle_enable": True,
+        "vio.msckf.retry_lane.posttri_recover_protect_enable": True,
+        "vio.msckf.retry_lane.posttri_recover_protect_cycles": 2,
+        "vio.msckf.retry_lane.posttri_recover_depth_soft_accept_enable": True,
+        "vio.msckf.retry_lane.posttri_recover_depth_full_rescue_enable": True,
+        "vio.msckf.retry_lane.posttri_recover_depth_bounded_relax_enable": True,
+        "vio.msckf.retry_lane.posttri_recover_depth_gate_override_enable": True,
+        "vio.msckf.retry_lane.posttri_recover_depth_bounded_relax_obs_delta": 1,
+        "vio.msckf.retry_lane.posttri_recover_depth_bounded_relax_parallax_mult": 0.88,
+        "vio.msckf.retry_lane.posttri_recover_depth_bounded_relax_quality_delta": 0.03,
+        "vio.msckf.retry_lane.posttri_recover_depth_soft_depth_ratio": 0.72,
+        "vio.msckf.retry_lane.posttri_recover_depth_soft_max_promote": 2,
+        "vio.msckf.retry_lane.posttri_recover_depth_soft_error_mult": 1.15,
+    },
+    "C3": {
+        # VPS quality-scored bounded apply (failsoft is not apply-default).
+        "vps.apply_gate.strict_score_th": 0.74,
+        "vps.apply_gate.failsoft_score_th": 0.54,
+        "vps.apply_gate.hint_score_th": 0.32,
+        "vps.apply_gate.failsoft_default_hint_only": True,
+        "vps.apply_gate.motion_consistency.enable": True,
+        "vps.apply_gate.bounded_soft.enable": True,
+        "vps.position_controller.force_failsoft_on_reject": False,
+    },
+    "C4": {
+        # Option3 X2.1 practical (trajectory-safe): energy shaping, not threshold hardening.
+        "backend.switchable_constraints.residual_xy_m": 10.0,
+    },
+    "C4_2": {
+        # C4.2 fallback knob: cap correction energy per apply step.
+        "backend.correction_blend.max_step_dp_xy_m": 4.5,
+    },
+    "C4_3": {
+        # C4.3 fallback knob: raise switchable low-tail floor.
+        "backend.switchable_constraints.min_weight": 0.20,
+    },
+    "C5": {
+        # Option3 X2.2 + X3 strict contract.
+        "backend.hybrid_factor_lite.use_vps_yaw": True,
+        "backend.hybrid_factor_lite.vps_yaw_quality_floor": 0.45,
+        "backend.hybrid_factor_lite.vps_yaw_cap_deg": 1.5,
+        "backend.contract_v1.strict_require_version": True,
+        "backend.contract_v1.expected_version": "v1",
+        "backend.contract_v1.strict_require_source_mix": True,
+        "backend.contract_v1.strict_require_residual_summary": True,
+        "backend.kinematic_consistency.enable": True,
+        "backend.kinematic_consistency.min_cos": -0.10,
+    },
+    "C6": {
+        # Anti-tangle cleanup verification phase (no knob delta by design).
     },
 }
 
@@ -690,6 +772,8 @@ def evaluate_lock_profile(run_dir: Path | None, profile_name: str) -> tuple[bool
     backend_contract_violation_count = _to_float(row, "backend_contract_violation_count")
     backend_stale_drop_count = _to_float(row, "backend_stale_drop_count")
     backend_poll_count = _to_float(row, "backend_poll_count")
+    backend_apply_count = _to_float(row, "backend_apply_count")
+    backend_snap_reject_count = _to_float(row, "backend_snap_reject_count")
     policy_conflict_count = _to_float(row, "policy_conflict_count")
     err3d_mean = read_err3d_mean(run_dir)
     err3d_final = read_err3d_final(run_dir)
@@ -874,6 +958,9 @@ def evaluate_lock_profile(run_dir: Path | None, profile_name: str) -> tuple[bool
         "vps_failsoft_apply_ratio": failsoft_apply_ratio,
         "vps_jump_reject_ratio": jump_ratio,
         "backend_stale_drop_ratio": stale_ratio,
+        "backend_stale_ratio": stale_ratio,
+        "backend_apply_count": backend_apply_count,
+        "backend_snap_reject_count": backend_snap_reject_count,
         "backend_contract_violation_count": backend_contract_violation_count,
         "reproj_fail_rate_per_attempt": reproj_fail_rate_per_attempt,
         "policy_conflict_count": policy_conflict_count,
@@ -889,6 +976,15 @@ def _pct_delta_abs(cur: float, base: float) -> float:
     if abs(base) <= 1e-12:
         return float("nan")
     return float(abs(cur - base) / abs(base) * 100.0)
+
+
+def _pct_improve(cur: float, base: float) -> float:
+    """Positive means improvement (lower is better metrics)."""
+    if not (np.isfinite(cur) and np.isfinite(base)):
+        return float("nan")
+    if abs(base) <= 1e-12:
+        return float("nan")
+    return float((base - cur) / abs(base) * 100.0)
 
 
 def evaluate_h_phase(
@@ -1125,6 +1221,201 @@ def evaluate_h_phase(
     return len(failed_items) == 0, detail
 
 
+def evaluate_c_phase(
+    phase: str,
+    run_dir: Path | None,
+    c_reference_run: Path | None,
+) -> tuple[bool, dict[str, Any]]:
+    """Phase-specific compare checks for C3/C4/C5/C6."""
+    phase_u = str(phase).upper()
+    row = read_health_row(run_dir)
+    cur_metrics = read_heading_metrics(run_dir)
+    cur_err3d_mean = read_err3d_mean(run_dir)
+    cur_err3d_final = read_err3d_final(run_dir)
+    cur_vps_used = parse_vps_used((run_dir / "run.log") if run_dir else Path(""))
+
+    def _from_row(key: str) -> float:
+        return _to_float(row, key) if row is not None else float("nan")
+
+    cur_abs_corr_apply = _from_row("abs_corr_apply_count")
+    cur_failsoft_ratio = _from_row("vps_failsoft_apply_ratio")
+    cur_backend_apply_count = _from_row("backend_apply_count")
+    cur_backend_stale_ratio = _from_row("backend_stale_ratio")
+    if not np.isfinite(cur_backend_stale_ratio):
+        stale_drop = _from_row("backend_stale_drop_count")
+        poll_count = _from_row("backend_poll_count")
+        if np.isfinite(stale_drop) and np.isfinite(poll_count) and poll_count > 0:
+            cur_backend_stale_ratio = float(stale_drop / poll_count)
+    cur_backend_contract_violation = _from_row("backend_contract_violation_count")
+    cur_backend_snap_reject_count = _from_row("backend_snap_reject_count")
+    cur_cov_large = _from_row("cov_large_rate")
+    cur_pmax_max = _from_row("pmax_max")
+    cur_policy_conflict = _from_row("policy_conflict_count")
+
+    if c_reference_run is None:
+        return False, {
+            "failed_items": ["missing_c_reference_run"],
+            "checks": [("c_reference_run exists", False, "value=None")],
+        }
+
+    ref_row = read_health_row(c_reference_run)
+    ref_err3d_mean = read_err3d_mean(c_reference_run)
+    ref_err3d_final = read_err3d_final(c_reference_run)
+    ref_abs_corr_apply = _to_float(ref_row, "abs_corr_apply_count") if ref_row is not None else float("nan")
+
+    checks: list[tuple[str, bool, str]] = []
+    checks.append(
+        (
+            "cov_large_rate == 0",
+            bool(np.isfinite(cur_cov_large) and abs(cur_cov_large) <= 1e-12),
+            f"value={cur_cov_large:.6f}" if np.isfinite(cur_cov_large) else "value=nan",
+        )
+    )
+    checks.append(
+        (
+            "pmax_max <= 1e6",
+            bool(np.isfinite(cur_pmax_max) and cur_pmax_max <= 1.0e6),
+            f"value={cur_pmax_max:.3e}" if np.isfinite(cur_pmax_max) else "value=nan",
+        )
+    )
+    checks.append(
+        (
+            "policy_conflict_count == 0",
+            bool(np.isfinite(cur_policy_conflict) and abs(cur_policy_conflict) <= 1e-12),
+            f"value={cur_policy_conflict:.0f}" if np.isfinite(cur_policy_conflict) else "value=nan",
+        )
+    )
+    checks.append(
+        (
+            "backend_contract_violation_count == 0",
+            bool(np.isfinite(cur_backend_contract_violation) and abs(cur_backend_contract_violation) <= 1e-12),
+            (
+                f"value={cur_backend_contract_violation:.0f}"
+                if np.isfinite(cur_backend_contract_violation)
+                else "value=nan"
+            ),
+        )
+    )
+
+    if phase_u == "C3":
+        improve_final = _pct_improve(cur_err3d_final, ref_err3d_final)
+        checks.extend(
+            [
+                (
+                    "0.10 <= vps_failsoft_apply_ratio <= 0.35",
+                    bool(np.isfinite(cur_failsoft_ratio) and 0.10 <= cur_failsoft_ratio <= 0.35),
+                    f"value={cur_failsoft_ratio:.4f}" if np.isfinite(cur_failsoft_ratio) else "value=nan",
+                ),
+                (
+                    "abs_corr_apply_count >= 20",
+                    bool(np.isfinite(cur_abs_corr_apply) and cur_abs_corr_apply >= 20.0),
+                    f"value={cur_abs_corr_apply:.0f}" if np.isfinite(cur_abs_corr_apply) else "value=nan",
+                ),
+                (
+                    "vps_used >= 20",
+                    bool(np.isfinite(cur_vps_used) and cur_vps_used >= 20.0),
+                    f"value={cur_vps_used:.0f}" if np.isfinite(cur_vps_used) else "value=nan",
+                ),
+                (
+                    f"err3d_final improved >= 10% vs {c_reference_run.name}",
+                    bool(np.isfinite(improve_final) and improve_final >= 10.0),
+                    f"improve={improve_final:.2f}%",
+                ),
+            ]
+        )
+    elif phase_u in {"C4", "C4_2", "C4_3"}:
+        improve_mean = _pct_improve(cur_err3d_mean, ref_err3d_mean)
+        checks.extend(
+            [
+                (
+                    "backend_apply_count >= 25",
+                    bool(np.isfinite(cur_backend_apply_count) and cur_backend_apply_count >= 25.0),
+                    f"value={cur_backend_apply_count:.0f}" if np.isfinite(cur_backend_apply_count) else "value=nan",
+                ),
+                (
+                    "backend_stale_ratio <= 0.015",
+                    bool(np.isfinite(cur_backend_stale_ratio) and cur_backend_stale_ratio <= 0.015),
+                    (
+                        f"value={cur_backend_stale_ratio:.6f}"
+                        if np.isfinite(cur_backend_stale_ratio)
+                        else "value=nan"
+                    ),
+                ),
+                (
+                    f"err3d_mean improved >= 10% vs {c_reference_run.name}",
+                    bool(np.isfinite(improve_mean) and improve_mean >= 10.0),
+                    f"improve={improve_mean:.2f}%",
+                ),
+            ]
+        )
+    elif phase_u == "C5":
+        improve_final = _pct_improve(cur_err3d_final, ref_err3d_final)
+        checks.extend(
+            [
+                (
+                    "backend_snap_reject_count == 0",
+                    bool(np.isfinite(cur_backend_snap_reject_count) and abs(cur_backend_snap_reject_count) <= 1e-12),
+                    (
+                        f"value={cur_backend_snap_reject_count:.0f}"
+                        if np.isfinite(cur_backend_snap_reject_count)
+                        else "value=nan"
+                    ),
+                ),
+                (
+                    f"err3d_final improved >= 10% vs {c_reference_run.name}",
+                    bool(np.isfinite(improve_final) and improve_final >= 10.0),
+                    f"improve={improve_final:.2f}%",
+                ),
+            ]
+        )
+    elif phase_u == "C6":
+        drift_mean = _pct_delta_abs(cur_err3d_mean, ref_err3d_mean)
+        drift_final = _pct_delta_abs(cur_err3d_final, ref_err3d_final)
+        drift_apply = _pct_delta_abs(cur_abs_corr_apply, ref_abs_corr_apply)
+        checks.extend(
+            [
+                (
+                    f"err3d_mean drift <= 3% vs {c_reference_run.name}",
+                    bool(np.isfinite(drift_mean) and drift_mean <= 3.0),
+                    f"delta={drift_mean:.2f}%",
+                ),
+                (
+                    f"err3d_final drift <= 3% vs {c_reference_run.name}",
+                    bool(np.isfinite(drift_final) and drift_final <= 3.0),
+                    f"delta={drift_final:.2f}%",
+                ),
+                (
+                    f"abs_corr_apply_count drift <= 3% vs {c_reference_run.name}",
+                    bool(np.isfinite(drift_apply) and drift_apply <= 3.0),
+                    f"delta={drift_apply:.2f}%",
+                ),
+            ]
+        )
+    else:
+        checks.append(("known C phase", False, f"phase={phase_u}"))
+
+    failed_items = [name for name, ok, _ in checks if not ok]
+    detail = {
+        "checks": checks,
+        "failed_items": failed_items,
+        "profile_name": "c_compare",
+        "heading_final_abs_deg": float(cur_metrics.get("heading_final_abs_deg", float("nan"))),
+        "heading_mae_deg": float(cur_metrics.get("heading_mae_deg", float("nan"))),
+        "heading_p95_abs_deg": float(cur_metrics.get("heading_p95_abs_deg", float("nan"))),
+        "spike_rate_abs_err_gt30_deg": float(cur_metrics.get("spike_rate_abs_err_gt30_deg", float("nan"))),
+        "err3d_mean": float(cur_err3d_mean),
+        "err3d_final": float(cur_err3d_final),
+        "vps_used": float(cur_vps_used),
+        "abs_corr_apply_count": float(cur_abs_corr_apply),
+        "vps_failsoft_apply_ratio": float(cur_failsoft_ratio),
+        "backend_apply_count": float(cur_backend_apply_count),
+        "backend_stale_ratio": float(cur_backend_stale_ratio),
+        "backend_snap_reject_count": float(cur_backend_snap_reject_count),
+        "backend_contract_violation_count": float(cur_backend_contract_violation),
+    }
+    return len(failed_items) == 0, detail
+
+
 def classify_rtf_pass_tier(rtf_proc_sim: float) -> str:
     """Classify runtime tier for near-RT tracking dashboards."""
     if not np.isfinite(rtf_proc_sim):
@@ -1141,7 +1432,14 @@ def classify_rtf_pass_tier(rtf_proc_sim: float) -> str:
 def save_phase_results(path: Path, rows: list[dict[str, Any]]) -> None:
     if not rows:
         return
-    keys = list(rows[0].keys())
+    keys: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        for k in row.keys():
+            if k in seen:
+                continue
+            seen.add(k)
+            keys.append(k)
     with path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=keys)
         writer.writeheader()
@@ -1205,7 +1503,19 @@ def main() -> int:
     parser.add_argument(
         "--phase_set",
         default="stageA",
-        choices=["stageA", "stageE", "stageF", "stageG", "stageG_cont", "stageG_mag", "stageYawAuth", "stageH", "stageL", "custom"],
+        choices=[
+            "stageA",
+            "stageE",
+            "stageF",
+            "stageG",
+            "stageG_cont",
+            "stageG_mag",
+            "stageYawAuth",
+            "stageH",
+            "stageL",
+            "stageC",
+            "custom",
+        ],
     )
     parser.add_argument("--phases", default="")
     parser.add_argument("--dry_run", action="store_true", help="Plan and emit phase table without running benchmarks")
@@ -1262,6 +1572,8 @@ def main() -> int:
         default_phases = DEFAULT_PHASE_SEQUENCE_STAGE_H
     elif args.phase_set == "stageL":
         default_phases = DEFAULT_PHASE_SEQUENCE_STAGE_L
+    elif args.phase_set == "stageC":
+        default_phases = DEFAULT_PHASE_SEQUENCE_STAGE_C
     else:
         default_phases = DEFAULT_PHASE_SEQUENCE
     phases_raw = args.phases if str(args.phases).strip() else ",".join(default_phases)
@@ -1284,6 +1596,7 @@ def main() -> int:
     cfg_by_run: dict[str, dict[str, Any]] = {}
     rows: list[dict[str, Any]] = []
     h2_reference_run: Path | None = None
+    c_reference_run: Path | None = baseline_run
 
     for phase in phases:
         print(f"\n================ Phase {phase} ================")
@@ -1297,6 +1610,48 @@ def main() -> int:
                 print(f"    - {ck}")
         else:
             print("  changed keys (0): phase is already at target values")
+
+        phase_noop_guard_status = "OK"
+        if not changed_keys and phase in C_COMPARE_PHASES and not args.force_run_noop:
+            phase_noop_guard_status = "NOOP_FAIL"
+            rows.append(
+                {
+                    "phase": phase,
+                    "profile_name": args.lock_profile,
+                    "status": "FAIL",
+                    "reason": "noop_phase_no_delta",
+                    "lock_failed_items": "phase_requires_delta",
+                    "run_dir": "",
+                    "returncode": 0,
+                    "err3d_mean": baseline_err,
+                    "err3d_baseline": baseline_err,
+                    "err3d_delta_pct": 0.0,
+                    "locks_ok": False,
+                    "vps_used": np.nan,
+                    "heading_final_abs_deg": np.nan,
+                    "heading_mae_deg": np.nan,
+                    "heading_p95_abs_deg": np.nan,
+                    "spike_rate_abs_err_gt30_deg": np.nan,
+                    "mag_cholfail_rate": np.nan,
+                    "cov_large_rate": np.nan,
+                    "pmax_max": np.nan,
+                    "overflow_hits": np.nan,
+                    "reproj_fail_rate_per_attempt": np.nan,
+                    "rtf_proc_sim": np.nan,
+                    "rtf_pass_tier": "nan",
+                    "decision_mode": "noop_guard",
+                    "compare_ok": False,
+                    "compare_failed_items": "phase_requires_delta",
+                    "backend_locks_ok": np.nan,
+                    "backend_lock_failed_items": "",
+                    "h_reference_run": "",
+                    "phase_noop_guard_status": phase_noop_guard_status,
+                    "changed_key_count": 0,
+                    "changed_keys": "",
+                }
+            )
+            print(f"[Phase {phase}] NOOP_FAIL: changed_key_count=0 (phase requires one-knob delta)")
+            continue
 
         force_run_no_change = (phase in FORCE_RUN_IF_NO_CHANGE)
         if not changed_keys and force_run_no_change:
@@ -1334,6 +1689,7 @@ def main() -> int:
                     "backend_locks_ok": np.nan,
                     "backend_lock_failed_items": "",
                     "h_reference_run": "",
+                    "phase_noop_guard_status": phase_noop_guard_status,
                     "changed_key_count": 0,
                     "changed_keys": "",
                 }
@@ -1373,6 +1729,7 @@ def main() -> int:
                     "backend_locks_ok": np.nan,
                     "backend_lock_failed_items": "",
                     "h_reference_run": "",
+                    "phase_noop_guard_status": phase_noop_guard_status,
                     "changed_key_count": len(changed_keys),
                     "changed_keys": "|".join(changed_keys),
                 }
@@ -1424,6 +1781,7 @@ def main() -> int:
                     "backend_locks_ok": np.nan,
                     "backend_lock_failed_items": "",
                     "h_reference_run": "",
+                    "phase_noop_guard_status": phase_noop_guard_status,
                     "changed_key_count": len(changed_keys),
                     "changed_keys": "|".join(changed_keys),
                 }
@@ -1444,6 +1802,7 @@ def main() -> int:
 
         backend_locks_ok, backend_lock_detail = evaluate_lock_profile(run_dir, args.lock_profile)
         use_h_compare = bool(int(args.h_compare_focused) == 1 and phase in H_COMPARE_PHASES)
+        use_c_compare = bool(phase in C_COMPARE_PHASES)
         compare_ok = np.nan
         compare_detail: dict[str, Any] = {}
         locks_ok = backend_locks_ok
@@ -1464,6 +1823,17 @@ def main() -> int:
                 h_reference_run = str(compare_detail.get("h3_ref_run", "") or "")
             elif heading_recovery_baseline is not None:
                 h_reference_run = str(heading_recovery_baseline)
+        elif use_c_compare:
+            compare_ok, compare_detail = evaluate_c_phase(
+                phase=phase,
+                run_dir=run_dir,
+                c_reference_run=c_reference_run,
+            )
+            locks_ok = bool(compare_ok)
+            lock_detail = compare_detail
+            regress_fail = False  # C3-C6 use phase-specific compare criteria.
+            if c_reference_run is not None:
+                h_reference_run = str(c_reference_run)
 
         phase_ok = bool(ret == 0 and locks_ok and not regress_fail and np.isfinite(err_cur))
         reason = []
@@ -1517,14 +1887,39 @@ def main() -> int:
                 "reproj_fail_rate_per_attempt",
                 np.nan,
             ),
+            "backend_apply_count": lock_detail.get(
+                "backend_apply_count",
+                backend_lock_detail.get("backend_apply_count", np.nan),
+            ),
+            "backend_stale_ratio": lock_detail.get(
+                "backend_stale_ratio",
+                backend_lock_detail.get("backend_stale_ratio", np.nan),
+            ),
+            "backend_snap_reject_count": lock_detail.get(
+                "backend_snap_reject_count",
+                backend_lock_detail.get("backend_snap_reject_count", np.nan),
+            ),
+            "backend_contract_violation_count": lock_detail.get(
+                "backend_contract_violation_count",
+                backend_lock_detail.get("backend_contract_violation_count", np.nan),
+            ),
             "rtf_proc_sim": backend_lock_detail.get("rtf_proc_sim", np.nan),
             "rtf_pass_tier": classify_rtf_pass_tier(float(backend_lock_detail.get("rtf_proc_sim", np.nan))),
-            "decision_mode": "h_compare_focused" if use_h_compare else "lock_profile",
-            "compare_ok": compare_ok,
-            "compare_failed_items": "|".join(compare_detail.get("failed_items", [])) if use_h_compare else "",
+            "decision_mode": (
+                "h_compare_focused"
+                if use_h_compare
+                else ("c_compare_focused" if use_c_compare else "lock_profile")
+            ),
+            "compare_ok": compare_ok if (use_h_compare or use_c_compare) else np.nan,
+            "compare_failed_items": (
+                "|".join(compare_detail.get("failed_items", []))
+                if (use_h_compare or use_c_compare)
+                else ""
+            ),
             "backend_locks_ok": backend_locks_ok,
             "backend_lock_failed_items": "|".join(backend_lock_detail.get("failed_items", [])),
             "h_reference_run": h_reference_run,
+            "phase_noop_guard_status": phase_noop_guard_status,
             "changed_key_count": len(changed_keys),
             "changed_keys": "|".join(changed_keys),
         }
@@ -1536,6 +1931,8 @@ def main() -> int:
             baseline_err = err_cur
             if phase == "H2":
                 h2_reference_run = run_dir
+            if phase in C_COMPARE_PHASES:
+                c_reference_run = run_dir
             print(f"[Phase {phase}] PASS -> new baseline: {run_dir} (err3d_mean={err_cur:.3f} m)")
         else:
             print(f"[Phase {phase}] ROLLBACK ({reason_text})")

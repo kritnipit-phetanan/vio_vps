@@ -603,12 +603,27 @@ class BackendOptimizer:
             self.stats["last_switch_weight_max"] = float(np.max(switch_w)) if switch_w.size else 1.0
             self.stats["last_hint_count"] = int(len(win_hints))
 
+        xy_res_all = np.linalg.norm(dp_stack[:, :2] - dp_est[:2].reshape(1, 2), axis=1)
+        yaw_res_all = np.array(
+            [abs(_wrap_angle_deg(float(dy) - float(dyaw_est))) for dy in dyaw_arr],
+            dtype=float,
+        )
+        residual_xy_p50 = float(np.percentile(xy_res_all, 50)) if xy_res_all.size > 0 else 0.0
+        residual_xy_p95 = float(np.percentile(xy_res_all, 95)) if xy_res_all.size > 0 else 0.0
+        residual_yaw_p50 = float(np.percentile(yaw_res_all, 50)) if yaw_res_all.size > 0 else 0.0
+        residual_yaw_p95 = float(np.percentile(yaw_res_all, 95)) if yaw_res_all.size > 0 else 0.0
+
         cov_scale = float(np.clip(1.0 + 0.6 * (1.0 - q_est), 1.0, 1.8))
         residual_summary = {
             "hint_count": float(len(win_hints)),
             "switch_weight_mean": float(np.mean(switch_w)) if switch_w.size else 1.0,
             "switch_weight_min": float(np.min(switch_w)) if switch_w.size else 1.0,
             "switch_weight_max": float(np.max(switch_w)) if switch_w.size else 1.0,
+            "residual_xy_mean": float(np.mean(xy_res_all)) if xy_res_all.size > 0 else 0.0,
+            "residual_xy_p50": residual_xy_p50,
+            "residual_xy_p95": residual_xy_p95,
+            "residual_yaw_p50": residual_yaw_p50,
+            "residual_yaw_p95": residual_yaw_p95,
         }
         return BackendCorrection(
             t_ref=float(t_max),

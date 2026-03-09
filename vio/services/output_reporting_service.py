@@ -885,6 +885,39 @@ class OutputReportingService:
         msckf_quality_p50 = float("nan")
         msckf_quality_p10 = float("nan")
         msckf_stable_geometry_ratio = float("nan")
+        msckf_depth_total_fail = float("nan")
+        msckf_fail_depth_sign_init = float("nan")
+        msckf_fail_depth_sign_post_refine = float("nan")
+        msckf_fail_depth_large = float("nan")
+        msckf_fail_depth_sparse_recoverable = float("nan")
+        msckf_posttri_retry_recover_depth_defer_count = float("nan")
+        msckf_posttri_retry_recover_depth_success_count = float("nan")
+        msckf_depth_init_candidate_count = float("nan")
+        msckf_depth_init_routed_count = float("nan")
+        msckf_posttri_retry_recover_depth_gate_reject_count = float("nan")
+        msckf_posttri_retry_recover_depth_soft_accept_count = float("nan")
+        msckf_posttri_retry_recover_depth_retry_seen_count = float("nan")
+        msckf_posttri_retry_recover_depth_same_cycle_attempt_count = float("nan")
+        msckf_posttri_retry_recover_depth_same_cycle_success_count = float("nan")
+        msckf_posttri_retry_recover_depth_same_cycle_entered_count = float("nan")
+        msckf_posttri_retry_recover_depth_same_cycle_fail_depth_count = float("nan")
+        msckf_posttri_retry_recover_depth_same_cycle_fail_reproj_count = float("nan")
+        msckf_posttri_retry_recover_depth_same_cycle_fail_geometry_count = float("nan")
+        msckf_posttri_retry_recover_depth_same_cycle_fail_nonlinear_count = float("nan")
+        msckf_posttri_retry_recover_depth_same_cycle_fail_other_count = float("nan")
+        msckf_posttri_retry_recover_depth_borderline_promote_count = float("nan")
+        msckf_posttri_retry_recover_depth_protected_added_count = float("nan")
+        msckf_posttri_retry_recover_depth_protected_carried_count = float("nan")
+        msckf_posttri_retry_recover_depth_protected_truncated_count = float("nan")
+        msckf_posttri_retry_recover_depth_protected_missing_clone_count = float("nan")
+        msckf_posttri_retry_recover_depth_protected_source_missing_count = float("nan")
+        msckf_posttri_retry_recover_depth_protected_depth_gate_again_count = float("nan")
+        msckf_posttri_retry_recover_depth_relaxed_gate_used_count = float("nan")
+        msckf_posttri_retry_recover_depth_fail_depth_count = float("nan")
+        msckf_posttri_retry_recover_depth_fail_reproj_count = float("nan")
+        msckf_posttri_retry_recover_depth_fail_geometry_count = float("nan")
+        msckf_posttri_retry_recover_depth_fail_nonlinear_count = float("nan")
+        msckf_posttri_retry_recover_depth_fail_other_count = float("nan")
         msckf_reclass_to_geometry_count = float("nan")
         msckf_unstable_lane_count = float("nan")
         msckf_stable_lane_used_count = float("nan")
@@ -913,6 +946,100 @@ class OutputReportingService:
             )
             if np.isfinite(denom_attempt) and denom_attempt > 0.0 and np.isfinite(msckf_fail_reproj):
                 reproj_fail_rate_per_attempt = float(msckf_fail_reproj / denom_attempt)
+            msckf_fail_depth_sign_init = float(MSCKF_STATS.get("fail_depth_sign_init", np.nan))
+            msckf_fail_depth_sign_post_refine = float(MSCKF_STATS.get("fail_depth_sign_post_refine", np.nan))
+            msckf_fail_depth_large = float(MSCKF_STATS.get("fail_depth_large", np.nan))
+            if np.isfinite(msckf_fail_depth_sign_init) and np.isfinite(msckf_fail_depth_sign_post_refine) and np.isfinite(msckf_fail_depth_large):
+                msckf_depth_total_fail = float(
+                    msckf_fail_depth_sign_init + msckf_fail_depth_sign_post_refine + msckf_fail_depth_large
+                )
+            msckf_fail_depth_sparse_recoverable = float(
+                MSCKF_STATS.get("fail_depth_sparse_recoverable", np.nan)
+            )
+            msckf_posttri_retry_recover_depth_defer_count = float(
+                MSCKF_STATS.get("posttri_retry_recover_depth_defer_count", np.nan)
+            )
+            msckf_posttri_retry_recover_depth_success_count = float(
+                MSCKF_STATS.get("posttri_retry_recover_depth_success_count", np.nan)
+            )
+            msckf_depth_init_candidate_count = float(
+                MSCKF_STATS.get("depth_init_candidate_count", np.nan)
+            )
+            msckf_depth_init_routed_count = float(
+                MSCKF_STATS.get("depth_init_routed_count", np.nan)
+            )
+            msckf_posttri_retry_recover_depth_gate_reject_count = float(
+                MSCKF_STATS.get("posttri_retry_recover_depth_gate_reject_count", np.nan)
+            )
+            msckf_posttri_retry_recover_depth_soft_accept_count = float(
+                MSCKF_STATS.get("posttri_retry_recover_depth_soft_accept_count", np.nan)
+            )
+            msckf_posttri_retry_recover_depth_retry_seen_count = float(
+                MSCKF_STATS.get("posttri_retry_recover_depth_retry_seen_count", np.nan)
+            )
+            msckf_posttri_retry_recover_depth_same_cycle_attempt_count = float(
+                MSCKF_STATS.get("posttri_retry_recover_depth_same_cycle_attempt_count", np.nan)
+            )
+            msckf_posttri_retry_recover_depth_same_cycle_success_count = float(
+                MSCKF_STATS.get("posttri_retry_recover_depth_same_cycle_success_count", np.nan)
+            )
+            msckf_posttri_retry_recover_depth_same_cycle_entered_count = float(
+                MSCKF_STATS.get("posttri_retry_recover_depth_same_cycle_entered_count", np.nan)
+            )
+            msckf_posttri_retry_recover_depth_same_cycle_fail_depth_count = float(
+                MSCKF_STATS.get("posttri_retry_recover_depth_same_cycle_fail_depth_count", np.nan)
+            )
+            msckf_posttri_retry_recover_depth_same_cycle_fail_reproj_count = float(
+                MSCKF_STATS.get("posttri_retry_recover_depth_same_cycle_fail_reproj_count", np.nan)
+            )
+            msckf_posttri_retry_recover_depth_same_cycle_fail_geometry_count = float(
+                MSCKF_STATS.get("posttri_retry_recover_depth_same_cycle_fail_geometry_count", np.nan)
+            )
+            msckf_posttri_retry_recover_depth_same_cycle_fail_nonlinear_count = float(
+                MSCKF_STATS.get("posttri_retry_recover_depth_same_cycle_fail_nonlinear_count", np.nan)
+            )
+            msckf_posttri_retry_recover_depth_same_cycle_fail_other_count = float(
+                MSCKF_STATS.get("posttri_retry_recover_depth_same_cycle_fail_other_count", np.nan)
+            )
+            msckf_posttri_retry_recover_depth_borderline_promote_count = float(
+                MSCKF_STATS.get("posttri_retry_recover_depth_borderline_promote_count", np.nan)
+            )
+            msckf_posttri_retry_recover_depth_protected_added_count = float(
+                MSCKF_STATS.get("posttri_retry_recover_depth_protected_added_count", np.nan)
+            )
+            msckf_posttri_retry_recover_depth_protected_carried_count = float(
+                MSCKF_STATS.get("posttri_retry_recover_depth_protected_carried_count", np.nan)
+            )
+            msckf_posttri_retry_recover_depth_protected_truncated_count = float(
+                MSCKF_STATS.get("posttri_retry_recover_depth_protected_truncated_count", np.nan)
+            )
+            msckf_posttri_retry_recover_depth_protected_missing_clone_count = float(
+                MSCKF_STATS.get("posttri_retry_recover_depth_protected_missing_clone_count", np.nan)
+            )
+            msckf_posttri_retry_recover_depth_protected_source_missing_count = float(
+                MSCKF_STATS.get("posttri_retry_recover_depth_protected_source_missing_count", np.nan)
+            )
+            msckf_posttri_retry_recover_depth_protected_depth_gate_again_count = float(
+                MSCKF_STATS.get("posttri_retry_recover_depth_protected_depth_gate_again_count", np.nan)
+            )
+            msckf_posttri_retry_recover_depth_relaxed_gate_used_count = float(
+                MSCKF_STATS.get("posttri_retry_recover_depth_relaxed_gate_used_count", np.nan)
+            )
+            msckf_posttri_retry_recover_depth_fail_depth_count = float(
+                MSCKF_STATS.get("posttri_retry_recover_depth_fail_depth_count", np.nan)
+            )
+            msckf_posttri_retry_recover_depth_fail_reproj_count = float(
+                MSCKF_STATS.get("posttri_retry_recover_depth_fail_reproj_count", np.nan)
+            )
+            msckf_posttri_retry_recover_depth_fail_geometry_count = float(
+                MSCKF_STATS.get("posttri_retry_recover_depth_fail_geometry_count", np.nan)
+            )
+            msckf_posttri_retry_recover_depth_fail_nonlinear_count = float(
+                MSCKF_STATS.get("posttri_retry_recover_depth_fail_nonlinear_count", np.nan)
+            )
+            msckf_posttri_retry_recover_depth_fail_other_count = float(
+                MSCKF_STATS.get("posttri_retry_recover_depth_fail_other_count", np.nan)
+            )
             msckf_reclass_to_geometry_count = float(
                 MSCKF_STATS.get("reclass_to_geometry_count", np.nan)
             )
@@ -961,6 +1088,10 @@ class OutputReportingService:
         if np.isfinite(backend_emit_count) and backend_emit_count > 0 and np.isfinite(backend_apply_count):
             backend_emit_to_apply_ratio = float(backend_apply_count / backend_emit_count)
         backend_apply_quality_p50 = float("nan")
+        backend_apply_dp_xy_p50 = float("nan")
+        backend_apply_dp_xy_p95 = float("nan")
+        backend_apply_residual_xy_p50 = float("nan")
+        backend_apply_residual_xy_p95 = float("nan")
         try:
             q_hist = np.asarray(getattr(self.runner, "_backend_apply_quality_history", []), dtype=float)
             q_hist = q_hist[np.isfinite(q_hist)]
@@ -968,7 +1099,24 @@ class OutputReportingService:
                 backend_apply_quality_p50 = float(np.percentile(q_hist, 50))
         except Exception:
             pass
+        try:
+            dp_hist = np.asarray(getattr(self.runner, "_backend_apply_dp_xy_history", []), dtype=float)
+            dp_hist = dp_hist[np.isfinite(dp_hist)]
+            if dp_hist.size > 0:
+                backend_apply_dp_xy_p50 = float(np.percentile(dp_hist, 50))
+                backend_apply_dp_xy_p95 = float(np.percentile(dp_hist, 95))
+        except Exception:
+            pass
+        try:
+            resid_hist = np.asarray(getattr(self.runner, "_backend_apply_residual_xy_history", []), dtype=float)
+            resid_hist = resid_hist[np.isfinite(resid_hist)]
+            if resid_hist.size > 0:
+                backend_apply_residual_xy_p50 = float(np.percentile(resid_hist, 50))
+                backend_apply_residual_xy_p95 = float(np.percentile(resid_hist, 95))
+        except Exception:
+            pass
         backend_snap_reject_count = float(int(getattr(self.runner, "_backend_snap_reject_count", 0)))
+        backend_kinematic_reject_count = float(int(getattr(self.runner, "_backend_kinematic_reject_count", 0)))
         memory_peak_rss_mb = float(self.runner._memory_peak_rss_mb) if np.isfinite(float(getattr(self.runner, "_memory_peak_rss_mb", float("nan")))) else float("nan")
         memory_peak_vms_mb = float(self.runner._memory_peak_vms_mb) if np.isfinite(float(getattr(self.runner, "_memory_peak_vms_mb", float("nan")))) else float("nan")
         memory_peak_uss_mb = float(self.runner._memory_peak_uss_mb) if np.isfinite(float(getattr(self.runner, "_memory_peak_uss_mb", float("nan")))) else float("nan")
@@ -1060,6 +1208,39 @@ class OutputReportingService:
             msckf_quality_p50=msckf_quality_p50,
             msckf_quality_p10=msckf_quality_p10,
             msckf_stable_geometry_ratio=msckf_stable_geometry_ratio,
+            msckf_depth_total_fail=msckf_depth_total_fail,
+            msckf_fail_depth_sign_init=msckf_fail_depth_sign_init,
+            msckf_fail_depth_sign_post_refine=msckf_fail_depth_sign_post_refine,
+            msckf_fail_depth_large=msckf_fail_depth_large,
+            msckf_fail_depth_sparse_recoverable=msckf_fail_depth_sparse_recoverable,
+            msckf_posttri_retry_recover_depth_defer_count=msckf_posttri_retry_recover_depth_defer_count,
+            msckf_posttri_retry_recover_depth_success_count=msckf_posttri_retry_recover_depth_success_count,
+            msckf_depth_init_candidate_count=msckf_depth_init_candidate_count,
+            msckf_depth_init_routed_count=msckf_depth_init_routed_count,
+            msckf_posttri_retry_recover_depth_gate_reject_count=msckf_posttri_retry_recover_depth_gate_reject_count,
+            msckf_posttri_retry_recover_depth_soft_accept_count=msckf_posttri_retry_recover_depth_soft_accept_count,
+            msckf_posttri_retry_recover_depth_retry_seen_count=msckf_posttri_retry_recover_depth_retry_seen_count,
+            msckf_posttri_retry_recover_depth_same_cycle_attempt_count=msckf_posttri_retry_recover_depth_same_cycle_attempt_count,
+            msckf_posttri_retry_recover_depth_same_cycle_success_count=msckf_posttri_retry_recover_depth_same_cycle_success_count,
+            msckf_posttri_retry_recover_depth_same_cycle_entered_count=msckf_posttri_retry_recover_depth_same_cycle_entered_count,
+            msckf_posttri_retry_recover_depth_same_cycle_fail_depth_count=msckf_posttri_retry_recover_depth_same_cycle_fail_depth_count,
+            msckf_posttri_retry_recover_depth_same_cycle_fail_reproj_count=msckf_posttri_retry_recover_depth_same_cycle_fail_reproj_count,
+            msckf_posttri_retry_recover_depth_same_cycle_fail_geometry_count=msckf_posttri_retry_recover_depth_same_cycle_fail_geometry_count,
+            msckf_posttri_retry_recover_depth_same_cycle_fail_nonlinear_count=msckf_posttri_retry_recover_depth_same_cycle_fail_nonlinear_count,
+            msckf_posttri_retry_recover_depth_same_cycle_fail_other_count=msckf_posttri_retry_recover_depth_same_cycle_fail_other_count,
+            msckf_posttri_retry_recover_depth_borderline_promote_count=msckf_posttri_retry_recover_depth_borderline_promote_count,
+            msckf_posttri_retry_recover_depth_protected_added_count=msckf_posttri_retry_recover_depth_protected_added_count,
+            msckf_posttri_retry_recover_depth_protected_carried_count=msckf_posttri_retry_recover_depth_protected_carried_count,
+            msckf_posttri_retry_recover_depth_protected_truncated_count=msckf_posttri_retry_recover_depth_protected_truncated_count,
+            msckf_posttri_retry_recover_depth_protected_missing_clone_count=msckf_posttri_retry_recover_depth_protected_missing_clone_count,
+            msckf_posttri_retry_recover_depth_protected_source_missing_count=msckf_posttri_retry_recover_depth_protected_source_missing_count,
+            msckf_posttri_retry_recover_depth_protected_depth_gate_again_count=msckf_posttri_retry_recover_depth_protected_depth_gate_again_count,
+            msckf_posttri_retry_recover_depth_relaxed_gate_used_count=msckf_posttri_retry_recover_depth_relaxed_gate_used_count,
+            msckf_posttri_retry_recover_depth_fail_depth_count=msckf_posttri_retry_recover_depth_fail_depth_count,
+            msckf_posttri_retry_recover_depth_fail_reproj_count=msckf_posttri_retry_recover_depth_fail_reproj_count,
+            msckf_posttri_retry_recover_depth_fail_geometry_count=msckf_posttri_retry_recover_depth_fail_geometry_count,
+            msckf_posttri_retry_recover_depth_fail_nonlinear_count=msckf_posttri_retry_recover_depth_fail_nonlinear_count,
+            msckf_posttri_retry_recover_depth_fail_other_count=msckf_posttri_retry_recover_depth_fail_other_count,
             msckf_reclass_to_geometry_count=msckf_reclass_to_geometry_count,
             msckf_unstable_lane_count=msckf_unstable_lane_count,
             msckf_stable_lane_used_count=msckf_stable_lane_used_count,
@@ -1067,6 +1248,11 @@ class OutputReportingService:
             backend_stale_ratio=backend_stale_ratio,
             backend_emit_to_apply_ratio=backend_emit_to_apply_ratio,
             backend_apply_quality_p50=backend_apply_quality_p50,
+            backend_kinematic_reject_count=backend_kinematic_reject_count,
+            backend_apply_dp_xy_p50=backend_apply_dp_xy_p50,
+            backend_apply_dp_xy_p95=backend_apply_dp_xy_p95,
+            backend_apply_residual_xy_p50=backend_apply_residual_xy_p50,
+            backend_apply_residual_xy_p95=backend_apply_residual_xy_p95,
             backend_snap_reject_count=backend_snap_reject_count,
             backend_apply_latency_ms_p95=backend_apply_latency_ms_p95,
             backend_contract_violation_count=backend_contract_violation_count,
@@ -1103,6 +1289,9 @@ class OutputReportingService:
             f"msckf_reclass={msckf_reclass_to_geometry_count:.0f}, "
             f"msckf_unstable_lane={msckf_unstable_lane_count:.0f}, "
             f"msckf_preagg_parallax={msckf_preagg_parallax_low_entered_count:.0f}, "
+            f"backend_kinrej={backend_kinematic_reject_count:.0f}, "
+            f"backend_dp95={backend_apply_dp_xy_p95:.2f}m, "
+            f"backend_res95={backend_apply_residual_xy_p95:.2f}m, "
             f"backend_stale_ratio={backend_stale_ratio:.3f}, "
             f"backend_emit_to_apply={backend_emit_to_apply_ratio:.3f}, "
             f"backend_q50={backend_apply_quality_p50:.3f}, "

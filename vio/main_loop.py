@@ -201,8 +201,11 @@ class VIORunner:
         self._backend_emit_stale_drop_count: int = 0
         self._backend_overwrite_count: int = 0
         self._backend_apply_quality_history: list[float] = []
+        self._backend_apply_dp_xy_history: list[float] = []
+        self._backend_apply_residual_xy_history: list[float] = []
         self._backend_snap_reject_count: int = 0
         self._backend_contract_violation_count: int = 0
+        self._backend_kinematic_reject_count: int = 0
         self._backend_apply_latency_ms_history: list[float] = []
         self._backend_pending_dp_enu: Optional[np.ndarray] = None
         self._backend_pending_dyaw_deg: float = 0.0

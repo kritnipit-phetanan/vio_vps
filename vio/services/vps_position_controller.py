@@ -1036,6 +1036,14 @@ class VPSPositionController:
             return
         try:
             match_reason = "matched_failsoft" if bool(evidence.vps_match_failsoft) else "matched_strict"
+            residual_xy = float(evidence.abs_offset_m) if np.isfinite(float(evidence.abs_offset_m)) else float("nan")
+            applied_dp_xy = 0.0
+            if bool(applied):
+                if np.isfinite(float(decision.bounded_clamp_m)) and float(decision.bounded_clamp_m) > 0.0:
+                    applied_dp_xy = float(min(max(0.0, residual_xy), float(decision.bounded_clamp_m)))
+                else:
+                    applied_dp_xy = float(max(0.0, residual_xy))
+            reject_reason = "" if bool(applied) else str(reason_code)
             with open(csv_path, "a", newline="") as f:
                 f.write(
                     f"{float(evidence.t_cam):.6f},{int(evidence.frame_idx)},"
@@ -1047,7 +1055,8 @@ class VPSPositionController:
                     f"{int(decision.position_first_direct_xy_candidate)},{float(decision.hint_quality):.6f},"
                     f"{float(evidence.abs_offset_m):.3f},{int(evidence.vps_num_inliers)},"
                     f"{float(evidence.vps_conf):.6f},{float(evidence.vps_reproj):.6f},"
-                    f"{int(applied)},{reason_code},"
+                    f"{int(applied)},{reason_code},{reject_reason},"
+                    f"{residual_xy:.6f},{applied_dp_xy:.6f},"
                     f"{decision.policy_reject_note},{decision.hard_reject_note},"
                     f"{decision.temporal_reject_note},{decision.position_first_direct_xy_note}\n"
                 )

@@ -58,6 +58,11 @@ HEALTH_COLUMNS = [
     "backend_stale_ratio",
     "backend_emit_to_apply_ratio",
     "backend_apply_quality_p50",
+    "backend_kinematic_reject_count",
+    "backend_apply_dp_xy_p50",
+    "backend_apply_dp_xy_p95",
+    "backend_apply_residual_xy_p50",
+    "backend_apply_residual_xy_p95",
     "backend_snap_reject_count",
     "backend_apply_latency_ms_p95",
     "backend_contract_violation_count",
@@ -78,6 +83,22 @@ def _to_float(v: object, default: float = np.nan) -> float:
         return out
     except Exception:
         return float(default)
+
+
+def _pct_improve(cur: float, base: float) -> float:
+    if not (np.isfinite(cur) and np.isfinite(base)):
+        return float("nan")
+    if abs(base) <= 1e-12:
+        return float("nan")
+    return float((base - cur) / abs(base) * 100.0)
+
+
+def _pct_delta_abs(cur: float, base: float) -> float:
+    if not (np.isfinite(cur) and np.isfinite(base)):
+        return float("nan")
+    if abs(base) <= 1e-12:
+        return float("nan")
+    return float(abs(cur - base) / abs(base) * 100.0)
 
 
 def _run_id_from_dir(run_dir: Path) -> str:
@@ -647,6 +668,171 @@ def evaluate_locks(
     return all_ok, checks, overflow_hits, vps_used
 
 
+def evaluate_phase_gate(
+    phase_gate: str,
+    *,
+    current_row: pd.Series,
+    output_dir: Path,
+    baseline_row: pd.Series | None,
+    baseline_dir: Path | None,
+) -> tuple[bool, list[tuple[str, bool, str]]]:
+    """Evaluate phase-specific C3/C4/C5/C6 acceptance checks."""
+    phase = str(phase_gate).strip().upper()
+    checks: list[tuple[str, bool, str]] = []
+
+    cur_accuracy = _load_accuracy_metrics(output_dir)
+    cur_err3d_mean = float(cur_accuracy.get("err3d_mean", float("nan")))
+    cur_err3d_final = float(cur_accuracy.get("err3d_final", float("nan")))
+    cur_vps_used = float(cur_accuracy.get("vps_used", float("nan")))
+    cur_abs_corr_apply = _to_float(current_row.get("abs_corr_apply_count"))
+    cur_failsoft_apply_ratio = _to_float(current_row.get("vps_failsoft_apply_ratio"))
+    cur_backend_apply_count = _to_float(current_row.get("backend_apply_count"))
+    cur_backend_stale_ratio = _to_float(current_row.get("backend_stale_ratio"))
+    if not np.isfinite(cur_backend_stale_ratio):
+        stale_drop = _to_float(current_row.get("backend_stale_drop_count"))
+        poll_count = _to_float(current_row.get("backend_poll_count"))
+        if np.isfinite(stale_drop) and np.isfinite(poll_count) and poll_count > 0:
+            cur_backend_stale_ratio = float(stale_drop / poll_count)
+    cur_backend_contract_violation = _to_float(current_row.get("backend_contract_violation_count"))
+    cur_backend_snap_reject = _to_float(current_row.get("backend_snap_reject_count"))
+    cur_cov_large = _to_float(current_row.get("cov_large_rate"))
+    cur_pmax = _to_float(current_row.get("pmax_max"))
+    cur_policy_conflict = _to_float(current_row.get("policy_conflict_count"))
+
+    checks.extend(
+        [
+            (
+                "cov_large_rate == 0",
+                np.isfinite(cur_cov_large) and abs(cur_cov_large) <= 1e-12,
+                f"value={cur_cov_large:.6f}" if np.isfinite(cur_cov_large) else "value=nan",
+            ),
+            (
+                "pmax_max <= 1e6",
+                np.isfinite(cur_pmax) and cur_pmax <= 1.0e6,
+                f"value={cur_pmax:.3e}" if np.isfinite(cur_pmax) else "value=nan",
+            ),
+            (
+                "policy_conflict_count == 0",
+                np.isfinite(cur_policy_conflict) and abs(cur_policy_conflict) <= 1e-12,
+                f"value={cur_policy_conflict:.0f}" if np.isfinite(cur_policy_conflict) else "value=nan",
+            ),
+            (
+                "backend_contract_violation_count == 0",
+                np.isfinite(cur_backend_contract_violation) and abs(cur_backend_contract_violation) <= 1e-12,
+                (
+                    f"value={cur_backend_contract_violation:.0f}"
+                    if np.isfinite(cur_backend_contract_violation)
+                    else "value=nan"
+                ),
+            ),
+        ]
+    )
+
+    if baseline_row is None or baseline_dir is None:
+        checks.append(("baseline run available for phase gate", False, "missing baseline row/dir"))
+        return False, checks
+
+    base_accuracy = _load_accuracy_metrics(baseline_dir)
+    base_err3d_mean = float(base_accuracy.get("err3d_mean", float("nan")))
+    base_err3d_final = float(base_accuracy.get("err3d_final", float("nan")))
+    base_abs_corr_apply = _to_float(baseline_row.get("abs_corr_apply_count"))
+
+    if phase == "C3":
+        checks.extend(
+            [
+                (
+                    "0.10 <= vps_failsoft_apply_ratio <= 0.35",
+                    np.isfinite(cur_failsoft_apply_ratio) and 0.10 <= cur_failsoft_apply_ratio <= 0.35,
+                    (
+                        f"value={cur_failsoft_apply_ratio:.4f}"
+                        if np.isfinite(cur_failsoft_apply_ratio)
+                        else "value=nan"
+                    ),
+                ),
+                (
+                    "abs_corr_apply_count >= 20",
+                    np.isfinite(cur_abs_corr_apply) and cur_abs_corr_apply >= 20.0,
+                    f"value={cur_abs_corr_apply:.0f}" if np.isfinite(cur_abs_corr_apply) else "value=nan",
+                ),
+                (
+                    "vps_used >= 20",
+                    np.isfinite(cur_vps_used) and cur_vps_used >= 20.0,
+                    f"value={cur_vps_used:.0f}" if np.isfinite(cur_vps_used) else "value=nan",
+                ),
+                (
+                    f"err3d_final improved >= 10% vs {baseline_dir.name}",
+                    np.isfinite(_pct_improve(cur_err3d_final, base_err3d_final))
+                    and _pct_improve(cur_err3d_final, base_err3d_final) >= 10.0,
+                    f"improve={_pct_improve(cur_err3d_final, base_err3d_final):.2f}%",
+                ),
+            ]
+        )
+    elif phase == "C4":
+        checks.extend(
+            [
+                (
+                    "backend_apply_count >= 25",
+                    np.isfinite(cur_backend_apply_count) and cur_backend_apply_count >= 25.0,
+                    f"value={cur_backend_apply_count:.0f}" if np.isfinite(cur_backend_apply_count) else "value=nan",
+                ),
+                (
+                    "backend_stale_ratio <= 0.015",
+                    np.isfinite(cur_backend_stale_ratio) and cur_backend_stale_ratio <= 0.015,
+                    f"value={cur_backend_stale_ratio:.6f}" if np.isfinite(cur_backend_stale_ratio) else "value=nan",
+                ),
+                (
+                    f"err3d_mean improved >= 10% vs {baseline_dir.name}",
+                    np.isfinite(_pct_improve(cur_err3d_mean, base_err3d_mean))
+                    and _pct_improve(cur_err3d_mean, base_err3d_mean) >= 10.0,
+                    f"improve={_pct_improve(cur_err3d_mean, base_err3d_mean):.2f}%",
+                ),
+            ]
+        )
+    elif phase == "C5":
+        checks.extend(
+            [
+                (
+                    "backend_snap_reject_count == 0",
+                    np.isfinite(cur_backend_snap_reject) and abs(cur_backend_snap_reject) <= 1e-12,
+                    f"value={cur_backend_snap_reject:.0f}" if np.isfinite(cur_backend_snap_reject) else "value=nan",
+                ),
+                (
+                    f"err3d_final improved >= 10% vs {baseline_dir.name}",
+                    np.isfinite(_pct_improve(cur_err3d_final, base_err3d_final))
+                    and _pct_improve(cur_err3d_final, base_err3d_final) >= 10.0,
+                    f"improve={_pct_improve(cur_err3d_final, base_err3d_final):.2f}%",
+                ),
+            ]
+        )
+    elif phase == "C6":
+        checks.extend(
+            [
+                (
+                    f"err3d_mean drift <= 3% vs {baseline_dir.name}",
+                    np.isfinite(_pct_delta_abs(cur_err3d_mean, base_err3d_mean))
+                    and _pct_delta_abs(cur_err3d_mean, base_err3d_mean) <= 3.0,
+                    f"delta={_pct_delta_abs(cur_err3d_mean, base_err3d_mean):.2f}%",
+                ),
+                (
+                    f"err3d_final drift <= 3% vs {baseline_dir.name}",
+                    np.isfinite(_pct_delta_abs(cur_err3d_final, base_err3d_final))
+                    and _pct_delta_abs(cur_err3d_final, base_err3d_final) <= 3.0,
+                    f"delta={_pct_delta_abs(cur_err3d_final, base_err3d_final):.2f}%",
+                ),
+                (
+                    f"abs_corr_apply_count drift <= 3% vs {baseline_dir.name}",
+                    np.isfinite(_pct_delta_abs(cur_abs_corr_apply, base_abs_corr_apply))
+                    and _pct_delta_abs(cur_abs_corr_apply, base_abs_corr_apply) <= 3.0,
+                    f"delta={_pct_delta_abs(cur_abs_corr_apply, base_abs_corr_apply):.2f}%",
+                ),
+            ]
+        )
+    else:
+        checks.append(("phase gate recognized", False, f"phase_gate={phase}"))
+
+    return all(ok for _, ok, _ in checks), checks
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Compare benchmark output with baseline and check locks.")
     parser.add_argument("--output_dir", required=True, help="Current run output directory")
@@ -655,6 +841,12 @@ def main() -> int:
         "--lock_profile",
         default="backend",
         choices=["pre_backend", "backend", "near_rt_backend", "accuracy_position"],
+    )
+    parser.add_argument(
+        "--phase_gate",
+        default="",
+        choices=["", "C3", "C4", "C5", "C6"],
+        help="Optional C-phase acceptance gate evaluated on top of lock profile checks.",
     )
     parser.add_argument("--enforce_locks", action="store_true", help="Return non-zero when any hard lock fails")
     args = parser.parse_args()
@@ -706,7 +898,33 @@ def main() -> int:
             for line in overflow_hits[:5]:
                 print(f"    - {line}")
     print("")
-    if args.enforce_locks and not all_ok:
+
+    phase_gate_ok = True
+    if str(args.phase_gate).strip():
+        print("=== Phase Gate Checks ===")
+        if not (baseline_dir and baseline_dir.is_dir()):
+            print("❌ PHASE GATE RESULT: FAIL (baseline_run required)")
+            phase_gate_ok = False
+        else:
+            base_summary = ensure_health_summary(baseline_dir)
+            base_row = _load_last_row(base_summary) if base_summary is not None else None
+            phase_gate_ok, phase_checks = evaluate_phase_gate(
+                str(args.phase_gate),
+                current_row=cur_row,
+                output_dir=out_dir,
+                baseline_row=base_row,
+                baseline_dir=baseline_dir,
+            )
+            for name, ok, detail in phase_checks:
+                tag = "PASS" if ok else "FAIL"
+                print(f"[{tag}] {name:52s} ({detail})")
+            if phase_gate_ok:
+                print("✅ PHASE GATE RESULT: PASS")
+            else:
+                print("❌ PHASE GATE RESULT: FAIL")
+        print("")
+
+    if args.enforce_locks and (not all_ok or not phase_gate_ok):
         return 3
     return 0
 

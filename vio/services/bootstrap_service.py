@@ -673,6 +673,10 @@ class BootstrapService:
         runner._msckf_stable_geometry_history = []
         runner._vps_apply_score_history = []
         runner._vps_hint_only_count = 0
+        runner._backend_apply_quality_history = []
+        runner._backend_apply_dp_xy_history = []
+        runner._backend_apply_residual_xy_history = []
+        runner._backend_kinematic_reject_count = 0
         if getattr(runner, "policy_runtime_service", None) is not None:
             try:
                 runner.policy_runtime_service._owner_map_written = False

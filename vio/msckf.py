@@ -18,7 +18,7 @@ import numpy as np
 from typing import Optional, Tuple, List, Dict, Any
 from scipy.spatial.transform import Rotation as R_scipy
 
-from .math_utils import quat_to_rot, quaternion_to_yaw, skew_symmetric, safe_matrix_inverse
+from .math_utils import skew_symmetric, safe_matrix_inverse
 from .policy.types import MsckfQualitySnapshot
 
 
@@ -183,9 +183,16 @@ MSCKF_STATS = {
     'fail_depth_sign_init': 0,
     'fail_depth_sign_post_refine': 0,
     'fail_depth_large': 0,
-    'init_depth_recover_candidate_count': 0,
-    'init_depth_recover_used_count': 0,
-    'depth_support_rescue_count': 0,
+    'depth_init_fail_count': 0,
+    'depth_init_short_track_count': 0,
+    'depth_init_parallax_low_count': 0,
+    'depth_init_quality_low_count': 0,
+    'depth_init_candidate_count': 0,
+    'depth_init_routed_count': 0,
+    'depth_init_gate_block_count': 0,
+    'depth_sparse_recover_candidate_count': 0,
+    'depth_sparse_recover_gate_block_count': 0,
+    'depth_sparse_recover_parallax_low_count': 0,
     'reproj_eval_attempt': 0,
     'fail_reproj_error': 0,
     'fail_reproj_sparse': 0,
@@ -217,6 +224,7 @@ MSCKF_STATS = {
     'preagg_predicate_enough_signal_count': 0,
     'preagg_predicate_quality_ok_count': 0,
     'preagg_predicate_all_true_count': 0,
+    'preagg_parallax_low_entered_count': 0,
     'retry_lane_defer_count': 0,
     'posttri_retry_defer_count': 0,
     'posttri_retry_recover_defer_count': 0,
@@ -225,6 +233,33 @@ MSCKF_STATS = {
     'posttri_retry_recover_depth_defer_count': 0,
     'posttri_retry_recover_depth_exhausted_count': 0,
     'posttri_retry_recover_depth_success_count': 0,
+    'posttri_retry_recover_depth_gate_reject_count': 0,
+    'posttri_retry_recover_depth_soft_accept_count': 0,
+    'posttri_retry_recover_depth_retry_seen_count': 0,
+    'posttri_retry_recover_depth_same_cycle_attempt_count': 0,
+    'posttri_retry_recover_depth_same_cycle_success_count': 0,
+    'posttri_retry_recover_depth_same_cycle_entered_count': 0,
+    'posttri_retry_recover_depth_same_cycle_fail_depth_count': 0,
+    'posttri_retry_recover_depth_same_cycle_fail_reproj_count': 0,
+    'posttri_retry_recover_depth_same_cycle_fail_geometry_count': 0,
+    'posttri_retry_recover_depth_same_cycle_fail_nonlinear_count': 0,
+    'posttri_retry_recover_depth_same_cycle_fail_other_count': 0,
+    'posttri_retry_recover_depth_same_cycle_clip_proj_count': 0,
+    'posttri_retry_recover_depth_gate_override_count': 0,
+    'posttri_retry_recover_depth_gate_override_reject_count': 0,
+    'posttri_retry_recover_depth_borderline_promote_count': 0,
+    'posttri_retry_recover_depth_protected_added_count': 0,
+    'posttri_retry_recover_depth_protected_carried_count': 0,
+    'posttri_retry_recover_depth_protected_truncated_count': 0,
+    'posttri_retry_recover_depth_protected_missing_clone_count': 0,
+    'posttri_retry_recover_depth_protected_source_missing_count': 0,
+    'posttri_retry_recover_depth_protected_depth_gate_again_count': 0,
+    'posttri_retry_recover_depth_relaxed_gate_used_count': 0,
+    'posttri_retry_recover_depth_fail_depth_count': 0,
+    'posttri_retry_recover_depth_fail_reproj_count': 0,
+    'posttri_retry_recover_depth_fail_geometry_count': 0,
+    'posttri_retry_recover_depth_fail_nonlinear_count': 0,
+    'posttri_retry_recover_depth_fail_other_count': 0,
     'unstable_lane_count': 0,
     'stable_lane_used_count': 0,
     'fail_nonlinear': 0,
@@ -232,6 +267,28 @@ MSCKF_STATS = {
     'fail_solver': 0,
     'fail_other': 0,
 }
+
+# Single-source fail-reason priority for post-tri retry routing and diagnostics.
+MSCKF_FAIL_REASON_PRIORITY = (
+    "fail_depth_sign_init",
+    "fail_depth_sign_post_refine",
+    "fail_depth_sign",
+    "fail_prefilter_geometry",
+    "fail_geometry_insufficient_pretri",
+    "fail_geometry_insufficient_posttri",
+    "fail_reproj_pixel",
+    "fail_reproj_normalized",
+    "fail_reproj_error",
+    "fail_reproj_sparse",
+    "fail_reproj_sparse_recoverable",
+    "fail_depth_sparse_recoverable",
+    "fail_geometry_borderline",
+    "fail_parallax",
+    "fail_baseline",
+    "fail_nonlinear",
+    "fail_solver",
+    "fail_other",
+)
 
 
 def reset_msckf_stats():
@@ -288,13 +345,45 @@ def print_msckf_stats():
         f" recovered={int(MSCKF_STATS.get('posttri_retry_recover_success_count', 0))},"
         f" depth_defer={int(MSCKF_STATS.get('posttri_retry_recover_depth_defer_count', 0))},"
         f" depth_exhausted={int(MSCKF_STATS.get('posttri_retry_recover_depth_exhausted_count', 0))},"
-        f" depth_recovered={int(MSCKF_STATS.get('posttri_retry_recover_depth_success_count', 0))}"
+        f" depth_recovered={int(MSCKF_STATS.get('posttri_retry_recover_depth_success_count', 0))},"
+        f" depth_gate_reject={int(MSCKF_STATS.get('posttri_retry_recover_depth_gate_reject_count', 0))},"
+        f" depth_soft_accept={int(MSCKF_STATS.get('posttri_retry_recover_depth_soft_accept_count', 0))},"
+        f" retry_seen={int(MSCKF_STATS.get('posttri_retry_recover_depth_retry_seen_count', 0))},"
+        f" same_cycle_attempt={int(MSCKF_STATS.get('posttri_retry_recover_depth_same_cycle_attempt_count', 0))},"
+        f" same_cycle_success={int(MSCKF_STATS.get('posttri_retry_recover_depth_same_cycle_success_count', 0))},"
+        f" same_cycle_entered={int(MSCKF_STATS.get('posttri_retry_recover_depth_same_cycle_entered_count', 0))},"
+        f" same_cycle_fail_depth={int(MSCKF_STATS.get('posttri_retry_recover_depth_same_cycle_fail_depth_count', 0))},"
+        f" same_cycle_fail_reproj={int(MSCKF_STATS.get('posttri_retry_recover_depth_same_cycle_fail_reproj_count', 0))},"
+        f" same_cycle_fail_geometry={int(MSCKF_STATS.get('posttri_retry_recover_depth_same_cycle_fail_geometry_count', 0))},"
+        f" same_cycle_fail_nonlinear={int(MSCKF_STATS.get('posttri_retry_recover_depth_same_cycle_fail_nonlinear_count', 0))},"
+        f" same_cycle_fail_other={int(MSCKF_STATS.get('posttri_retry_recover_depth_same_cycle_fail_other_count', 0))},"
+        f" same_cycle_clip_proj={int(MSCKF_STATS.get('posttri_retry_recover_depth_same_cycle_clip_proj_count', 0))},"
+        f" borderline_promote={int(MSCKF_STATS.get('posttri_retry_recover_depth_borderline_promote_count', 0))},"
+        f" protected_add={int(MSCKF_STATS.get('posttri_retry_recover_depth_protected_added_count', 0))},"
+        f" protected_carry={int(MSCKF_STATS.get('posttri_retry_recover_depth_protected_carried_count', 0))},"
+        f" protected_trunc={int(MSCKF_STATS.get('posttri_retry_recover_depth_protected_truncated_count', 0))},"
+        f" protected_missing_clone={int(MSCKF_STATS.get('posttri_retry_recover_depth_protected_missing_clone_count', 0))},"
+        f" protected_source_missing={int(MSCKF_STATS.get('posttri_retry_recover_depth_protected_source_missing_count', 0))},"
+        f" protected_depth_gate_again={int(MSCKF_STATS.get('posttri_retry_recover_depth_protected_depth_gate_again_count', 0))},"
+        f" relaxed_gate={int(MSCKF_STATS.get('posttri_retry_recover_depth_relaxed_gate_used_count', 0))},"
+        f" gate_override={int(MSCKF_STATS.get('posttri_retry_recover_depth_gate_override_count', 0))},"
+        f" gate_override_reject={int(MSCKF_STATS.get('posttri_retry_recover_depth_gate_override_reject_count', 0))}"
     )
     print(
-        "  depth_recover:"
-        f" init_candidate={int(MSCKF_STATS.get('init_depth_recover_candidate_count', 0))},"
-        f" init_used={int(MSCKF_STATS.get('init_depth_recover_used_count', 0))},"
-        f" support_rescue={int(MSCKF_STATS.get('depth_support_rescue_count', 0))}"
+        "  depth_sparse_lane:"
+        f" candidate={int(MSCKF_STATS.get('depth_sparse_recover_candidate_count', 0))},"
+        f" gate_block={int(MSCKF_STATS.get('depth_sparse_recover_gate_block_count', 0))},"
+        f" parallax_low={int(MSCKF_STATS.get('depth_sparse_recover_parallax_low_count', 0))}"
+    )
+    print(
+        "  depth_init_lane:"
+        f" fail={int(MSCKF_STATS.get('depth_init_fail_count', 0))},"
+        f" short_track={int(MSCKF_STATS.get('depth_init_short_track_count', 0))},"
+        f" parallax_low={int(MSCKF_STATS.get('depth_init_parallax_low_count', 0))},"
+        f" quality_low={int(MSCKF_STATS.get('depth_init_quality_low_count', 0))},"
+        f" candidate={int(MSCKF_STATS.get('depth_init_candidate_count', 0))},"
+        f" routed={int(MSCKF_STATS.get('depth_init_routed_count', 0))},"
+        f" gate_block={int(MSCKF_STATS.get('depth_init_gate_block_count', 0))}"
     )
     print(
         "  preagg lanes:"
@@ -439,9 +528,11 @@ def _summarize_msckf_quality(
     depth_min = float(cfg.get("MSCKF_QUALITY_GATE_DEPTH_POSITIVE_MIN", 0.62))
     reproj_max = float(cfg.get("MSCKF_QUALITY_GATE_REPROJ_P95_MAX", 0.06))
     camera_view = str(cfg.get("DEFAULT_CAMERA_VIEW", "nadir")).strip().lower()
-    depth_floor_nadir = float(cfg.get("MSCKF_QUALITY_GATE_DEPTH_POSITIVE_MIN_FLOOR_NADIR", 0.30))
-    depth_track_relax_gain = float(cfg.get("MSCKF_QUALITY_GATE_DEPTH_POSITIVE_TRACK_RELAX_GAIN", 0.20))
-    depth_parallax_relax_gain = float(cfg.get("MSCKF_QUALITY_GATE_DEPTH_POSITIVE_PARALLAX_RELAX_GAIN", 0.14))
+    depth_floor_nadir = float(cfg.get("MSCKF_QUALITY_GATE_DEPTH_POSITIVE_MIN_FLOOR_NADIR", depth_min))
+    # Keep default behavior conservative for sparse test/local configs that do not
+    # provide adaptive-depth tuning keys explicitly.
+    depth_track_relax_gain = float(cfg.get("MSCKF_QUALITY_GATE_DEPTH_POSITIVE_TRACK_RELAX_GAIN", 0.0))
+    depth_parallax_relax_gain = float(cfg.get("MSCKF_QUALITY_GATE_DEPTH_POSITIVE_PARALLAX_RELAX_GAIN", 0.0))
     depth_parallax_relax_cap_ratio = float(
         cfg.get("MSCKF_QUALITY_GATE_DEPTH_POSITIVE_PARALLAX_RELAX_CAP_RATIO", 2.0)
     )
@@ -810,11 +901,9 @@ def triangulate_point_linear(observations: List[dict], cam_states: List[dict]) -
         p_w = cam_state['p']   # Camera position in world
         
         # Convert quaternion to rotation matrix
-        from scipy.spatial.transform import Rotation as R_scipy
         q_xyzw = np.array([q_wc[1], q_wc[2], q_wc[3], q_wc[0]])
         R_wc = R_scipy.from_quat(q_xyzw).as_matrix()  # World to camera
-        R_cw = R_wc.T  # Camera to world
-        
+
         # Projection: p_cam = R_wc @ (p_world - p_w)
         # Normalized: [u, v, 1]^T ~ R_wc @ (p_world - p_w)
         # Let t = -R_wc @ p_w, then p_cam = R_wc @ p_world + t
@@ -1052,7 +1141,8 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
                         global_config: dict = None,
                         reproj_scale: float = 1.0,
                         phase: int = 2,
-                        health_state: str = "HEALTHY") -> Optional[dict]:
+                        health_state: str = "HEALTHY",
+                        retry_mode: str = "") -> Optional[dict]:
     """
     Triangulate a feature using multi-view observations.
     
@@ -1115,29 +1205,9 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
         (global_config or {}).get("MSCKF_DEPTHSIGN_UNSTABLE_MIN_DEPTH_FLOOR_M", 0.015)
         if isinstance(global_config, dict) else 0.015
     )
-    depth_relax_min_depth_enable = bool(
-        (global_config or {}).get("MSCKF_DEPTHSIGN_UNSTABLE_RELAX_MIN_DEPTH_ENABLE", False)
-        if isinstance(global_config, dict) else False
-    )
     depth_reclass_enable = bool(
         (global_config or {}).get("MSCKF_DEPTHSIGN_UNSTABLE_RECLASSIFY_ENABLE", True)
         if isinstance(global_config, dict) else True
-    )
-    depth_init_recover_enable = bool(
-        (global_config or {}).get("MSCKF_DEPTH_INIT_RECOVER_ENABLE", True)
-        if isinstance(global_config, dict) else True
-    )
-    depth_init_recover_min_depth_m = float(
-        (global_config or {}).get("MSCKF_DEPTH_INIT_RECOVER_MIN_DEPTH_M", 0.005)
-        if isinstance(global_config, dict) else 0.005
-    )
-    depth_init_recover_min_parallax_mult = float(
-        (global_config or {}).get("MSCKF_DEPTH_INIT_RECOVER_MIN_PARALLAX_MULT", 1.0)
-        if isinstance(global_config, dict) else 1.0
-    )
-    depth_init_recover_min_quality = float(
-        (global_config or {}).get("MSCKF_DEPTH_INIT_RECOVER_MIN_QUALITY", 0.30)
-        if isinstance(global_config, dict) else 0.30
     )
     # L2 one-knob: state-aware depth-sign guard for unstable geometry only.
     # Block weak-depth triangulation from entering updates when positive-depth
@@ -1157,10 +1227,6 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
     depth_state_gate_min_reject_ratio = float(
         (global_config or {}).get("MSCKF_DEPTHSIGN_STATE_AWARE_UNSTABLE_MIN_REJECT_RATIO", 0.62)
         if isinstance(global_config, dict) else 0.62
-    )
-    depth_reclass_dom_ratio_th = float(
-        (global_config or {}).get("MSCKF_DEPTHSIGN_UNSTABLE_RECLASSIFY_DOM_RATIO_TH", 0.70)
-        if isinstance(global_config, dict) else 0.70
     )
     depth_sign_strict_dom_ratio_th = float(
         (global_config or {}).get("MSCKF_DEPTHSIGN_STRICT_DOM_RATIO_TH", 0.92)
@@ -1188,26 +1254,6 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
         (global_config or {}).get("MSCKF_DEPTHSIGN_STRICT_MIN_QUALITY", 0.45)
         if isinstance(global_config, dict) else 0.45
     )
-    depth_support_rescue_enable = bool(
-        (global_config or {}).get("MSCKF_DEPTH_SUPPORT_RESCUE_ENABLE", True)
-        if isinstance(global_config, dict) else True
-    )
-    depth_support_rescue_min_valid_obs = int(
-        (global_config or {}).get("MSCKF_DEPTH_SUPPORT_RESCUE_MIN_VALID_OBS", 2)
-        if isinstance(global_config, dict) else 2
-    )
-    depth_support_rescue_min_parallax_px = float(
-        (global_config or {}).get("MSCKF_DEPTH_SUPPORT_RESCUE_MIN_PARALLAX_PX", 1.2)
-        if isinstance(global_config, dict) else 1.2
-    )
-    depth_support_rescue_min_quality = float(
-        (global_config or {}).get("MSCKF_DEPTH_SUPPORT_RESCUE_MIN_QUALITY", 0.34)
-        if isinstance(global_config, dict) else 0.34
-    )
-    depth_support_rescue_max_reproj_to_gate = float(
-        (global_config or {}).get("MSCKF_DEPTH_SUPPORT_RESCUE_MAX_REPROJ_TO_GATE", 1.02)
-        if isinstance(global_config, dict) else 1.02
-    )
     depth_sparse_recover_enable = bool(
         (global_config or {}).get("MSCKF_DEPTH_SPARSE_RECOVER_ENABLE", True)
         if isinstance(global_config, dict) else True
@@ -1227,6 +1273,117 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
     depth_sparse_recover_min_depth_dom_ratio = float(
         (global_config or {}).get("MSCKF_DEPTH_SPARSE_RECOVER_MIN_DEPTH_DOM_RATIO", 0.55)
         if isinstance(global_config, dict) else 0.55
+    )
+    depth_init_recover_enable = bool(
+        (global_config or {}).get("MSCKF_DEPTH_INIT_RECOVER_ENABLE", True)
+        if isinstance(global_config, dict) else True
+    )
+    depth_init_recover_min_obs = int(
+        (global_config or {}).get(
+            "MSCKF_DEPTH_INIT_RECOVER_MIN_OBS",
+            max(4, int(depth_sparse_recover_min_obs)),
+        )
+        if isinstance(global_config, dict) else max(4, int(depth_sparse_recover_min_obs))
+    )
+    depth_init_recover_min_parallax_px = float(
+        (global_config or {}).get(
+            "MSCKF_DEPTH_INIT_RECOVER_MIN_PARALLAX_PX",
+            max(0.35, 0.65 * float(depth_sparse_recover_min_parallax_px)),
+        )
+        if isinstance(global_config, dict) else max(0.35, 0.65 * float(depth_sparse_recover_min_parallax_px))
+    )
+    depth_init_recover_max_parallax_px = float(
+        (global_config or {}).get(
+            "MSCKF_DEPTH_INIT_RECOVER_MAX_PARALLAX_PX",
+            max(0.5, 1.05 * float(depth_sparse_recover_min_parallax_px)),
+        )
+        if isinstance(global_config, dict) else max(0.5, 1.05 * float(depth_sparse_recover_min_parallax_px))
+    )
+    depth_init_recover_min_quality = float(
+        (global_config or {}).get(
+            "MSCKF_DEPTH_INIT_RECOVER_MIN_QUALITY",
+            max(0.0, float(depth_sparse_recover_min_quality) - 0.02),
+        )
+        if isinstance(global_config, dict) else max(0.0, float(depth_sparse_recover_min_quality) - 0.02)
+    )
+    depth_init_recover_min_depth_fail_ratio = float(
+        (global_config or {}).get("MSCKF_DEPTH_INIT_RECOVER_MIN_DEPTH_FAIL_RATIO", 0.60)
+        if isinstance(global_config, dict) else 0.60
+    )
+    depth_retry_soft_accept_enable = bool(
+        (global_config or {}).get("MSCKF_RETRY_LANE_POSTTRI_RECOVER_DEPTH_SOFT_ACCEPT_ENABLE", False)
+        if isinstance(global_config, dict) else False
+    )
+    depth_retry_soft_depth_ratio = float(
+        (global_config or {}).get("MSCKF_RETRY_LANE_POSTTRI_RECOVER_DEPTH_SOFT_DEPTH_RATIO", 0.72)
+        if isinstance(global_config, dict) else 0.72
+    )
+    depth_retry_soft_max_promote = int(
+        (global_config or {}).get("MSCKF_RETRY_LANE_POSTTRI_RECOVER_DEPTH_SOFT_MAX_PROMOTE", 2)
+        if isinstance(global_config, dict) else 2
+    )
+    depth_retry_soft_error_mult = float(
+        (global_config or {}).get("MSCKF_RETRY_LANE_POSTTRI_RECOVER_DEPTH_SOFT_ERROR_MULT", 1.15)
+        if isinstance(global_config, dict) else 1.15
+    )
+    depth_retry_full_rescue_enable = bool(
+        (global_config or {}).get("MSCKF_RETRY_LANE_POSTTRI_RECOVER_DEPTH_FULL_RESCUE_ENABLE", False)
+        if isinstance(global_config, dict) else False
+    )
+    depth_retry_bounded_relax_enable = bool(
+        (global_config or {}).get("MSCKF_RETRY_LANE_POSTTRI_RECOVER_DEPTH_BOUNDED_RELAX_ENABLE", False)
+        if isinstance(global_config, dict) else False
+    )
+    depth_retry_bounded_relax_obs_delta = int(
+        (global_config or {}).get("MSCKF_RETRY_LANE_POSTTRI_RECOVER_DEPTH_BOUNDED_RELAX_OBS_DELTA", 1)
+        if isinstance(global_config, dict) else 1
+    )
+    depth_retry_bounded_relax_parallax_mult = float(
+        (global_config or {}).get("MSCKF_RETRY_LANE_POSTTRI_RECOVER_DEPTH_BOUNDED_RELAX_PARALLAX_MULT", 0.88)
+        if isinstance(global_config, dict) else 0.88
+    )
+    depth_retry_bounded_relax_quality_delta = float(
+        (global_config or {}).get("MSCKF_RETRY_LANE_POSTTRI_RECOVER_DEPTH_BOUNDED_RELAX_QUALITY_DELTA", 0.03)
+        if isinstance(global_config, dict) else 0.03
+    )
+    depth_retry_gate_override_enable = bool(
+        (global_config or {}).get("MSCKF_RETRY_LANE_POSTTRI_RECOVER_DEPTH_GATE_OVERRIDE_ENABLE", False)
+        if isinstance(global_config, dict) else False
+    )
+    retry_mode_key = str(retry_mode).strip().lower()
+    protected_retry_context = bool(
+        retry_mode_key in ("depth_sparse_recover", "depth_sparse_same_cycle_rescue")
+    )
+    use_depth_same_cycle_full_rescue = bool(
+        retry_mode_key == "depth_sparse_same_cycle_rescue"
+        and bool(depth_retry_full_rescue_enable)
+    )
+    use_depth_retry_soft_accept = bool(
+        retry_mode_key in ("depth_sparse_recover", "depth_sparse_same_cycle_rescue")
+        and bool(depth_retry_soft_accept_enable)
+    )
+    use_depth_retry_bounded_relax = bool(
+        retry_mode_key in ("depth_sparse_recover", "depth_sparse_same_cycle_rescue")
+        and bool(depth_retry_bounded_relax_enable)
+    )
+    depth_retry_soft_depth_ratio_use = float(
+        np.clip(
+            float(depth_retry_soft_depth_ratio)
+            * (0.80 if use_depth_same_cycle_full_rescue else 1.0),
+            0.25,
+            1.0,
+        )
+    )
+    depth_retry_soft_max_promote_use = int(
+        max(0, int(depth_retry_soft_max_promote) + (1 if use_depth_same_cycle_full_rescue else 0))
+    )
+    depth_retry_soft_error_mult_use = float(
+        np.clip(
+            float(depth_retry_soft_error_mult)
+            * (1.12 if use_depth_same_cycle_full_rescue else 1.0),
+            1.0,
+            2.5,
+        )
     )
     # Deterministic stable-geometry reproj lane (single canonical lane).
     # Legacy stable_norm keys are kept as fallback aliases for backward compatibility.
@@ -1413,17 +1570,6 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
             MSCKF_STATS['reclass_to_geometry_count'] += 1
             return None
 
-    recover_candidate: Optional[np.ndarray] = None
-    recover_candidate_score = -np.inf
-    init_recover_parallax_ok = bool(
-        np.isfinite(parallax_med_px_init)
-        and float(parallax_med_px_init)
-        >= float(max(0.1, depth_gate_parallax_min_px * depth_init_recover_min_parallax_mult))
-    )
-    init_recover_quality_ok = bool(
-        (not np.isfinite(q_med_init))
-        or float(q_med_init) >= float(np.clip(depth_init_recover_min_quality, 0.0, 1.0))
-    )
     for obs_idx0, obs_idx1 in candidate_pairs:
         obs0 = obs_list[obs_idx0]
         obs1 = obs_list[obs_idx1]
@@ -1505,27 +1651,6 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
             )
         max_depth_m = 700.0
         if depth0 <= min_depth_m or depth1 <= min_depth_m:
-            recover_min_depth = float(
-                min(
-                    max(1e-4, float(min_depth_m)),
-                    max(1e-4, float(depth_init_recover_min_depth_m)),
-                )
-            )
-            init_recover_ok = bool(
-                depth_init_recover_enable
-                and unstable_geometry_init
-                and init_recover_parallax_ok
-                and init_recover_quality_ok
-                and depth0 > recover_min_depth
-                and depth1 > recover_min_depth
-            )
-            if init_recover_ok:
-                recover_score = float(pair_score * 0.90)
-                if recover_score > recover_candidate_score:
-                    recover_candidate_score = recover_score
-                    recover_candidate = p_candidate
-                MSCKF_STATS['init_depth_recover_candidate_count'] += 1
-                continue
             fail_counts["depth"] += 1
             continue
         if depth0 > max_depth_m or depth1 > max_depth_m:
@@ -1536,11 +1661,45 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
             best_pair_score = pair_score
             p_init = p_candidate
 
-    if p_init is None and recover_candidate is not None:
-        p_init = recover_candidate
-        MSCKF_STATS['init_depth_recover_used_count'] += 1
     if p_init is None:
         if fail_counts["depth"] > 0:
+            MSCKF_STATS['depth_init_fail_count'] += 1
+            if len(obs_list) < int(max(2, depth_init_recover_min_obs)):
+                MSCKF_STATS['depth_init_short_track_count'] += 1
+            if np.isfinite(parallax_med_px_init) and float(parallax_med_px_init) < float(depth_init_recover_min_parallax_px):
+                MSCKF_STATS['depth_init_parallax_low_count'] += 1
+            if np.isfinite(q_med_init) and float(q_med_init) < float(np.clip(depth_init_recover_min_quality, 0.0, 1.0)):
+                MSCKF_STATS['depth_init_quality_low_count'] += 1
+
+            total_pair_fail = int(sum(int(v) for v in fail_counts.values()))
+            depth_fail_ratio = float(fail_counts["depth"]) / float(max(1, total_pair_fail))
+            parallax_init_ok = bool(
+                np.isfinite(parallax_med_px_init)
+                and float(parallax_med_px_init) >= float(depth_init_recover_min_parallax_px)
+                and float(parallax_med_px_init) <= float(max(depth_init_recover_min_parallax_px, depth_init_recover_max_parallax_px))
+            )
+            quality_init_ok = bool(
+                (not np.isfinite(q_med_init))
+                or float(q_med_init) >= float(np.clip(depth_init_recover_min_quality, 0.0, 1.0))
+            )
+            init_recover_candidate = bool(
+                bool(depth_init_recover_enable)
+                and bool(depth_sparse_recover_enable)
+                and bool(unstable_geometry_init)
+                and len(obs_list) >= int(max(2, depth_init_recover_min_obs))
+                and depth_fail_ratio >= float(np.clip(depth_init_recover_min_depth_fail_ratio, 0.0, 1.0))
+                and parallax_init_ok
+                and quality_init_ok
+            )
+            if init_recover_candidate:
+                MSCKF_STATS['depth_init_candidate_count'] += 1
+                MSCKF_STATS['depth_init_routed_count'] += 1
+                MSCKF_STATS['depth_sparse_recover_candidate_count'] += 1
+                MSCKF_STATS['fail_depth_sparse_recoverable'] += 1
+                MSCKF_STATS['fail_geometry_borderline'] += 1
+                MSCKF_STATS['reclass_to_geometry_count'] += 1
+                return None
+            MSCKF_STATS['depth_init_gate_block_count'] += 1
             MSCKF_STATS['fail_depth_sign_init'] += 1
             # Taxonomy split:
             # - init-stage depth failures are tracked as depth_large/init-specific,
@@ -1642,17 +1801,9 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
         (global_config or {}).get("MSCKF_DEPTHSIGN_UNSTABLE_MIN_DEPTH_FLOOR_M", 0.015)
         if isinstance(global_config, dict) else 0.015
     )
-    depth_relax_min_depth_enable = bool(
-        (global_config or {}).get("MSCKF_DEPTHSIGN_UNSTABLE_RELAX_MIN_DEPTH_ENABLE", False)
-        if isinstance(global_config, dict) else False
-    )
     depth_reclass_enable = bool(
         (global_config or {}).get("MSCKF_DEPTHSIGN_UNSTABLE_RECLASSIFY_ENABLE", True)
         if isinstance(global_config, dict) else True
-    )
-    depth_reclass_dom_ratio_th = float(
-        (global_config or {}).get("MSCKF_DEPTHSIGN_UNSTABLE_RECLASSIFY_DOM_RATIO_TH", 0.70)
-        if isinstance(global_config, dict) else 0.70
     )
     unstable_geometry_depth_gate = bool(
         depth_gate_enable and (
@@ -1675,14 +1826,21 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
     )
     MAX_REPROJ_ERROR_PX *= float(reproj_policy.get("gate_mult", 1.0))
     total_error = 0.0
+    rescue_total_error = 0.0
     max_pixel_error = 0.0
     valid_obs: List[dict] = []
+    rescue_valid_obs: List[dict] = []
     obs_error_norm_values: List[float] = []
+    rescue_obs_error_norm_values: List[float] = []
     depth_rejects = 0
     reproj_rejects = 0
     pixel_rejects = 0
     norm_rejects = 0
     borderline_rejects = 0
+    rescue_borderline_rejects = 0
+    depth_retry_promoted_obs = 0
+    rescue_promoted_obs = 0
+    rescue_obs_set_used = False
 
     norm_scale_px = 120.0
     try:
@@ -1854,19 +2012,80 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
                 float(min_depth_threshold) * float(np.clip(depth_gate_mult, 0.1, 1.0)),
             )
         
+        promoted_by_depth_retry = False
+        promoted_by_same_cycle_rescue = False
+        same_cycle_retry_mode = bool(
+            bool(use_depth_same_cycle_full_rescue)
+            and (retry_mode_key == "depth_sparse_same_cycle_rescue")
+            and bool(protected_retry_context)
+        )
         if p_c[2] < min_depth_threshold:
-            depth_rejects += 1
-            continue
+            soft_depth_threshold = max(
+                float(depth_gate_floor_m) * 0.5,
+                float(min_depth_threshold) * float(depth_retry_soft_depth_ratio_use),
+            )
+            same_cycle_rescue_threshold = max(
+                float(depth_gate_floor_m) * 0.35,
+                float(min_depth_threshold) * (0.48 if use_depth_same_cycle_full_rescue else 0.60),
+            )
+            same_cycle_retry_floor_threshold = max(
+                float(depth_gate_floor_m) * 0.12,
+                float(min_depth_threshold) * 0.22,
+            )
+            if (
+                use_depth_retry_soft_accept
+                and depth_retry_promoted_obs < int(depth_retry_soft_max_promote_use)
+                and p_c[2] >= soft_depth_threshold
+            ):
+                promoted_by_depth_retry = True
+            elif (
+                use_depth_same_cycle_full_rescue
+                and rescue_promoted_obs < int(depth_retry_soft_max_promote_use)
+                and (
+                    p_c[2] >= same_cycle_rescue_threshold
+                    or (same_cycle_retry_mode and p_c[2] >= same_cycle_retry_floor_threshold)
+                )
+            ):
+                promoted_by_same_cycle_rescue = True
+                if bool(same_cycle_retry_mode) and p_c[2] < same_cycle_rescue_threshold:
+                    # Retry-mode-only bounded relaxation for depth-sparse protected lane.
+                    MSCKF_STATS['posttri_retry_recover_depth_relaxed_gate_used_count'] += 1
+            else:
+                depth_rejects += 1
+                continue
         
-        # Compute normalized coordinates (legacy method - always used)
-        x_pred = p_c[0] / p_c[2]
-        y_pred = p_c[1] / p_c[2]
+        # Retry-mode same-cycle rescue lane:
+        # use positive-depth clipped projection only for promoted observations to
+        # avoid near-zero depth blow-ups while keeping legacy depth-gate behavior
+        # unchanged for normal lanes.
+        p_c_proj = p_c
+        if promoted_by_same_cycle_rescue and bool(same_cycle_retry_mode):
+            clip_depth_floor = max(
+                float(depth_gate_floor_m) * 0.14,
+                float(min_depth_threshold) * 0.35,
+            )
+            if p_c[2] < clip_depth_floor:
+                p_c_proj = p_c.copy()
+                vec_norm = float(np.linalg.norm(p_c_proj))
+                if vec_norm > 1e-9:
+                    ray_dir = p_c_proj / vec_norm
+                    if ray_dir[2] > 1e-6:
+                        p_c_proj = ray_dir * float(clip_depth_floor / ray_dir[2])
+                    else:
+                        p_c_proj[2] = clip_depth_floor
+                else:
+                    p_c_proj[2] = clip_depth_floor
+                MSCKF_STATS['posttri_retry_recover_depth_same_cycle_clip_proj_count'] += 1
+
+        # Compute normalized coordinates
+        x_pred = p_c_proj[0] / p_c_proj[2]
+        y_pred = p_c_proj[1] / p_c_proj[2]
         
         x_obs, y_obs = obs['pt_norm']
         norm_error = np.sqrt((x_obs - x_pred)**2 + (y_obs - y_pred)**2)
 
         # Ray-angle validation is more stable for fisheye than pure pixel/normalized residuals.
-        ray_pred = p_c.reshape(3,)
+        ray_pred = p_c_proj.reshape(3,)
         ray_pred /= max(1e-9, np.linalg.norm(ray_pred))
         ray_obs = normalized_to_unit_ray(float(x_obs), float(y_obs))
         ray_err_deg = float(np.degrees(np.arccos(np.clip(np.dot(ray_pred, ray_obs), -1.0, 1.0))))
@@ -1881,7 +2100,7 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
         # NEW: Pixel-level reprojection validation (if K, D available)
         if has_pixel_obs:
             # Project 3D point to pixel coordinates
-            pts_reproj = kannala_brandt_project(p_c.reshape(1, 3), K, D)
+            pts_reproj = kannala_brandt_project(p_c_proj.reshape(1, 3), K, D)
             
             if pts_reproj.size > 0:
                 pt_obs_px = np.array(obs['pt_px'], dtype=float).reshape(-1)
@@ -1903,15 +2122,80 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
                         obs_error_metric *= 1.15
                         borderline_rejects += 1
 
-        total_error += float(obs_error_metric)
-        obs_error_norm_values.append(float(obs_error_metric))
-        valid_obs.append(obs)
+        strict_obs_metric = float(obs_error_metric)
+        rescue_obs_metric = float(obs_error_metric)
+        if promoted_by_depth_retry:
+            depth_retry_promoted_obs += 1
+            borderline_rejects += 1
+            strict_obs_metric = float(strict_obs_metric) * float(
+                depth_retry_soft_error_mult_use
+            )
+            rescue_obs_metric = float(strict_obs_metric)
+            MSCKF_STATS['posttri_retry_recover_depth_soft_accept_count'] += 1
+        if promoted_by_same_cycle_rescue:
+            rescue_promoted_obs += 1
+            rescue_borderline_rejects += 1
+            rescue_obs_metric = float(rescue_obs_metric) * float(
+                min(2.75, depth_retry_soft_error_mult_use * 1.12)
+            )
+            MSCKF_STATS['posttri_retry_recover_depth_soft_accept_count'] += 1
+        else:
+            total_error += float(strict_obs_metric)
+            obs_error_norm_values.append(float(strict_obs_metric))
+            valid_obs.append(obs)
+        rescue_total_error += float(rescue_obs_metric)
+        rescue_obs_error_norm_values.append(float(rescue_obs_metric))
+        rescue_valid_obs.append(obs)
 
-    obs_reproj_p95_norm = (
-        float(np.percentile(np.asarray(obs_error_norm_values, dtype=float), 95))
-        if len(obs_error_norm_values) > 0
-        else float("nan")
+    if (
+        use_depth_same_cycle_full_rescue
+        and rescue_promoted_obs > 0
+        and len(rescue_valid_obs) >= 2
+        and len(rescue_valid_obs) > len(valid_obs)
+    ):
+        p_rescue = triangulate_point_nonlinear(
+            rescue_valid_obs,
+            cam_states,
+            p_refined,
+            kf,
+            debug=debug,
+            global_config=global_config,
+        )
+        if p_rescue is not None:
+            p_refined = p_rescue
+            valid_obs = list(rescue_valid_obs)
+            obs_error_norm_values = list(rescue_obs_error_norm_values)
+            total_error = float(rescue_total_error)
+            borderline_rejects = int(borderline_rejects + rescue_borderline_rejects)
+            depth_retry_promoted_obs = int(depth_retry_promoted_obs + rescue_promoted_obs)
+            rescue_obs_set_used = True
+            MSCKF_STATS['posttri_retry_recover_depth_borderline_promote_count'] += 1
+        elif retry_mode_key == "depth_sparse_same_cycle_rescue" and len(valid_obs) < 2:
+            # Same-cycle rescue fallback:
+            # in retry-mode, allow bounded rescue observation set to proceed
+            # even if re-triangulation fails, so the update lane can activate.
+            valid_obs = list(rescue_valid_obs)
+            obs_error_norm_values = list(rescue_obs_error_norm_values)
+            total_error = float(rescue_total_error)
+            borderline_rejects = int(borderline_rejects + rescue_borderline_rejects)
+            depth_retry_promoted_obs = int(depth_retry_promoted_obs + rescue_promoted_obs)
+            rescue_obs_set_used = True
+            MSCKF_STATS['posttri_retry_recover_depth_borderline_promote_count'] += 1
+
+    same_cycle_rescue_direct_lane_active = bool(
+        bool(use_depth_same_cycle_full_rescue)
+        and (retry_mode_key == "depth_sparse_same_cycle_rescue")
+        and bool(rescue_obs_set_used)
+        and int(len(valid_obs)) >= 2
+        and int(depth_retry_promoted_obs + (0 if rescue_obs_set_used else rescue_promoted_obs)) > 0
     )
+    promoted_obs_total = int(
+        depth_retry_promoted_obs + (0 if rescue_obs_set_used else rescue_promoted_obs)
+    )
+    same_cycle_rescue_direct_max_promoted = int(
+        max(1, int(depth_retry_soft_max_promote_use) + 1)
+    )
+
     valid_obs_ratio_now = float(len(valid_obs)) / float(max(1, len(obs_list)))
     def _use_geometry_borderline_preagg(avg_gate: float, avg_err: Optional[float]) -> bool:
         # Deterministic pre-aggregation lane:
@@ -1992,41 +2276,108 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
             )
         )
         if weak_depth_support:
-            avg_err_candidate = (
-                float(total_error) / float(max(1, valid_obs_n))
-                if valid_obs_n > 0
-                else float("nan")
-            )
-            avg_gate_candidate = float(avg_gate_factor * norm_threshold)
-            support_rescue = bool(
-                depth_support_rescue_enable
-                and valid_obs_n >= max(2, int(depth_support_rescue_min_valid_obs))
-                and depth_pos_ratio >= max(0.15, float(np.clip(depth_state_gate_min_pos_ratio, 0.05, 1.0)) * 0.80)
-                and depth_reject_ratio <= 0.92
-                and np.isfinite(parallax_med_px)
-                and float(parallax_med_px) >= float(max(0.1, depth_support_rescue_min_parallax_px))
-                and (
+            # C2 hardening:
+            # Do not early-exit sparse weak-depth cases here; route them to the
+            # len(valid_obs)<2 lane so depth-sparse recovery can activate.
+            # Keep immediate reject only for clearly unrecoverable dense cases.
+            if valid_obs_n >= 2:
+                same_cycle_direct_bypass_ok = bool(
+                    same_cycle_rescue_direct_lane_active
+                    and int(promoted_obs_total)
+                    <= int(same_cycle_rescue_direct_max_promoted)
+                )
+                same_cycle_rescue_promote_ok = bool(
+                    bool(use_depth_same_cycle_full_rescue)
+                    and valid_obs_n >= 2
+                    and int(promoted_obs_total) > 0
+                    and depth_pos_ratio >= float(np.clip(float(depth_state_gate_min_pos_ratio) * 0.50, 0.10, 1.0))
+                    and depth_reject_ratio <= float(np.clip(float(depth_state_gate_min_reject_ratio) * 1.35, 0.0, 0.99))
+                    and (
+                        (not np.isfinite(parallax_med_px))
+                        or float(parallax_med_px) >= float(
+                            max(0.1, float(depth_sparse_recover_min_parallax_px) * 0.75)
+                        )
+                    )
+                )
+                borderline_parallax_ok = bool(
+                    (not np.isfinite(parallax_med_px))
+                    or float(parallax_med_px) >= float(
+                        max(
+                            0.1,
+                            float(depth_sparse_recover_min_parallax_px)
+                            * float(np.clip(depth_retry_bounded_relax_parallax_mult, 0.5, 1.0)),
+                        )
+                    )
+                )
+                borderline_quality_ok = bool(
                     (not np.isfinite(feature_quality))
-                    or float(feature_quality) >= float(np.clip(depth_support_rescue_min_quality, 0.0, 1.0))
+                    or float(feature_quality) >= float(
+                        np.clip(
+                            float(depth_sparse_recover_min_quality) - float(depth_retry_bounded_relax_quality_delta),
+                            0.0,
+                            1.0,
+                        )
+                    )
                 )
-                and np.isfinite(avg_err_candidate)
-                and np.isfinite(avg_gate_candidate)
-                and avg_gate_candidate > 1e-9
-                and avg_err_candidate <= avg_gate_candidate * float(
-                    max(1.0, depth_support_rescue_max_reproj_to_gate)
+                borderline_promote_ok = bool(
+                    bool(use_depth_retry_bounded_relax)
+                    and bool(protected_retry_context)
+                    and valid_obs_n >= max(2, int(depth_state_gate_min_valid_obs) - 1)
+                    and depth_pos_ratio >= float(np.clip(float(depth_state_gate_min_pos_ratio) * 0.60, 0.10, 1.0))
+                    and depth_reject_ratio <= float(np.clip(float(depth_state_gate_min_reject_ratio) * 1.15, 0.0, 0.98))
+                    and borderline_parallax_ok
+                    and borderline_quality_ok
                 )
-            )
-            if support_rescue:
-                MSCKF_STATS['depth_support_rescue_count'] += 1
-            else:
-                if bool(depth_reclass_enable):
-                    MSCKF_STATS['fail_geometry_borderline'] += 1
-                    MSCKF_STATS['fail_depth_large'] += 1
-                    MSCKF_STATS['reclass_to_geometry_count'] += 1
+                same_cycle_gate_override_ok = bool(
+                    bool(depth_retry_gate_override_enable)
+                    and bool(use_depth_same_cycle_full_rescue)
+                    and (retry_mode_key == "depth_sparse_same_cycle_rescue")
+                    and valid_obs_n >= 2
+                    and int(promoted_obs_total) > 0
+                    and int(promoted_obs_total)
+                    <= max(1, int(depth_retry_soft_max_promote_use))
+                    and depth_pos_ratio >= float(np.clip(float(depth_state_gate_min_pos_ratio) * 0.45, 0.10, 1.0))
+                    and depth_reject_ratio <= float(np.clip(float(depth_state_gate_min_reject_ratio) * 1.50, 0.0, 0.99))
+                    and (
+                        (not np.isfinite(parallax_med_px))
+                        or float(parallax_med_px) >= float(
+                            max(0.1, float(depth_sparse_recover_min_parallax_px) * 0.65)
+                        )
+                    )
+                )
+                if same_cycle_direct_bypass_ok:
+                    # Deterministic bounded bypass in same-cycle retry-mode:
+                    # skip legacy unstable depth-gate so rescued observations
+                    # can enter update path directly.
+                    MSCKF_STATS['posttri_retry_recover_depth_gate_override_count'] += 1
+                    MSCKF_STATS['posttri_retry_recover_depth_relaxed_gate_used_count'] += 1
+                elif same_cycle_gate_override_ok:
+                    MSCKF_STATS['posttri_retry_recover_depth_gate_override_count'] += 1
+                    MSCKF_STATS['posttri_retry_recover_depth_relaxed_gate_used_count'] += 1
+                elif rescue_obs_set_used and same_cycle_rescue_promote_ok:
+                    MSCKF_STATS['posttri_retry_recover_depth_borderline_promote_count'] += 1
+                    MSCKF_STATS['posttri_retry_recover_depth_relaxed_gate_used_count'] += 1
+                elif borderline_promote_ok:
+                    # Bounded dense-borderline promote for retry-depth lane only.
+                    # Keep geometry alive long enough to reach the deterministic
+                    # update/retry path instead of dying at the unstable depth gate.
+                    MSCKF_STATS['posttri_retry_recover_depth_borderline_promote_count'] += 1
+                    MSCKF_STATS['posttri_retry_recover_depth_relaxed_gate_used_count'] += 1
                 else:
-                    MSCKF_STATS['fail_depth_sign_post_refine'] += 1
-                    MSCKF_STATS['fail_depth_sign'] += 1
-                return None
+                    if (
+                        bool(depth_retry_gate_override_enable)
+                        and bool(use_depth_same_cycle_full_rescue)
+                        and (retry_mode_key == "depth_sparse_same_cycle_rescue")
+                    ):
+                        MSCKF_STATS['posttri_retry_recover_depth_gate_override_reject_count'] += 1
+                    if bool(depth_reclass_enable):
+                        MSCKF_STATS['fail_geometry_borderline'] += 1
+                        MSCKF_STATS['fail_depth_large'] += 1
+                        MSCKF_STATS['reclass_to_geometry_count'] += 1
+                    else:
+                        MSCKF_STATS['fail_depth_sign_post_refine'] += 1
+                        MSCKF_STATS['fail_depth_sign'] += 1
+                    return None
 
     if len(valid_obs) < 2:
         total_rejects = max(1, int(depth_rejects + reproj_rejects))
@@ -2047,6 +2398,7 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
                 MSCKF_STATS['reclass_to_geometry_count'] += 1
                 return None
         if depth_rejects >= reproj_rejects:
+            valid_obs_n = int(len(valid_obs))
             depth_dom_ratio = float(depth_rejects) / float(total_rejects)
             strict_depth_sign = bool(
                 (not bool(unstable_geometry_depth_gate))
@@ -2066,24 +2418,103 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
                 np.isfinite(parallax_med_px)
                 and float(parallax_med_px) >= float(max(0.1, depth_sparse_recover_min_parallax_px))
             )
+            parallax_low_for_depth_sparse = bool(
+                np.isfinite(parallax_med_px)
+                and float(parallax_med_px) < float(max(0.1, depth_sign_strict_min_parallax_px) * 1.10)
+            )
             quality_recover_ok = bool(
                 (not np.isfinite(feature_quality))
                 or float(feature_quality) >= float(np.clip(depth_sparse_recover_min_quality, 0.0, 1.0))
             )
-            recoverable_depth_sparse = bool(
+            if parallax_low_for_depth_sparse:
+                MSCKF_STATS['depth_sparse_recover_parallax_low_count'] += 1
+            strict_min_obs_recover = max(3, int(depth_sparse_recover_min_obs))
+            min_obs_recover = int(strict_min_obs_recover)
+            if bool(unstable_geometry_depth_gate) and parallax_low_for_depth_sparse:
+                min_obs_recover = max(3, min_obs_recover - 1)
+            relaxed_min_obs_recover = max(3, strict_min_obs_recover - max(0, int(depth_retry_bounded_relax_obs_delta)))
+            strict_parallax_lane_ok = bool(
+                parallax_recover_ok
+                or (
+                    bool(unstable_geometry_depth_gate)
+                    and parallax_low_for_depth_sparse
+                    and depth_dom_ratio >= float(np.clip(depth_sparse_recover_min_depth_dom_ratio, 0.0, 1.0))
+                )
+            )
+            relaxed_parallax_lane_ok = bool(
+                np.isfinite(parallax_med_px)
+                and float(parallax_med_px) >= float(
+                    max(
+                        0.1,
+                        float(depth_sparse_recover_min_parallax_px)
+                        * float(np.clip(depth_retry_bounded_relax_parallax_mult, 0.5, 1.0)),
+                    )
+                )
+            )
+            relaxed_quality_recover_ok = bool(
+                (not np.isfinite(feature_quality))
+                or float(feature_quality) >= float(
+                    np.clip(
+                        float(depth_sparse_recover_min_quality) - float(depth_retry_bounded_relax_quality_delta),
+                        0.0,
+                        1.0,
+                    )
+                )
+            )
+            parallax_lane_ok = bool(
+                strict_parallax_lane_ok
+                or (
+                    bool(use_depth_retry_bounded_relax)
+                    and bool(relaxed_parallax_lane_ok)
+                    and depth_dom_ratio >= float(np.clip(depth_sparse_recover_min_depth_dom_ratio, 0.0, 1.0))
+                )
+            )
+            depth_sparse_candidate = bool(
                 depth_sparse_recover_enable
-                and len(obs_list) >= max(3, int(depth_sparse_recover_min_obs))
+                and len(obs_list) >= min_obs_recover
                 and depth_dom_ratio >= float(np.clip(depth_sparse_recover_min_depth_dom_ratio, 0.0, 1.0))
-                and valid_obs_ratio > 0.0
-                and parallax_recover_ok
-                and quality_recover_ok
-                and bool(unstable_geometry_depth_gate)
+                and parallax_lane_ok
+                and (quality_recover_ok or (bool(use_depth_retry_bounded_relax) and bool(relaxed_quality_recover_ok)))
+            )
+            relaxed_depth_sparse_candidate = bool(
+                bool(use_depth_retry_bounded_relax)
+                and depth_sparse_recover_enable
+                and len(obs_list) >= relaxed_min_obs_recover
+                and depth_dom_ratio >= float(np.clip(depth_sparse_recover_min_depth_dom_ratio, 0.0, 1.0))
+                and bool(relaxed_parallax_lane_ok)
+                and bool(relaxed_quality_recover_ok)
+            )
+            if depth_sparse_candidate:
+                MSCKF_STATS['depth_sparse_recover_candidate_count'] += 1
+                if (not strict_parallax_lane_ok or len(obs_list) < strict_min_obs_recover or (not quality_recover_ok)) and relaxed_depth_sparse_candidate:
+                    MSCKF_STATS['posttri_retry_recover_depth_relaxed_gate_used_count'] += 1
+            recoverable_depth_sparse = bool(
+                depth_sparse_candidate
+                and (bool(unstable_geometry_depth_gate) or parallax_low_for_depth_sparse)
+                and (
+                    valid_obs_n >= 1
+                    or (
+                        bool(unstable_geometry_depth_gate)
+                        and parallax_low_for_depth_sparse
+                        and depth_rejects >= max(2, int(0.55 * len(obs_list)))
+                    )
+                )
             )
             if (not strict_depth_sign) and recoverable_depth_sparse:
+                if bool(use_depth_same_cycle_full_rescue):
+                    # Same-cycle full-rescue lane should not bounce back to
+                    # fail_depth_sparse_recoverable. Keep it in geometry bucket
+                    # so retry diagnostics can separate lane-entry from legacy depth-gate loops.
+                    MSCKF_STATS['fail_geometry_insufficient_posttri'] += 1
+                    MSCKF_STATS['fail_geometry_borderline'] += 1
+                    MSCKF_STATS['reclass_to_geometry_count'] += 1
+                    return None
                 MSCKF_STATS['fail_depth_sparse_recoverable'] += 1
                 if borderline_rejects > 0:
                     MSCKF_STATS['fail_geometry_borderline'] += 1
                 return None
+            if depth_sparse_candidate and (not recoverable_depth_sparse):
+                MSCKF_STATS['depth_sparse_recover_gate_block_count'] += 1
             if (not strict_depth_sign) and bool(depth_reclass_enable):
                 MSCKF_STATS['fail_geometry_borderline'] += 1
                 MSCKF_STATS['fail_depth_large'] += 1
@@ -2346,6 +2777,11 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
         'stable_reproj_lane_cap': float(stable_lane_cap) if np.isfinite(stable_lane_cap) else np.nan,
         'stable_reproj_lane_borderline_ratio': float(stable_lane_borderline_ratio),
         'stable_reproj_lane_valid_obs_ratio': float(stable_lane_valid_obs_ratio),
+        'retry_mode_key': str(retry_mode_key),
+        'rescue_obs_set_used': bool(rescue_obs_set_used),
+        'rescue_promoted_obs_total': int(promoted_obs_total),
+        'rescue_promoted_obs_cap': int(same_cycle_rescue_direct_max_promoted),
+        'same_cycle_rescue_direct_lane_active': bool(same_cycle_rescue_direct_lane_active),
     }
     
     # Add pixel-level error if available
@@ -2441,16 +2877,14 @@ def compute_measurement_jacobian(p_w: np.ndarray, cam_state: dict,
     
     # Preintegration Jacobians (bias coupling)
     # Try preint object first, then stored jacobians
-    J_R_bg = J_v_bg = J_v_ba = J_p_bg = J_p_ba = None
+    J_R_bg = J_p_bg = J_p_ba = None
     if use_preint_jacobians:
         if 'preint' in cam_state and cam_state['preint'] is not None:
             preint = cam_state['preint']
-            J_R_bg, J_v_bg, J_v_ba, J_p_bg, J_p_ba = preint.get_jacobians()
+            J_R_bg, _, _, J_p_bg, J_p_ba = preint.get_jacobians()
         elif 'J_R_bg' in cam_state and cam_state['J_R_bg'] is not None:
             # Use stored Jacobians from clone time
             J_R_bg = cam_state['J_R_bg']
-            J_v_bg = cam_state['J_v_bg']
-            J_v_ba = cam_state['J_v_ba']
             J_p_bg = cam_state['J_p_bg']
             J_p_ba = cam_state['J_p_ba']
     
@@ -2484,9 +2918,6 @@ def compute_observability_nullspace(kf: ExtendedKalmanFilter,
     Returns: (err_state_size, 3) nullspace matrix
     """
     err_state_size = 18 + 6 * num_clones  # v3.9.7: 18 core + 6*clones
-    
-    q_imu = kf.x[6:10, 0]
-    yaw = quaternion_to_yaw(q_imu)
     
     U = np.zeros((err_state_size, 3), dtype=float)
     
@@ -2864,8 +3295,6 @@ def msckf_measurement_update_with_plane(fid: int, triangulated: dict,
             timestamp=float("nan"),
             stage="MSCKF_PLANE_ENTRY",
         )
-    from .plane_utils import compute_plane_jacobian
-    
     # =========================================================================
     # Part 1: Standard MSCKF bearing measurements
     # =========================================================================
@@ -2921,7 +3350,6 @@ def msckf_measurement_update_with_plane(fid: int, triangulated: dict,
             [0, z_inv, -p_c[1]*z_inv2]
         ])
         
-        J_point = J_proj @ R_wc
         J_q = -J_proj @ R_cw @ skew_symmetric(p_c)
         J_p = -J_proj @ R_wc
         
@@ -3021,7 +3449,6 @@ def msckf_measurement_update_with_plane(fid: int, triangulated: dict,
                 dp_dθ0 = λ0 * dr0_dθ0
                 
                 # Similar for second camera
-                dr1_dθ1 = -R1_wc @ skew_symmetric(ray1_c)
                 # ∂λ0/∂θ1 comes from ∂r1/∂θ1 affecting dot products
                 # For simplicity, use numerical approximation or neglect (small)
                 dp_dθ1 = np.zeros((3, 3))  # Approximation: first-order only
@@ -3238,12 +3665,6 @@ def perform_msckf_updates(vio_fe, cam_observations: List[dict],
         max_features=max_features,
     )
     
-    if len(mature_fids) == 0:
-        return 0
-    
-    if len(mature_fids) > max_features:
-        mature_fids = mature_fids[:max_features]
-    
     num_successful = 0
     num_attempted = 0
     dof_samples: List[int] = []
@@ -3299,9 +3720,87 @@ def perform_msckf_updates(vio_fe, cam_observations: List[dict],
             ),
         )
     )
+    posttri_retry_recover_min_obs = int(
+        max(2, prefilter_cfg.get("MSCKF_RETRY_LANE_POSTTRI_RECOVER_MIN_OBS", 5))
+    )
+    posttri_retry_recover_min_parallax_px = float(
+        prefilter_cfg.get("MSCKF_RETRY_LANE_POSTTRI_RECOVER_MIN_PARALLAX_PX", 1.15)
+    )
+    posttri_retry_recover_min_quality = float(
+        prefilter_cfg.get("MSCKF_RETRY_LANE_POSTTRI_RECOVER_MIN_QUALITY", 0.34)
+    )
+    posttri_retry_recover_depth_same_cycle_enable = bool(
+        prefilter_cfg.get("MSCKF_RETRY_LANE_POSTTRI_RECOVER_DEPTH_SAME_CYCLE_ENABLE", False)
+    )
+    posttri_retry_recover_depth_full_rescue_enable = bool(
+        prefilter_cfg.get("MSCKF_RETRY_LANE_POSTTRI_RECOVER_DEPTH_FULL_RESCUE_ENABLE", False)
+    )
+    posttri_retry_recover_protect_enable = bool(
+        prefilter_cfg.get("MSCKF_RETRY_LANE_POSTTRI_RECOVER_PROTECT_ENABLE", False)
+    )
+    posttri_retry_recover_protect_cycles = int(
+        max(0, prefilter_cfg.get("MSCKF_RETRY_LANE_POSTTRI_RECOVER_PROTECT_CYCLES", 2))
+    )
+    posttri_retry_recover_depth_bounded_relax_enable = bool(
+        prefilter_cfg.get("MSCKF_RETRY_LANE_POSTTRI_RECOVER_DEPTH_BOUNDED_RELAX_ENABLE", False)
+    )
+    posttri_retry_recover_depth_bounded_relax_obs_delta = int(
+        max(0, prefilter_cfg.get("MSCKF_RETRY_LANE_POSTTRI_RECOVER_DEPTH_BOUNDED_RELAX_OBS_DELTA", 1))
+    )
+    posttri_retry_recover_depth_bounded_relax_parallax_mult = float(
+        prefilter_cfg.get("MSCKF_RETRY_LANE_POSTTRI_RECOVER_DEPTH_BOUNDED_RELAX_PARALLAX_MULT", 0.88)
+    )
+    posttri_retry_recover_depth_bounded_relax_quality_delta = float(
+        prefilter_cfg.get("MSCKF_RETRY_LANE_POSTTRI_RECOVER_DEPTH_BOUNDED_RELAX_QUALITY_DELTA", 0.03)
+    )
+    posttri_retry_recover_depth_gate_enable = bool(
+        prefilter_cfg.get("MSCKF_RETRY_LANE_POSTTRI_RECOVER_DEPTH_GATE_ENABLE", True)
+    )
+    # Deterministic caps for retry-mode same-cycle depth rescue.
+    posttri_retry_same_cycle_max_promoted_obs = int(
+        np.clip(
+            prefilter_cfg.get(
+                "MSCKF_RETRY_LANE_POSTTRI_RECOVER_DEPTH_SAME_CYCLE_MAX_PROMOTED_OBS",
+                3,
+            ),
+            1,
+            8,
+        )
+    )
+    posttri_retry_same_cycle_max_avg_reproj_norm = float(
+        np.clip(
+            prefilter_cfg.get(
+                "MSCKF_RETRY_LANE_POSTTRI_RECOVER_DEPTH_SAME_CYCLE_MAX_AVG_REPROJ_NORM",
+                0.06,
+            ),
+            0.005,
+            0.30,
+        )
+    )
+    posttri_retry_same_cycle_min_depth_ratio = float(
+        np.clip(
+            prefilter_cfg.get(
+                "MSCKF_RETRY_LANE_POSTTRI_RECOVER_DEPTH_SAME_CYCLE_MIN_DEPTH_RATIO",
+                0.30,
+            ),
+            0.05,
+            1.00,
+        )
+    )
+    posttri_retry_same_cycle_chi2_scale_mult = float(
+        np.clip(
+            prefilter_cfg.get(
+                "MSCKF_RETRY_LANE_POSTTRI_RECOVER_DEPTH_SAME_CYCLE_CHI2_SCALE_MULT",
+                0.85,
+            ),
+            0.2,
+            1.0,
+        )
+    )
     retry_state: Dict[int, int] = {}
     posttri_retry_state: Dict[int, int] = {}
     posttri_retry_source: Dict[int, str] = {}
+    posttri_retry_protect_state: Dict[int, int] = {}
     if vio_fe is not None:
         try:
             retry_state = dict(getattr(vio_fe, "_msckf_retry_state", {}))
@@ -3315,24 +3814,186 @@ def perform_msckf_updates(vio_fe, cam_observations: List[dict],
             posttri_retry_source = dict(getattr(vio_fe, "_msckf_posttri_retry_source", {}))
         except Exception:
             posttri_retry_source = {}
+        try:
+            posttri_retry_protect_state = dict(getattr(vio_fe, "_msckf_posttri_retry_protect_state", {}))
+        except Exception:
+            posttri_retry_protect_state = {}
+    if posttri_retry_protect_state:
+        posttri_retry_protect_state = {
+            int(fid): int(cnt)
+            for fid, cnt in posttri_retry_protect_state.items()
+            if int(cnt) > 0
+        }
+    valid_fid_set = {int(fid) for fid in mature_fids}
+    if posttri_retry_protect_state:
+        valid_fid_set.update(int(fid) for fid in posttri_retry_protect_state.keys())
     if retry_state:
-        valid_fid_set = {int(fid) for fid in mature_fids}
-        retry_state = {int(fid): int(cnt) for fid, cnt in retry_state.items() if int(fid) in valid_fid_set}
+        retry_state = {
+            int(fid): int(cnt)
+            for fid, cnt in retry_state.items()
+            if int(fid) in valid_fid_set
+        }
     if posttri_retry_state:
-        valid_fid_set = {int(fid) for fid in mature_fids}
         posttri_retry_state = {
             int(fid): int(cnt)
             for fid, cnt in posttri_retry_state.items()
             if int(fid) in valid_fid_set
         }
     if posttri_retry_source:
-        valid_fid_set = {int(fid) for fid in mature_fids}
         posttri_retry_source = {
             int(fid): str(src)
             for fid, src in posttri_retry_source.items()
             if int(fid) in valid_fid_set
         }
-    
+
+    def _record_depth_retry_failure(reason: str) -> None:
+        reason = str(reason or "")
+        if reason in (
+            "fail_depth_sign_init",
+            "fail_depth_sign_post_refine",
+            "fail_depth_sign",
+            "fail_depth_large",
+            "fail_depth_sparse_recoverable",
+        ):
+            MSCKF_STATS['posttri_retry_recover_depth_fail_depth_count'] += 1
+        elif reason in (
+            "fail_reproj_pixel",
+            "fail_reproj_normalized",
+            "fail_reproj_error",
+            "fail_reproj_sparse",
+            "fail_reproj_sparse_recoverable",
+        ):
+            MSCKF_STATS['posttri_retry_recover_depth_fail_reproj_count'] += 1
+        elif reason in (
+            "fail_prefilter_geometry",
+            "fail_geometry_insufficient_pretri",
+            "fail_geometry_insufficient_posttri",
+            "fail_geometry_borderline",
+            "fail_parallax",
+            "fail_baseline",
+            "fail_solver",
+        ):
+            MSCKF_STATS['posttri_retry_recover_depth_fail_geometry_count'] += 1
+        elif reason == "fail_nonlinear":
+            MSCKF_STATS['posttri_retry_recover_depth_fail_nonlinear_count'] += 1
+        else:
+            MSCKF_STATS['posttri_retry_recover_depth_fail_other_count'] += 1
+
+    def _record_same_cycle_retry_failure(reason: str) -> None:
+        reason = str(reason or "")
+        if reason in (
+            "fail_depth_sign_init",
+            "fail_depth_sign_post_refine",
+            "fail_depth_sign",
+            "fail_depth_large",
+            "fail_depth_sparse_recoverable",
+        ):
+            MSCKF_STATS['posttri_retry_recover_depth_same_cycle_fail_depth_count'] += 1
+        elif reason in (
+            "fail_reproj_pixel",
+            "fail_reproj_normalized",
+            "fail_reproj_error",
+            "fail_reproj_sparse",
+            "fail_reproj_sparse_recoverable",
+        ):
+            MSCKF_STATS['posttri_retry_recover_depth_same_cycle_fail_reproj_count'] += 1
+        elif reason in (
+            "fail_prefilter_geometry",
+            "fail_geometry_insufficient_pretri",
+            "fail_geometry_insufficient_posttri",
+            "fail_geometry_borderline",
+            "fail_parallax",
+            "fail_baseline",
+            "fail_solver",
+        ):
+            MSCKF_STATS['posttri_retry_recover_depth_same_cycle_fail_geometry_count'] += 1
+        elif reason == "fail_nonlinear":
+            MSCKF_STATS['posttri_retry_recover_depth_same_cycle_fail_nonlinear_count'] += 1
+        else:
+            MSCKF_STATS['posttri_retry_recover_depth_same_cycle_fail_other_count'] += 1
+
+    def _depth_recover_gate_ok(quick_obs_local: List[dict], quick_parallax_local: float, q_med_local: float) -> Tuple[bool, bool]:
+        strict_depth_recover_gate_ok = bool(
+            len(quick_obs_local) >= int(max(2, posttri_retry_recover_min_obs))
+            and np.isfinite(quick_parallax_local)
+            and float(quick_parallax_local) >= float(max(0.1, posttri_retry_recover_min_parallax_px))
+            and (
+                (not np.isfinite(q_med_local))
+                or float(q_med_local) >= float(np.clip(posttri_retry_recover_min_quality, 0.0, 1.0))
+            )
+        )
+        relaxed_depth_recover_gate_ok = bool(
+            bool(posttri_retry_recover_depth_bounded_relax_enable)
+            and len(quick_obs_local) >= int(max(2, posttri_retry_recover_min_obs - posttri_retry_recover_depth_bounded_relax_obs_delta))
+            and np.isfinite(quick_parallax_local)
+            and float(quick_parallax_local) >= float(
+                max(
+                    0.1,
+                    posttri_retry_recover_min_parallax_px
+                    * np.clip(posttri_retry_recover_depth_bounded_relax_parallax_mult, 0.5, 1.0),
+                )
+            )
+            and (
+                (not np.isfinite(q_med_local))
+                or float(q_med_local) >= float(
+                    np.clip(
+                        posttri_retry_recover_min_quality - posttri_retry_recover_depth_bounded_relax_quality_delta,
+                        0.0,
+                        1.0,
+                    )
+                )
+            )
+        )
+        return bool(strict_depth_recover_gate_ok or relaxed_depth_recover_gate_ok), bool(
+            (not strict_depth_recover_gate_ok) and relaxed_depth_recover_gate_ok
+        )
+
+    protected_retry_carried_fids = set()
+    if posttri_retry_recover_protect_enable and posttri_retry_protect_state:
+        protected_fids = []
+        cleaned_protect_state = {}
+        for fid, cycles_left in sorted(posttri_retry_protect_state.items()):
+            if cycles_left <= 0:
+                continue
+            src = str(posttri_retry_source.get(int(fid), "")).strip().lower()
+            if src != "depth_sparse":
+                MSCKF_STATS['posttri_retry_recover_depth_protected_source_missing_count'] += 1
+                posttri_retry_source.pop(int(fid), None)
+                continue
+            obs = get_feature_multi_view_observations(fid, cam_observations)
+            valid_clone_obs = [
+                o for o in obs
+                if 0 <= int(o.get("cam_id", -1)) < len(cam_states)
+            ]
+            if len(valid_clone_obs) >= max(2, int(min_observations)):
+                protected_fids.append(int(fid))
+                protected_retry_carried_fids.add(int(fid))
+                cleaned_protect_state[int(fid)] = int(cycles_left)
+            else:
+                MSCKF_STATS['posttri_retry_recover_depth_protected_missing_clone_count'] += 1
+                posttri_retry_source.pop(int(fid), None)
+        posttri_retry_protect_state = cleaned_protect_state
+        if protected_fids:
+            merged = []
+            seen = set()
+            for fid in protected_fids + mature_fids:
+                fid_i = int(fid)
+                if fid_i in seen:
+                    continue
+                seen.add(fid_i)
+                merged.append(fid_i)
+            mature_fids = merged
+
+    if len(mature_fids) == 0:
+        return 0
+
+    if len(mature_fids) > max_features:
+        truncated_fids = set(int(fid) for fid in mature_fids[max_features:])
+        truncated_protected = truncated_fids & protected_retry_carried_fids
+        if truncated_protected:
+            MSCKF_STATS['posttri_retry_recover_depth_protected_truncated_count'] += int(len(truncated_protected))
+        mature_fids = mature_fids[:max_features]
+
     # =========================================================================
     # Plane Detection (if enabled)
     # =========================================================================
@@ -3371,14 +4032,33 @@ def perform_msckf_updates(vio_fe, cam_observations: List[dict],
     # =========================================================================
     for i, fid in enumerate(mature_fids):
         quick_obs = get_feature_multi_view_observations(fid, cam_observations)
+        protected_retry_carried = bool(int(fid) in protected_retry_carried_fids)
         if len(quick_obs) == 0:
+            if protected_retry_carried:
+                MSCKF_STATS['posttri_retry_recover_depth_protected_missing_clone_count'] += 1
             retry_state.pop(int(fid), None)
             posttri_retry_state.pop(int(fid), None)
             posttri_retry_source.pop(int(fid), None)
+            posttri_retry_protect_state.pop(int(fid), None)
             continue
+        if protected_retry_carried:
+            valid_clone_obs = sum(
+                1 for o in quick_obs if 0 <= int(o.get("cam_id", -1)) < len(cam_states)
+            )
+            if valid_clone_obs < max(2, int(min_observations)):
+                MSCKF_STATS['posttri_retry_recover_depth_protected_missing_clone_count'] += 1
+                retry_state.pop(int(fid), None)
+                posttri_retry_state.pop(int(fid), None)
+                posttri_retry_source.pop(int(fid), None)
+                posttri_retry_protect_state.pop(int(fid), None)
+                continue
+            MSCKF_STATS['posttri_retry_recover_depth_protected_carried_count'] += 1
         quick_parallax = _pairwise_parallax_med_px(quick_obs, 120.0)
         t_vals = [float(o.get("t", np.nan)) for o in quick_obs]
         t_arr = np.asarray(t_vals, dtype=float)
+        q_vals = [float(o.get("quality", np.nan)) for o in quick_obs]
+        q_arr = np.asarray(q_vals, dtype=float)
+        q_med = float(np.nanmedian(q_arr)) if (q_arr.size > 0 and np.isfinite(q_arr).any()) else float("nan")
         time_span_sec = (
             float(np.nanmax(t_arr) - np.nanmin(t_arr))
             if (t_arr.size > 1 and np.isfinite(t_arr).any())
@@ -3393,15 +4073,23 @@ def perform_msckf_updates(vio_fe, cam_observations: List[dict],
             (not np.isfinite(time_span_sec))
             or float(time_span_sec) < float(max(1e-3, retry_lane_min_time_span_sec))
         )
+        in_posttri_recover_retry = bool(int(posttri_retry_state.get(int(fid), 0)) > 0)
+        depth_sparse_retry_source = bool(
+            str(posttri_retry_source.get(int(fid), "")).strip().lower() == "depth_sparse"
+        )
+        in_depth_sparse_retry_path = bool(
+            depth_sparse_retry_source and (in_posttri_recover_retry or protected_retry_carried)
+        )
         if retry_lane_enable and retry_lane_max_cycles > 0:
-            if sparse_short_track and (sparse_low_parallax or sparse_short_span):
+            if (not in_depth_sparse_retry_path) and sparse_short_track and (sparse_low_parallax or sparse_short_span):
                 cur_retry = int(retry_state.get(int(fid), 0))
                 if cur_retry < int(retry_lane_max_cycles):
                     retry_state[int(fid)] = cur_retry + 1
                     MSCKF_STATS['retry_lane_defer_count'] += 1
                     continue
             retry_state.pop(int(fid), None)
-        in_posttri_recover_retry = bool(int(posttri_retry_state.get(int(fid), 0)) > 0)
+        if in_depth_sparse_retry_path:
+            MSCKF_STATS['posttri_retry_recover_depth_retry_seen_count'] += 1
 
         # L2 (logic-first): prefilter weak geometry before triangulation so depth-sign
         # failures are concentrated to truly stable/strict cases only.
@@ -3409,9 +4097,6 @@ def perform_msckf_updates(vio_fe, cam_observations: List[dict],
             if len(quick_obs) < max(2, prefilter_min_obs):
                 MSCKF_STATS['fail_prefilter_geometry'] += 1
                 continue
-            q_vals = [float(o.get("quality", np.nan)) for o in quick_obs]
-            q_arr = np.asarray(q_vals, dtype=float)
-            q_med = float(np.nanmedian(q_arr)) if (q_arr.size > 0 and np.isfinite(q_arr).any()) else float("nan")
             weak_short_track = bool(
                 len(quick_obs) <= max(3, prefilter_min_obs)
                 and (
@@ -3443,6 +4128,25 @@ def perform_msckf_updates(vio_fe, cam_observations: List[dict],
 
         stats_before = dict(MSCKF_STATS)
         enable_debug = (i < 3)
+        retry_mode = ""
+        if int(posttri_retry_state.get(int(fid), 0)) > 0:
+            retry_mode = str(posttri_retry_source.get(int(fid), "")).strip().lower()
+            if retry_mode == "depth_sparse":
+                retry_mode = "depth_sparse_recover"
+            elif retry_mode == "reproj_sparse":
+                retry_mode = "reproj_sparse_recover"
+        retry_mode_same_cycle_rescue_active = bool(
+            bool(posttri_retry_recover_depth_same_cycle_enable)
+            and bool(posttri_retry_recover_depth_full_rescue_enable)
+            and bool(in_posttri_recover_retry)
+            and bool(depth_sparse_retry_source)
+            and len(quick_obs) >= 2
+            and bool(protected_retry_carried)
+        )
+        if retry_mode_same_cycle_rescue_active:
+            retry_mode = "depth_sparse_same_cycle_rescue"
+            MSCKF_STATS['posttri_retry_recover_depth_same_cycle_entered_count'] += 1
+            MSCKF_STATS['posttri_retry_recover_depth_same_cycle_attempt_count'] += 1
         triangulated = triangulate_feature(fid, cam_observations, cam_states, kf, 
                                           use_plane_constraint=True, ground_altitude=0.0,
                                           debug=enable_debug,
@@ -3451,45 +4155,126 @@ def perform_msckf_updates(vio_fe, cam_observations: List[dict],
                                           global_config=global_config,
                                           reproj_scale=reproj_scale,
                                           phase=phase,
-                                          health_state=health_state)
+                                          health_state=health_state,
+                                          retry_mode=retry_mode)
         
         if triangulated is None:
             fail_reason = "triangulation_failed"
-            for key in (
-                "fail_depth_sign_init",
-                "fail_depth_sign_post_refine",
-                "fail_depth_sign",
-                "fail_prefilter_geometry",
-                "fail_geometry_insufficient_pretri",
-                "fail_geometry_insufficient_posttri",
-                "fail_reproj_pixel",
-                "fail_reproj_normalized",
-                "fail_reproj_error",
-                "fail_reproj_sparse",
-                "fail_reproj_sparse_recoverable",
-                "fail_depth_sparse_recoverable",
-                "fail_geometry_borderline",
-                "fail_parallax",
-                "fail_baseline",
-                "fail_nonlinear",
-                "fail_solver",
-                "fail_other",
-            ):
+            for key in MSCKF_FAIL_REASON_PRIORITY:
                 if int(MSCKF_STATS.get(key, 0)) > int(stats_before.get(key, 0)):
                     fail_reason = key
                     break
+            if in_posttri_recover_retry and str(posttri_retry_source.get(int(fid), "")) == "depth_sparse":
+                _record_depth_retry_failure(fail_reason)
+                if bool(retry_mode_same_cycle_rescue_active):
+                    _record_same_cycle_retry_failure(fail_reason)
+            if protected_retry_carried and fail_reason == "fail_depth_sparse_recoverable":
+                MSCKF_STATS['posttri_retry_recover_depth_protected_depth_gate_again_count'] += 1
             if (
+                triangulated is None
+                and (not in_posttri_recover_retry)
+                and bool(posttri_retry_recover_enable)
+                and bool(posttri_retry_recover_depth_same_cycle_enable)
+                and fail_reason == "fail_depth_sparse_recoverable"
+            ):
+                depth_recover_gate_ok, used_relaxed_gate = _depth_recover_gate_ok(
+                    quick_obs_local=quick_obs,
+                    quick_parallax_local=quick_parallax,
+                    q_med_local=q_med,
+                )
+                if depth_recover_gate_ok and used_relaxed_gate:
+                    MSCKF_STATS['posttri_retry_recover_depth_relaxed_gate_used_count'] += 1
+                if depth_recover_gate_ok:
+                    MSCKF_STATS['posttri_retry_recover_depth_same_cycle_entered_count'] += 1
+                    MSCKF_STATS['posttri_retry_recover_depth_same_cycle_attempt_count'] += 1
+                    retry_stats_before = dict(MSCKF_STATS)
+                    retry_mode_same_cycle = "depth_sparse_recover"
+                    if (
+                        bool(posttri_retry_recover_depth_full_rescue_enable)
+                        and bool(protected_retry_carried)
+                        and len(quick_obs) >= 2
+                    ):
+                        retry_mode_same_cycle = "depth_sparse_same_cycle_rescue"
+                    triangulated_retry = triangulate_feature(
+                        fid,
+                        cam_observations,
+                        cam_states,
+                        kf,
+                        use_plane_constraint=True,
+                        ground_altitude=0.0,
+                        debug=enable_debug,
+                        dem_reader=dem_reader,
+                        origin_lat=origin_lat,
+                        origin_lon=origin_lon,
+                        global_config=global_config,
+                        reproj_scale=reproj_scale,
+                        phase=phase,
+                        health_state=health_state,
+                        retry_mode=retry_mode_same_cycle,
+                    )
+                    if triangulated_retry is not None:
+                        triangulated = triangulated_retry
+                        MSCKF_STATS['posttri_retry_recover_depth_same_cycle_success_count'] += 1
+                    else:
+                        fail_reason_retry = "triangulation_failed"
+                        for key in MSCKF_FAIL_REASON_PRIORITY:
+                            if int(MSCKF_STATS.get(key, 0)) > int(retry_stats_before.get(key, 0)):
+                                fail_reason_retry = key
+                                break
+                        if protected_retry_carried and fail_reason_retry == "fail_depth_sparse_recoverable":
+                            MSCKF_STATS['posttri_retry_recover_depth_protected_depth_gate_again_count'] += 1
+                        _record_same_cycle_retry_failure(fail_reason_retry)
+                        _record_depth_retry_failure(fail_reason_retry)
+            if (
+                triangulated is None
+                and
                 posttri_retry_defer_enable
                 and posttri_retry_recover_enable
                 and posttri_retry_recover_max_cycles > 0
                 and fail_reason in ("fail_reproj_sparse_recoverable", "fail_depth_sparse_recoverable")
             ):
+                if fail_reason == "fail_depth_sparse_recoverable" and posttri_retry_recover_depth_gate_enable:
+                    depth_recover_gate_ok, used_relaxed_gate = _depth_recover_gate_ok(
+                        quick_obs_local=quick_obs,
+                        quick_parallax_local=quick_parallax,
+                        q_med_local=q_med,
+                    )
+                    if depth_recover_gate_ok and used_relaxed_gate:
+                        MSCKF_STATS['posttri_retry_recover_depth_relaxed_gate_used_count'] += 1
+                    if not depth_recover_gate_ok:
+                        MSCKF_STATS['posttri_retry_recover_depth_gate_reject_count'] += 1
+                        if protected_retry_carried:
+                            MSCKF_STATS['posttri_retry_recover_depth_protected_depth_gate_again_count'] += 1
+                        posttri_retry_source.pop(int(fid), None)
+                        posttri_retry_state.pop(int(fid), None)
+                        posttri_retry_protect_state.pop(int(fid), None)
+                        if msckf_dbg_path:
+                            num_obs = sum(
+                                1 for cam_obs in cam_observations
+                                for obs in cam_obs.get('observations', [])
+                                if obs.get('fid') == fid
+                            )
+                            with open(msckf_dbg_path, "a", newline="") as mf:
+                                mf.write(
+                                    f"{vio_fe.frame_idx},{fid},{num_obs},0,nan,nan,0,nan,posttri_retry_depth_gate_reject\n"
+                                )
+                        continue
                 cur_retry = abs(int(posttri_retry_state.get(int(fid), 0)))
                 if cur_retry < int(posttri_retry_recover_max_cycles):
                     posttri_retry_state[int(fid)] = cur_retry + 1
                     posttri_retry_source[int(fid)] = (
                         "depth_sparse" if fail_reason == "fail_depth_sparse_recoverable" else "reproj_sparse"
                     )
+                    if (
+                        fail_reason == "fail_depth_sparse_recoverable"
+                        and bool(posttri_retry_recover_protect_enable)
+                        and int(posttri_retry_recover_protect_cycles) > 0
+                    ):
+                        posttri_retry_protect_state[int(fid)] = max(
+                            int(posttri_retry_protect_state.get(int(fid), 0)),
+                            int(posttri_retry_recover_protect_cycles) + 1,
+                        )
+                        MSCKF_STATS['posttri_retry_recover_depth_protected_added_count'] += 1
                     MSCKF_STATS['posttri_retry_recover_defer_count'] += 1
                     if fail_reason == "fail_depth_sparse_recoverable":
                         MSCKF_STATS['posttri_retry_recover_depth_defer_count'] += 1
@@ -3508,6 +4293,7 @@ def perform_msckf_updates(vio_fe, cam_observations: List[dict],
                 if str(posttri_retry_source.get(int(fid), "")) == "depth_sparse":
                     MSCKF_STATS['posttri_retry_recover_depth_exhausted_count'] += 1
                 posttri_retry_source.pop(int(fid), None)
+                posttri_retry_protect_state.pop(int(fid), None)
             if (
                 posttri_retry_defer_enable
                 and posttri_retry_max_cycles > 0
@@ -3532,6 +4318,7 @@ def perform_msckf_updates(vio_fe, cam_observations: List[dict],
                     continue
             posttri_retry_state.pop(int(fid), None)
             posttri_retry_source.pop(int(fid), None)
+            posttri_retry_protect_state.pop(int(fid), None)
             if msckf_dbg_path:
                 num_obs = sum(1 for cam_obs in cam_observations 
                              for obs in cam_obs.get('observations', []) 
@@ -3581,18 +4368,50 @@ def perform_msckf_updates(vio_fe, cam_observations: List[dict],
         dof_est = max(1, 2 * max(1, num_obs) + (1 if use_plane_constraint else 0))
         num_attempted += 1
         dof_samples.append(dof_est)
+        retry_mode_key_used = str(triangulated.get("retry_mode_key", "")).strip().lower()
+        same_cycle_retry_update_mode = bool(
+            retry_mode_key_used == "depth_sparse_same_cycle_rescue"
+            and bool(in_posttri_recover_retry)
+            and bool(depth_sparse_retry_source)
+            and bool(protected_retry_carried)
+        )
+        if same_cycle_retry_update_mode:
+            promoted_obs = int(max(0, triangulated.get("rescue_promoted_obs_total", 0)))
+            avg_reproj_err = float(triangulated.get("avg_reproj_error", np.nan))
+            depth_pos_ratio = float(triangulated.get("depth_positive_ratio", np.nan))
+            if promoted_obs <= 0 or promoted_obs > int(posttri_retry_same_cycle_max_promoted_obs):
+                _record_same_cycle_retry_failure("fail_geometry_insufficient_posttri")
+                _record_depth_retry_failure("fail_geometry_insufficient_posttri")
+                continue
+            if (not np.isfinite(avg_reproj_err)) or (
+                avg_reproj_err > float(posttri_retry_same_cycle_max_avg_reproj_norm)
+            ):
+                _record_same_cycle_retry_failure("fail_reproj_sparse_recoverable")
+                _record_depth_retry_failure("fail_reproj_sparse_recoverable")
+                continue
+            if (not np.isfinite(depth_pos_ratio)) or (
+                depth_pos_ratio < float(posttri_retry_same_cycle_min_depth_ratio)
+            ):
+                _record_same_cycle_retry_failure("fail_depth_sparse_recoverable")
+                _record_depth_retry_failure("fail_depth_sparse_recoverable")
+                continue
+        local_chi2_scale = float(chi2_scale)
+        if same_cycle_retry_update_mode:
+            local_chi2_scale *= float(posttri_retry_same_cycle_chi2_scale_mult)
 
         if associated_plane is not None and plane_config.get('PLANE_USE_CONSTRAINTS', True):
             # Stacked measurement: bearing (2D per obs) + plane constraint (1D)
             success, innovation_norm, chi2_test = msckf_measurement_update_with_plane(
                 fid, triangulated, cam_observations, cam_states, kf,
                 associated_plane, plane_config,
-                chi2_scale=chi2_scale, global_config=global_config)
+                chi2_scale=local_chi2_scale,
+                global_config=global_config)
         else:
             # Standard MSCKF update (bearing only)
             success, innovation_norm, chi2_test = msckf_measurement_update(
                 fid, triangulated, cam_observations, cam_states, kf,
-                chi2_scale=chi2_scale, global_config=global_config)
+                chi2_scale=local_chi2_scale,
+                global_config=global_config)
         
         if np.isfinite(chi2_test):
             chi2_norm_samples.append(float(chi2_test) / float(max(1, dof_est)))
@@ -3612,8 +4431,21 @@ def perform_msckf_updates(vio_fe, cam_observations: List[dict],
                 MSCKF_STATS['posttri_retry_recover_success_count'] += 1
                 if str(posttri_retry_source.get(int(fid), "")) == "depth_sparse":
                     MSCKF_STATS['posttri_retry_recover_depth_success_count'] += 1
+                    if bool(same_cycle_retry_update_mode):
+                        MSCKF_STATS['posttri_retry_recover_depth_same_cycle_success_count'] += 1
             posttri_retry_state.pop(int(fid), None)
             posttri_retry_source.pop(int(fid), None)
+            posttri_retry_protect_state.pop(int(fid), None)
+        elif bool(same_cycle_retry_update_mode):
+            _record_same_cycle_retry_failure("fail_reproj_sparse_recoverable")
+            _record_depth_retry_failure("fail_reproj_sparse_recoverable")
+
+    if posttri_retry_protect_state:
+        posttri_retry_protect_state = {
+            int(fid): int(cnt) - 1
+            for fid, cnt in posttri_retry_protect_state.items()
+            if int(cnt) - 1 > 0
+        }
 
     if vio_fe is not None:
         try:
@@ -3626,6 +4458,10 @@ def perform_msckf_updates(vio_fe, cam_observations: List[dict],
             pass
         try:
             setattr(vio_fe, "_msckf_posttri_retry_source", posttri_retry_source)
+        except Exception:
+            pass
+        try:
+            setattr(vio_fe, "_msckf_posttri_retry_protect_state", posttri_retry_protect_state)
         except Exception:
             pass
     
