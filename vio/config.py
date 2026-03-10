@@ -2513,6 +2513,9 @@ def load_config(config_path: str) -> VIOConfig:
     result['BACKEND_SUPERVISOR_REQUIRE_EVIDENCE'] = bool(
         supervisor_cfg.get('require_evidence', True)
     )
+    result['BACKEND_SUPERVISOR_PROXY_EVIDENCE_ENABLE'] = bool(
+        supervisor_cfg.get('proxy_evidence_enable', True)
+    )
     result['BACKEND_SUPERVISOR_RESIDUAL_ABS_MAX_M'] = float(
         max(0.1, supervisor_cfg.get('residual_abs_max_m', 12.0))
     )
@@ -2528,6 +2531,18 @@ def load_config(config_path: str) -> VIOConfig:
     result['BACKEND_SUPERVISOR_PROXY_MIN_SOURCE_REL'] = float(
         np.clip(supervisor_cfg.get('proxy_min_source_rel', 0.30), 0.0, 1.0)
     )
+    result['BACKEND_SUPERVISOR_RESIDUAL_MONOTONIC_COMMIT_ENABLE'] = bool(
+        supervisor_cfg.get('residual_monotonic_commit_enable', False)
+    )
+    result['BACKEND_SUPERVISOR_RESIDUAL_MONOTONIC_TICKS'] = int(
+        max(2, supervisor_cfg.get('residual_monotonic_ticks', 2))
+    )
+    result['BACKEND_SUPERVISOR_RESIDUAL_MONOTONIC_MIN_DROP'] = float(
+        max(0.0, supervisor_cfg.get('residual_monotonic_min_drop', 0.0))
+    )
+    result['BACKEND_SUPERVISOR_PROXY_MAX_SPEED_M_S'] = float(
+        max(0.0, supervisor_cfg.get('proxy_max_speed_m_s', 1.0e9))
+    )
     result['BACKEND_SUPERVISOR_DEFER_DIRECTION_GATE'] = bool(
         supervisor_cfg.get('defer_direction_gate', True)
     )
@@ -2536,6 +2551,53 @@ def load_config(config_path: str) -> VIOConfig:
     )
     result['BACKEND_SUPERVISOR_REPLACE_FORCE_MAX_AGE_SEC'] = float(
         max(0.0, supervisor_cfg.get('replace_force_max_age_sec', 0.45))
+    )
+    result['BACKEND_SUPERVISOR_SKIP_SCHEDULE_MAG_CLAMP'] = bool(
+        supervisor_cfg.get('skip_schedule_mag_clamp', True)
+    )
+    result['BACKEND_SUPERVISOR_COMMIT_STEP_CAP_M'] = float(
+        max(0.1, supervisor_cfg.get('commit_step_cap_m', 2.0))
+    )
+    result['BACKEND_SUPERVISOR_COMMIT_MIN_BLEND_STEPS'] = int(
+        max(1, supervisor_cfg.get('commit_min_blend_steps', 4))
+    )
+    result['BACKEND_SUPERVISOR_COMMIT_MAX_DP_XY_M'] = float(
+        max(0.1, supervisor_cfg.get('commit_max_dp_xy_m', 10.0))
+    )
+    result['BACKEND_SUPERVISOR_COMMIT_MAX_DYAW_DEG'] = float(
+        max(0.01, supervisor_cfg.get('commit_max_dyaw_deg', 1.0))
+    )
+    result['BACKEND_SUPERVISOR_COMMIT_ENERGY_SHAPING_ENABLE'] = bool(
+        supervisor_cfg.get('commit_energy_shaping_enable', False)
+    )
+    # Deprecated in logic-first probation: keep key for backward compatibility,
+    # but default disabled to prevent re-enabling quality-reject bounded commits.
+    result['BACKEND_SUPERVISOR_BOUNDED_COMMIT_ON_QUALITY_REJECT_ENABLE'] = bool(
+        supervisor_cfg.get('bounded_commit_on_quality_reject_enable', False)
+    )
+    result['BACKEND_SUPERVISOR_BOUNDED_COMMIT_MIN_QUALITY'] = float(
+        np.clip(supervisor_cfg.get('bounded_commit_min_quality', 0.18), 0.0, 1.0)
+    )
+    result['BACKEND_SUPERVISOR_BOUNDED_COMMIT_MAX_ENTRY_DP_XY_M'] = float(
+        max(0.1, supervisor_cfg.get('bounded_commit_max_entry_dp_xy_m', 14.0))
+    )
+    result['BACKEND_SUPERVISOR_BOUNDED_COMMIT_MAX_DP_XY_M'] = float(
+        max(0.1, supervisor_cfg.get('bounded_commit_max_dp_xy_m', 3.0))
+    )
+    result['BACKEND_SUPERVISOR_BOUNDED_COMMIT_STEP_CAP_M'] = float(
+        max(0.1, supervisor_cfg.get('bounded_commit_step_cap_m', 0.9))
+    )
+    result['BACKEND_SUPERVISOR_BOUNDED_COMMIT_MIN_BLEND_STEPS'] = int(
+        max(1, supervisor_cfg.get('bounded_commit_min_blend_steps', 6))
+    )
+    result['BACKEND_SUPERVISOR_BOUNDED_COMMIT_MAX_DYAW_DEG'] = float(
+        max(0.01, supervisor_cfg.get('bounded_commit_max_dyaw_deg', 0.35))
+    )
+    result['BACKEND_SUPERVISOR_BOUNDED_COMMIT_QUALITY_SCALE'] = float(
+        np.clip(supervisor_cfg.get('bounded_commit_quality_scale', 0.70), 0.0, 1.0)
+    )
+    result['BACKEND_SUPERVISOR_BOUNDED_COMMIT_REQUIRE_KINEMATIC_PASS'] = bool(
+        supervisor_cfg.get('bounded_commit_require_kinematic_pass', True)
     )
     result['BACKEND_TIME_ALIGNED_APPLY_ENABLE'] = bool(time_aligned_cfg.get('enable', True))
     result['BACKEND_TIME_ALIGNED_MAX_AGE_SEC'] = float(

@@ -2703,12 +2703,119 @@ class VIOService:
 
         ok_now = True
         fail_reason = ""
+        magnitude_consistency_pass = True
+        direction_consistency_pass = True
         dp = np.asarray(candidate.get("dp", np.zeros(3, dtype=float)), dtype=float).reshape(3,)
         dp_xy_norm = float(np.linalg.norm(dp[:2]))
         source = str(candidate.get("source", "BACKEND")).upper()
         quality = float(candidate.get("corr_quality", np.nan))
         source_rel = float(self._backend_source_reliability_map().get(source, 0.5))
         counts = self._backend_reject_counts()
+
+        def _shape_probation_payload(
+            dp_in: np.ndarray,
+            dyaw_in_deg: float,
+            blend_steps_in: int,
+            *,
+            bounded: bool,
+        ) -> tuple[np.ndarray, float, int, bool]:
+            """Deterministic energy shaping for probation commits."""
+            dp_shaped = np.asarray(dp_in, dtype=float).reshape(3,).copy()
+            dyaw_shaped = float(dyaw_in_deg)
+            shaped = False
+            if bounded:
+                max_total_dp_xy = float(
+                    max(
+                        0.1,
+                        runner.global_config.get(
+                            "BACKEND_SUPERVISOR_BOUNDED_COMMIT_MAX_DP_XY_M",
+                            3.0,
+                        ),
+                    )
+                )
+                step_cap_m = float(
+                    max(
+                        0.1,
+                        runner.global_config.get(
+                            "BACKEND_SUPERVISOR_BOUNDED_COMMIT_STEP_CAP_M",
+                            0.9,
+                        ),
+                    )
+                )
+                min_blend_steps = int(
+                    max(
+                        1,
+                        runner.global_config.get(
+                            "BACKEND_SUPERVISOR_BOUNDED_COMMIT_MIN_BLEND_STEPS",
+                            6,
+                        ),
+                    )
+                )
+                max_dyaw_deg = float(
+                    max(
+                        0.01,
+                        runner.global_config.get(
+                            "BACKEND_SUPERVISOR_BOUNDED_COMMIT_MAX_DYAW_DEG",
+                            0.35,
+                        ),
+                    )
+                )
+            else:
+                max_total_dp_xy = float(
+                    max(
+                        0.1,
+                        runner.global_config.get(
+                            "BACKEND_SUPERVISOR_COMMIT_MAX_DP_XY_M",
+                            10.0,
+                        ),
+                    )
+                )
+                step_cap_m = float(
+                    max(
+                        0.1,
+                        runner.global_config.get(
+                            "BACKEND_SUPERVISOR_COMMIT_STEP_CAP_M",
+                            2.0,
+                        ),
+                    )
+                )
+                min_blend_steps = int(
+                    max(
+                        1,
+                        runner.global_config.get(
+                            "BACKEND_SUPERVISOR_COMMIT_MIN_BLEND_STEPS",
+                            4,
+                        ),
+                    )
+                )
+                max_dyaw_deg = float(
+                    max(
+                        0.01,
+                        runner.global_config.get(
+                            "BACKEND_SUPERVISOR_COMMIT_MAX_DYAW_DEG",
+                            1.0,
+                        ),
+                    )
+                )
+
+            dp_xy_local = float(np.linalg.norm(dp_shaped[:2]))
+            if np.isfinite(dp_xy_local) and dp_xy_local > max_total_dp_xy and max_total_dp_xy > 1e-6:
+                scale = float(np.clip(max_total_dp_xy / max(dp_xy_local, 1e-9), 0.0, 1.0))
+                dp_shaped[:2] *= scale
+                dyaw_shaped *= scale
+                shaped = True
+            if np.isfinite(dyaw_shaped) and abs(dyaw_shaped) > max_dyaw_deg:
+                dyaw_shaped = float(np.clip(dyaw_shaped, -max_dyaw_deg, max_dyaw_deg))
+                shaped = True
+
+            dp_xy_local = float(np.linalg.norm(dp_shaped[:2]))
+            blend_steps_out = int(max(1, int(blend_steps_in)))
+            if step_cap_m > 1e-6 and np.isfinite(dp_xy_local) and dp_xy_local > 1e-9:
+                blend_steps_out = int(max(blend_steps_out, int(np.ceil(dp_xy_local / step_cap_m))))
+            blend_steps_out = int(max(blend_steps_out, int(min_blend_steps)))
+            if blend_steps_out > int(max(1, int(blend_steps_in))):
+                shaped = True
+            return dp_shaped, float(dyaw_shaped), int(blend_steps_out), bool(shaped)
 
         # C4.1 (logic-first): dynamic magnitude consistency in probation.
         # Clamp oversized short-horizon correction energy before commit decision
@@ -2764,6 +2871,7 @@ class VIOService:
             runner.global_config.get("BACKEND_SUPERVISOR_MAGNITUDE_CLAMP_ENABLE", True)
         )
         if np.isfinite(dp_xy_norm) and dp_xy_norm > prob_max_allow_m and prob_max_allow_m > 1e-6:
+            magnitude_consistency_pass = False
             if probation_mag_clamp_enable:
                 scale = float(np.clip(prob_max_allow_m / max(dp_xy_norm, 1e-9), 0.0, 1.0))
                 dp[:2] *= scale
@@ -2801,6 +2909,7 @@ class VIOService:
         ):
             cos_dir = float(np.dot(np.asarray(dp[:2], dtype=float), vel_xy) / (speed_xy * dp_xy_norm))
             if np.isfinite(cos_dir) and cos_dir < float(min_cos):
+                direction_consistency_pass = False
                 ok_now = False
                 fail_reason = "kinematic_reject"
 
@@ -2810,6 +2919,7 @@ class VIOService:
         residual_xy = float(candidate.get("residual_xy_metric", np.nan))
         improve_ratio_max = float(max(0.05, runner.global_config.get("BACKEND_SUPERVISOR_INNOVATION_IMPROVE_RATIO_MAX", 1.05)))
         innovation_evidence = False
+        residual_eval_metric = float("nan")
         if ok_now:
             hist = np.asarray(getattr(runner, "_backend_apply_residual_xy_history", []), dtype=float)
             hist = hist[np.isfinite(hist) & (hist > 1e-6)]
@@ -2817,6 +2927,7 @@ class VIOService:
             if np.isfinite(residual_xy) and residual_xy > 1e-6:
                 if np.isfinite(baseline) and baseline > 1e-9:
                     innovation_evidence = bool(float(residual_xy) <= float(improve_ratio_max * baseline))
+                    residual_eval_metric = float(residual_xy / baseline)
                 else:
                     abs_residual_cap = float(
                         max(
@@ -2828,9 +2939,13 @@ class VIOService:
                         )
                     )
                     innovation_evidence = bool(float(residual_xy) <= abs_residual_cap)
+                    residual_eval_metric = float(residual_xy)
 
             # Sparse/no-residual fallback: bounded proxy evidence.
-            if not innovation_evidence:
+            proxy_evidence_enable = bool(
+                runner.global_config.get("BACKEND_SUPERVISOR_PROXY_EVIDENCE_ENABLE", True)
+            )
+            if proxy_evidence_enable and not innovation_evidence:
                 proxy_ref_m = float(
                     max(0.1, runner.global_config.get("BACKEND_SUPERVISOR_PROXY_REF_M", 12.0))
                 )
@@ -2851,8 +2966,23 @@ class VIOService:
                         1.0,
                     )
                 )
+                proxy_max_speed = float(
+                    max(
+                        0.0,
+                        runner.global_config.get(
+                            "BACKEND_SUPERVISOR_PROXY_MAX_SPEED_M_S",
+                            1.0e9,
+                        ),
+                    )
+                )
+                proxy_speed_ok = bool(
+                    (not np.isfinite(speed_xy))
+                    or float(speed_xy) <= float(proxy_max_speed)
+                )
                 proxy_norm = float(dp_xy_norm / proxy_ref_m) if np.isfinite(dp_xy_norm) else float("nan")
                 innovation_evidence = bool(
+                    proxy_speed_ok
+                    and
                     np.isfinite(proxy_norm)
                     and proxy_norm <= proxy_max
                     and np.isfinite(quality)
@@ -2860,6 +2990,12 @@ class VIOService:
                     and np.isfinite(source_rel)
                     and float(source_rel) >= proxy_min_source_rel
                 )
+                if (not np.isfinite(residual_eval_metric)) and np.isfinite(proxy_norm):
+                    residual_eval_metric = float(proxy_norm)
+                if (not innovation_evidence) and (not proxy_speed_ok):
+                    counts["proxy_speed_block"] = int(
+                        counts.get("proxy_speed_block", 0)
+                    ) + 1
 
             require_evidence = bool(
                 runner.global_config.get("BACKEND_SUPERVISOR_REQUIRE_EVIDENCE", True)
@@ -2871,7 +3007,83 @@ class VIOService:
                     getattr(runner, "_backend_probation_evidence_fail_count", 0)
                 ) + 1
 
+        residual_eval_history = candidate.get("residual_eval_history", [])
+        if not isinstance(residual_eval_history, list):
+            residual_eval_history = []
+        if np.isfinite(residual_eval_metric):
+            residual_eval_history.append(float(residual_eval_metric))
+            if len(residual_eval_history) > 16:
+                del residual_eval_history[:-16]
+        candidate["residual_eval_history"] = residual_eval_history
+
+        residual_monotonic_enable = bool(
+            runner.global_config.get(
+                "BACKEND_SUPERVISOR_RESIDUAL_MONOTONIC_COMMIT_ENABLE",
+                False,
+            )
+        )
+        residual_monotonic_ticks = int(
+            max(
+                2,
+                runner.global_config.get(
+                    "BACKEND_SUPERVISOR_RESIDUAL_MONOTONIC_TICKS",
+                    2,
+                ),
+            )
+        )
+        residual_monotonic_min_drop = float(
+            max(
+                0.0,
+                runner.global_config.get(
+                    "BACKEND_SUPERVISOR_RESIDUAL_MONOTONIC_MIN_DROP",
+                    0.0,
+                ),
+            )
+        )
+        residual_monotonic_ready = False
+        residual_monotonic_pass = True
+        if residual_monotonic_enable:
+            if len(residual_eval_history) >= residual_monotonic_ticks:
+                window = np.asarray(
+                    residual_eval_history[-residual_monotonic_ticks:],
+                    dtype=float,
+                )
+                if np.all(np.isfinite(window)):
+                    residual_monotonic_ready = True
+                    deltas = np.diff(window)
+                    residual_monotonic_pass = bool(
+                        np.all(
+                            deltas
+                            <= (-float(residual_monotonic_min_drop) + 1e-12)
+                        )
+                    )
+                else:
+                    residual_monotonic_pass = False
+            else:
+                residual_monotonic_pass = False
+            candidate["residual_monotonic_ready"] = bool(residual_monotonic_ready)
+            candidate["residual_monotonic_pass"] = bool(residual_monotonic_pass)
+            if (
+                ok_now
+                and ticks_seen >= required_ticks
+                and (not residual_monotonic_ready or not residual_monotonic_pass)
+            ):
+                ok_now = False
+                fail_reason = "probation_residual_non_monotonic"
+                counts["probation_residual_non_monotonic"] = int(
+                    counts.get("probation_residual_non_monotonic", 0)
+                ) + 1
+                runner._backend_probation_residual_non_monotonic_fail_count = int(
+                    getattr(
+                        runner,
+                        "_backend_probation_residual_non_monotonic_fail_count",
+                        0,
+                    )
+                ) + 1
+
         candidate["all_pass"] = bool(candidate.get("all_pass", True) and ok_now)
+        candidate["probation_direction_consistent"] = bool(direction_consistency_pass)
+        candidate["probation_magnitude_consistent"] = bool(magnitude_consistency_pass)
         if bool(innovation_evidence):
             candidate["evidence_pass_ticks"] = int(candidate.get("evidence_pass_ticks", 0)) + 1
         runner._backend_probation_candidate = candidate
@@ -2880,6 +3092,28 @@ class VIOService:
 
         committed = bool(candidate.get("all_pass", False))
         if committed:
+            commit_energy_shaping_enable = bool(
+                runner.global_config.get(
+                    "BACKEND_SUPERVISOR_COMMIT_ENERGY_SHAPING_ENABLE",
+                    False,
+                )
+            )
+            if commit_energy_shaping_enable:
+                shaped_dp, shaped_dyaw, shaped_steps, energy_shaped = _shape_probation_payload(
+                    np.asarray(candidate.get("dp", np.zeros(3, dtype=float)), dtype=float),
+                    float(candidate.get("dyaw_deg", 0.0)),
+                    int(candidate.get("blend_steps", 1)),
+                    bounded=False,
+                )
+            else:
+                shaped_dp = np.asarray(candidate.get("dp", np.zeros(3, dtype=float)), dtype=float).reshape(3,)
+                shaped_dyaw = float(candidate.get("dyaw_deg", 0.0))
+                shaped_steps = int(max(1, int(candidate.get("blend_steps", 1))))
+                energy_shaped = False
+            if bool(energy_shaped):
+                counts["probation_commit_energy_shaped"] = int(
+                    counts.get("probation_commit_energy_shaped", 0)
+                ) + 1
             q_hist = getattr(runner, "_backend_apply_quality_history", None)
             if isinstance(q_hist, list):
                 q_hist.append(float(quality))
@@ -2898,18 +3132,22 @@ class VIOService:
                 if len(resid_hist) > 20000:
                     del resid_hist[:-20000]
             self._enqueue_backend_pending(
-                dp=np.asarray(candidate.get("dp", np.zeros(3, dtype=float)), dtype=float),
-                dyaw_deg=float(candidate.get("dyaw_deg", 0.0)),
-                blend_steps=int(candidate.get("blend_steps", 1)),
+                dp=np.asarray(shaped_dp, dtype=float),
+                dyaw_deg=float(shaped_dyaw),
+                blend_steps=int(shaped_steps),
                 corr_quality=quality,
                 corr_age_sec=float(candidate.get("corr_age_sec", np.nan)),
                 residual_xy_metric=float(candidate.get("residual_xy_metric", np.nan)),
                 source=source,
                 t_ref=float(candidate.get("t_ref", np.nan)),
                 time_aligned_used=bool(candidate.get("time_aligned_used", False)),
-                reason="probation_commit",
+                reason=(
+                    "probation_commit_energy_shaped"
+                    if bool(energy_shaped)
+                    else "probation_commit"
+                ),
             )
-            dyaw_commit = float(candidate.get("dyaw_deg", 0.0))
+            dyaw_commit = float(shaped_dyaw)
             if abs(dyaw_commit) > 1e-9 and getattr(runner, "yaw_authority_service", None) is not None:
                 try:
                     runner.yaw_authority_service.register_applied(
@@ -2936,8 +3174,12 @@ class VIOService:
                     source=source,
                     decision_state="COMMIT",
                     reason=(
-                        "probation_commit_clamped"
+                        "probation_commit_clamped_energy_shaped"
+                        if bool(candidate.get("probation_clamped", False)) and bool(energy_shaped)
+                        else "probation_commit_clamped"
                         if bool(candidate.get("probation_clamped", False))
+                        else "probation_commit_energy_shaped"
+                        if bool(energy_shaped)
                         else "probation_commit"
                     ),
                     quality_score=quality,
@@ -3289,28 +3531,38 @@ class VIOService:
                         max_allow = float(min(max_allow, float(magnitude_max_m)))
                     max_allow = float(max(max(0.0, min_dp_xy), max_allow))
                     if np.isfinite(max_allow) and dp_xy_norm > max_allow:
-                        # C4: deterministic clamp (throughput-preserving) instead of hard reject.
-                        # Direction gate below is kept unchanged.
-                        orig_dp_xy_norm = float(dp_xy_norm)
-                        scale = float(np.clip(max_allow / max(dp_xy_norm, 1e-9), 0.0, 1.0))
-                        dp[:2] = np.asarray(dp[:2], dtype=float) * scale
-                        dyaw_deg = float(dyaw_deg * scale)
-                        dp_xy = np.asarray(dp[:2], dtype=float).reshape(2,)
-                        dp_xy_norm = float(np.linalg.norm(dp_xy))
-                        counts["kinematic_clamp_magnitude"] = int(
-                            counts.get("kinematic_clamp_magnitude", 0)
-                        ) + 1
-                        runner._backend_kinematic_magnitude_clamp_count = int(
-                            getattr(runner, "_backend_kinematic_magnitude_clamp_count", 0)
-                        ) + 1
-                        if bool(getattr(runner.config, "save_debug_data", False)):
-                            print(
-                                "[BACKEND] kinematic_clamp(magnitude):"
-                                f" orig_dp_xy={orig_dp_xy_norm:.2f},"
-                                f" clamped_dp_xy={dp_xy_norm:.2f}, max_allow={max_allow:.2f},"
-                                f" speed_xy={speed_xy:.2f}, horizon={horizon:.2f},"
-                                f" base={base_allow:.2f}, gain={speed_gain:.2f}, scale={scale:.3f}"
+                        defer_mag_to_probation = bool(supervisor_enable) and bool(
+                            runner.global_config.get(
+                                "BACKEND_SUPERVISOR_SKIP_SCHEDULE_MAG_CLAMP",
+                                True,
                             )
+                        )
+                        if bool(defer_mag_to_probation):
+                            counts["kinematic_clamp_magnitude_probation_deferred"] = int(
+                                counts.get("kinematic_clamp_magnitude_probation_deferred", 0)
+                            ) + 1
+                        else:
+                            # Supervisor disabled: keep deterministic clamp in schedule stage.
+                            orig_dp_xy_norm = float(dp_xy_norm)
+                            scale = float(np.clip(max_allow / max(dp_xy_norm, 1e-9), 0.0, 1.0))
+                            dp[:2] = np.asarray(dp[:2], dtype=float) * scale
+                            dyaw_deg = float(dyaw_deg * scale)
+                            dp_xy = np.asarray(dp[:2], dtype=float).reshape(2,)
+                            dp_xy_norm = float(np.linalg.norm(dp_xy))
+                            counts["kinematic_clamp_magnitude"] = int(
+                                counts.get("kinematic_clamp_magnitude", 0)
+                            ) + 1
+                            runner._backend_kinematic_magnitude_clamp_count = int(
+                                getattr(runner, "_backend_kinematic_magnitude_clamp_count", 0)
+                            ) + 1
+                            if bool(getattr(runner.config, "save_debug_data", False)):
+                                print(
+                                    "[BACKEND] kinematic_clamp(magnitude):"
+                                    f" orig_dp_xy={orig_dp_xy_norm:.2f},"
+                                    f" clamped_dp_xy={dp_xy_norm:.2f}, max_allow={max_allow:.2f},"
+                                    f" speed_xy={speed_xy:.2f}, horizon={horizon:.2f},"
+                                    f" base={base_allow:.2f}, gain={speed_gain:.2f}, scale={scale:.3f}"
+                                )
 
                 if dp_xy_norm > 1e-6:
                     cos_dir = float(np.dot(dp_xy, vel_xy) / (speed_xy * dp_xy_norm))

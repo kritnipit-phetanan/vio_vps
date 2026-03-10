@@ -431,10 +431,27 @@ backend:
     probation_ticks: 2
     probation_min_interval_sec: 0.08
     innovation_improve_ratio_max: 1.05
+    proxy_evidence_enable: true
+    residual_monotonic_commit_enable: false
     reject_to_hint_only: true
     defer_direction_gate: true
     replace_min_score_delta: 0.08
     replace_force_max_age_sec: 0.45
+    skip_schedule_mag_clamp: true
+    commit_step_cap_m: 2.0
+    commit_min_blend_steps: 4
+    commit_max_dp_xy_m: 10.0
+    commit_max_dyaw_deg: 1.0
+    commit_energy_shaping_enable: true
+    bounded_commit_on_quality_reject_enable: false
+    bounded_commit_min_quality: 0.18
+    bounded_commit_max_entry_dp_xy_m: 14.0
+    bounded_commit_max_dp_xy_m: 3.0
+    bounded_commit_step_cap_m: 0.9
+    bounded_commit_min_blend_steps: 6
+    bounded_commit_max_dyaw_deg: 0.35
+    bounded_commit_quality_scale: 0.70
+    bounded_commit_require_kinematic_pass: true
   time_aligned_apply:
     enable: true
     max_age_sec: 0.35
