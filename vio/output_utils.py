@@ -562,6 +562,10 @@ def append_benchmark_health_summary(summary_csv: Optional[str],
                                     backend_emit_to_apply_ratio: float = float("nan"),
                                     backend_apply_quality_p50: float = float("nan"),
                                     backend_kinematic_reject_count: float = float("nan"),
+                                    backend_kinematic_reject_direction_count: float = float("nan"),
+                                    backend_kinematic_reject_magnitude_count: float = float("nan"),
+                                    backend_kinematic_reject_budget_count: float = float("nan"),
+                                    backend_kinematic_budget_clamp_count: float = float("nan"),
                                     backend_apply_dp_xy_p50: float = float("nan"),
                                     backend_apply_dp_xy_p95: float = float("nan"),
                                     backend_apply_residual_xy_p50: float = float("nan"),
@@ -569,6 +573,20 @@ def append_benchmark_health_summary(summary_csv: Optional[str],
                                     backend_snap_reject_count: float = float("nan"),
                                     backend_apply_latency_ms_p95: float = float("nan"),
                                     backend_contract_violation_count: float = float("nan"),
+                                    backend_proposed_count: float = float("nan"),
+                                    backend_probation_count: float = float("nan"),
+                                    backend_probation_commit_count: float = float("nan"),
+                                    backend_probation_reject_count: float = float("nan"),
+                                    backend_time_aligned_apply_count: float = float("nan"),
+                                    backend_source_reliability_vps_p50: float = float("nan"),
+                                    backend_source_reliability_loop_p50: float = float("nan"),
+                                    backend_source_reliability_backend_p50: float = float("nan"),
+                                    backend_source_reliability_mag_p50: float = float("nan"),
+                                    backend_reject_contract_violation_count: float = float("nan"),
+                                    backend_reject_stale_reject_count: float = float("nan"),
+                                    backend_reject_kinematic_reject_count: float = float("nan"),
+                                    backend_reject_snap_reject_count: float = float("nan"),
+                                    backend_reject_quality_reject_count: float = float("nan"),
                                     alignment_lock_violation_count: float = float("nan"),
                                     alignment_lock_hint_only_count: float = float("nan"),
                                     alignment_lock_reject_count: float = float("nan"),
@@ -648,10 +666,26 @@ def append_benchmark_health_summary(summary_csv: Optional[str],
                 f"{msckf_stable_lane_used_count:.6f},{msckf_preagg_parallax_low_entered_count:.6f},"
                 f"{backend_stale_ratio:.6f},{backend_emit_to_apply_ratio:.6f},"
                 f"{backend_apply_quality_p50:.6f},{backend_kinematic_reject_count:.6f},"
+                f"{backend_kinematic_reject_direction_count:.6f},"
+                f"{backend_kinematic_reject_magnitude_count:.6f},"
+                f"{backend_kinematic_reject_budget_count:.6f},"
+                f"{backend_kinematic_budget_clamp_count:.6f},"
                 f"{backend_apply_dp_xy_p50:.6f},{backend_apply_dp_xy_p95:.6f},"
                 f"{backend_apply_residual_xy_p50:.6f},{backend_apply_residual_xy_p95:.6f},"
                 f"{backend_snap_reject_count:.6f},"
                 f"{backend_apply_latency_ms_p95:.6f},{backend_contract_violation_count:.6f},"
+                f"{backend_proposed_count:.6f},{backend_probation_count:.6f},"
+                f"{backend_probation_commit_count:.6f},{backend_probation_reject_count:.6f},"
+                f"{backend_time_aligned_apply_count:.6f},"
+                f"{backend_source_reliability_vps_p50:.6f},"
+                f"{backend_source_reliability_loop_p50:.6f},"
+                f"{backend_source_reliability_backend_p50:.6f},"
+                f"{backend_source_reliability_mag_p50:.6f},"
+                f"{backend_reject_contract_violation_count:.6f},"
+                f"{backend_reject_stale_reject_count:.6f},"
+                f"{backend_reject_kinematic_reject_count:.6f},"
+                f"{backend_reject_snap_reject_count:.6f},"
+                f"{backend_reject_quality_reject_count:.6f},"
                 f"{alignment_lock_violation_count:.6f},{alignment_lock_hint_only_count:.6f},"
                 f"{alignment_lock_reject_count:.6f},"
                 f"{memory_peak_rss_mb:.6f},{memory_peak_vms_mb:.6f},{memory_peak_uss_mb:.6f},"
@@ -1725,14 +1759,31 @@ def init_output_csvs(output_dir: str, save_debug_data: bool = False) -> Dict[str
             "msckf_reclass_to_geometry_count,msckf_unstable_lane_count,msckf_stable_lane_used_count,"
             "msckf_preagg_parallax_low_entered_count,"
             "backend_stale_ratio,backend_emit_to_apply_ratio,backend_apply_quality_p50,"
-            "backend_kinematic_reject_count,backend_apply_dp_xy_p50,backend_apply_dp_xy_p95,"
+            "backend_kinematic_reject_count,backend_kinematic_reject_direction_count,"
+            "backend_kinematic_reject_magnitude_count,backend_kinematic_reject_budget_count,"
+            "backend_kinematic_budget_clamp_count,"
+            "backend_apply_dp_xy_p50,backend_apply_dp_xy_p95,"
             "backend_apply_residual_xy_p50,backend_apply_residual_xy_p95,"
             "backend_snap_reject_count,backend_apply_latency_ms_p95,backend_contract_violation_count,"
+            "backend_proposed_count,backend_probation_count,backend_probation_commit_count,"
+            "backend_probation_reject_count,backend_time_aligned_apply_count,"
+            "backend_source_reliability_vps_p50,backend_source_reliability_loop_p50,"
+            "backend_source_reliability_backend_p50,backend_source_reliability_mag_p50,"
+            "backend_reject_contract_violation_count,backend_reject_stale_reject_count,"
+            "backend_reject_kinematic_reject_count,backend_reject_snap_reject_count,"
+            "backend_reject_quality_reject_count,"
             "alignment_lock_violation_count,alignment_lock_hint_only_count,alignment_lock_reject_count,"
             "memory_peak_rss_mb,memory_peak_vms_mb,memory_peak_uss_mb,"
             "memory_compact_count,memory_pressure_events,"
             "reproj_fail_rate_per_attempt,"
             "rtf_proc_sim\n"
+        )
+
+    # Backend correction funnel trace (always-on lightweight diagnostics)
+    paths['backend_apply_trace_csv'] = os.path.join(output_dir, "backend_apply_trace.csv")
+    with open(paths['backend_apply_trace_csv'], "w", newline="") as f:
+        f.write(
+            "t,source,state,reason,quality,residual_xy,dp_xy_in,dp_xy_applied,age_sec,t_ref,time_aligned_used\n"
         )
 
     # Deterministic runtime signature (one-line JSON-like metadata)

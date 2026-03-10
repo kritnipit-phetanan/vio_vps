@@ -410,11 +410,53 @@ backend:
     min_speed_m_s: 8.0
     min_dp_xy_m: 4.0
     min_cos: -0.25
+    magnitude_enable: true
+    magnitude_horizon_sec: 0.8
+    magnitude_base_m: 10.0
+    magnitude_speed_gain: 1.5
+    magnitude_max_m: 45.0
+    budget_enable: true
+    budget_window_sec: 2.0
+    budget_base_m: 18.0
+    budget_speed_gain: 0.80
+    budget_max_m: 60.0
+    budget_min_step_m: 0.30
   contract_v1:
     strict_require_version: true
     expected_version: v1
     strict_require_source_mix: true
     strict_require_residual_summary: true
+  supervisor:
+    enable: true
+    probation_ticks: 2
+    probation_min_interval_sec: 0.08
+    innovation_improve_ratio_max: 1.05
+    reject_to_hint_only: true
+    defer_direction_gate: true
+    replace_min_score_delta: 0.08
+    replace_force_max_age_sec: 0.45
+  time_aligned_apply:
+    enable: true
+    max_age_sec: 0.35
+    reject_stale: true
+  xy_yaw_decouple_enable: true
+  pseudo_measurement:
+    enable: true
+    gain_base: 0.75
+    gain_quality_gain: 0.35
+    gain_residual_ref_m: 12.0
+    gain_min: 0.25
+    gain_max: 1.00
+  source_reliability:
+    enable: true
+    alpha: 0.10
+    reject_penalty: 0.12
+    default: 0.50
+    quarantine_th: 0.20
+    escalate_th: 0.75
+    hint_only_below_th: true
+    residual_ref_m: 12.0
+  apply_trace_enable: true
   vps_yaw_hint_enable: true
   vps_yaw_hint_gain: 0.35
   vps_yaw_hint_max_abs_deg: 35.0
@@ -1506,6 +1548,12 @@ vps:
     accuracy_local_first_recent_success_sec: 120.0
     accuracy_local_first_fail_streak_max: 24
     accuracy_local_first_require_anchor: true
+    local_first_budget_split_enable: true
+    local_first_budget_fraction: 0.70
+    local_first_time_fraction: 0.65
+    local_first_min_candidates: 8
+    local_first_min_time_ms: 220.0
+    local_first_center_radius_m: 180.0
     budget_escalator_enable: true
     budget_escalator_trigger_streak: 3
     budget_escalator_max_level: 3
@@ -1514,6 +1562,15 @@ vps:
     budget_escalator_max_candidate_scale: 2.5
     budget_escalator_max_time_scale: 2.5
     budget_escalator_decay_successes: 2
+    coarse_fine:
+      enable: true
+      coarse_center_limit: 2
+      coarse_candidate_limit: 3
+      fine_refine_radius_m: 80.0
+      fine_refine_max_centers: 4
+      anchor_require_strict: true
+      anchor_min_inliers: 7
+      anchor_min_confidence: 0.3
     ring_radius_m:
     - 35.0
     - 80.0

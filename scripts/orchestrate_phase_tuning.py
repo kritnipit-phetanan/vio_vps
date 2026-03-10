@@ -330,7 +330,8 @@ PHASE_ASSIGNMENTS: dict[str, dict[str, Any]] = {
         "vio.msckf.retry_lane.posttri_recover_depth_soft_error_mult": 1.15,
     },
     "C3": {
-        # VPS quality-scored bounded apply (failsoft is not apply-default).
+        # C3_LOCKED: VPS quality-scored bounded apply (failsoft is not apply-default)
+        # with explicit disable of C4/C5 runtime logic so baseline is stable.
         "vps.apply_gate.strict_score_th": 0.74,
         "vps.apply_gate.failsoft_score_th": 0.54,
         "vps.apply_gate.hint_score_th": 0.32,
@@ -338,21 +339,35 @@ PHASE_ASSIGNMENTS: dict[str, dict[str, Any]] = {
         "vps.apply_gate.motion_consistency.enable": True,
         "vps.apply_gate.bounded_soft.enable": True,
         "vps.position_controller.force_failsoft_on_reject": False,
+        "vps.relocalization.coarse_fine.enable": False,
+        "backend.supervisor.enable": False,
+        "backend.time_aligned_apply.enable": False,
+        "backend.pseudo_measurement.enable": False,
+        "backend.source_reliability.enable": False,
+        "backend.kinematic_consistency.enable": False,
     },
     "C4": {
-        # Option3 X2.1 practical (trajectory-safe): energy shaping, not threshold hardening.
-        "backend.switchable_constraints.residual_xy_m": 10.0,
+        # C4.1 supervisor lane (logic-first): enable supervisor + time-aligned path
+        # after C3_LOCKED baseline, then tune probation evidence rule.
+        "backend.supervisor.enable": True,
+        "backend.time_aligned_apply.enable": True,
+        "backend.supervisor.require_evidence": True,
+        "backend.supervisor.innovation_improve_ratio_max": 1.00,
     },
     "C4_2": {
-        # C4.2 fallback knob: cap correction energy per apply step.
-        "backend.correction_blend.max_step_dp_xy_m": 4.5,
+        # C4.2 time-aligned apply (logic-first): stricter age window.
+        "backend.time_aligned_apply.enable": True,
+        "backend.time_aligned_apply.max_age_sec": 0.30,
     },
     "C4_3": {
-        # C4.3 fallback knob: raise switchable low-tail floor.
-        "backend.switchable_constraints.min_weight": 0.20,
+        # C4.3 reliability shaping (logic-first): stronger quarantine boundary.
+        "backend.source_reliability.enable": True,
+        "backend.source_reliability.quarantine_th": 0.24,
     },
     "C5": {
-        # Option3 X2.2 + X3 strict contract.
+        # C5 contract + pseudo-measurement + reliability core.
+        "backend.supervisor.enable": True,
+        "backend.time_aligned_apply.enable": True,
         "backend.hybrid_factor_lite.use_vps_yaw": True,
         "backend.hybrid_factor_lite.vps_yaw_quality_floor": 0.45,
         "backend.hybrid_factor_lite.vps_yaw_cap_deg": 1.5,
@@ -360,6 +375,8 @@ PHASE_ASSIGNMENTS: dict[str, dict[str, Any]] = {
         "backend.contract_v1.expected_version": "v1",
         "backend.contract_v1.strict_require_source_mix": True,
         "backend.contract_v1.strict_require_residual_summary": True,
+        "backend.pseudo_measurement.enable": True,
+        "backend.source_reliability.enable": True,
         "backend.kinematic_consistency.enable": True,
         "backend.kinematic_consistency.min_cos": -0.10,
     },
@@ -464,6 +481,21 @@ def phase_changed_keys(cfg: dict[str, Any], phase: str) -> list[str]:
     return changed
 
 
+def is_runtime_effective_key(key: str) -> bool:
+    """Heuristic runtime-effective key guard for phase no-op protection."""
+    key_l = str(key).strip().lower()
+    runtime_prefixes = (
+        "backend.",
+        "vps.apply_gate.",
+        "vps.position_controller.",
+        "vio.msckf.",
+        "yaw_authority.",
+        "alignment_lock.",
+        "magnetometer.",
+    )
+    return key_l.startswith(runtime_prefixes)
+
+
 def apply_phase(cfg: dict[str, Any], phase: str) -> dict[str, Any]:
     out = copy.deepcopy(cfg)
     assignments = PHASE_ASSIGNMENTS.get(phase, {})
@@ -558,6 +590,52 @@ def read_err3d_final(run_dir: Path | None) -> float:
         return float("nan")
 
 
+def _read_csv_relaxed(csv_path: Path) -> pd.DataFrame | None:
+    if not csv_path.is_file():
+        return None
+    try:
+        return pd.read_csv(csv_path)
+    except Exception:
+        try:
+            return pd.read_csv(csv_path, engine="python", on_bad_lines="skip")
+        except Exception:
+            return None
+
+
+def _quantile_from_columns(df: pd.DataFrame, columns: list[str], q: float) -> float:
+    for col in columns:
+        if col not in df.columns:
+            continue
+        vals = pd.to_numeric(df[col], errors="coerce").to_numpy(dtype=float)
+        vals = vals[np.isfinite(vals)]
+        if vals.size > 0:
+            return float(np.quantile(vals, q))
+    return float("nan")
+
+
+def _backend_apply_dp_xy_quantile_fallback(run_dir: Path | None, q: float) -> float:
+    if run_dir is None:
+        return float("nan")
+    # Preferred source: backend apply trace.
+    backend_trace = _read_csv_relaxed(run_dir / "backend_apply_trace.csv")
+    if backend_trace is not None and len(backend_trace) > 0:
+        v = _quantile_from_columns(
+            backend_trace,
+            ["dp_xy_applied", "applied_dp_xy", "dp_xy_in", "dp_xy"],
+            q,
+        )
+        if np.isfinite(v):
+            return float(v)
+
+    # Legacy fallback for older baselines.
+    vps_trace = _read_csv_relaxed(run_dir / "vps_position_trace.csv")
+    if vps_trace is not None and len(vps_trace) > 0:
+        v = _quantile_from_columns(vps_trace, ["applied_dp_xy", "dp_xy_applied", "offset_m"], q)
+        if np.isfinite(v):
+            return float(v)
+    return float("nan")
+
+
 def read_health_row(run_dir: Path | None) -> pd.Series | None:
     if run_dir is None:
         return None
@@ -570,7 +648,14 @@ def read_health_row(run_dir: Path | None) -> pd.Series | None:
         return None
     if len(df) == 0:
         return None
-    return df.iloc[-1]
+    row = df.iloc[-1].copy()
+    cur_dp95 = float(pd.to_numeric(row.get("backend_apply_dp_xy_p95"), errors="coerce"))
+    cur_dp50 = float(pd.to_numeric(row.get("backend_apply_dp_xy_p50"), errors="coerce"))
+    if not np.isfinite(cur_dp95):
+        row["backend_apply_dp_xy_p95"] = _backend_apply_dp_xy_quantile_fallback(run_dir, 0.95)
+    if not np.isfinite(cur_dp50):
+        row["backend_apply_dp_xy_p50"] = _backend_apply_dp_xy_quantile_fallback(run_dir, 0.50)
+    return row
 
 
 def read_heading_final_abs(run_dir: Path | None) -> float:
@@ -1240,6 +1325,7 @@ def evaluate_c_phase(
     cur_abs_corr_apply = _from_row("abs_corr_apply_count")
     cur_failsoft_ratio = _from_row("vps_failsoft_apply_ratio")
     cur_backend_apply_count = _from_row("backend_apply_count")
+    cur_backend_apply_dp_xy_p95 = _from_row("backend_apply_dp_xy_p95")
     cur_backend_stale_ratio = _from_row("backend_stale_ratio")
     if not np.isfinite(cur_backend_stale_ratio):
         stale_drop = _from_row("backend_stale_drop_count")
@@ -1262,6 +1348,8 @@ def evaluate_c_phase(
     ref_err3d_mean = read_err3d_mean(c_reference_run)
     ref_err3d_final = read_err3d_final(c_reference_run)
     ref_abs_corr_apply = _to_float(ref_row, "abs_corr_apply_count") if ref_row is not None else float("nan")
+    ref_backend_apply_count = _to_float(ref_row, "backend_apply_count") if ref_row is not None else float("nan")
+    ref_backend_apply_dp_xy_p95 = _to_float(ref_row, "backend_apply_dp_xy_p95") if ref_row is not None else float("nan")
 
     checks: list[tuple[str, bool, str]] = []
     checks.append(
@@ -1299,6 +1387,8 @@ def evaluate_c_phase(
 
     if phase_u == "C3":
         improve_final = _pct_improve(cur_err3d_final, ref_err3d_final)
+        cur_backend_probation_count = _from_row("backend_probation_count")
+        cur_backend_time_aligned_count = _from_row("backend_time_aligned_apply_count")
         checks.extend(
             [
                 (
@@ -1321,16 +1411,42 @@ def evaluate_c_phase(
                     bool(np.isfinite(improve_final) and improve_final >= 10.0),
                     f"improve={improve_final:.2f}%",
                 ),
+                (
+                    "backend_probation_count == 0 (C3_LOCKED)",
+                    bool(np.isfinite(cur_backend_probation_count) and abs(cur_backend_probation_count) <= 1e-12),
+                    (
+                        f"value={cur_backend_probation_count:.0f}"
+                        if np.isfinite(cur_backend_probation_count)
+                        else "value=nan"
+                    ),
+                ),
+                (
+                    "backend_time_aligned_apply_count == 0 (C3_LOCKED)",
+                    bool(np.isfinite(cur_backend_time_aligned_count) and abs(cur_backend_time_aligned_count) <= 1e-12),
+                    (
+                        f"value={cur_backend_time_aligned_count:.0f}"
+                        if np.isfinite(cur_backend_time_aligned_count)
+                        else "value=nan"
+                    ),
+                ),
             ]
         )
     elif phase_u in {"C4", "C4_2", "C4_3"}:
-        improve_mean = _pct_improve(cur_err3d_mean, ref_err3d_mean)
+        improve_final = _pct_improve(cur_err3d_final, ref_err3d_final)
+        improve_dp95 = _pct_improve(cur_backend_apply_dp_xy_p95, ref_backend_apply_dp_xy_p95)
+        apply_floor = 25.0
+        if np.isfinite(ref_backend_apply_count):
+            apply_floor = max(1.0, float(ref_backend_apply_count) * 0.80)
         checks.extend(
             [
                 (
-                    "backend_apply_count >= 25",
-                    bool(np.isfinite(cur_backend_apply_count) and cur_backend_apply_count >= 25.0),
-                    f"value={cur_backend_apply_count:.0f}" if np.isfinite(cur_backend_apply_count) else "value=nan",
+                    "backend_apply_count >= 80% of reference",
+                    bool(np.isfinite(cur_backend_apply_count) and cur_backend_apply_count >= apply_floor),
+                    (
+                        f"value={cur_backend_apply_count:.0f},floor={apply_floor:.1f}"
+                        if np.isfinite(cur_backend_apply_count)
+                        else f"value=nan,floor={apply_floor:.1f}"
+                    ),
                 ),
                 (
                     "backend_stale_ratio <= 0.015",
@@ -1342,13 +1458,19 @@ def evaluate_c_phase(
                     ),
                 ),
                 (
-                    f"err3d_mean improved >= 10% vs {c_reference_run.name}",
-                    bool(np.isfinite(improve_mean) and improve_mean >= 10.0),
-                    f"improve={improve_mean:.2f}%",
+                    f"err3d_final improved >= 10% vs {c_reference_run.name}",
+                    bool(np.isfinite(improve_final) and improve_final >= 10.0),
+                    f"improve={improve_final:.2f}%",
+                ),
+                (
+                    f"backend_apply_dp_xy_p95 improved >= 15% vs {c_reference_run.name}",
+                    bool(np.isfinite(improve_dp95) and improve_dp95 >= 15.0),
+                    f"improve={improve_dp95:.2f}%",
                 ),
             ]
         )
     elif phase_u == "C5":
+        improve_mean = _pct_improve(cur_err3d_mean, ref_err3d_mean)
         improve_final = _pct_improve(cur_err3d_final, ref_err3d_final)
         checks.extend(
             [
@@ -1360,6 +1482,11 @@ def evaluate_c_phase(
                         if np.isfinite(cur_backend_snap_reject_count)
                         else "value=nan"
                     ),
+                ),
+                (
+                    f"err3d_mean improved >= 8% vs {c_reference_run.name}",
+                    bool(np.isfinite(improve_mean) and improve_mean >= 8.0),
+                    f"improve={improve_mean:.2f}%",
                 ),
                 (
                     f"err3d_final improved >= 10% vs {c_reference_run.name}",
@@ -1409,6 +1536,7 @@ def evaluate_c_phase(
         "abs_corr_apply_count": float(cur_abs_corr_apply),
         "vps_failsoft_apply_ratio": float(cur_failsoft_ratio),
         "backend_apply_count": float(cur_backend_apply_count),
+        "backend_apply_dp_xy_p95": float(cur_backend_apply_dp_xy_p95),
         "backend_stale_ratio": float(cur_backend_stale_ratio),
         "backend_snap_reject_count": float(cur_backend_snap_reject_count),
         "backend_contract_violation_count": float(cur_backend_contract_violation),
@@ -1612,7 +1740,13 @@ def main() -> int:
             print("  changed keys (0): phase is already at target values")
 
         phase_noop_guard_status = "OK"
-        if not changed_keys and phase in C_COMPARE_PHASES and not args.force_run_noop:
+        effective_changed_keys = [k for k in changed_keys if is_runtime_effective_key(k)]
+        if (
+            not changed_keys
+            and phase in C_COMPARE_PHASES
+            and phase not in FORCE_RUN_IF_NO_CHANGE
+            and not args.force_run_noop
+        ):
             phase_noop_guard_status = "NOOP_FAIL"
             rows.append(
                 {
@@ -1648,9 +1782,56 @@ def main() -> int:
                     "phase_noop_guard_status": phase_noop_guard_status,
                     "changed_key_count": 0,
                     "changed_keys": "",
+                    "runtime_effective_changed_key_count": 0,
+                    "runtime_effective_keys": "",
                 }
             )
             print(f"[Phase {phase}] NOOP_FAIL: changed_key_count=0 (phase requires one-knob delta)")
+            continue
+        if changed_keys and phase in C_COMPARE_PHASES and len(effective_changed_keys) == 0:
+            phase_noop_guard_status = "NOOP_FAIL"
+            rows.append(
+                {
+                    "phase": phase,
+                    "profile_name": args.lock_profile,
+                    "status": "FAIL",
+                    "reason": "noop_phase_not_runtime_effective",
+                    "lock_failed_items": "phase_requires_runtime_effective_delta",
+                    "run_dir": "",
+                    "returncode": 0,
+                    "err3d_mean": baseline_err,
+                    "err3d_baseline": baseline_err,
+                    "err3d_delta_pct": 0.0,
+                    "locks_ok": False,
+                    "vps_used": np.nan,
+                    "heading_final_abs_deg": np.nan,
+                    "heading_mae_deg": np.nan,
+                    "heading_p95_abs_deg": np.nan,
+                    "spike_rate_abs_err_gt30_deg": np.nan,
+                    "mag_cholfail_rate": np.nan,
+                    "cov_large_rate": np.nan,
+                    "pmax_max": np.nan,
+                    "overflow_hits": np.nan,
+                    "reproj_fail_rate_per_attempt": np.nan,
+                    "rtf_proc_sim": np.nan,
+                    "rtf_pass_tier": "nan",
+                    "decision_mode": "noop_runtime_guard",
+                    "compare_ok": False,
+                    "compare_failed_items": "phase_requires_runtime_effective_delta",
+                    "backend_locks_ok": np.nan,
+                    "backend_lock_failed_items": "",
+                    "h_reference_run": "",
+                    "phase_noop_guard_status": phase_noop_guard_status,
+                    "changed_key_count": len(changed_keys),
+                    "changed_keys": "|".join(changed_keys),
+                    "runtime_effective_changed_key_count": 0,
+                    "runtime_effective_keys": "",
+                }
+            )
+            print(
+                f"[Phase {phase}] NOOP_FAIL: changed keys are not runtime-effective "
+                f"({','.join(changed_keys)})"
+            )
             continue
 
         force_run_no_change = (phase in FORCE_RUN_IF_NO_CHANGE)
@@ -1692,6 +1873,8 @@ def main() -> int:
                     "phase_noop_guard_status": phase_noop_guard_status,
                     "changed_key_count": 0,
                     "changed_keys": "",
+                    "runtime_effective_changed_key_count": 0,
+                    "runtime_effective_keys": "",
                 }
             )
             continue
@@ -1732,6 +1915,8 @@ def main() -> int:
                     "phase_noop_guard_status": phase_noop_guard_status,
                     "changed_key_count": len(changed_keys),
                     "changed_keys": "|".join(changed_keys),
+                    "runtime_effective_changed_key_count": len(effective_changed_keys),
+                    "runtime_effective_keys": "|".join(effective_changed_keys),
                 }
             )
             current_cfg = candidate_cfg
@@ -1784,6 +1969,8 @@ def main() -> int:
                     "phase_noop_guard_status": phase_noop_guard_status,
                     "changed_key_count": len(changed_keys),
                     "changed_keys": "|".join(changed_keys),
+                    "runtime_effective_changed_key_count": len(effective_changed_keys),
+                    "runtime_effective_keys": "|".join(effective_changed_keys),
                 }
             )
             print(f"[Phase {phase}] FAIL: no run directory detected")
@@ -1922,6 +2109,8 @@ def main() -> int:
             "phase_noop_guard_status": phase_noop_guard_status,
             "changed_key_count": len(changed_keys),
             "changed_keys": "|".join(changed_keys),
+            "runtime_effective_changed_key_count": len(effective_changed_keys),
+            "runtime_effective_keys": "|".join(effective_changed_keys),
         }
         rows.append(row)
 

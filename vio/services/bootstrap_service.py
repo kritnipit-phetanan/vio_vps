@@ -661,6 +661,7 @@ class BootstrapService:
         runner.sensor_time_audit_csv = csv_paths.get("sensor_time_audit_csv")
         runner.vps_reloc_summary_csv = csv_paths.get("vps_reloc_summary_csv")
         runner.vps_position_trace_csv = csv_paths.get("vps_position_trace_csv")
+        runner.backend_apply_trace_csv = csv_paths.get("backend_apply_trace_csv")
         runner.policy_trace_csv = csv_paths.get("policy_trace_csv")
         runner.policy_conflict_csv = csv_paths.get("policy_conflict_csv")
         runner.policy_owner_map_csv = csv_paths.get("policy_owner_map_csv")
@@ -676,6 +677,20 @@ class BootstrapService:
         runner._backend_apply_quality_history = []
         runner._backend_apply_dp_xy_history = []
         runner._backend_apply_residual_xy_history = []
+        runner._backend_proposed_count = 0
+        runner._backend_probation_count = 0
+        runner._backend_probation_commit_count = 0
+        runner._backend_probation_reject_count = 0
+        runner._backend_time_aligned_apply_count = 0
+        runner._backend_probation_candidate = None
+        runner._backend_source_reliability = {}
+        runner._backend_source_reliability_hist = {
+            "VPS": [],
+            "LOOP": [],
+            "BACKEND": [],
+            "MAG": [],
+        }
+        runner._backend_reject_reason_counts = {}
         runner._backend_kinematic_reject_count = 0
         if getattr(runner, "policy_runtime_service", None) is not None:
             try:

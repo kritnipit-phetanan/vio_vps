@@ -120,7 +120,59 @@ def _load_last_row(csv_path: Path) -> pd.Series | None:
     for col in HEALTH_COLUMNS:
         if col not in row.index:
             row[col] = np.nan
+    run_dir = csv_path.parent
+    cur_dp95 = _to_float(row.get("backend_apply_dp_xy_p95"))
+    cur_dp50 = _to_float(row.get("backend_apply_dp_xy_p50"))
+    if not np.isfinite(cur_dp95):
+        row["backend_apply_dp_xy_p95"] = _backend_apply_dp_xy_quantile_fallback(run_dir, 0.95)
+    if not np.isfinite(cur_dp50):
+        row["backend_apply_dp_xy_p50"] = _backend_apply_dp_xy_quantile_fallback(run_dir, 0.50)
     return row
+
+
+def _read_csv_relaxed(csv_path: Path) -> pd.DataFrame | None:
+    if not csv_path.is_file():
+        return None
+    try:
+        return pd.read_csv(csv_path)
+    except Exception:
+        try:
+            return pd.read_csv(csv_path, engine="python", on_bad_lines="skip")
+        except Exception:
+            return None
+
+
+def _quantile_from_columns(df: pd.DataFrame, columns: list[str], q: float) -> float:
+    for col in columns:
+        if col not in df.columns:
+            continue
+        vals = pd.to_numeric(df[col], errors="coerce").to_numpy(dtype=float)
+        vals = vals[np.isfinite(vals)]
+        if vals.size > 0:
+            return float(np.quantile(vals, q))
+    return float("nan")
+
+
+def _backend_apply_dp_xy_quantile_fallback(run_dir: Path, q: float) -> float:
+    # Preferred source: backend apply trace (true backend applied dp).
+    backend_trace = _read_csv_relaxed(run_dir / "backend_apply_trace.csv")
+    if backend_trace is not None and len(backend_trace) > 0:
+        v = _quantile_from_columns(
+            backend_trace,
+            ["dp_xy_applied", "applied_dp_xy", "dp_xy_in", "dp_xy"],
+            q,
+        )
+        if np.isfinite(v):
+            return float(v)
+
+    # Legacy fallback: vps position trace (older runs without backend_apply_trace).
+    # Keeps phase-gate comparable instead of failing with NaN.
+    vps_trace = _read_csv_relaxed(run_dir / "vps_position_trace.csv")
+    if vps_trace is not None and len(vps_trace) > 0:
+        v = _quantile_from_columns(vps_trace, ["applied_dp_xy", "dp_xy_applied", "offset_m"], q)
+        if np.isfinite(v):
+            return float(v)
+    return float("nan")
 
 
 def _build_health_summary_fallback(run_dir: Path, out_csv: Path) -> Path | None:
@@ -695,6 +747,8 @@ def evaluate_phase_gate(
             cur_backend_stale_ratio = float(stale_drop / poll_count)
     cur_backend_contract_violation = _to_float(current_row.get("backend_contract_violation_count"))
     cur_backend_snap_reject = _to_float(current_row.get("backend_snap_reject_count"))
+    cur_backend_probation_count = _to_float(current_row.get("backend_probation_count"))
+    cur_backend_time_aligned_count = _to_float(current_row.get("backend_time_aligned_apply_count"))
     cur_cov_large = _to_float(current_row.get("cov_large_rate"))
     cur_pmax = _to_float(current_row.get("pmax_max"))
     cur_policy_conflict = _to_float(current_row.get("policy_conflict_count"))
@@ -764,6 +818,24 @@ def evaluate_phase_gate(
                     np.isfinite(_pct_improve(cur_err3d_final, base_err3d_final))
                     and _pct_improve(cur_err3d_final, base_err3d_final) >= 10.0,
                     f"improve={_pct_improve(cur_err3d_final, base_err3d_final):.2f}%",
+                ),
+                (
+                    "backend_probation_count == 0 (C3_LOCKED)",
+                    np.isfinite(cur_backend_probation_count) and abs(cur_backend_probation_count) <= 1e-12,
+                    (
+                        f"value={cur_backend_probation_count:.0f}"
+                        if np.isfinite(cur_backend_probation_count)
+                        else "value=nan"
+                    ),
+                ),
+                (
+                    "backend_time_aligned_apply_count == 0 (C3_LOCKED)",
+                    np.isfinite(cur_backend_time_aligned_count) and abs(cur_backend_time_aligned_count) <= 1e-12,
+                    (
+                        f"value={cur_backend_time_aligned_count:.0f}"
+                        if np.isfinite(cur_backend_time_aligned_count)
+                        else "value=nan"
+                    ),
                 ),
             ]
         )

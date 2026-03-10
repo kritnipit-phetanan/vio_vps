@@ -117,3 +117,33 @@ class HeadingOwnerState:
     score_backend: float
     score_msckf: float
     switched: bool = False
+
+
+@dataclass(frozen=True)
+class CorrectionDecisionState:
+    """State-machine snapshot for backend correction decision lifecycle."""
+
+    state: str = "PROPOSE"  # PROPOSE|PROBATION|COMMIT|REJECT|HINT_ONLY
+    reason: str = ""
+    source: str = "UNKNOWN"
+    quality_score: float = float("nan")
+    residual_xy: float = float("nan")
+    age_sec: float = float("nan")
+    t_ref: float = float("nan")
+
+
+@dataclass(frozen=True)
+class ApplyDecisionRecord:
+    """Compact apply/reject trace payload for deterministic funnel telemetry."""
+
+    timestamp: float
+    source: str
+    decision_state: str
+    reason: str
+    quality_score: float
+    residual_xy: float
+    dp_xy_in: float
+    dp_xy_applied: float
+    age_sec: float
+    t_ref: float
+    time_aligned_used: bool = False

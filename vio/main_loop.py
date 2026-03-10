@@ -133,6 +133,7 @@ class VIORunner:
         self.sensor_time_audit_csv = None
         self.vps_reloc_summary_csv = None
         self.vps_position_trace_csv = None
+        self.backend_apply_trace_csv = None
         self.policy_trace_csv = None
         self.policy_conflict_csv = None
         self.policy_owner_map_csv = None
@@ -203,6 +204,15 @@ class VIORunner:
         self._backend_apply_quality_history: list[float] = []
         self._backend_apply_dp_xy_history: list[float] = []
         self._backend_apply_residual_xy_history: list[float] = []
+        self._backend_proposed_count: int = 0
+        self._backend_probation_count: int = 0
+        self._backend_probation_commit_count: int = 0
+        self._backend_probation_reject_count: int = 0
+        self._backend_time_aligned_apply_count: int = 0
+        self._backend_probation_candidate: Optional[Dict[str, Any]] = None
+        self._backend_source_reliability: Dict[str, float] = {}
+        self._backend_source_reliability_hist: Dict[str, list[float]] = {}
+        self._backend_reject_reason_counts: Dict[str, int] = {}
         self._backend_snap_reject_count: int = 0
         self._backend_contract_violation_count: int = 0
         self._backend_kinematic_reject_count: int = 0

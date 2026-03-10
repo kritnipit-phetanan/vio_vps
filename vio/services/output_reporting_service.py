@@ -1116,7 +1116,81 @@ class OutputReportingService:
         except Exception:
             pass
         backend_snap_reject_count = float(int(getattr(self.runner, "_backend_snap_reject_count", 0)))
+        backend_proposed_count = float(int(getattr(self.runner, "_backend_proposed_count", 0)))
+        backend_probation_count = float(int(getattr(self.runner, "_backend_probation_count", 0)))
+        backend_probation_commit_count = float(int(getattr(self.runner, "_backend_probation_commit_count", 0)))
+        backend_probation_reject_count = float(int(getattr(self.runner, "_backend_probation_reject_count", 0)))
+        backend_time_aligned_apply_count = float(int(getattr(self.runner, "_backend_time_aligned_apply_count", 0)))
+        backend_source_reliability_vps_p50 = float("nan")
+        backend_source_reliability_loop_p50 = float("nan")
+        backend_source_reliability_backend_p50 = float("nan")
+        backend_source_reliability_mag_p50 = float("nan")
         backend_kinematic_reject_count = float(int(getattr(self.runner, "_backend_kinematic_reject_count", 0)))
+        backend_kinematic_reject_direction_count = float("nan")
+        backend_kinematic_reject_magnitude_count = float("nan")
+        backend_kinematic_reject_budget_count = float("nan")
+        backend_kinematic_budget_clamp_count = float(
+            int(getattr(self.runner, "_backend_kinematic_budget_clamp_count", 0))
+        )
+        backend_reject_contract_violation_count = 0.0
+        backend_reject_stale_reject_count = 0.0
+        backend_reject_kinematic_reject_count = 0.0
+        backend_reject_snap_reject_count = 0.0
+        backend_reject_quality_reject_count = 0.0
+        try:
+            reason_counts = getattr(self.runner, "_backend_reject_reason_counts", {})
+            if isinstance(reason_counts, dict):
+                backend_kinematic_reject_direction_count = float(
+                    int(reason_counts.get("kinematic_reject_direction", 0))
+                )
+                backend_kinematic_reject_magnitude_count = float(
+                    int(reason_counts.get("kinematic_reject_magnitude", 0))
+                )
+                backend_kinematic_reject_budget_count = float(
+                    int(reason_counts.get("kinematic_reject_budget", 0))
+                )
+                if not np.isfinite(float(backend_kinematic_budget_clamp_count)):
+                    backend_kinematic_budget_clamp_count = float(
+                        int(reason_counts.get("kinematic_budget_clamp", 0))
+                    )
+                backend_reject_contract_violation_count = float(
+                    int(reason_counts.get("contract_violation", 0))
+                )
+                backend_reject_stale_reject_count = float(
+                    int(reason_counts.get("stale_reject", 0))
+                )
+                backend_reject_kinematic_reject_count = float(
+                    int(reason_counts.get("kinematic_reject", 0))
+                )
+                backend_reject_snap_reject_count = float(
+                    int(reason_counts.get("snap_reject", 0))
+                )
+                backend_reject_quality_reject_count = float(
+                    int(reason_counts.get("quality_reject", 0))
+                )
+        except Exception:
+            pass
+        try:
+            rel_hist = getattr(self.runner, "_backend_source_reliability_hist", {})
+            if isinstance(rel_hist, dict):
+                arr_vps = np.asarray(rel_hist.get("VPS", []), dtype=float)
+                arr_vps = arr_vps[np.isfinite(arr_vps)]
+                if arr_vps.size > 0:
+                    backend_source_reliability_vps_p50 = float(np.percentile(arr_vps, 50))
+                arr_loop = np.asarray(rel_hist.get("LOOP", []), dtype=float)
+                arr_loop = arr_loop[np.isfinite(arr_loop)]
+                if arr_loop.size > 0:
+                    backend_source_reliability_loop_p50 = float(np.percentile(arr_loop, 50))
+                arr_backend = np.asarray(rel_hist.get("BACKEND", []), dtype=float)
+                arr_backend = arr_backend[np.isfinite(arr_backend)]
+                if arr_backend.size > 0:
+                    backend_source_reliability_backend_p50 = float(np.percentile(arr_backend, 50))
+                arr_mag = np.asarray(rel_hist.get("MAG", []), dtype=float)
+                arr_mag = arr_mag[np.isfinite(arr_mag)]
+                if arr_mag.size > 0:
+                    backend_source_reliability_mag_p50 = float(np.percentile(arr_mag, 50))
+        except Exception:
+            pass
         memory_peak_rss_mb = float(self.runner._memory_peak_rss_mb) if np.isfinite(float(getattr(self.runner, "_memory_peak_rss_mb", float("nan")))) else float("nan")
         memory_peak_vms_mb = float(self.runner._memory_peak_vms_mb) if np.isfinite(float(getattr(self.runner, "_memory_peak_vms_mb", float("nan")))) else float("nan")
         memory_peak_uss_mb = float(self.runner._memory_peak_uss_mb) if np.isfinite(float(getattr(self.runner, "_memory_peak_uss_mb", float("nan")))) else float("nan")
@@ -1249,6 +1323,10 @@ class OutputReportingService:
             backend_emit_to_apply_ratio=backend_emit_to_apply_ratio,
             backend_apply_quality_p50=backend_apply_quality_p50,
             backend_kinematic_reject_count=backend_kinematic_reject_count,
+            backend_kinematic_reject_direction_count=backend_kinematic_reject_direction_count,
+            backend_kinematic_reject_magnitude_count=backend_kinematic_reject_magnitude_count,
+            backend_kinematic_reject_budget_count=backend_kinematic_reject_budget_count,
+            backend_kinematic_budget_clamp_count=backend_kinematic_budget_clamp_count,
             backend_apply_dp_xy_p50=backend_apply_dp_xy_p50,
             backend_apply_dp_xy_p95=backend_apply_dp_xy_p95,
             backend_apply_residual_xy_p50=backend_apply_residual_xy_p50,
@@ -1256,6 +1334,20 @@ class OutputReportingService:
             backend_snap_reject_count=backend_snap_reject_count,
             backend_apply_latency_ms_p95=backend_apply_latency_ms_p95,
             backend_contract_violation_count=backend_contract_violation_count,
+            backend_proposed_count=backend_proposed_count,
+            backend_probation_count=backend_probation_count,
+            backend_probation_commit_count=backend_probation_commit_count,
+            backend_probation_reject_count=backend_probation_reject_count,
+            backend_time_aligned_apply_count=backend_time_aligned_apply_count,
+            backend_source_reliability_vps_p50=backend_source_reliability_vps_p50,
+            backend_source_reliability_loop_p50=backend_source_reliability_loop_p50,
+            backend_source_reliability_backend_p50=backend_source_reliability_backend_p50,
+            backend_source_reliability_mag_p50=backend_source_reliability_mag_p50,
+            backend_reject_contract_violation_count=backend_reject_contract_violation_count,
+            backend_reject_stale_reject_count=backend_reject_stale_reject_count,
+            backend_reject_kinematic_reject_count=backend_reject_kinematic_reject_count,
+            backend_reject_snap_reject_count=backend_reject_snap_reject_count,
+            backend_reject_quality_reject_count=backend_reject_quality_reject_count,
             alignment_lock_violation_count=alignment_lock_violation_count,
             alignment_lock_hint_only_count=alignment_lock_hint_only_count,
             alignment_lock_reject_count=alignment_lock_reject_count,
@@ -1290,6 +1382,14 @@ class OutputReportingService:
             f"msckf_unstable_lane={msckf_unstable_lane_count:.0f}, "
             f"msckf_preagg_parallax={msckf_preagg_parallax_low_entered_count:.0f}, "
             f"backend_kinrej={backend_kinematic_reject_count:.0f}, "
+            f"backend_kinrej_dir={backend_kinematic_reject_direction_count:.0f}, "
+            f"backend_kinrej_mag={backend_kinematic_reject_magnitude_count:.0f}, "
+            f"backend_kinrej_budget={backend_kinematic_reject_budget_count:.0f}, "
+            f"backend_kinclamp={backend_kinematic_budget_clamp_count:.0f}, "
+            f"backend_probation={backend_probation_count:.0f}, "
+            f"backend_prob_commit={backend_probation_commit_count:.0f}, "
+            f"backend_prob_reject={backend_probation_reject_count:.0f}, "
+            f"backend_time_aligned={backend_time_aligned_apply_count:.0f}, "
             f"backend_dp95={backend_apply_dp_xy_p95:.2f}m, "
             f"backend_res95={backend_apply_residual_xy_p95:.2f}m, "
             f"backend_stale_ratio={backend_stale_ratio:.3f}, "

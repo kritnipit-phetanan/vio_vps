@@ -2396,8 +2396,20 @@ def load_config(config_path: str) -> VIOConfig:
     contract_cfg = backend_cfg.get('contract', {})
     kinematic_cfg = backend_cfg.get('kinematic_consistency', {})
     contract_v1_cfg = backend_cfg.get('contract_v1', {})
+    supervisor_cfg = backend_cfg.get('supervisor', {})
+    time_aligned_cfg = backend_cfg.get('time_aligned_apply', {})
+    pseudo_measurement_cfg = backend_cfg.get('pseudo_measurement', {})
+    source_reliability_cfg = backend_cfg.get('source_reliability', {})
     if not isinstance(contract_v1_cfg, dict):
         contract_v1_cfg = {}
+    if not isinstance(supervisor_cfg, dict):
+        supervisor_cfg = {}
+    if not isinstance(time_aligned_cfg, dict):
+        time_aligned_cfg = {}
+    if not isinstance(pseudo_measurement_cfg, dict):
+        pseudo_measurement_cfg = {}
+    if not isinstance(source_reliability_cfg, dict):
+        source_reliability_cfg = {}
     result['BACKEND_ROBUST_YAW_ENABLE'] = bool(robust_yaw_cfg.get('enable', True))
     result['BACKEND_ROBUST_YAW_HUBER_DEG'] = float(robust_yaw_cfg.get('huber_deg', 6.0))
     result['BACKEND_SWITCHABLE_CONSTRAINTS_ENABLE'] = bool(switchable_cfg.get('enable', True))
@@ -2466,6 +2478,126 @@ def load_config(config_path: str) -> VIOConfig:
     )
     result['BACKEND_CONTRACT_V1_EXPECTED_VERSION'] = str(
         contract_v1_cfg.get('expected_version', "v1")
+    )
+    result['BACKEND_SUPERVISOR_ENABLE'] = bool(supervisor_cfg.get('enable', True))
+    result['BACKEND_SUPERVISOR_PROBATION_TICKS'] = int(
+        max(1, supervisor_cfg.get('probation_ticks', 2))
+    )
+    result['BACKEND_SUPERVISOR_PROBATION_MIN_INTERVAL_SEC'] = float(
+        max(0.01, supervisor_cfg.get('probation_min_interval_sec', 0.08))
+    )
+    result['BACKEND_SUPERVISOR_INNOVATION_IMPROVE_RATIO_MAX'] = float(
+        max(0.05, supervisor_cfg.get('innovation_improve_ratio_max', 1.05))
+    )
+    result['BACKEND_SUPERVISOR_REJECT_TO_HINT_ONLY'] = bool(
+        supervisor_cfg.get('reject_to_hint_only', True)
+    )
+    result['BACKEND_SUPERVISOR_MAGNITUDE_CLAMP_ENABLE'] = bool(
+        supervisor_cfg.get('magnitude_clamp_enable', True)
+    )
+    result['BACKEND_SUPERVISOR_MAGNITUDE_HORIZON_SEC'] = float(
+        max(0.05, supervisor_cfg.get('magnitude_horizon_sec', 0.8))
+    )
+    result['BACKEND_SUPERVISOR_MAGNITUDE_HORIZON_MAX_SEC'] = float(
+        max(0.05, supervisor_cfg.get('magnitude_horizon_max_sec', 2.0))
+    )
+    result['BACKEND_SUPERVISOR_MAGNITUDE_BASE_M'] = float(
+        max(0.0, supervisor_cfg.get('magnitude_base_m', 8.0))
+    )
+    result['BACKEND_SUPERVISOR_MAGNITUDE_SPEED_GAIN'] = float(
+        max(0.0, supervisor_cfg.get('magnitude_speed_gain', 1.2))
+    )
+    result['BACKEND_SUPERVISOR_MAGNITUDE_MAX_M'] = float(
+        max(0.1, supervisor_cfg.get('magnitude_max_m', 35.0))
+    )
+    result['BACKEND_SUPERVISOR_REQUIRE_EVIDENCE'] = bool(
+        supervisor_cfg.get('require_evidence', True)
+    )
+    result['BACKEND_SUPERVISOR_RESIDUAL_ABS_MAX_M'] = float(
+        max(0.1, supervisor_cfg.get('residual_abs_max_m', 12.0))
+    )
+    result['BACKEND_SUPERVISOR_PROXY_REF_M'] = float(
+        max(0.1, supervisor_cfg.get('proxy_ref_m', 12.0))
+    )
+    result['BACKEND_SUPERVISOR_PROXY_MAX'] = float(
+        max(0.05, supervisor_cfg.get('proxy_max', 1.0))
+    )
+    result['BACKEND_SUPERVISOR_PROXY_MIN_QUALITY'] = float(
+        np.clip(supervisor_cfg.get('proxy_min_quality', 0.35), 0.0, 1.0)
+    )
+    result['BACKEND_SUPERVISOR_PROXY_MIN_SOURCE_REL'] = float(
+        np.clip(supervisor_cfg.get('proxy_min_source_rel', 0.30), 0.0, 1.0)
+    )
+    result['BACKEND_SUPERVISOR_DEFER_DIRECTION_GATE'] = bool(
+        supervisor_cfg.get('defer_direction_gate', True)
+    )
+    result['BACKEND_SUPERVISOR_REPLACE_MIN_SCORE_DELTA'] = float(
+        max(0.0, supervisor_cfg.get('replace_min_score_delta', 0.08))
+    )
+    result['BACKEND_SUPERVISOR_REPLACE_FORCE_MAX_AGE_SEC'] = float(
+        max(0.0, supervisor_cfg.get('replace_force_max_age_sec', 0.45))
+    )
+    result['BACKEND_TIME_ALIGNED_APPLY_ENABLE'] = bool(time_aligned_cfg.get('enable', True))
+    result['BACKEND_TIME_ALIGNED_MAX_AGE_SEC'] = float(
+        max(0.0, time_aligned_cfg.get('max_age_sec', backend_cfg.get('max_correction_age_sec', 2.0)))
+    )
+    result['BACKEND_TIME_ALIGNED_REJECT_STALE'] = bool(
+        time_aligned_cfg.get('reject_stale', True)
+    )
+    result['BACKEND_XY_YAW_DECOUPLE_ENABLE'] = bool(
+        backend_cfg.get('xy_yaw_decouple_enable', True)
+    )
+    result['BACKEND_PSEUDOMEAS_ENABLE'] = bool(
+        pseudo_measurement_cfg.get('enable', True)
+    )
+    result['BACKEND_PSEUDOMEAS_GAIN_BASE'] = float(
+        np.clip(pseudo_measurement_cfg.get('gain_base', 0.75), 0.0, 2.0)
+    )
+    result['BACKEND_PSEUDOMEAS_GAIN_QUALITY_GAIN'] = float(
+        np.clip(pseudo_measurement_cfg.get('gain_quality_gain', 0.35), 0.0, 2.0)
+    )
+    result['BACKEND_PSEUDOMEAS_GAIN_RESIDUAL_REF_M'] = float(
+        max(0.1, pseudo_measurement_cfg.get('gain_residual_ref_m', 12.0))
+    )
+    result['BACKEND_PSEUDOMEAS_GAIN_MIN'] = float(
+        np.clip(pseudo_measurement_cfg.get('gain_min', 0.25), 0.0, 2.0)
+    )
+    result['BACKEND_PSEUDOMEAS_GAIN_MAX'] = float(
+        np.clip(
+            pseudo_measurement_cfg.get(
+                'gain_max',
+                pseudo_measurement_cfg.get('gain_base', 0.75),
+            ),
+            0.0,
+            2.0,
+        )
+    )
+    result['BACKEND_SOURCE_RELIABILITY_ENABLE'] = bool(
+        source_reliability_cfg.get('enable', True)
+    )
+    result['BACKEND_SOURCE_RELIABILITY_ALPHA'] = float(
+        np.clip(source_reliability_cfg.get('alpha', 0.10), 0.0, 1.0)
+    )
+    result['BACKEND_SOURCE_RELIABILITY_REJECT_PENALTY'] = float(
+        np.clip(source_reliability_cfg.get('reject_penalty', 0.12), 0.0, 1.0)
+    )
+    result['BACKEND_SOURCE_RELIABILITY_DEFAULT'] = float(
+        np.clip(source_reliability_cfg.get('default', 0.50), 0.0, 1.0)
+    )
+    result['BACKEND_SOURCE_RELIABILITY_QUARANTINE_TH'] = float(
+        np.clip(source_reliability_cfg.get('quarantine_th', 0.20), 0.0, 1.0)
+    )
+    result['BACKEND_SOURCE_RELIABILITY_ESCALATE_TH'] = float(
+        np.clip(source_reliability_cfg.get('escalate_th', 0.75), 0.0, 1.0)
+    )
+    result['BACKEND_SOURCE_RELIABILITY_HINT_ONLY_BELOW_TH'] = bool(
+        source_reliability_cfg.get('hint_only_below_th', True)
+    )
+    result['BACKEND_SOURCE_RELIABILITY_RESIDUAL_REF_M'] = float(
+        max(0.1, source_reliability_cfg.get('residual_ref_m', 12.0))
+    )
+    result['BACKEND_APPLY_TRACE_ENABLE'] = bool(
+        backend_cfg.get('apply_trace_enable', True)
     )
     result['BACKEND_VPS_YAW_HINT_ENABLE'] = bool(
         backend_cfg.get('vps_yaw_hint_enable', True)
@@ -2566,7 +2698,39 @@ def load_config(config_path: str) -> VIOConfig:
     result['BACKEND_KINEMATIC_CONSISTENCY_MIN_COS'] = float(
         kinematic_cfg.get('min_cos', -0.25)
     )
-
+    result['BACKEND_KINEMATIC_CONSISTENCY_MAGNITUDE_ENABLE'] = bool(
+        kinematic_cfg.get('magnitude_enable', True)
+    )
+    result['BACKEND_KINEMATIC_CONSISTENCY_MAGNITUDE_HORIZON_SEC'] = float(
+        kinematic_cfg.get('magnitude_horizon_sec', 0.8)
+    )
+    result['BACKEND_KINEMATIC_CONSISTENCY_MAGNITUDE_BASE_M'] = float(
+        kinematic_cfg.get('magnitude_base_m', 6.0)
+    )
+    result['BACKEND_KINEMATIC_CONSISTENCY_MAGNITUDE_SPEED_GAIN'] = float(
+        kinematic_cfg.get('magnitude_speed_gain', 1.5)
+    )
+    result['BACKEND_KINEMATIC_CONSISTENCY_MAGNITUDE_MAX_M'] = float(
+        kinematic_cfg.get('magnitude_max_m', 45.0)
+    )
+    result['BACKEND_KINEMATIC_CONSISTENCY_BUDGET_ENABLE'] = bool(
+        kinematic_cfg.get('budget_enable', True)
+    )
+    result['BACKEND_KINEMATIC_CONSISTENCY_BUDGET_WINDOW_SEC'] = float(
+        kinematic_cfg.get('budget_window_sec', 2.0)
+    )
+    result['BACKEND_KINEMATIC_CONSISTENCY_BUDGET_BASE_M'] = float(
+        kinematic_cfg.get('budget_base_m', 18.0)
+    )
+    result['BACKEND_KINEMATIC_CONSISTENCY_BUDGET_SPEED_GAIN'] = float(
+        kinematic_cfg.get('budget_speed_gain', 0.80)
+    )
+    result['BACKEND_KINEMATIC_CONSISTENCY_BUDGET_MAX_M'] = float(
+        kinematic_cfg.get('budget_max_m', 60.0)
+    )
+    result['BACKEND_KINEMATIC_CONSISTENCY_BUDGET_MIN_STEP_M'] = float(
+        kinematic_cfg.get('budget_min_step_m', 0.30)
+    )
     # =========================================================================
     # NEW: Adaptive + State-aware control policy (IMU-driven)
     # =========================================================================

@@ -24,7 +24,7 @@ from ..output_utils import (
 )
 from ..propagation import apply_preintegration_at_camera, clone_camera_for_msckf
 from ..state_manager import imu_to_gnss_position
-from ..policy.types import SensorPolicyDecision
+from ..policy.types import ApplyDecisionRecord, SensorPolicyDecision
 from .vps_position_controller import VPSPositionController, VpsMatchEvidence
 
 
@@ -2562,6 +2562,423 @@ class VIOService:
             return None, str(note)
         return contract, ""
 
+    def _backend_reject_counts(self) -> Dict[str, int]:
+        """Single-source reason counter map for backend correction rejects."""
+        runner = self.runner
+        counts = getattr(runner, "_backend_reject_reason_counts", None)
+        if not isinstance(counts, dict):
+            counts = {}
+            runner._backend_reject_reason_counts = counts
+        return counts
+
+    def _backend_source_reliability_map(self) -> Dict[str, float]:
+        """Return mutable source reliability map with defaults initialized."""
+        runner = self.runner
+        rel_map = getattr(runner, "_backend_source_reliability", None)
+        if not isinstance(rel_map, dict):
+            rel_map = {}
+            runner._backend_source_reliability = rel_map
+        default_rel = float(np.clip(runner.global_config.get("BACKEND_SOURCE_RELIABILITY_DEFAULT", 0.50), 0.0, 1.0))
+        for key in ("VPS", "LOOP", "BACKEND", "MAG"):
+            if key not in rel_map or not np.isfinite(float(rel_map.get(key, np.nan))):
+                rel_map[key] = default_rel
+        return rel_map
+
+    def _backend_source_reliability_hist_map(self) -> Dict[str, list[float]]:
+        """Return mutable source reliability history map."""
+        runner = self.runner
+        hist_map = getattr(runner, "_backend_source_reliability_hist", None)
+        if not isinstance(hist_map, dict):
+            hist_map = {}
+            runner._backend_source_reliability_hist = hist_map
+        for key in ("VPS", "LOOP", "BACKEND", "MAG"):
+            if not isinstance(hist_map.get(key, None), list):
+                hist_map[key] = []
+        return hist_map
+
+    def _backend_update_source_reliability(
+        self,
+        *,
+        source: str,
+        quality_score: float,
+        residual_xy: float,
+        committed: bool,
+    ) -> float:
+        """Update rolling source reliability after commit/reject decisions."""
+        runner = self.runner
+        source_u = str(source or "BACKEND").upper()
+        rel_map = self._backend_source_reliability_map()
+        hist_map = self._backend_source_reliability_hist_map()
+        prev = float(np.clip(rel_map.get(source_u, 0.5), 0.0, 1.0))
+        if not bool(runner.global_config.get("BACKEND_SOURCE_RELIABILITY_ENABLE", True)):
+            hist = hist_map.setdefault(source_u, [])
+            hist.append(prev)
+            if len(hist) > 20000:
+                del hist[:-20000]
+            return prev
+
+        alpha = float(np.clip(runner.global_config.get("BACKEND_SOURCE_RELIABILITY_ALPHA", 0.10), 0.0, 1.0))
+        penalty = float(np.clip(runner.global_config.get("BACKEND_SOURCE_RELIABILITY_REJECT_PENALTY", 0.12), 0.0, 1.0))
+        residual_ref_m = float(max(0.1, runner.global_config.get("BACKEND_SOURCE_RELIABILITY_RESIDUAL_REF_M", 12.0)))
+        q = float(np.clip(quality_score, 0.0, 1.0)) if np.isfinite(float(quality_score)) else 0.0
+        r = float(residual_xy) if np.isfinite(float(residual_xy)) else residual_ref_m
+        obs = float(np.clip(q * np.clip(1.0 / (1.0 + max(0.0, r) / residual_ref_m), 0.0, 1.0), 0.0, 1.0))
+        if committed:
+            new_rel = float(np.clip((1.0 - alpha) * prev + alpha * obs, 0.0, 1.0))
+        else:
+            new_rel = float(np.clip(prev * (1.0 - penalty), 0.0, 1.0))
+        rel_map[source_u] = new_rel
+        hist = hist_map.setdefault(source_u, [])
+        hist.append(new_rel)
+        if len(hist) > 20000:
+            del hist[:-20000]
+        return new_rel
+
+    def _log_backend_apply_trace(self, record: ApplyDecisionRecord) -> None:
+        """Append one deterministic backend apply funnel trace row."""
+        runner = self.runner
+        if not bool(runner.global_config.get("BACKEND_APPLY_TRACE_ENABLE", True)):
+            return
+        trace_csv = getattr(runner, "backend_apply_trace_csv", None)
+        if not trace_csv:
+            return
+        try:
+            with open(trace_csv, "a", newline="") as f:
+                f.write(
+                    f"{float(record.timestamp):.6f},{str(record.source)},"
+                    f"{str(record.decision_state)},{str(record.reason).replace(',', ';')},"
+                    f"{float(record.quality_score):.6f},{float(record.residual_xy):.6f},"
+                    f"{float(record.dp_xy_in):.6f},{float(record.dp_xy_applied):.6f},"
+                    f"{float(record.age_sec):.6f},{float(record.t_ref):.6f},"
+                    f"{int(bool(record.time_aligned_used))}\n"
+                )
+        except Exception:
+            pass
+
+    def _enqueue_backend_pending(
+        self,
+        *,
+        dp: np.ndarray,
+        dyaw_deg: float,
+        blend_steps: int,
+        corr_quality: float,
+        corr_age_sec: float,
+        residual_xy_metric: float,
+        source: str,
+        t_ref: float,
+        time_aligned_used: bool,
+        reason: str,
+    ) -> None:
+        """Commit backend correction payload into pending blend queue."""
+        runner = self.runner
+        runner._backend_pending_dp_enu = np.asarray(dp, dtype=float).reshape(3,).copy()
+        runner._backend_pending_dyaw_deg = float(dyaw_deg)
+        runner._backend_pending_steps_left = int(max(1, int(blend_steps)))
+        runner._backend_pending_quality = float(np.clip(corr_quality, 0.0, 1.0))
+        runner._backend_pending_source = str(source or "BACKEND").upper()
+        runner._backend_pending_t_ref = float(t_ref) if np.isfinite(float(t_ref)) else float("nan")
+        runner._backend_pending_age_sec = float(corr_age_sec) if np.isfinite(float(corr_age_sec)) else float("nan")
+        runner._backend_pending_residual_xy = float(residual_xy_metric) if np.isfinite(float(residual_xy_metric)) else float("nan")
+        runner._backend_pending_dp_xy_in = float(np.linalg.norm(np.asarray(dp[:2], dtype=float)))
+        runner._backend_pending_reason = str(reason)
+        runner._backend_pending_time_aligned_used = bool(time_aligned_used)
+
+    def _process_backend_probation(self, t_now: float) -> None:
+        """Advance PROBATION state and commit/reject deterministically."""
+        runner = self.runner
+        candidate = getattr(runner, "_backend_probation_candidate", None)
+        if not isinstance(candidate, dict):
+            return
+        # Do not evaluate probation while pending correction is still blending.
+        if int(getattr(runner, "_backend_pending_steps_left", 0)) > 0:
+            return
+        min_interval = float(max(0.01, runner.global_config.get("BACKEND_SUPERVISOR_PROBATION_MIN_INTERVAL_SEC", 0.08)))
+        last_eval_t = float(candidate.get("last_eval_t", -1e9))
+        if np.isfinite(float(t_now)) and (float(t_now) - last_eval_t) < min_interval:
+            return
+        candidate["last_eval_t"] = float(t_now)
+        ticks_seen = int(candidate.get("ticks_seen", 0)) + 1
+        candidate["ticks_seen"] = ticks_seen
+        required_ticks = int(max(1, runner.global_config.get("BACKEND_SUPERVISOR_PROBATION_TICKS", 2)))
+
+        ok_now = True
+        fail_reason = ""
+        dp = np.asarray(candidate.get("dp", np.zeros(3, dtype=float)), dtype=float).reshape(3,)
+        dp_xy_norm = float(np.linalg.norm(dp[:2]))
+        source = str(candidate.get("source", "BACKEND")).upper()
+        quality = float(candidate.get("corr_quality", np.nan))
+        source_rel = float(self._backend_source_reliability_map().get(source, 0.5))
+        counts = self._backend_reject_counts()
+
+        # C4.1 (logic-first): dynamic magnitude consistency in probation.
+        # Clamp oversized short-horizon correction energy before commit decision
+        # so throughput is preserved while suppressing burst tails.
+        try:
+            vel_xy_mag = float(
+                np.linalg.norm(np.asarray(runner.kf.x[3:5, 0], dtype=float).reshape(2,))
+            )
+        except Exception:
+            vel_xy_mag = 0.0
+        cand_age = float(candidate.get("corr_age_sec", np.nan))
+        prob_horizon_sec = float(
+            max(
+                0.05,
+                runner.global_config.get(
+                    "BACKEND_SUPERVISOR_MAGNITUDE_HORIZON_SEC",
+                    0.8,
+                ),
+            )
+        )
+        if np.isfinite(cand_age):
+            prob_horizon_sec = float(
+                np.clip(
+                    max(prob_horizon_sec, cand_age + 0.05),
+                    0.05,
+                    max(
+                        prob_horizon_sec,
+                        float(
+                            runner.global_config.get(
+                                "BACKEND_SUPERVISOR_MAGNITUDE_HORIZON_MAX_SEC",
+                                2.0,
+                            )
+                        ),
+                    ),
+                )
+            )
+        prob_mag_base_m = float(
+            max(0.0, runner.global_config.get("BACKEND_SUPERVISOR_MAGNITUDE_BASE_M", 8.0))
+        )
+        prob_mag_speed_gain = float(
+            max(0.0, runner.global_config.get("BACKEND_SUPERVISOR_MAGNITUDE_SPEED_GAIN", 1.2))
+        )
+        prob_mag_max_m = float(
+            max(0.1, runner.global_config.get("BACKEND_SUPERVISOR_MAGNITUDE_MAX_M", 35.0))
+        )
+        prob_max_allow_m = float(
+            min(
+                prob_mag_max_m,
+                prob_mag_base_m + prob_mag_speed_gain * max(0.0, vel_xy_mag) * prob_horizon_sec,
+            )
+        )
+        probation_mag_clamp_enable = bool(
+            runner.global_config.get("BACKEND_SUPERVISOR_MAGNITUDE_CLAMP_ENABLE", True)
+        )
+        if np.isfinite(dp_xy_norm) and dp_xy_norm > prob_max_allow_m and prob_max_allow_m > 1e-6:
+            if probation_mag_clamp_enable:
+                scale = float(np.clip(prob_max_allow_m / max(dp_xy_norm, 1e-9), 0.0, 1.0))
+                dp[:2] *= scale
+                candidate["dp"] = np.asarray(dp, dtype=float).reshape(3,).copy()
+                dyaw_prev = float(candidate.get("dyaw_deg", 0.0))
+                candidate["dyaw_deg"] = float(dyaw_prev * scale)
+                candidate["probation_clamped"] = True
+                dp_xy_norm = float(np.linalg.norm(dp[:2]))
+                counts["kinematic_clamp_magnitude"] = int(
+                    counts.get("kinematic_clamp_magnitude", 0)
+                ) + 1
+                runner._backend_kinematic_budget_clamp_count = int(
+                    getattr(runner, "_backend_kinematic_budget_clamp_count", 0)
+                ) + 1
+            else:
+                ok_now = False
+                fail_reason = "kinematic_reject"
+
+        # Motion consistency check in probation window.
+        try:
+            vel_xy = np.asarray(runner.kf.x[3:5, 0], dtype=float).reshape(2,)
+        except Exception:
+            vel_xy = np.zeros(2, dtype=float)
+        speed_xy = float(np.linalg.norm(vel_xy))
+        min_speed = float(runner.global_config.get("BACKEND_KINEMATIC_CONSISTENCY_MIN_SPEED_M_S", 8.0))
+        min_dp_xy = float(runner.global_config.get("BACKEND_KINEMATIC_CONSISTENCY_MIN_DP_XY_M", 4.0))
+        min_cos = float(runner.global_config.get("BACKEND_KINEMATIC_CONSISTENCY_MIN_COS", -0.25))
+        if (
+            np.isfinite(speed_xy)
+            and np.isfinite(dp_xy_norm)
+            and speed_xy >= max(0.0, min_speed)
+            and dp_xy_norm >= max(0.0, min_dp_xy)
+            and speed_xy > 1e-6
+            and dp_xy_norm > 1e-6
+        ):
+            cos_dir = float(np.dot(np.asarray(dp[:2], dtype=float), vel_xy) / (speed_xy * dp_xy_norm))
+            if np.isfinite(cos_dir) and cos_dir < float(min_cos):
+                ok_now = False
+                fail_reason = "kinematic_reject"
+
+        # Innovation evidence check in probation window.
+        # Require either: (a) residual improvement vs running baseline, or
+        # (b) bounded proxy evidence for sparse/noisy residual cases.
+        residual_xy = float(candidate.get("residual_xy_metric", np.nan))
+        improve_ratio_max = float(max(0.05, runner.global_config.get("BACKEND_SUPERVISOR_INNOVATION_IMPROVE_RATIO_MAX", 1.05)))
+        innovation_evidence = False
+        if ok_now:
+            hist = np.asarray(getattr(runner, "_backend_apply_residual_xy_history", []), dtype=float)
+            hist = hist[np.isfinite(hist) & (hist > 1e-6)]
+            baseline = float(np.percentile(hist, 50)) if hist.size > 0 else float("nan")
+            if np.isfinite(residual_xy) and residual_xy > 1e-6:
+                if np.isfinite(baseline) and baseline > 1e-9:
+                    innovation_evidence = bool(float(residual_xy) <= float(improve_ratio_max * baseline))
+                else:
+                    abs_residual_cap = float(
+                        max(
+                            0.1,
+                            runner.global_config.get(
+                                "BACKEND_SUPERVISOR_RESIDUAL_ABS_MAX_M",
+                                12.0,
+                            ),
+                        )
+                    )
+                    innovation_evidence = bool(float(residual_xy) <= abs_residual_cap)
+
+            # Sparse/no-residual fallback: bounded proxy evidence.
+            if not innovation_evidence:
+                proxy_ref_m = float(
+                    max(0.1, runner.global_config.get("BACKEND_SUPERVISOR_PROXY_REF_M", 12.0))
+                )
+                proxy_max = float(
+                    max(0.05, runner.global_config.get("BACKEND_SUPERVISOR_PROXY_MAX", 1.0))
+                )
+                proxy_min_quality = float(
+                    np.clip(
+                        runner.global_config.get("BACKEND_SUPERVISOR_PROXY_MIN_QUALITY", 0.35),
+                        0.0,
+                        1.0,
+                    )
+                )
+                proxy_min_source_rel = float(
+                    np.clip(
+                        runner.global_config.get("BACKEND_SUPERVISOR_PROXY_MIN_SOURCE_REL", 0.30),
+                        0.0,
+                        1.0,
+                    )
+                )
+                proxy_norm = float(dp_xy_norm / proxy_ref_m) if np.isfinite(dp_xy_norm) else float("nan")
+                innovation_evidence = bool(
+                    np.isfinite(proxy_norm)
+                    and proxy_norm <= proxy_max
+                    and np.isfinite(quality)
+                    and float(quality) >= proxy_min_quality
+                    and np.isfinite(source_rel)
+                    and float(source_rel) >= proxy_min_source_rel
+                )
+
+            require_evidence = bool(
+                runner.global_config.get("BACKEND_SUPERVISOR_REQUIRE_EVIDENCE", True)
+            )
+            if require_evidence and not innovation_evidence:
+                ok_now = False
+                fail_reason = "quality_reject"
+                runner._backend_probation_evidence_fail_count = int(
+                    getattr(runner, "_backend_probation_evidence_fail_count", 0)
+                ) + 1
+
+        candidate["all_pass"] = bool(candidate.get("all_pass", True) and ok_now)
+        if bool(innovation_evidence):
+            candidate["evidence_pass_ticks"] = int(candidate.get("evidence_pass_ticks", 0)) + 1
+        runner._backend_probation_candidate = candidate
+        if ticks_seen < required_ticks:
+            return
+
+        committed = bool(candidate.get("all_pass", False))
+        if committed:
+            q_hist = getattr(runner, "_backend_apply_quality_history", None)
+            if isinstance(q_hist, list):
+                q_hist.append(float(quality))
+                if len(q_hist) > 20000:
+                    del q_hist[:-20000]
+            lat_hist = getattr(runner, "_backend_apply_latency_ms_history", None)
+            cand_age = float(candidate.get("corr_age_sec", np.nan))
+            if isinstance(lat_hist, list) and np.isfinite(cand_age):
+                lat_hist.append(float(max(0.0, cand_age) * 1000.0))
+                if len(lat_hist) > 20000:
+                    del lat_hist[:-20000]
+            resid_hist = getattr(runner, "_backend_apply_residual_xy_history", None)
+            cand_resid = float(candidate.get("residual_xy_metric", np.nan))
+            if isinstance(resid_hist, list) and np.isfinite(cand_resid):
+                resid_hist.append(float(cand_resid))
+                if len(resid_hist) > 20000:
+                    del resid_hist[:-20000]
+            self._enqueue_backend_pending(
+                dp=np.asarray(candidate.get("dp", np.zeros(3, dtype=float)), dtype=float),
+                dyaw_deg=float(candidate.get("dyaw_deg", 0.0)),
+                blend_steps=int(candidate.get("blend_steps", 1)),
+                corr_quality=quality,
+                corr_age_sec=float(candidate.get("corr_age_sec", np.nan)),
+                residual_xy_metric=float(candidate.get("residual_xy_metric", np.nan)),
+                source=source,
+                t_ref=float(candidate.get("t_ref", np.nan)),
+                time_aligned_used=bool(candidate.get("time_aligned_used", False)),
+                reason="probation_commit",
+            )
+            dyaw_commit = float(candidate.get("dyaw_deg", 0.0))
+            if abs(dyaw_commit) > 1e-9 and getattr(runner, "yaw_authority_service", None) is not None:
+                try:
+                    runner.yaw_authority_service.register_applied(
+                        source="BACKEND",
+                        timestamp=float(candidate.get("t_ref", np.nan)),
+                        abs_yaw_deg=float(abs(dyaw_commit)),
+                    )
+                except Exception:
+                    pass
+            runner._backend_probation_commit_count = int(getattr(runner, "_backend_probation_commit_count", 0)) + 1
+            if bool(candidate.get("time_aligned_used", False)):
+                runner._backend_time_aligned_apply_count = int(
+                    getattr(runner, "_backend_time_aligned_apply_count", 0)
+                ) + 1
+            self._backend_update_source_reliability(
+                source=source,
+                quality_score=quality,
+                residual_xy=float(candidate.get("residual_xy_metric", np.nan)),
+                committed=True,
+            )
+            self._log_backend_apply_trace(
+                ApplyDecisionRecord(
+                    timestamp=float(t_now),
+                    source=source,
+                    decision_state="COMMIT",
+                    reason=(
+                        "probation_commit_clamped"
+                        if bool(candidate.get("probation_clamped", False))
+                        else "probation_commit"
+                    ),
+                    quality_score=quality,
+                    residual_xy=float(candidate.get("residual_xy_metric", np.nan)),
+                    dp_xy_in=float(np.linalg.norm(np.asarray(candidate.get("dp", np.zeros(3))[:2], dtype=float))),
+                    dp_xy_applied=0.0,
+                    age_sec=float(candidate.get("corr_age_sec", np.nan)),
+                    t_ref=float(candidate.get("t_ref", np.nan)),
+                    time_aligned_used=bool(candidate.get("time_aligned_used", False)),
+                )
+            )
+        else:
+            reason = fail_reason if str(fail_reason).strip() else "quality_reject"
+            counts[str(reason)] = int(counts.get(str(reason), 0)) + 1
+            runner._backend_probation_reject_count = int(getattr(runner, "_backend_probation_reject_count", 0)) + 1
+            self._backend_update_source_reliability(
+                source=source,
+                quality_score=quality,
+                residual_xy=float(candidate.get("residual_xy_metric", np.nan)),
+                committed=False,
+            )
+            reject_to_hint = bool(runner.global_config.get("BACKEND_SUPERVISOR_REJECT_TO_HINT_ONLY", True))
+            state_name = "HINT_ONLY" if reject_to_hint else "REJECT"
+            self._log_backend_apply_trace(
+                ApplyDecisionRecord(
+                    timestamp=float(t_now),
+                    source=source,
+                    decision_state=state_name,
+                    reason=reason,
+                    quality_score=quality,
+                    residual_xy=float(candidate.get("residual_xy_metric", np.nan)),
+                    dp_xy_in=float(np.linalg.norm(np.asarray(candidate.get("dp", np.zeros(3))[:2], dtype=float))),
+                    dp_xy_applied=0.0,
+                    age_sec=float(candidate.get("corr_age_sec", np.nan)),
+                    t_ref=float(candidate.get("t_ref", np.nan)),
+                    time_aligned_used=False,
+                )
+            )
+
+        runner._backend_probation_candidate = None
+
     def schedule_backend_correction(self, corr) -> None:
         """
         Schedule backend correction for gradual blend-in to avoid EKF state jumps.
@@ -2569,14 +2986,28 @@ class VIOService:
         runner = self.runner
         if corr is None:
             return
+        state_t_now = float(getattr(getattr(runner, "state", None), "t", 0.0))
         contract, contract_note = self._validate_backend_contract_v1(corr)
         if contract is None:
             runner._backend_contract_violation_count = int(getattr(runner, "_backend_contract_violation_count", 0)) + 1
-            counts = getattr(runner, "_backend_reject_reason_counts", None)
-            if not isinstance(counts, dict):
-                counts = {}
-                runner._backend_reject_reason_counts = counts
+            counts = self._backend_reject_counts()
             counts["contract_violation"] = int(counts.get("contract_violation", 0)) + 1
+            counts["backend_contract_violation"] = int(counts.get("backend_contract_violation", 0)) + 1
+            self._log_backend_apply_trace(
+                ApplyDecisionRecord(
+                    timestamp=state_t_now,
+                    source=str(getattr(corr, "source", "BACKEND")).upper(),
+                    decision_state="REJECT",
+                    reason="contract_violation",
+                    quality_score=float(getattr(corr, "quality_score", np.nan)),
+                    residual_xy=float("nan"),
+                    dp_xy_in=float("nan"),
+                    dp_xy_applied=0.0,
+                    age_sec=float(getattr(corr, "age_sec", np.nan)),
+                    t_ref=float(getattr(corr, "t_ref", np.nan)),
+                    time_aligned_used=False,
+                )
+            )
             if bool(getattr(runner.config, "save_debug_data", False)):
                 print(f"[BACKEND] contract violation: correction rejected ({contract_note})")
             return
@@ -2586,6 +3017,13 @@ class VIOService:
         yaw_auth_reason = ""
         src_mix = dict(contract.source_mix)
         resid = dict(contract.residual_summary)
+        source_name = str(getattr(corr, "source", "")).strip().upper()
+        if not source_name:
+            source_name = (
+                str(max(src_mix.items(), key=lambda kv: float(kv[1]))[0]).upper()
+                if len(src_mix) > 0
+                else "BACKEND"
+            )
         direct_xy_lane = bool(float(resid.get("direct_xy_lane", 0.0)) >= 0.5)
         corr_quality = float(np.clip(float(contract.quality_score), 0.0, 1.0))
         corr_age_sec = float(contract.age_sec)
@@ -2595,6 +3033,62 @@ class VIOService:
                 resid.get("residual_xy_mean", np.nan),
             )
         )
+        if (not np.isfinite(state_t_now)) or float(state_t_now) <= 0.0:
+            t_ref_trace = float(contract.t_ref)
+            if np.isfinite(t_ref_trace):
+                state_t_now = float(t_ref_trace)
+        supervisor_enable = bool(runner.global_config.get("BACKEND_SUPERVISOR_ENABLE", True))
+        if getattr(runner, "state", None) is None:
+            supervisor_enable = False
+        runner._backend_proposed_count = int(getattr(runner, "_backend_proposed_count", 0)) + 1
+        self._log_backend_apply_trace(
+            ApplyDecisionRecord(
+                timestamp=state_t_now,
+                source=source_name,
+                decision_state="PROPOSE",
+                reason="proposed",
+                quality_score=float(corr_quality),
+                residual_xy=float(residual_xy_metric),
+                dp_xy_in=float(np.linalg.norm(dp[:2])),
+                dp_xy_applied=0.0,
+                age_sec=float(corr_age_sec),
+                t_ref=float(contract.t_ref),
+                time_aligned_used=False,
+            )
+        )
+
+        # Source reliability quarantine: low-reliability sources are downgraded
+        # to deterministic HINT_ONLY unless reliability recovers.
+        source_rel_map = self._backend_source_reliability_map()
+        source_rel = float(source_rel_map.get(source_name, 0.5))
+        if bool(runner.global_config.get("BACKEND_SOURCE_RELIABILITY_ENABLE", True)):
+            quarantine_th = float(np.clip(runner.global_config.get("BACKEND_SOURCE_RELIABILITY_QUARANTINE_TH", 0.20), 0.0, 1.0))
+            hint_only_below = bool(runner.global_config.get("BACKEND_SOURCE_RELIABILITY_HINT_ONLY_BELOW_TH", True))
+            if hint_only_below and np.isfinite(source_rel) and source_rel < quarantine_th:
+                counts = self._backend_reject_counts()
+                counts["quality_reject"] = int(counts.get("quality_reject", 0)) + 1
+                self._backend_update_source_reliability(
+                    source=source_name,
+                    quality_score=float(corr_quality),
+                    residual_xy=float(residual_xy_metric),
+                    committed=False,
+                )
+                self._log_backend_apply_trace(
+                    ApplyDecisionRecord(
+                        timestamp=state_t_now,
+                        source=source_name,
+                        decision_state="HINT_ONLY",
+                        reason="quality_reject",
+                        quality_score=float(corr_quality),
+                        residual_xy=float(residual_xy_metric),
+                        dp_xy_in=float(np.linalg.norm(dp[:2])),
+                        dp_xy_applied=0.0,
+                        age_sec=float(corr_age_sec),
+                        t_ref=float(contract.t_ref),
+                        time_aligned_used=False,
+                    )
+                )
+                return
 
         position_first_lane = bool(runner.global_config.get("POSITION_FIRST_LANE", False))
         max_dp = float(runner.global_config.get("BACKEND_MAX_APPLY_DP_XY_M", 25.0))
@@ -2661,6 +3155,7 @@ class VIOService:
                 yaw_auth_reason = "position_first_xy_only"
 
         if getattr(runner, "yaw_authority_service", None) is not None:
+            yaw_denied = False
             speed_now = float(np.linalg.norm(np.asarray(runner.kf.x[3:6, 0], dtype=float)))
             adaptive_decision = getattr(runner, "current_adaptive_decision", None)
             health_state = str(getattr(adaptive_decision, "health_state", "HEALTHY")).upper()
@@ -2709,6 +3204,7 @@ class VIOService:
                 if (not bool(auth_dec.allow)) or str(auth_dec.mode).upper() in ("HOLD", "SKIP"):
                     yaw_auth_reason = f"skip:{auth_dec.reason}"
                     dyaw_deg = 0.0
+                    yaw_denied = True
                 else:
                     cap = float(auth_dec.max_update_dyaw_deg) if np.isfinite(float(auth_dec.max_update_dyaw_deg)) else float(max_dyaw_deg)
                     cap = max(0.05, min(float(max_dyaw_deg), cap))
@@ -2717,9 +3213,35 @@ class VIOService:
                         yaw_auth_reason = f"soft:{auth_dec.reason}"
                     else:
                         yaw_auth_reason = f"apply:{auth_dec.reason}"
+            if yaw_denied and not bool(runner.global_config.get("BACKEND_XY_YAW_DECOUPLE_ENABLE", True)):
+                counts = self._backend_reject_counts()
+                counts["quality_reject"] = int(counts.get("quality_reject", 0)) + 1
+                self._backend_update_source_reliability(
+                    source=source_name,
+                    quality_score=float(corr_quality),
+                    residual_xy=float(residual_xy_metric),
+                    committed=False,
+                )
+                self._log_backend_apply_trace(
+                    ApplyDecisionRecord(
+                        timestamp=state_t_now,
+                        source=source_name,
+                        decision_state="REJECT",
+                        reason="quality_reject",
+                        quality_score=float(corr_quality),
+                        residual_xy=float(residual_xy_metric),
+                        dp_xy_in=float(np.linalg.norm(np.asarray(dp[:2], dtype=float))),
+                        dp_xy_applied=0.0,
+                        age_sec=float(corr_age_sec),
+                        t_ref=float(contract.t_ref),
+                        time_aligned_used=False,
+                    )
+                )
+                return
 
-        # Deterministic kinematic consistency gate (C5): block opposite-direction
-        # correction bursts during high-speed motion before they enter blend queue.
+        # Deterministic kinematic consistency gate (C5):
+        # 1) magnitude-consistency: reject physically implausible short-horizon jumps
+        # 2) direction-consistency: reject strong opposite-direction pushes
         if bool(runner.global_config.get("BACKEND_KINEMATIC_CONSISTENCY_ENABLE", True)):
             try:
                 vel_xy = np.asarray(runner.kf.x[3:5, 0], dtype=float).reshape(2,)
@@ -2731,6 +3253,21 @@ class VIOService:
             min_speed = float(runner.global_config.get("BACKEND_KINEMATIC_CONSISTENCY_MIN_SPEED_M_S", 8.0))
             min_dp_xy = float(runner.global_config.get("BACKEND_KINEMATIC_CONSISTENCY_MIN_DP_XY_M", 4.0))
             min_cos = float(runner.global_config.get("BACKEND_KINEMATIC_CONSISTENCY_MIN_COS", -0.25))
+            magnitude_enable = bool(
+                runner.global_config.get("BACKEND_KINEMATIC_CONSISTENCY_MAGNITUDE_ENABLE", True)
+            )
+            magnitude_horizon_sec = float(
+                runner.global_config.get("BACKEND_KINEMATIC_CONSISTENCY_MAGNITUDE_HORIZON_SEC", 0.8)
+            )
+            magnitude_base_m = float(
+                runner.global_config.get("BACKEND_KINEMATIC_CONSISTENCY_MAGNITUDE_BASE_M", 6.0)
+            )
+            magnitude_speed_gain = float(
+                runner.global_config.get("BACKEND_KINEMATIC_CONSISTENCY_MAGNITUDE_SPEED_GAIN", 1.5)
+            )
+            magnitude_max_m = float(
+                runner.global_config.get("BACKEND_KINEMATIC_CONSISTENCY_MAGNITUDE_MAX_M", 45.0)
+            )
             if (
                 np.isfinite(speed_xy)
                 and np.isfinite(dp_xy_norm)
@@ -2739,23 +3276,90 @@ class VIOService:
                 and speed_xy > 1e-6
                 and dp_xy_norm > 1e-6
             ):
-                cos_dir = float(np.dot(dp_xy, vel_xy) / (speed_xy * dp_xy_norm))
-                if np.isfinite(cos_dir) and cos_dir < float(min_cos):
-                    runner._backend_kinematic_reject_count = int(
-                        getattr(runner, "_backend_kinematic_reject_count", 0)
-                    ) + 1
-                    counts = getattr(runner, "_backend_reject_reason_counts", None)
-                    if not isinstance(counts, dict):
-                        counts = {}
-                        runner._backend_reject_reason_counts = counts
-                    counts["kinematic_reject"] = int(counts.get("kinematic_reject", 0)) + 1
-                    if bool(getattr(runner.config, "save_debug_data", False)):
-                        print(
-                            "[BACKEND] kinematic_reject:"
-                            f" cos={cos_dir:.3f}<min_cos={float(min_cos):.3f},"
-                            f" speed_xy={speed_xy:.2f}, dp_xy={dp_xy_norm:.2f}"
-                        )
-                    return
+                counts = self._backend_reject_counts()
+
+                # Magnitude-consistency: allow correction size proportional to
+                # short-horizon kinematic travel plus a fixed base margin.
+                if bool(magnitude_enable):
+                    horizon = max(0.05, float(magnitude_horizon_sec))
+                    base_allow = max(0.0, float(magnitude_base_m))
+                    speed_gain = max(0.0, float(magnitude_speed_gain))
+                    max_allow = float(base_allow + speed_gain * speed_xy * horizon)
+                    if np.isfinite(magnitude_max_m) and magnitude_max_m > 0.0:
+                        max_allow = float(min(max_allow, float(magnitude_max_m)))
+                    max_allow = float(max(max(0.0, min_dp_xy), max_allow))
+                    if np.isfinite(max_allow) and dp_xy_norm > max_allow:
+                        # C4: deterministic clamp (throughput-preserving) instead of hard reject.
+                        # Direction gate below is kept unchanged.
+                        orig_dp_xy_norm = float(dp_xy_norm)
+                        scale = float(np.clip(max_allow / max(dp_xy_norm, 1e-9), 0.0, 1.0))
+                        dp[:2] = np.asarray(dp[:2], dtype=float) * scale
+                        dyaw_deg = float(dyaw_deg * scale)
+                        dp_xy = np.asarray(dp[:2], dtype=float).reshape(2,)
+                        dp_xy_norm = float(np.linalg.norm(dp_xy))
+                        counts["kinematic_clamp_magnitude"] = int(
+                            counts.get("kinematic_clamp_magnitude", 0)
+                        ) + 1
+                        runner._backend_kinematic_magnitude_clamp_count = int(
+                            getattr(runner, "_backend_kinematic_magnitude_clamp_count", 0)
+                        ) + 1
+                        if bool(getattr(runner.config, "save_debug_data", False)):
+                            print(
+                                "[BACKEND] kinematic_clamp(magnitude):"
+                                f" orig_dp_xy={orig_dp_xy_norm:.2f},"
+                                f" clamped_dp_xy={dp_xy_norm:.2f}, max_allow={max_allow:.2f},"
+                                f" speed_xy={speed_xy:.2f}, horizon={horizon:.2f},"
+                                f" base={base_allow:.2f}, gain={speed_gain:.2f}, scale={scale:.3f}"
+                            )
+
+                if dp_xy_norm > 1e-6:
+                    cos_dir = float(np.dot(dp_xy, vel_xy) / (speed_xy * dp_xy_norm))
+                    if np.isfinite(cos_dir) and cos_dir < float(min_cos):
+                        if bool(supervisor_enable) and bool(
+                            runner.global_config.get("BACKEND_SUPERVISOR_DEFER_DIRECTION_GATE", True)
+                        ):
+                            counts["kinematic_reject_direction_probation_deferred"] = int(
+                                counts.get("kinematic_reject_direction_probation_deferred", 0)
+                            ) + 1
+                        else:
+                            runner._backend_kinematic_reject_count = int(
+                                getattr(runner, "_backend_kinematic_reject_count", 0)
+                            ) + 1
+                            counts["kinematic_reject"] = int(counts.get("kinematic_reject", 0)) + 1
+                            counts["kinematic_reject_direction"] = int(
+                                counts.get("kinematic_reject_direction", 0)
+                            ) + 1
+                            counts["backend_kinematic_reject"] = int(
+                                counts.get("backend_kinematic_reject", 0)
+                            ) + 1
+                            self._backend_update_source_reliability(
+                                source=source_name,
+                                quality_score=float(corr_quality),
+                                residual_xy=float(residual_xy_metric),
+                                committed=False,
+                            )
+                            self._log_backend_apply_trace(
+                                ApplyDecisionRecord(
+                                    timestamp=state_t_now,
+                                    source=source_name,
+                                    decision_state="REJECT",
+                                    reason="kinematic_reject",
+                                    quality_score=float(corr_quality),
+                                    residual_xy=float(residual_xy_metric),
+                                    dp_xy_in=float(np.linalg.norm(np.asarray(dp[:2], dtype=float))),
+                                    dp_xy_applied=0.0,
+                                    age_sec=float(corr_age_sec),
+                                    t_ref=float(contract.t_ref),
+                                    time_aligned_used=False,
+                                )
+                            )
+                            if bool(getattr(runner.config, "save_debug_data", False)):
+                                print(
+                                    "[BACKEND] kinematic_reject(direction):"
+                                    f" cos={cos_dir:.3f}<min_cos={float(min_cos):.3f},"
+                                    f" speed_xy={speed_xy:.2f}, dp_xy={dp_xy_norm:.2f}"
+                                )
+                            return
 
         corr_weight = float(runner.global_config.get("BACKEND_CORRECTION_WEIGHT", 1.0))
         if position_first_lane:
@@ -2771,6 +3375,30 @@ class VIOService:
         if bool(runner.global_config.get("BACKEND_BLEND_QUALITY_SOFT_SCALE", True)) and not direct_xy_lane:
             q_corr = float(corr_quality)
             corr_weight *= float(np.clip(0.55 + 0.45 * q_corr, 0.25, 1.0))
+        # Pseudo-measurement gain (C5): replace raw offset-style authority with
+        # deterministic normalized gain from quality + residual.
+        if bool(runner.global_config.get("BACKEND_PSEUDOMEAS_ENABLE", True)):
+            gain_base = float(np.clip(runner.global_config.get("BACKEND_PSEUDOMEAS_GAIN_BASE", 0.75), 0.0, 2.0))
+            gain_q = float(np.clip(runner.global_config.get("BACKEND_PSEUDOMEAS_GAIN_QUALITY_GAIN", 0.35), 0.0, 2.0))
+            gain_ref_m = float(max(0.1, runner.global_config.get("BACKEND_PSEUDOMEAS_GAIN_RESIDUAL_REF_M", 12.0)))
+            gain_min = float(np.clip(runner.global_config.get("BACKEND_PSEUDOMEAS_GAIN_MIN", 0.25), 0.0, 2.0))
+            gain_max = float(np.clip(runner.global_config.get("BACKEND_PSEUDOMEAS_GAIN_MAX", 1.0), 0.0, 2.0))
+            q_term = float(np.clip(corr_quality, 0.0, 1.0))
+            residual_term = 1.0
+            if np.isfinite(float(residual_xy_metric)):
+                residual_term = float(np.clip(1.0 / (1.0 + max(0.0, float(residual_xy_metric)) / gain_ref_m), 0.0, 1.0))
+            pseudo_gain = float(np.clip((gain_base + gain_q * q_term) * residual_term, gain_min, max(gain_min, gain_max)))
+            corr_weight *= pseudo_gain
+
+        # Source reliability escalation/de-escalation in commit authority.
+        if bool(runner.global_config.get("BACKEND_SOURCE_RELIABILITY_ENABLE", True)):
+            source_rel = float(self._backend_source_reliability_map().get(source_name, 0.5))
+            escalate_th = float(np.clip(runner.global_config.get("BACKEND_SOURCE_RELIABILITY_ESCALATE_TH", 0.75), 0.0, 1.0))
+            if np.isfinite(source_rel):
+                rel_scale = float(np.clip(0.60 + 0.70 * source_rel, 0.20, 1.20))
+                if source_rel >= escalate_th:
+                    rel_scale = float(np.clip(rel_scale * 1.05, 0.20, 1.30))
+                corr_weight *= rel_scale
         if corr_weight < 1.0:
             dp *= corr_weight
             dyaw_deg *= corr_weight
@@ -2793,26 +3421,183 @@ class VIOService:
                         )
                     ),
                 )
-        runner._backend_pending_dp_enu = dp.copy()
-        runner._backend_pending_dyaw_deg = float(dyaw_deg)
-        runner._backend_pending_steps_left = int(blend_steps)
-        runner._backend_pending_quality = float(corr_quality)
-        # X1/X3 metrics for backend consistency and deterministic contract observability.
-        q_hist = getattr(runner, "_backend_apply_quality_history", None)
-        if isinstance(q_hist, list):
-            q_hist.append(float(corr_quality))
-            if len(q_hist) > 20000:
-                del q_hist[:-20000]
-        lat_hist = getattr(runner, "_backend_apply_latency_ms_history", None)
-        if isinstance(lat_hist, list) and np.isfinite(corr_age_sec):
-            lat_hist.append(float(max(0.0, corr_age_sec) * 1000.0))
-            if len(lat_hist) > 20000:
-                del lat_hist[:-20000]
-        resid_hist = getattr(runner, "_backend_apply_residual_xy_history", None)
-        if isinstance(resid_hist, list) and np.isfinite(residual_xy_metric):
-            resid_hist.append(float(residual_xy_metric))
-            if len(resid_hist) > 20000:
-                del resid_hist[:-20000]
+
+        # C4.2: deterministic time-aligned apply gating.
+        time_aligned_enable = bool(runner.global_config.get("BACKEND_TIME_ALIGNED_APPLY_ENABLE", True))
+        time_aligned_max_age_sec = float(max(0.0, runner.global_config.get("BACKEND_TIME_ALIGNED_MAX_AGE_SEC", 0.35)))
+        time_aligned_reject_stale = bool(runner.global_config.get("BACKEND_TIME_ALIGNED_REJECT_STALE", True))
+        time_aligned_used = bool(time_aligned_enable and np.isfinite(corr_age_sec) and corr_age_sec <= time_aligned_max_age_sec)
+        if (
+            bool(time_aligned_enable)
+            and bool(time_aligned_reject_stale)
+            and np.isfinite(corr_age_sec)
+            and corr_age_sec > time_aligned_max_age_sec
+        ):
+            counts = self._backend_reject_counts()
+            counts["stale_reject"] = int(counts.get("stale_reject", 0)) + 1
+            self._backend_update_source_reliability(
+                source=source_name,
+                quality_score=float(corr_quality),
+                residual_xy=float(residual_xy_metric),
+                committed=False,
+            )
+            self._log_backend_apply_trace(
+                ApplyDecisionRecord(
+                    timestamp=state_t_now,
+                    source=source_name,
+                    decision_state="REJECT",
+                    reason="stale_reject",
+                    quality_score=float(corr_quality),
+                    residual_xy=float(residual_xy_metric),
+                    dp_xy_in=float(np.linalg.norm(np.asarray(dp[:2], dtype=float))),
+                    dp_xy_applied=0.0,
+                    age_sec=float(corr_age_sec),
+                    t_ref=float(contract.t_ref),
+                    time_aligned_used=False,
+                )
+            )
+            return
+
+        def _record_schedule_histories() -> None:
+            q_hist = getattr(runner, "_backend_apply_quality_history", None)
+            if isinstance(q_hist, list):
+                q_hist.append(float(corr_quality))
+                if len(q_hist) > 20000:
+                    del q_hist[:-20000]
+            lat_hist = getattr(runner, "_backend_apply_latency_ms_history", None)
+            if isinstance(lat_hist, list) and np.isfinite(corr_age_sec):
+                lat_hist.append(float(max(0.0, corr_age_sec) * 1000.0))
+                if len(lat_hist) > 20000:
+                    del lat_hist[:-20000]
+            resid_hist = getattr(runner, "_backend_apply_residual_xy_history", None)
+            if isinstance(resid_hist, list) and np.isfinite(residual_xy_metric):
+                resid_hist.append(float(residual_xy_metric))
+                if len(resid_hist) > 20000:
+                    del resid_hist[:-20000]
+
+        # C4.1: supervisor lane (PROPOSE -> PROBATION -> COMMIT|REJECT).
+        if supervisor_enable:
+            existing_candidate = getattr(runner, "_backend_probation_candidate", None)
+            if isinstance(existing_candidate, dict):
+                source_rel_map = self._backend_source_reliability_map()
+                existing_source = str(existing_candidate.get("source", "BACKEND")).upper()
+                existing_rel = float(source_rel_map.get(existing_source, 0.5))
+                existing_quality = float(existing_candidate.get("corr_quality", np.nan))
+                existing_score = (
+                    float(np.clip(existing_quality, 0.0, 1.0)) * float(np.clip(existing_rel, 0.0, 1.0))
+                    if np.isfinite(existing_quality)
+                    else 0.0
+                )
+                new_score = float(np.clip(corr_quality, 0.0, 1.0)) * float(
+                    np.clip(source_rel, 0.0, 1.0) if np.isfinite(source_rel) else 0.5
+                )
+                replace_min_delta = float(
+                    max(
+                        0.0,
+                        runner.global_config.get("BACKEND_SUPERVISOR_REPLACE_MIN_SCORE_DELTA", 0.08),
+                    )
+                )
+                force_replace_max_age_sec = float(
+                    max(
+                        0.0,
+                        runner.global_config.get("BACKEND_SUPERVISOR_REPLACE_FORCE_MAX_AGE_SEC", 0.45),
+                    )
+                )
+                existing_age = float(existing_candidate.get("corr_age_sec", np.nan))
+                force_replace = bool(np.isfinite(existing_age) and existing_age > force_replace_max_age_sec)
+                if (not force_replace) and (
+                    new_score <= (existing_score + replace_min_delta)
+                ):
+                    counts = self._backend_reject_counts()
+                    counts["probation_deferred"] = int(counts.get("probation_deferred", 0)) + 1
+                    self._log_backend_apply_trace(
+                        ApplyDecisionRecord(
+                            timestamp=state_t_now,
+                            source=source_name,
+                            decision_state="HINT_ONLY",
+                            reason="probation_deferred",
+                            quality_score=float(corr_quality),
+                            residual_xy=float(residual_xy_metric),
+                            dp_xy_in=float(np.linalg.norm(np.asarray(dp[:2], dtype=float))),
+                            dp_xy_applied=0.0,
+                            age_sec=float(corr_age_sec),
+                            t_ref=float(contract.t_ref),
+                            time_aligned_used=bool(time_aligned_used),
+                        )
+                    )
+                    return
+                runner._backend_probation_replace_count = int(
+                    getattr(runner, "_backend_probation_replace_count", 0)
+                ) + 1
+            runner._backend_probation_count = int(getattr(runner, "_backend_probation_count", 0)) + 1
+            runner._backend_probation_candidate = {
+                "dp": np.asarray(dp, dtype=float).reshape(3,).copy(),
+                "dyaw_deg": float(dyaw_deg),
+                "blend_steps": int(blend_steps),
+                "corr_quality": float(corr_quality),
+                "corr_age_sec": float(corr_age_sec),
+                "residual_xy_metric": float(residual_xy_metric),
+                "source": str(source_name),
+                "t_ref": float(contract.t_ref),
+                "time_aligned_used": bool(time_aligned_used),
+                "ticks_seen": 0,
+                "last_eval_t": -1e9,
+                "all_pass": True,
+            }
+            self._log_backend_apply_trace(
+                ApplyDecisionRecord(
+                    timestamp=state_t_now,
+                    source=source_name,
+                    decision_state="PROBATION",
+                    reason="probation_start",
+                    quality_score=float(corr_quality),
+                    residual_xy=float(residual_xy_metric),
+                    dp_xy_in=float(np.linalg.norm(np.asarray(dp[:2], dtype=float))),
+                    dp_xy_applied=0.0,
+                    age_sec=float(corr_age_sec),
+                    t_ref=float(contract.t_ref),
+                    time_aligned_used=bool(time_aligned_used),
+                )
+            )
+            return
+
+        # Direct commit fallback when supervisor lane is disabled.
+        _record_schedule_histories()
+        self._enqueue_backend_pending(
+            dp=np.asarray(dp, dtype=float).reshape(3,),
+            dyaw_deg=float(dyaw_deg),
+            blend_steps=int(blend_steps),
+            corr_quality=float(corr_quality),
+            corr_age_sec=float(corr_age_sec),
+            residual_xy_metric=float(residual_xy_metric),
+            source=str(source_name),
+            t_ref=float(contract.t_ref),
+            time_aligned_used=bool(time_aligned_used),
+            reason="direct_commit",
+        )
+        if bool(time_aligned_used):
+            runner._backend_time_aligned_apply_count = int(getattr(runner, "_backend_time_aligned_apply_count", 0)) + 1
+        self._backend_update_source_reliability(
+            source=source_name,
+            quality_score=float(corr_quality),
+            residual_xy=float(residual_xy_metric),
+            committed=True,
+        )
+        self._log_backend_apply_trace(
+            ApplyDecisionRecord(
+                timestamp=state_t_now,
+                source=source_name,
+                decision_state="COMMIT",
+                reason="direct_commit",
+                quality_score=float(corr_quality),
+                residual_xy=float(residual_xy_metric),
+                dp_xy_in=float(np.linalg.norm(np.asarray(dp[:2], dtype=float))),
+                dp_xy_applied=0.0,
+                age_sec=float(corr_age_sec),
+                t_ref=float(contract.t_ref),
+                time_aligned_used=bool(time_aligned_used),
+            )
+        )
         if abs(dyaw_deg) > 1e-9 and getattr(runner, "yaw_authority_service", None) is not None:
             try:
                 runner.yaw_authority_service.register_applied(
@@ -2830,6 +3615,8 @@ class VIOService:
         Apply one blend step from pending backend correction.
         """
         runner = self.runner
+        # Advance C4.1 probation lane on deterministic cadence.
+        self._process_backend_probation(float(t_now))
         steps_left = int(getattr(runner, "_backend_pending_steps_left", 0))
         if steps_left <= 0:
             return False
@@ -2867,6 +3654,81 @@ class VIOService:
             if abs(step_dyaw_deg) > max_step_dyaw:
                 step_dyaw_deg = float(np.clip(step_dyaw_deg, -max_step_dyaw, max_step_dyaw))
 
+        step_xy_norm = float(np.linalg.norm(np.asarray(step_dp[:2], dtype=float)))
+
+        # Deterministic short-horizon energy shaping:
+        # block or clamp per-step XY correction if accumulated applied energy
+        # within a recent window exceeds physically plausible short-term travel.
+        if bool(runner.global_config.get("BACKEND_KINEMATIC_CONSISTENCY_BUDGET_ENABLE", True)):
+            try:
+                vel_xy_now = np.asarray(runner.kf.x[3:5, 0], dtype=float).reshape(2,)
+                speed_xy_now = float(np.linalg.norm(vel_xy_now))
+            except Exception:
+                speed_xy_now = 0.0
+            window_sec = float(
+                runner.global_config.get("BACKEND_KINEMATIC_CONSISTENCY_BUDGET_WINDOW_SEC", 2.0)
+            )
+            base_budget_m = float(
+                runner.global_config.get("BACKEND_KINEMATIC_CONSISTENCY_BUDGET_BASE_M", 18.0)
+            )
+            speed_gain = float(
+                runner.global_config.get("BACKEND_KINEMATIC_CONSISTENCY_BUDGET_SPEED_GAIN", 0.80)
+            )
+            max_budget_m = float(
+                runner.global_config.get("BACKEND_KINEMATIC_CONSISTENCY_BUDGET_MAX_M", 60.0)
+            )
+            min_step_m = float(
+                runner.global_config.get("BACKEND_KINEMATIC_CONSISTENCY_BUDGET_MIN_STEP_M", 0.30)
+            )
+            now_t = float(t_now)
+            if not np.isfinite(now_t):
+                now_t = float(getattr(runner.state, "t", 0.0))
+            hist = getattr(runner, "_backend_apply_energy_history", None)
+            if not isinstance(hist, list):
+                hist = []
+                runner._backend_apply_energy_history = hist
+            if np.isfinite(window_sec) and window_sec > 0.05 and np.isfinite(now_t):
+                cutoff = float(now_t - max(0.05, window_sec))
+                hist[:] = [
+                    (float(tt), float(mm))
+                    for tt, mm in hist
+                    if np.isfinite(tt) and np.isfinite(mm) and float(tt) >= cutoff and float(mm) >= 0.0
+                ]
+            recent_energy_m = float(sum(float(mm) for _, mm in hist))
+            budget_allow_m = float(max(0.0, base_budget_m + speed_gain * max(0.0, speed_xy_now) * max(0.05, window_sec)))
+            if np.isfinite(max_budget_m) and max_budget_m > 0.0:
+                budget_allow_m = float(min(budget_allow_m, max_budget_m))
+            remaining_budget_m = float(budget_allow_m - recent_energy_m)
+            if step_xy_norm > 1e-9 and np.isfinite(remaining_budget_m):
+                counts = self._backend_reject_counts()
+                floor_budget_m = max(0.0, float(min_step_m))
+                target_budget_m = float(max(0.0, remaining_budget_m))
+                if target_budget_m < floor_budget_m:
+                    target_budget_m = float(floor_budget_m)
+                if step_xy_norm > target_budget_m:
+                    scale = float(np.clip(target_budget_m / step_xy_norm, 0.0, 1.0))
+                    step_dp[:2] *= scale
+                    step_dyaw_deg *= scale
+                    step_xy_norm = float(np.linalg.norm(np.asarray(step_dp[:2], dtype=float)))
+                    counts["kinematic_budget_clamp"] = int(
+                        counts.get("kinematic_budget_clamp", 0)
+                    ) + 1
+                    if remaining_budget_m <= floor_budget_m:
+                        counts["kinematic_budget_floor_clamp"] = int(
+                            counts.get("kinematic_budget_floor_clamp", 0)
+                        ) + 1
+                    runner._backend_kinematic_budget_clamp_count = int(
+                        getattr(runner, "_backend_kinematic_budget_clamp_count", 0)
+                    ) + 1
+                    if bool(getattr(runner.config, "save_debug_data", False)):
+                        print(
+                            "[BACKEND] kinematic_budget_clamp:"
+                            f" scale={scale:.3f}, step={step_xy_norm:.2f}m,"
+                            f" remaining={remaining_budget_m:.2f}m,"
+                            f" target={target_budget_m:.2f}m,"
+                            f" floor={floor_budget_m:.2f}m"
+                        )
+
         inflate = float(runner.global_config.get("BACKEND_APPLY_COV_INFLATE", 1.05))
         if np.isfinite(inflate) and inflate > 1.0:
             runner.kf.P[0:6, 0:6] *= float(min(inflate, 1.25))
@@ -2889,17 +3751,47 @@ class VIOService:
         runner._backend_pending_dyaw_deg = dyaw_rem - step_dyaw_deg
         runner._backend_pending_steps_left = steps_left - 1
         runner._backend_apply_count = int(getattr(runner, "_backend_apply_count", 0)) + 1
+        self._log_backend_apply_trace(
+            ApplyDecisionRecord(
+                timestamp=float(t_now),
+                source=str(getattr(runner, "_backend_pending_source", "BACKEND")),
+                decision_state="COMMIT",
+                reason=str(getattr(runner, "_backend_pending_reason", "apply_step")),
+                quality_score=float(getattr(runner, "_backend_pending_quality", np.nan)),
+                residual_xy=float(getattr(runner, "_backend_pending_residual_xy", np.nan)),
+                dp_xy_in=float(getattr(runner, "_backend_pending_dp_xy_in", np.nan)),
+                dp_xy_applied=float(step_xy_norm),
+                age_sec=float(getattr(runner, "_backend_pending_age_sec", np.nan)),
+                t_ref=float(getattr(runner, "_backend_pending_t_ref", np.nan)),
+                time_aligned_used=bool(getattr(runner, "_backend_pending_time_aligned_used", False)),
+            )
+        )
         dp_hist = getattr(runner, "_backend_apply_dp_xy_history", None)
         if isinstance(dp_hist, list):
-            step_xy = float(np.linalg.norm(np.asarray(step_dp[:2], dtype=float)))
-            if np.isfinite(step_xy):
-                dp_hist.append(step_xy)
+            if np.isfinite(step_xy_norm):
+                dp_hist.append(step_xy_norm)
                 if len(dp_hist) > 20000:
                     del dp_hist[:-20000]
+        energy_hist = getattr(runner, "_backend_apply_energy_history", None)
+        if isinstance(energy_hist, list):
+            t_apply = float(t_now)
+            if not np.isfinite(t_apply):
+                t_apply = float(getattr(runner.state, "t", 0.0))
+            if np.isfinite(t_apply) and np.isfinite(step_xy_norm) and step_xy_norm >= 0.0:
+                energy_hist.append((t_apply, step_xy_norm))
+                if len(energy_hist) > 20000:
+                    del energy_hist[:-20000]
 
         if int(runner._backend_pending_steps_left) <= 0:
             runner._backend_pending_dp_enu = None
             runner._backend_pending_dyaw_deg = 0.0
             runner._backend_pending_steps_left = 0
             runner._backend_pending_quality = 0.0
+            runner._backend_pending_source = ""
+            runner._backend_pending_t_ref = float("nan")
+            runner._backend_pending_age_sec = float("nan")
+            runner._backend_pending_residual_xy = float("nan")
+            runner._backend_pending_dp_xy_in = float("nan")
+            runner._backend_pending_reason = ""
+            runner._backend_pending_time_aligned_used = False
         return True

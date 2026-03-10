@@ -521,7 +521,9 @@ def run_imu_driven_loop(runner):
                     max_age = float(runner.global_config.get("BACKEND_MAX_CORRECTION_AGE_SEC", 2.0))
                     if float(getattr(corr, "age_sec", 0.0)) > max_age:
                         runner._backend_stale_drop_count = int(getattr(runner, "_backend_stale_drop_count", 0)) + 1
-                        runner._backend_snap_reject_count = int(getattr(runner, "_backend_snap_reject_count", 0)) + 1
+                        counts = getattr(runner, "_backend_reject_reason_counts", None)
+                        if isinstance(counts, dict):
+                            counts["stale_reject"] = int(counts.get("stale_reject", 0)) + 1
                     else:
                         runner.vio_service.schedule_backend_correction(corr)
             # Deterministic blend apply cadence:

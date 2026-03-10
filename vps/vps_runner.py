@@ -142,6 +142,12 @@ class VPSConfig:
     reloc_accuracy_local_first_recent_success_sec: float = 120.0
     reloc_accuracy_local_first_fail_streak_max: int = 24
     reloc_accuracy_local_first_require_anchor: bool = True
+    reloc_local_first_budget_split_enable: bool = True
+    reloc_local_first_budget_fraction: float = 0.70
+    reloc_local_first_time_fraction: float = 0.65
+    reloc_local_first_min_candidates: int = 8
+    reloc_local_first_min_time_ms: float = 220.0
+    reloc_local_first_center_radius_m: float = 180.0
     reloc_no_coverage_radius_m: tuple = (25.0, 60.0)
     reloc_no_coverage_samples: int = 6
     reloc_no_coverage_max_centers: int = 6
@@ -155,6 +161,14 @@ class VPSConfig:
     reloc_budget_escalator_max_candidate_scale: float = 2.5
     reloc_budget_escalator_max_time_scale: float = 2.5
     reloc_budget_escalator_decay_successes: int = 2
+    reloc_coarse_fine_enable: bool = True
+    reloc_coarse_center_limit: int = 3
+    reloc_coarse_candidate_limit: int = 4
+    reloc_fine_refine_radius_m: float = 120.0
+    reloc_fine_refine_max_centers: int = 6
+    reloc_coarse_anchor_require_strict: bool = True
+    reloc_coarse_anchor_min_inliers: int = 5
+    reloc_coarse_anchor_min_confidence: float = 0.10
     runtime_verbosity: str = "debug"
     runtime_log_interval_sec: float = 1.0
 
@@ -319,6 +333,13 @@ class VPSRunner:
             'global_backoff_probes': 0,
             'coverage_recovery_used': 0,
             'altitude_bypass': 0,
+            'coarse_fine_anchor_locks': 0,
+            'coarse_fine_center_skips': 0,
+            'local_first_stage_attempts': 0,
+            'local_first_global_deferred': 0,
+            'local_first_reserved_candidates_sum': 0.0,
+            'local_first_used_candidates_sum': 0.0,
+            'local_first_stage_samples': 0,
         }
         
         print("[VPSRunner] Ready")
@@ -810,6 +831,11 @@ class VPSRunner:
             reloc_no_cov_radius = tuple(
                 float(v) for v in reloc_cfg.get("no_coverage_recovery_radius_m", [25.0, 60.0])
             )
+            reloc_coarse_fine_cfg = (
+                reloc_cfg.get("coarse_fine", {})
+                if isinstance(reloc_cfg.get("coarse_fine", {}), dict)
+                else {}
+            )
             reloc_global_yaw = tuple(float(v) for v in reloc_cfg.get(
                 "global_yaw_hypotheses_deg", [0.0, 45.0, 90.0, 135.0, 180.0, -45.0, -90.0, -135.0]
             ))
@@ -941,6 +967,24 @@ class VPSRunner:
                 reloc_accuracy_local_first_require_anchor=bool(
                     reloc_cfg.get("accuracy_local_first_require_anchor", True)
                 ),
+                reloc_local_first_budget_split_enable=bool(
+                    reloc_cfg.get("local_first_budget_split_enable", True)
+                ),
+                reloc_local_first_budget_fraction=float(
+                    reloc_cfg.get("local_first_budget_fraction", 0.70)
+                ),
+                reloc_local_first_time_fraction=float(
+                    reloc_cfg.get("local_first_time_fraction", 0.65)
+                ),
+                reloc_local_first_min_candidates=int(
+                    reloc_cfg.get("local_first_min_candidates", 8)
+                ),
+                reloc_local_first_min_time_ms=float(
+                    reloc_cfg.get("local_first_min_time_ms", 220.0)
+                ),
+                reloc_local_first_center_radius_m=float(
+                    reloc_cfg.get("local_first_center_radius_m", 180.0)
+                ),
                 reloc_no_coverage_radius_m=(
                     reloc_no_cov_radius if len(reloc_no_cov_radius) > 0 else (25.0, 60.0)
                 ),
@@ -978,6 +1022,30 @@ class VPSRunner:
                 reloc_budget_escalator_decay_successes=int(
                     reloc_cfg.get("budget_escalator_decay_successes", 2)
                 ),
+                reloc_coarse_fine_enable=bool(
+                    reloc_coarse_fine_cfg.get("enable", True)
+                ),
+                reloc_coarse_center_limit=int(
+                    reloc_coarse_fine_cfg.get("coarse_center_limit", 3)
+                ),
+                reloc_coarse_candidate_limit=int(
+                    reloc_coarse_fine_cfg.get("coarse_candidate_limit", 4)
+                ),
+                reloc_fine_refine_radius_m=float(
+                    reloc_coarse_fine_cfg.get("fine_refine_radius_m", 120.0)
+                ),
+                reloc_fine_refine_max_centers=int(
+                    reloc_coarse_fine_cfg.get("fine_refine_max_centers", 6)
+                ),
+                reloc_coarse_anchor_require_strict=bool(
+                    reloc_coarse_fine_cfg.get("anchor_require_strict", True)
+                ),
+                reloc_coarse_anchor_min_inliers=int(
+                    reloc_coarse_fine_cfg.get("anchor_min_inliers", 5)
+                ),
+                reloc_coarse_anchor_min_confidence=float(
+                    reloc_coarse_fine_cfg.get("anchor_min_confidence", 0.10)
+                ),
                 runtime_verbosity=str(
                     vps_cfg.get(
                         "runtime_verbosity",
@@ -1000,7 +1068,8 @@ class VPSRunner:
                 f"budget_ms(local/global)={vps_config.max_frame_time_ms_local:.0f}/{vps_config.max_frame_time_ms_global:.0f}, "
                 f"gbackoff_fail={vps_config.reloc_global_backoff_fail_streak},"
                 f"{vps_config.reloc_global_backoff_sec:.1f}s, "
-                f"budget_escalator={int(bool(vps_config.reloc_budget_escalator_enable))}"
+                f"budget_escalator={int(bool(vps_config.reloc_budget_escalator_enable))}, "
+                f"coarse_fine={int(bool(vps_config.reloc_coarse_fine_enable))}"
             )
         
         # Create VPSRunner
@@ -1070,6 +1139,79 @@ class VPSRunner:
             if len(dedup) >= max_cands:
                 break
         return dedup
+
+    @staticmethod
+    def _candidate_key(pair: Tuple[float, float]) -> Tuple[float, float]:
+        return (round(float(pair[0]), 3), round(float(pair[1]), 3))
+
+    @staticmethod
+    def _approx_distance_m(lat0: float, lon0: float, lat1: float, lon1: float) -> float:
+        lat_ref = float(0.5 * (float(lat0) + float(lat1)))
+        m_per_deg_lat = 111320.0
+        m_per_deg_lon = max(1e-6, 111320.0 * np.cos(np.radians(lat_ref)))
+        dn = (float(lat1) - float(lat0)) * m_per_deg_lat
+        de = (float(lon1) - float(lon0)) * m_per_deg_lon
+        return float(np.hypot(de, dn))
+
+    def _build_coarse_candidate_order(self, candidates: List[Tuple[float, float]]) -> Tuple[List[Tuple[float, float]], int]:
+        """Return coarse-first candidate order and coarse candidate count."""
+        if not candidates:
+            return [], 0
+        limit = max(1, int(self.config.reloc_coarse_candidate_limit))
+        primary: List[Tuple[float, float]] = []
+        remainder: List[Tuple[float, float]] = []
+        for yaw_d, sc in candidates:
+            y = float(yaw_d)
+            s = float(sc)
+            # Coarse stage: near-zero yaw and near-unit scale first.
+            if abs(y) <= 1e-6 and abs(s - 1.0) <= 1e-6:
+                primary.append((y, s))
+            elif abs(y) in (90.0, 180.0) and abs(s - 1.0) <= 1e-6:
+                primary.append((y, s))
+            else:
+                remainder.append((y, s))
+        ordered = primary + remainder
+        dedup: List[Tuple[float, float]] = []
+        seen = set()
+        for pair in ordered:
+            key = self._candidate_key(pair)
+            if key in seen:
+                continue
+            seen.add(key)
+            dedup.append(pair)
+        coarse_count = min(int(limit), len(dedup))
+        return dedup, coarse_count
+
+    def _build_coarse_center_order(
+        self,
+        search_centers: List[Tuple[float, float]],
+        *,
+        est_lat: float,
+        est_lon: float,
+    ) -> Tuple[List[Tuple[float, float]], int]:
+        """Return coarse-first center order and coarse center count."""
+        if not search_centers:
+            return [], 0
+        limit = max(1, int(self.config.reloc_coarse_center_limit))
+        if np.isfinite(self._last_success_center_lat) and np.isfinite(self._last_success_center_lon):
+            anchor_lat = float(self._last_success_center_lat)
+            anchor_lon = float(self._last_success_center_lon)
+        else:
+            anchor_lat = float(est_lat)
+            anchor_lon = float(est_lon)
+        ranked = sorted(
+            [(self._approx_distance_m(anchor_lat, anchor_lon, c_lat, c_lon), idx, (float(c_lat), float(c_lon))) for idx, (c_lat, c_lon) in enumerate(search_centers)],
+            key=lambda item: (item[0], item[1]),
+        )
+        coarse_centers = [item[2] for item in ranked[:limit]]
+        coarse_set = {(round(c[0], 8), round(c[1], 8)) for c in coarse_centers}
+        ordered = list(coarse_centers)
+        for c_lat, c_lon in search_centers:
+            key = (round(float(c_lat), 8), round(float(c_lon), 8))
+            if key in coarse_set:
+                continue
+            ordered.append((float(c_lat), float(c_lon)))
+        return ordered, min(len(coarse_centers), len(ordered))
 
     def _should_accept_failsoft(self, match_result: MatchResult) -> bool:
         """Allow low-inlier but geometrically coherent matches with conservative thresholds."""
@@ -1232,6 +1374,13 @@ class VPSRunner:
         stopped_by_time_budget = False
         stopped_by_candidate_budget = False
         evaluated_candidates = 0
+        local_eval_count = 0
+        global_eval_count = 0
+        local_first_split_enable = False
+        local_reserved_candidates = 0
+        global_reserved_candidates = 0
+        local_reserved_time_ms = 0.0
+        local_center_keys = set()
         raw_num_candidates = 0
         num_candidates = 0
         frame_budget_ms = 0.0
@@ -1298,6 +1447,16 @@ class VPSRunner:
             self.stats["evaluated_candidates_samples"] = int(
                 self.stats.get("evaluated_candidates_samples", 0)
             ) + 1
+            if local_first_split_enable:
+                self.stats["local_first_reserved_candidates_sum"] = float(
+                    self.stats.get("local_first_reserved_candidates_sum", 0.0)
+                ) + float(max(0, int(local_reserved_candidates)))
+                self.stats["local_first_used_candidates_sum"] = float(
+                    self.stats.get("local_first_used_candidates_sum", 0.0)
+                ) + float(max(0, int(local_eval_count)))
+                self.stats["local_first_stage_samples"] = int(
+                    self.stats.get("local_first_stage_samples", 0)
+                ) + 1
             self.stats["budget_escalation_level_sum"] = float(
                 self.stats.get("budget_escalation_level_sum", 0.0)
             ) + float(max(0, int(getattr(self, "_budget_escalation_level", 0))))
@@ -1557,6 +1716,69 @@ class VPSRunner:
         # 3/4/5/6. Search centers + preprocess hypotheses + matching
         camera_yaw_base = est_yaw + self.camera_yaw_offset_rad
         candidates = self._build_preprocess_candidates(global_mode=global_mode, objective=objective_mode)
+        coarse_fine_enabled = bool(
+            bool(self.config.reloc_coarse_fine_enable)
+            and (str(objective_mode).lower() == "accuracy" or bool(self.config.accuracy_mode))
+        )
+        coarse_center_count = 0
+        coarse_candidate_count = 0
+        coarse_eval_limit = 0
+        coarse_anchor_locked = False
+        coarse_anchor_lat = float("nan")
+        coarse_anchor_lon = float("nan")
+        fine_refine_radius_m = max(0.0, float(self.config.reloc_fine_refine_radius_m))
+        fine_refine_max_centers = max(1, int(self.config.reloc_fine_refine_max_centers))
+        fine_refine_seen_centers = set()
+        fine_refine_skips = 0
+        if coarse_fine_enabled:
+            search_centers, coarse_center_count = self._build_coarse_center_order(
+                search_centers,
+                est_lat=float(est_lat),
+                est_lon=float(est_lon),
+            )
+            candidates, coarse_candidate_count = self._build_coarse_candidate_order(candidates)
+            coarse_eval_limit = max(0, int(coarse_center_count) * int(coarse_candidate_count))
+
+        # Continuity lane: reserve a deterministic local-first budget slice so local
+        # anchor recovery cannot be starved by global/ambiguous search expansions.
+        local_first_split_enable = bool(
+            bool(self.config.reloc_local_first_budget_split_enable)
+            and (str(objective_mode).lower() == "accuracy" or bool(self.config.accuracy_mode))
+            and len(search_centers) > 1
+        )
+        if local_first_split_enable:
+            anchor_lat = float(est_lat)
+            anchor_lon = float(est_lon)
+            if np.isfinite(float(self._last_success_center_lat)) and np.isfinite(
+                float(self._last_success_center_lon)
+            ):
+                anchor_lat = float(self._last_success_center_lat)
+                anchor_lon = float(self._last_success_center_lon)
+            radius_m = float(max(5.0, self.config.reloc_local_first_center_radius_m))
+            local_centers = []
+            global_centers = []
+            for c_lat, c_lon in search_centers:
+                dist_m = self._approx_distance_m(
+                    anchor_lat,
+                    anchor_lon,
+                    float(c_lat),
+                    float(c_lon),
+                )
+                if np.isfinite(dist_m) and float(dist_m) <= float(radius_m):
+                    local_centers.append((float(c_lat), float(c_lon)))
+                else:
+                    global_centers.append((float(c_lat), float(c_lon)))
+            if len(local_centers) > 0:
+                local_center_keys = {
+                    (round(float(c_lat), 8), round(float(c_lon), 8))
+                    for c_lat, c_lon in local_centers
+                }
+                search_centers = list(local_centers) + list(global_centers)
+                self.stats["local_first_stage_attempts"] = int(
+                    self.stats.get("local_first_stage_attempts", 0)
+                ) + 1
+            else:
+                local_first_split_enable = False
         centers_total = int(len(search_centers))
         budget_plan = self._resolve_budget_plan(
             raw_num_candidates=int(len(candidates) * max(1, centers_total)),
@@ -1565,8 +1787,67 @@ class VPSRunner:
         raw_num_candidates = int(budget_plan.raw_num_candidates)
         num_candidates = int(budget_plan.budget_num_candidates)
         frame_budget_ms = float(budget_plan.frame_budget_ms)
+        if local_first_split_enable and num_candidates > 0:
+            frac = float(np.clip(self.config.reloc_local_first_budget_fraction, 0.05, 0.95))
+            min_cands = max(1, int(self.config.reloc_local_first_min_candidates))
+            local_reserved_candidates = int(
+                np.clip(
+                    int(round(float(num_candidates) * frac)),
+                    min_cands,
+                    int(num_candidates),
+                )
+            )
+            global_reserved_candidates = int(max(0, int(num_candidates) - int(local_reserved_candidates)))
+            if frame_budget_ms > 0.0:
+                time_frac = float(np.clip(self.config.reloc_local_first_time_fraction, 0.05, 0.95))
+                min_time_ms = float(max(1.0, self.config.reloc_local_first_min_time_ms))
+                local_reserved_time_ms = float(
+                    min(
+                        float(frame_budget_ms),
+                        max(min_time_ms, float(frame_budget_ms) * time_frac),
+                    )
+                )
+        else:
+            local_reserved_candidates = int(num_candidates)
+            global_reserved_candidates = 0
+            local_reserved_time_ms = 0.0
 
         for center_idx, (center_lat, center_lon) in enumerate(search_centers):
+            center_key = (round(float(center_lat), 8), round(float(center_lon), 8))
+            center_is_local = bool(local_first_split_enable and center_key in local_center_keys)
+            if local_first_split_enable and (not center_is_local):
+                # Hold global centers until local continuity stage receives its
+                # reserved candidate/time budget.
+                elapsed_ms_pre = float((time.time() - t_start) * 1000.0)
+                local_time_guard_done = (
+                    local_reserved_time_ms <= 0.0 or elapsed_ms_pre >= local_reserved_time_ms
+                )
+                local_cand_guard_done = int(local_eval_count) >= int(local_reserved_candidates)
+                if not (local_time_guard_done or local_cand_guard_done):
+                    self.stats["local_first_global_deferred"] = int(
+                        self.stats.get("local_first_global_deferred", 0)
+                    ) + 1
+                    continue
+            if (
+                coarse_fine_enabled
+                and coarse_anchor_locked
+                and int(coarse_eval_limit) > 0
+                and int(evaluated_candidates) >= int(coarse_eval_limit)
+            ):
+                dist_m = self._approx_distance_m(
+                    float(coarse_anchor_lat),
+                    float(coarse_anchor_lon),
+                    float(center_lat),
+                    float(center_lon),
+                )
+                center_key = (round(float(center_lat), 8), round(float(center_lon), 8))
+                if np.isfinite(dist_m) and float(dist_m) > float(fine_refine_radius_m):
+                    fine_refine_skips += 1
+                    continue
+                if center_key not in fine_refine_seen_centers and len(fine_refine_seen_centers) >= int(fine_refine_max_centers):
+                    fine_refine_skips += 1
+                    continue
+                fine_refine_seen_centers.add(center_key)
             if not self.tile_cache.is_position_in_cache(center_lat, center_lon):
                 continue
             centers_in_cache += 1
@@ -1592,6 +1873,19 @@ class VPSRunner:
 
             sat_img = map_patch.image if len(map_patch.image.shape) == 2 else map_patch.image[:, :, 0]
             for cand_idx, (yaw_delta_deg, scale_mult) in enumerate(candidates):
+                if local_first_split_enable:
+                    if bool(center_is_local):
+                        if int(local_eval_count) >= int(local_reserved_candidates):
+                            break
+                    else:
+                        if int(global_reserved_candidates) <= 0:
+                            stopped_by_candidate_budget = True
+                            stop_search = True
+                            break
+                        if int(global_eval_count) >= int(global_reserved_candidates):
+                            stopped_by_candidate_budget = True
+                            stop_search = True
+                            break
                 if num_candidates > 0 and evaluated_candidates >= int(num_candidates):
                     stopped_by_candidate_budget = True
                     stop_search = True
@@ -1605,6 +1899,11 @@ class VPSRunner:
 
                 candidate_idx = int(evaluated_candidates)
                 evaluated_candidates += 1
+                if local_first_split_enable:
+                    if bool(center_is_local):
+                        local_eval_count = int(local_eval_count) + 1
+                    else:
+                        global_eval_count = int(global_eval_count) + 1
                 yaw_used_rad = float(camera_yaw_base + np.deg2rad(float(yaw_delta_deg)))
 
                 t_preprocess_start = time.time()
@@ -1758,6 +2057,26 @@ class VPSRunner:
                         selected_center_lat = float(map_patch.center_lat)
                         selected_center_lon = float(map_patch.center_lon)
                         selected_map_patch = map_patch
+                    if (
+                        coarse_fine_enabled
+                        and not coarse_anchor_locked
+                        and int(coarse_eval_limit) > 0
+                        and int(evaluated_candidates) <= int(coarse_eval_limit)
+                        and (
+                            bool(strict_ok)
+                            if bool(self.config.reloc_coarse_anchor_require_strict)
+                            else bool(strict_ok or failsoft_ok)
+                        )
+                        and int(num_i) >= max(1, int(self.config.reloc_coarse_anchor_min_inliers))
+                        and np.isfinite(conf)
+                        and float(conf) >= float(self.config.reloc_coarse_anchor_min_confidence)
+                    ):
+                        coarse_anchor_locked = True
+                        coarse_anchor_lat = float(map_patch.center_lat)
+                        coarse_anchor_lon = float(map_patch.center_lon)
+                        self.stats["coarse_fine_anchor_locks"] = int(
+                            self.stats.get("coarse_fine_anchor_locks", 0)
+                        ) + 1
                     if objective_mode != "accuracy" and not global_mode:
                         stop_search = True
                         break
@@ -1767,6 +2086,10 @@ class VPSRunner:
         # End center loop
         if stop_search:
             pass
+        if fine_refine_skips > 0:
+            self.stats["coarse_fine_center_skips"] = int(
+                self.stats.get("coarse_fine_center_skips", 0)
+            ) + int(fine_refine_skips)
 
         if selected_match is None:
             if coverage_found:
@@ -2068,6 +2391,21 @@ class VPSRunner:
             ),
             "budget_escalation_level_mean": (
                 float(esc_sum / max(1, esc_samples)) if esc_samples > 0 else float("nan")
+            ),
+            "local_first_reserved_candidates_mean": (
+                float(self.stats.get("local_first_reserved_candidates_sum", 0.0))
+                / max(1, int(self.stats.get("local_first_stage_samples", 0)))
+                if int(self.stats.get("local_first_stage_samples", 0)) > 0
+                else float("nan")
+            ),
+            "local_first_used_candidates_mean": (
+                float(self.stats.get("local_first_used_candidates_sum", 0.0))
+                / max(1, int(self.stats.get("local_first_stage_samples", 0)))
+                if int(self.stats.get("local_first_stage_samples", 0)) > 0
+                else float("nan")
+            ),
+            "local_first_global_deferred": float(
+                int(self.stats.get("local_first_global_deferred", 0))
             ),
         }
 
