@@ -115,3 +115,4 @@ mag_calibration_final.csv
 *.bin
 *.weights
 LightGlue/
+accelerated_features/
