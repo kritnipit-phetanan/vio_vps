@@ -438,7 +438,7 @@ backend:
     residual_monotonic_commit_enable: false
     reject_to_hint_only: true
     defer_direction_gate: true
-    replace_min_score_delta: 0.08
+    replace_min_score_delta: 0.06
     replace_force_max_age_sec: 0.45
     skip_schedule_mag_clamp: true
     commit_step_cap_m: 2.0
