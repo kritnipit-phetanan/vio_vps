@@ -88,6 +88,14 @@ class VPSConfig:
     mps_cache_clear_interval: int = 0
     max_cached_tiles: int = 50
     image_forward_axis: str = "top"  # top|bottom (front direction in image)
+    temporal_consensus_max_dir_change_deg: float = 50.0
+    temporal_consensus_max_rel_mag_change: float = 0.55
+    temporal_consensus_max_hits: int = 5
+    baro_scale_prune_enable: bool = False
+    baro_scale_prune_sigma_z_m: float = 12.0
+    baro_scale_prune_min_band_frac: float = 0.10
+    baro_scale_prune_max_band_frac: float = 0.30
+    baro_scale_prune_speed_gain: float = 0.002
 
     # Accuracy-first controls
     accuracy_mode: bool = False
@@ -293,6 +301,10 @@ class VPSRunner:
         self._global_backoff_probe_count = 0
         self._force_local_streak = 0
         self._no_coverage_streak = 0
+        self._temporal_consensus_hits = 0
+        self._temporal_consensus_prev_offset = np.zeros(2, dtype=float)
+        self._temporal_consensus_prev_valid = False
+        self._last_scale_pruned_band = "full"
         self._budget_stop_streak = 0
         self._budget_escalation_level = 0
         self._budget_escalation_stop_streak = 0
@@ -336,10 +348,14 @@ class VPSRunner:
             'coarse_fine_anchor_locks': 0,
             'coarse_fine_center_skips': 0,
             'local_first_stage_attempts': 0,
+            'local_first_success_count': 0,
             'local_first_global_deferred': 0,
             'local_first_reserved_candidates_sum': 0.0,
             'local_first_used_candidates_sum': 0.0,
             'local_first_stage_samples': 0,
+            'baro_scale_prune_applied_count': 0,
+            'baro_scale_prune_fallback_count': 0,
+            'anchor_failsoft_block_count': 0,
         }
         
         print("[VPSRunner] Ready")
@@ -875,6 +891,18 @@ class VPSRunner:
                 max_image_side=int(vps_cfg.get("max_image_side", 1024)),
                 mps_cache_clear_interval=int(vps_cfg.get("mps_cache_clear_interval", 8)),
                 image_forward_axis=str(vps_cfg.get("image_forward_axis", vps_cfg.get("camera_forward_axis", "top"))),
+                temporal_consensus_max_dir_change_deg=float(
+                    vps_cfg.get("temporal_consensus_max_dir_change_deg", 50.0)
+                ),
+                temporal_consensus_max_rel_mag_change=float(
+                    vps_cfg.get("temporal_consensus_max_rel_mag_change", 0.55)
+                ),
+                temporal_consensus_max_hits=int(vps_cfg.get("temporal_consensus_max_hits", 5)),
+                baro_scale_prune_enable=bool(vps_cfg.get("baro_scale_prune_enable", False)),
+                baro_scale_prune_sigma_z_m=float(vps_cfg.get("baro_scale_prune_sigma_z_m", 12.0)),
+                baro_scale_prune_min_band_frac=float(vps_cfg.get("baro_scale_prune_min_band_frac", 0.10)),
+                baro_scale_prune_max_band_frac=float(vps_cfg.get("baro_scale_prune_max_band_frac", 0.30)),
+                baro_scale_prune_speed_gain=float(vps_cfg.get("baro_scale_prune_speed_gain", 0.002)),
                 max_cached_tiles=int(vps_cfg.get("tile_cache_max_tiles", 50)),
                 yaw_hypotheses_deg=yaw_hyp if len(yaw_hyp) > 0 else (0.0, 180.0, 90.0, -90.0),
                 scale_hypotheses=scale_hyp if len(scale_hyp) > 0 else (1.0, 0.90, 1.10),
@@ -1090,9 +1118,13 @@ class VPSRunner:
             return failover
         return base
 
-    def _build_preprocess_candidates(self,
-                                     global_mode: bool = False,
-                                     objective: str = "stability") -> List[Tuple[float, float]]:
+    def _build_preprocess_candidates(
+        self,
+        global_mode: bool = False,
+        objective: str = "stability",
+        est_alt: float = float("nan"),
+        speed_m_s: float = float("nan"),
+    ) -> List[Tuple[float, float]]:
         """
         Build (yaw_delta_deg, target_gsd_scale) candidates.
         Keeps runtime bounded with max_candidates.
@@ -1112,6 +1144,56 @@ class VPSRunner:
             yaw_list = [0.0]
         if not scale_list:
             scale_list = [1.0]
+
+        # Baro-informed bounded pruning around nominal scale 1.0.
+        # Deterministic rules:
+        # - apply to local-first lane only (global keeps relocation recall),
+        # - always keep scale 1.0,
+        # - keep >= 2 scales, otherwise fallback to full list.
+        self._last_scale_pruned_band = "full"
+        baro_prune_used = False
+        if (
+            bool(self.config.baro_scale_prune_enable)
+            and not bool(global_mode)
+            and len(scale_list) > 2
+            and np.isfinite(float(est_alt))
+            and float(est_alt) > 1.0
+        ):
+            sigma_z = max(0.0, float(self.config.baro_scale_prune_sigma_z_m))
+            rel_unc = float(sigma_z / max(1.0, abs(float(est_alt))))
+            speed_term = 0.0
+            if np.isfinite(float(speed_m_s)):
+                speed_term = max(0.0, float(speed_m_s)) * max(
+                    0.0, float(self.config.baro_scale_prune_speed_gain)
+                )
+            band = float(
+                np.clip(
+                    rel_unc + speed_term,
+                    float(self.config.baro_scale_prune_min_band_frac),
+                    float(self.config.baro_scale_prune_max_band_frac),
+                )
+            )
+            lo = float(1.0 - band)
+            hi = float(1.0 + band)
+            pruned = [float(sc) for sc in scale_list if lo <= float(sc) <= hi]
+            if 1.0 not in pruned:
+                pruned.append(1.0)
+            pruned = sorted(set(float(v) for v in pruned))
+            if len(pruned) >= 2:
+                scale_list = pruned
+                baro_prune_used = True
+                self._last_scale_pruned_band = f"{lo:.3f}:{hi:.3f}"
+                self.stats["baro_scale_prune_applied_count"] = int(
+                    self.stats.get("baro_scale_prune_applied_count", 0)
+                ) + 1
+            else:
+                self.stats["baro_scale_prune_fallback_count"] = int(
+                    self.stats.get("baro_scale_prune_fallback_count", 0)
+                ) + 1
+        if not baro_prune_used:
+            self.stats["baro_scale_prune_fallback_count"] = int(
+                self.stats.get("baro_scale_prune_fallback_count", 0)
+            ) + 1
 
         # Prioritize primary candidate first, then yaw fix, then scale jitter.
         ordered: List[Tuple[float, float]] = [(0.0, 1.0)]
@@ -1715,7 +1797,12 @@ class VPSRunner:
 
         # 3/4/5/6. Search centers + preprocess hypotheses + matching
         camera_yaw_base = est_yaw + self.camera_yaw_offset_rad
-        candidates = self._build_preprocess_candidates(global_mode=global_mode, objective=objective_mode)
+        candidates = self._build_preprocess_candidates(
+            global_mode=global_mode,
+            objective=objective_mode,
+            est_alt=float(est_alt),
+            speed_m_s=float(state_speed_val),
+        )
         coarse_fine_enabled = bool(
             bool(self.config.reloc_coarse_fine_enable)
             and (str(objective_mode).lower() == "accuracy" or bool(self.config.accuracy_mode))
@@ -2077,6 +2164,23 @@ class VPSRunner:
                         self.stats["coarse_fine_anchor_locks"] = int(
                             self.stats.get("coarse_fine_anchor_locks", 0)
                         ) + 1
+                    elif (
+                        coarse_fine_enabled
+                        and not coarse_anchor_locked
+                        and int(coarse_eval_limit) > 0
+                        and int(evaluated_candidates) <= int(coarse_eval_limit)
+                        and bool(self.config.reloc_coarse_anchor_require_strict)
+                        and (not bool(strict_ok))
+                        and bool(failsoft_ok)
+                        and int(num_i) >= max(1, int(self.config.reloc_coarse_anchor_min_inliers))
+                        and np.isfinite(conf)
+                        and float(conf) >= float(self.config.reloc_coarse_anchor_min_confidence)
+                    ):
+                        # R0 telemetry: failsoft match looked anchor-worthy but was blocked
+                        # because anchor lane is strict-only.
+                        self.stats["anchor_failsoft_block_count"] = int(
+                            self.stats.get("anchor_failsoft_block_count", 0)
+                        ) + 1
                     if objective_mode != "accuracy" and not global_mode:
                         stop_search = True
                         break
@@ -2283,9 +2387,57 @@ class VPSRunner:
         self._budget_escalator_note_success()
         self.last_update_time = t_cam
         self._last_success_time = float(t_cam)
-        self._last_success_center_lat = float(selected_center_lat)
-        self._last_success_center_lon = float(selected_center_lon)
         self.last_result = vps_measurement
+        if bool(local_first_split_enable):
+            center_key_selected = (round(float(selected_center_lat), 8), round(float(selected_center_lon), 8))
+            if center_key_selected in local_center_keys:
+                self.stats["local_first_success_count"] = int(
+                    self.stats.get("local_first_success_count", 0)
+                ) + 1
+
+        # Strict-anchor only: failsoft must not advance anchor center when strict
+        # anchor policy is active.
+        strict_anchor_only = bool(self.config.reloc_coarse_anchor_require_strict)
+        success_is_failsoft = bool(selected_reason == "matched_failsoft")
+        if (not strict_anchor_only) or (not success_is_failsoft):
+            self._last_success_center_lat = float(selected_center_lat)
+            self._last_success_center_lon = float(selected_center_lon)
+        else:
+            self.stats["anchor_failsoft_block_count"] = int(
+                self.stats.get("anchor_failsoft_block_count", 0)
+            ) + 1
+
+        # Temporal consensus tracker (source quality):
+        # update directional/magnitude consistency streak from VPS offset sequence.
+        cur_off = np.asarray(getattr(vps_measurement, "offset_m", np.zeros(2, dtype=float)), dtype=float).reshape(-1,)
+        cur_xy = np.asarray(cur_off[:2], dtype=float) if cur_off.size >= 2 else np.zeros(2, dtype=float)
+        cur_norm = float(np.linalg.norm(cur_xy))
+        if np.isfinite(cur_norm) and cur_norm > 1e-6:
+            max_dir_change = float(max(1.0, self.config.temporal_consensus_max_dir_change_deg))
+            max_rel_mag_change = float(max(0.0, self.config.temporal_consensus_max_rel_mag_change))
+            max_hits = int(max(1, self.config.temporal_consensus_max_hits))
+            if bool(self._temporal_consensus_prev_valid):
+                prev_xy = np.asarray(self._temporal_consensus_prev_offset, dtype=float).reshape(2,)
+                prev_norm = float(np.linalg.norm(prev_xy))
+                dir_ok = True
+                mag_ok = True
+                if np.isfinite(prev_norm) and prev_norm > 1e-6:
+                    cos_dir = float(np.clip(np.dot(cur_xy, prev_xy) / max(cur_norm * prev_norm, 1e-9), -1.0, 1.0))
+                    dir_delta = float(np.degrees(np.arccos(cos_dir)))
+                    dir_ok = bool(np.isfinite(dir_delta) and dir_delta <= max_dir_change)
+                    rel_mag = float(abs(cur_norm - prev_norm) / max(prev_norm, 1e-6))
+                    mag_ok = bool(np.isfinite(rel_mag) and rel_mag <= max_rel_mag_change)
+                if dir_ok and mag_ok:
+                    self._temporal_consensus_hits = int(min(max_hits, int(self._temporal_consensus_hits) + 1))
+                else:
+                    self._temporal_consensus_hits = 1
+            else:
+                self._temporal_consensus_hits = 1
+            self._temporal_consensus_prev_offset = cur_xy.copy()
+            self._temporal_consensus_prev_valid = True
+        else:
+            self._temporal_consensus_hits = 0
+            self._temporal_consensus_prev_valid = False
 
         # Optional metadata for downstream position/yaw arbitration.
         # Keep this lightweight and deterministic so VIO can choose
@@ -2294,6 +2446,27 @@ class VPSRunner:
         try:
             setattr(vps_measurement, "match_reason", str(success_reason))
             setattr(vps_measurement, "match_is_failsoft", bool(success_reason == "matched_failsoft"))
+            setattr(
+                vps_measurement,
+                "rescue_trigger_reason",
+                str(getattr(match_result, "rescue_trigger_reason", "none")),
+            )
+            q_inlier = float(np.clip(float(match_result.num_inliers) / max(1.0, float(self.config.min_inliers)), 0.0, 2.0))
+            q_conf = float(np.clip(float(match_result.confidence), 0.0, 1.0))
+            q_reproj = float(np.clip(float(self.config.max_reproj_error) / max(float(match_result.reproj_error), 1e-3), 0.0, 2.0))
+            q_locality = 1.0 if (bool(local_first_split_enable) and ((round(float(selected_center_lat), 8), round(float(selected_center_lon), 8)) in local_center_keys)) else 0.0
+            # CSV-safe string (semicolon-delimited key=value pairs).
+            setattr(
+                vps_measurement,
+                "quality_subscores",
+                (
+                    f"inlier={q_inlier:.3f};conf={q_conf:.3f};reproj={q_reproj:.3f};"
+                    f"temporal={float(getattr(self, '_temporal_consensus_hits', 0.0)):.3f};"
+                    f"locality={q_locality:.3f}"
+                ),
+            )
+            setattr(vps_measurement, "temporal_hits", int(getattr(self, "_temporal_consensus_hits", 0)))
+            setattr(vps_measurement, "scale_pruned_band", str(getattr(self, "_last_scale_pruned_band", "full")))
         except Exception:
             pass
 
@@ -2380,6 +2553,9 @@ class VPSRunner:
         eval_total = int(self.stats.get("evaluated_candidates_total", 0))
         esc_samples = int(self.stats.get("budget_escalation_level_samples", 0))
         esc_sum = float(self.stats.get("budget_escalation_level_sum", 0.0))
+        mstats = getattr(self.matcher, "stats", {}) if hasattr(self, "matcher") else {}
+        rescue_attempt = int(mstats.get("rescue_attempts", 0)) if isinstance(mstats, dict) else 0
+        rescue_success = int(mstats.get("rescue_used", 0)) if isinstance(mstats, dict) else 0
         return {
             "attempt_ms_p50": float(np.percentile(wall_vals, 50.0)) if wall_vals.size > 0 else float("nan"),
             "attempt_ms_p95": float(np.percentile(wall_vals, 95.0)) if wall_vals.size > 0 else float("nan"),
@@ -2406,6 +2582,23 @@ class VPSRunner:
             ),
             "local_first_global_deferred": float(
                 int(self.stats.get("local_first_global_deferred", 0))
+            ),
+            "local_first_stage_attempts": float(
+                int(self.stats.get("local_first_stage_attempts", 0))
+            ),
+            "local_first_success_count": float(
+                int(self.stats.get("local_first_success_count", 0))
+            ),
+            "rescue_attempt_count": float(rescue_attempt),
+            "rescue_success_count": float(rescue_success),
+            "baro_scale_prune_applied_count": float(
+                int(self.stats.get("baro_scale_prune_applied_count", 0))
+            ),
+            "baro_scale_prune_fallback_count": float(
+                int(self.stats.get("baro_scale_prune_fallback_count", 0))
+            ),
+            "anchor_failsoft_block_count": float(
+                int(self.stats.get("anchor_failsoft_block_count", 0))
             ),
         }
 

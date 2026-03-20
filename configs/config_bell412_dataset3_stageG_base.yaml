@@ -429,8 +429,11 @@ backend:
   supervisor:
     enable: true
     probation_ticks: 2
+    max_probation_ticks: 3
     probation_min_interval_sec: 0.08
     innovation_improve_ratio_max: 1.05
+    evidence_min_ticks: 2
+    defer_first_enable: true
     proxy_evidence_enable: true
     residual_monotonic_commit_enable: false
     reject_to_hint_only: true
@@ -1473,6 +1476,8 @@ vps:
   apply_failsoft_enable: true
   apply_failsoft_large_offset_confirm_hits: 2
   apply_failsoft_large_offset_confirm_m: 60.0
+  temporal_consensus_min_hits_failsoft: 2
+  temporal_consensus_min_hits_rescue: 3
   apply_failsoft_max_dir_change_deg: 55.0
   apply_failsoft_dir_gate_max_speed_m_s: 12.0
   apply_failsoft_dir_gate_max_yaw_rate_deg_s: 25.0
@@ -1509,6 +1514,14 @@ vps:
   max_clones: 3
   max_delay_sec: 0.5
   max_keypoints: 2048
+  temporal_consensus_max_dir_change_deg: 50.0
+  temporal_consensus_max_rel_mag_change: 0.55
+  temporal_consensus_max_hits: 5
+  baro_scale_prune_enable: true
+  baro_scale_prune_sigma_z_m: 12.0
+  baro_scale_prune_min_band_frac: 0.10
+  baro_scale_prune_max_band_frac: 0.30
+  baro_scale_prune_speed_gain: 0.002
   tile_cache_max_tiles: 48
   mps_cache_clear_interval: 6
   max_offset_px_failsoft: 900.0

@@ -74,6 +74,7 @@ class MatchResult:
     offset_px: Tuple[float, float] # (dx, dy) pixel offset of drone center in sat image
     keypoints_drone: Optional[np.ndarray]     # Nx2 keypoints in drone image
     keypoints_sat: Optional[np.ndarray]       # Nx2 keypoints in satellite image
+    rescue_trigger_reason: str = "none"       # ORB->rescue trigger classifier (R0 telemetry)
 
 
 class SatelliteMatcher:
@@ -498,6 +499,24 @@ class SatelliteMatcher:
             return True
         return False
 
+    def _rescue_trigger_reason(self, result: MatchResult) -> str:
+        """Classify why hybrid mode would trigger rescue for telemetry/debug."""
+        if result is None:
+            return "no_result"
+        if bool(getattr(result, "success", False)):
+            return "none"
+        if int(getattr(result, "num_matches", 0)) < 4:
+            return "too_few_matches"
+        if int(getattr(result, "num_inliers", 0)) < int(self.rescue_min_inliers):
+            return "inliers_low"
+        reproj = float(getattr(result, "reproj_error", float("inf")))
+        if (not np.isfinite(reproj)) or reproj > float(self.rescue_max_reproj_error):
+            return "reproj_high"
+        conf = float(getattr(result, "confidence", 0.0))
+        if conf < float(self.rescue_min_confidence):
+            return "confidence_low"
+        return "weak_orb"
+
     def _build_result_from_points(self,
                                   drone_img: np.ndarray,
                                   sat_img: np.ndarray,
@@ -718,10 +737,13 @@ class SatelliteMatcher:
         if str(self.match_mode).lower() == "orb_lightglue_rescue":
             pts_orb_drone, pts_orb_sat, _ = self.match_orb(drone_img, sat_img)
             orb_result = self._build_result_from_points(drone_img, sat_img, pts_orb_drone, pts_orb_sat)
+            rescue_reason = self._rescue_trigger_reason(orb_result)
+            orb_result.rescue_trigger_reason = str(rescue_reason)
             if self._lightglue_ready and self._needs_lightglue_rescue(orb_result):
                 self.stats["rescue_attempts"] = int(self.stats.get("rescue_attempts", 0)) + 1
                 pts_lg_drone, pts_lg_sat, _ = self.match_lightglue(drone_img, sat_img)
                 lg_result = self._build_result_from_points(drone_img, sat_img, pts_lg_drone, pts_lg_sat)
+                lg_result.rescue_trigger_reason = str(rescue_reason)
                 if self._result_score(lg_result) > self._result_score(orb_result):
                     self.stats["rescue_used"] = int(self.stats.get("rescue_used", 0)) + 1
                     return lg_result

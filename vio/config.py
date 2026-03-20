@@ -1952,6 +1952,15 @@ def load_config(config_path: str) -> VIOConfig:
     result['VPS_APPLY_FAILSOFT_LARGE_OFFSET_CONFIRM_HITS'] = int(
         vps_cfg.get('apply_failsoft_large_offset_confirm_hits', 2)
     )
+    result['VPS_TEMPORAL_CONSENSUS_MIN_HITS_FAILSOFT'] = int(
+        max(1, vps_cfg.get('temporal_consensus_min_hits_failsoft', 2))
+    )
+    result['VPS_TEMPORAL_CONSENSUS_MIN_HITS_RESCUE'] = int(
+        max(
+            int(result['VPS_TEMPORAL_CONSENSUS_MIN_HITS_FAILSOFT']),
+            vps_cfg.get('temporal_consensus_min_hits_rescue', 3),
+        )
+    )
     result['VPS_APPLY_FAILSOFT_ALLOW_WARNING'] = bool(
         vps_cfg.get('apply_failsoft_allow_warning', True)
     )
@@ -2491,6 +2500,24 @@ def load_config(config_path: str) -> VIOConfig:
     )
     result['BACKEND_SUPERVISOR_REJECT_TO_HINT_ONLY'] = bool(
         supervisor_cfg.get('reject_to_hint_only', True)
+    )
+    result['BACKEND_SUPERVISOR_DEFER_FIRST_ENABLE'] = bool(
+        supervisor_cfg.get('defer_first_enable', True)
+    )
+    result['BACKEND_SUPERVISOR_MAX_PROBATION_TICKS'] = int(
+        max(
+            int(result['BACKEND_SUPERVISOR_PROBATION_TICKS']),
+            supervisor_cfg.get('max_probation_ticks', max(3, int(result['BACKEND_SUPERVISOR_PROBATION_TICKS']))),
+        )
+    )
+    result['BACKEND_SUPERVISOR_EVIDENCE_MIN_TICKS'] = int(
+        max(
+            1,
+            supervisor_cfg.get(
+                'evidence_min_ticks',
+                int(result['BACKEND_SUPERVISOR_PROBATION_TICKS']),
+            ),
+        )
     )
     result['BACKEND_SUPERVISOR_MAGNITUDE_CLAMP_ENABLE'] = bool(
         supervisor_cfg.get('magnitude_clamp_enable', True)

@@ -485,6 +485,15 @@ def append_benchmark_health_summary(summary_csv: Optional[str],
                                     mag_accept_rate: float = float("nan"),
                                     vps_jump_reject_count: float = float("nan"),
                                     vps_temporal_confirm_count: float = float("nan"),
+                                    vps_rescue_attempt_count: float = float("nan"),
+                                    vps_rescue_success_count: float = float("nan"),
+                                    vps_temporal_consensus_pass_count: float = float("nan"),
+                                    vps_temporal_consensus_block_count: float = float("nan"),
+                                    vps_anchor_failsoft_block_count: float = float("nan"),
+                                    vps_baro_scale_prune_applied_count: float = float("nan"),
+                                    vps_baro_scale_prune_fallback_count: float = float("nan"),
+                                    vps_local_first_stage_attempts: float = float("nan"),
+                                    vps_local_first_success_count: float = float("nan"),
                                     abs_corr_apply_count: float = float("nan"),
                                     abs_corr_soft_count: float = float("nan"),
                                     backend_apply_count: float = float("nan"),
@@ -611,8 +620,13 @@ def append_benchmark_health_summary(summary_csv: Optional[str],
                 f"{speed_max_m_s:.6f},{speed_p99_m_s:.6f},{loop_corr_count:.6f},"
                 f"{loop_abs_yaw_corr_sum_deg:.6f},{vps_soft_accept_count:.6f},"
                 f"{vps_soft_reject_count:.6f},{mag_accept_rate:.6f},"
-                f"{vps_jump_reject_count:.6f},{vps_temporal_confirm_count:.6f},"
-                f"{abs_corr_apply_count:.6f},{abs_corr_soft_count:.6f},"
+                    f"{vps_jump_reject_count:.6f},{vps_temporal_confirm_count:.6f},"
+                    f"{vps_rescue_attempt_count:.6f},{vps_rescue_success_count:.6f},"
+                    f"{vps_temporal_consensus_pass_count:.6f},{vps_temporal_consensus_block_count:.6f},"
+                    f"{vps_anchor_failsoft_block_count:.6f},"
+                    f"{vps_baro_scale_prune_applied_count:.6f},{vps_baro_scale_prune_fallback_count:.6f},"
+                    f"{vps_local_first_stage_attempts:.6f},{vps_local_first_success_count:.6f},"
+                    f"{abs_corr_apply_count:.6f},{abs_corr_soft_count:.6f},"
                 f"{backend_apply_count:.6f},{backend_stale_drop_count:.6f},"
                 f"{backend_emit_stale_drop_count:.6f},{backend_overwrite_count:.6f},"
                 f"{backend_poll_count:.6f},{vps_attempt_count:.6f},"
@@ -1664,7 +1678,8 @@ def init_output_csvs(output_dir: str, save_debug_data: bool = False) -> Dict[str
             "t,frame,match_reason,quality_mode,decision_lane,force_hint_only,"
             "apply_score,consensus_score,geometry_score,motion_score,bounded_clamp_m,allow_direct_xy_apply,"
             "direct_xy_candidate,hint_quality,offset_m,inliers,confidence,reproj_error,"
-            "applied,reason_code,reject_reason,residual_xy,applied_dp_xy,policy_note,hard_note,temporal_note,direct_note\n"
+            "applied,reason_code,reject_reason,residual_xy,applied_dp_xy,policy_note,hard_note,temporal_note,direct_note,"
+            "rescue_trigger_reason,quality_subscores,temporal_hits,scale_pruned_band\n"
         )
 
     # Single-authority policy traces
@@ -1712,6 +1727,11 @@ def init_output_csvs(output_dir: str, save_debug_data: bool = False) -> Dict[str
             "speed_max_m_s,speed_p99_m_s,loop_corr_count,loop_abs_yaw_corr_sum_deg,"
             "vps_soft_accept_count,vps_soft_reject_count,mag_accept_rate,"
             "vps_jump_reject_count,vps_temporal_confirm_count,"
+            "vps_rescue_attempt_count,vps_rescue_success_count,"
+            "vps_temporal_consensus_pass_count,vps_temporal_consensus_block_count,"
+            "vps_anchor_failsoft_block_count,"
+            "vps_baro_scale_prune_applied_count,vps_baro_scale_prune_fallback_count,"
+            "vps_local_first_stage_attempts,vps_local_first_success_count,"
             "abs_corr_apply_count,abs_corr_soft_count,"
             "backend_apply_count,backend_stale_drop_count,backend_emit_stale_drop_count,"
             "backend_overwrite_count,backend_poll_count,"

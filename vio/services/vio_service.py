@@ -230,6 +230,9 @@ class VIOService:
                 dir_delta_deg = float(np.degrees(np.arccos(cosang)))
                 if dir_delta_deg > max_dir_change_deg:
                     runner._vps_jump_reject_count = int(getattr(runner, "_vps_jump_reject_count", 0)) + 1
+                    runner._vps_temporal_consensus_block_count = int(
+                        getattr(runner, "_vps_temporal_consensus_block_count", 0)
+                    ) + 1
                     return False, f"SOFT_REJECT_DIR_CHANGE: dir={dir_delta_deg:.1f}deg>{max_dir_change_deg:.1f}deg"
 
         large_offset_m = float(
@@ -254,11 +257,17 @@ class VIOService:
             runner._vps_pending_large_offset_vec = cur.copy()
             runner._vps_pending_large_offset_hits = int(pending_hits)
             if pending_hits < required_hits:
+                runner._vps_temporal_consensus_block_count = int(
+                    getattr(runner, "_vps_temporal_consensus_block_count", 0)
+                ) + 1
                 return False, (
                     f"SOFT_REJECT_LARGE_OFFSET_PENDING: hits={pending_hits}/{required_hits}, "
                     f"offset={vps_offset_m:.1f}m"
                 )
             runner._vps_temporal_confirm_count = int(getattr(runner, "_vps_temporal_confirm_count", 0)) + 1
+            runner._vps_temporal_consensus_pass_count = int(
+                getattr(runner, "_vps_temporal_consensus_pass_count", 0)
+            ) + 1
             runner._vps_pending_large_offset_vec = None
             runner._vps_pending_large_offset_hits = 0
         elif np.isfinite(vps_offset_m) and vps_offset_m <= large_offset_m:
@@ -2128,6 +2137,16 @@ class VIOService:
                         fs_max_reproj=float(fs_max_reproj),
                         msckf_quality_score=float(msckf_quality_score),
                         msckf_stable_geometry_flag=bool(msckf_stable_geometry_flag),
+                        rescue_trigger_reason=str(getattr(vps_result, "rescue_trigger_reason", "none")),
+                        quality_subscores=str(getattr(vps_result, "quality_subscores", "")),
+                        temporal_hits=int(
+                            getattr(
+                                vps_result,
+                                "temporal_hits",
+                                getattr(runner, "_vps_pending_large_offset_hits", 0),
+                            )
+                        ),
+                        scale_pruned_band=str(getattr(vps_result, "scale_pruned_band", "full")),
                     )
                     pos_decision = self.vps_position_controller.decide_and_classify(evidence)
                     quality_mode = str(pos_decision.quality_mode)
@@ -3081,16 +3100,58 @@ class VIOService:
                     )
                 ) + 1
 
-        candidate["all_pass"] = bool(candidate.get("all_pass", True) and ok_now)
+        defer_first_enable = bool(
+            runner.global_config.get("BACKEND_SUPERVISOR_DEFER_FIRST_ENABLE", True)
+        )
+        max_probation_ticks = int(
+            max(
+                required_ticks,
+                runner.global_config.get(
+                    "BACKEND_SUPERVISOR_MAX_PROBATION_TICKS",
+                    max(required_ticks, 3),
+                ),
+            )
+        )
+        soft_fail_reason = str(fail_reason) in {
+            "quality_reject",
+            "probation_residual_non_monotonic",
+            "probation_evidence_insufficient",
+        }
+        candidate["all_pass"] = bool(ok_now)
         candidate["probation_direction_consistent"] = bool(direction_consistency_pass)
         candidate["probation_magnitude_consistent"] = bool(magnitude_consistency_pass)
         if bool(innovation_evidence):
             candidate["evidence_pass_ticks"] = int(candidate.get("evidence_pass_ticks", 0)) + 1
         runner._backend_probation_candidate = candidate
+        if (
+            (not ok_now)
+            and bool(defer_first_enable)
+            and bool(soft_fail_reason)
+            and ticks_seen < max_probation_ticks
+        ):
+            counts["probation_deferred"] = int(counts.get("probation_deferred", 0)) + 1
+            candidate["probation_defer_reason"] = str(fail_reason or "quality_reject")
+            runner._backend_probation_candidate = candidate
+            return
         if ticks_seen < required_ticks:
             return
 
-        committed = bool(candidate.get("all_pass", False))
+        committed = bool(ok_now)
+        evidence_min_ticks = int(
+            max(
+                1,
+                runner.global_config.get(
+                    "BACKEND_SUPERVISOR_EVIDENCE_MIN_TICKS",
+                    required_ticks,
+                ),
+            )
+        )
+        if committed and int(candidate.get("evidence_pass_ticks", 0)) < evidence_min_ticks:
+            committed = False
+            fail_reason = "probation_evidence_insufficient"
+            counts["probation_evidence_insufficient"] = int(
+                counts.get("probation_evidence_insufficient", 0)
+            ) + 1
         if committed:
             commit_energy_shaping_enable = bool(
                 runner.global_config.get(

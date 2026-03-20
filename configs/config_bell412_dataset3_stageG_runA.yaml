@@ -1565,7 +1565,7 @@ vps:
   camera_view: nadir
   image_forward_axis: bottom
   device: cuda
-  matcher_mode: orb_xfeat_lightglue_rescue
+  matcher_mode: orb
   rescue_local_first_only: true
   rescue_local_topk_candidates: 3
   rescue_disable_in_global_mode: true

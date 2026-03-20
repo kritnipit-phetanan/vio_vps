@@ -31,6 +31,10 @@ class VpsMatchEvidence:
     fs_max_reproj: float
     msckf_quality_score: float = float("nan")
     msckf_stable_geometry_flag: bool = False
+    rescue_trigger_reason: str = "none"
+    quality_subscores: str = ""
+    temporal_hits: int = 0
+    scale_pruned_band: str = "full"
 
 
 @dataclass(frozen=True)
@@ -616,6 +620,34 @@ class VPSPositionController:
                 position_first_soft_note = str(pos_first_note_candidate)
 
         if quality_mode == "failsoft":
+            # Source-quality temporal consensus gate (2-3 frame maturity)
+            # before promoting failsoft/rescue candidates.
+            temporal_hits = int(max(0, evidence.temporal_hits))
+            rescue_mode = str(getattr(evidence, "rescue_trigger_reason", "none")).strip().lower() not in ("", "none")
+            min_hits_failsoft = max(
+                1,
+                int(runner.global_config.get("VPS_TEMPORAL_CONSENSUS_MIN_HITS_FAILSOFT", 2)),
+            )
+            min_hits_rescue = max(
+                min_hits_failsoft,
+                int(runner.global_config.get("VPS_TEMPORAL_CONSENSUS_MIN_HITS_RESCUE", 3)),
+            )
+            min_hits_required = int(min_hits_rescue if rescue_mode else min_hits_failsoft)
+            if temporal_hits < min_hits_required:
+                quality_mode = "reject"
+                temporal_reject_note = (
+                    f"SOFT_REJECT_TEMPORAL_HITS:{temporal_hits}/{min_hits_required}"
+                    + ("|rescue" if rescue_mode else "")
+                )
+                runner._vps_temporal_consensus_block_count = int(
+                    getattr(runner, "_vps_temporal_consensus_block_count", 0)
+                ) + 1
+            else:
+                runner._vps_temporal_consensus_pass_count = int(
+                    getattr(runner, "_vps_temporal_consensus_pass_count", 0)
+                ) + 1
+
+        if quality_mode == "failsoft":
             skip_temporal = bool(
                 bool(drift_recovery_active)
                 and bool(runner.global_config.get("VPS_XY_DRIFT_RECOVERY_SKIP_TEMPORAL_GATE", True))
@@ -1044,6 +1076,10 @@ class VPSPositionController:
                 else:
                     applied_dp_xy = float(max(0.0, residual_xy))
             reject_reason = "" if bool(applied) else str(reason_code)
+            rescue_trigger_reason = str(getattr(evidence, "rescue_trigger_reason", "none")).replace(",", ";")
+            quality_subscores = str(getattr(evidence, "quality_subscores", "")).replace(",", ";")
+            temporal_hits = int(getattr(evidence, "temporal_hits", 0))
+            scale_pruned_band = str(getattr(evidence, "scale_pruned_band", "full")).replace(",", ";")
             with open(csv_path, "a", newline="") as f:
                 f.write(
                     f"{float(evidence.t_cam):.6f},{int(evidence.frame_idx)},"
@@ -1058,7 +1094,8 @@ class VPSPositionController:
                     f"{int(applied)},{reason_code},{reject_reason},"
                     f"{residual_xy:.6f},{applied_dp_xy:.6f},"
                     f"{decision.policy_reject_note},{decision.hard_reject_note},"
-                    f"{decision.temporal_reject_note},{decision.position_first_direct_xy_note}\n"
+                    f"{decision.temporal_reject_note},{decision.position_first_direct_xy_note},"
+                    f"{rescue_trigger_reason},{quality_subscores},{temporal_hits},{scale_pruned_band}\n"
                 )
         except Exception:
             pass

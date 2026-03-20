@@ -818,7 +818,20 @@ class OutputReportingService:
         vps_soft_reject_count = float(int(getattr(self.runner, "_vps_soft_reject_count", 0)))
         vps_jump_reject_count = float(int(getattr(self.runner, "_vps_jump_reject_count", 0)))
         vps_temporal_confirm_count = float(int(getattr(self.runner, "_vps_temporal_confirm_count", 0)))
+        vps_temporal_consensus_pass_count = float(
+            int(getattr(self.runner, "_vps_temporal_consensus_pass_count", getattr(self.runner, "_vps_temporal_confirm_count", 0)))
+        )
+        vps_temporal_consensus_block_count = float(
+            int(getattr(self.runner, "_vps_temporal_consensus_block_count", 0))
+        )
         vps_attempt_count = float(int(getattr(self.runner, "_vps_attempt_count", 0)))
+        vps_rescue_attempt_count = float("nan")
+        vps_rescue_success_count = float("nan")
+        vps_anchor_failsoft_block_count = float("nan")
+        vps_baro_scale_prune_applied_count = float("nan")
+        vps_baro_scale_prune_fallback_count = float("nan")
+        vps_local_first_stage_attempts = float("nan")
+        vps_local_first_success_count = float("nan")
         abs_corr_apply_count = float(int(getattr(self.runner, "_abs_corr_apply_count", 0)))
         abs_corr_soft_count = float(int(getattr(self.runner, "_abs_corr_soft_count", 0)))
         vps_failsoft_matched_count = float(int(getattr(self.runner, "_vps_failsoft_matched_count", 0)))
@@ -1065,6 +1078,21 @@ class OutputReportingService:
                 vps_budget_escalation_level_mean = float(
                     vps_rt.get("budget_escalation_level_mean", float("nan"))
                 )
+                vps_rescue_attempt_count = float(vps_rt.get("rescue_attempt_count", float("nan")))
+                vps_rescue_success_count = float(vps_rt.get("rescue_success_count", float("nan")))
+                vps_anchor_failsoft_block_count = float(vps_rt.get("anchor_failsoft_block_count", float("nan")))
+                vps_baro_scale_prune_applied_count = float(
+                    vps_rt.get("baro_scale_prune_applied_count", float("nan"))
+                )
+                vps_baro_scale_prune_fallback_count = float(
+                    vps_rt.get("baro_scale_prune_fallback_count", float("nan"))
+                )
+                vps_local_first_stage_attempts = float(
+                    vps_rt.get("local_first_stage_attempts", float("nan"))
+                )
+                vps_local_first_success_count = float(
+                    vps_rt.get("local_first_success_count", float("nan"))
+                )
             except Exception:
                 pass
         if getattr(self.runner, "backend_optimizer", None) is not None:
@@ -1246,6 +1274,15 @@ class OutputReportingService:
             mag_accept_rate=mag_accept_rate,
             vps_jump_reject_count=vps_jump_reject_count,
             vps_temporal_confirm_count=vps_temporal_confirm_count,
+            vps_rescue_attempt_count=vps_rescue_attempt_count,
+            vps_rescue_success_count=vps_rescue_success_count,
+            vps_temporal_consensus_pass_count=vps_temporal_consensus_pass_count,
+            vps_temporal_consensus_block_count=vps_temporal_consensus_block_count,
+            vps_anchor_failsoft_block_count=vps_anchor_failsoft_block_count,
+            vps_baro_scale_prune_applied_count=vps_baro_scale_prune_applied_count,
+            vps_baro_scale_prune_fallback_count=vps_baro_scale_prune_fallback_count,
+            vps_local_first_stage_attempts=vps_local_first_stage_attempts,
+            vps_local_first_success_count=vps_local_first_success_count,
             abs_corr_apply_count=abs_corr_apply_count,
             abs_corr_soft_count=abs_corr_soft_count,
             backend_apply_count=backend_apply_count,

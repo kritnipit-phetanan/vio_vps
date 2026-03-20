@@ -774,7 +774,7 @@ vps:
   failover_fail_streak: 6
   device: cuda
   max_keypoints: 2048
-  matcher_mode: orb_lightglue_rescue
+  matcher_mode: orb
   rescue_min_inliers: 8
   rescue_min_confidence: 0.12
   rescue_max_reproj_error: 2.5
