@@ -1640,7 +1640,7 @@ runtime_control:
     sync_vps: true
     lock_cadence: true
     disable_vps_budget_escalator: true
-    disable_vps_time_budget: false
+    disable_vps_time_budget: true
     force_backend_camera_tick_poll: true
     write_signature: true
   alignment_lock:
