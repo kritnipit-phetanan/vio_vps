@@ -429,7 +429,7 @@ backend:
   supervisor:
     enable: true
     probation_ticks: 2
-    max_probation_ticks: 3
+    max_probation_ticks: 4
     probation_min_interval_sec: 0.08
     innovation_improve_ratio_max: 1.05
     evidence_min_ticks: 2
