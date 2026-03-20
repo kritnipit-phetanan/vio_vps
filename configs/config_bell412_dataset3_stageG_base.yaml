@@ -1465,7 +1465,7 @@ vps:
   position_first_altitude_bypass_enable: true
   position_first_altitude_bypass_min_m: -150.0
   position_first_altitude_bypass_max_m: 1500.0
-  position_first_altitude_bypass_below_floor_m: 4.0
+  position_first_altitude_bypass_below_floor_m: 20.0
   accuracy_mode: true
   allow_failsoft_accept: true
   apply_degraded_conf_mult: 1.3
