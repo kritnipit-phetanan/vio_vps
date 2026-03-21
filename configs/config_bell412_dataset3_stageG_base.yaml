@@ -417,7 +417,7 @@ backend:
     magnitude_max_m: 45.0
     budget_enable: true
     budget_window_sec: 2.0
-    budget_base_m: 18.0
+    budget_base_m: 16.0
     budget_speed_gain: 0.80
     budget_max_m: 60.0
     budget_min_step_m: 0.30
@@ -435,7 +435,7 @@ backend:
     evidence_min_ticks: 2
     defer_first_enable: true
     proxy_evidence_enable: true
-    residual_monotonic_commit_enable: false
+    residual_monotonic_commit_enable: true
     reject_to_hint_only: true
     defer_direction_gate: true
     replace_min_score_delta: 0.06
@@ -1502,6 +1502,15 @@ vps:
   image_forward_axis: bottom
   device: cuda
   matcher_mode: orb
+  rescue_min_inliers: 8
+  rescue_min_confidence: 0.12
+  rescue_max_reproj_error: 2.5
+  rescue_local_only_enable: true
+  rescue_local_topk_candidates: 2
+  rescue_disable_above_speed_m_s: 22.0
+  rescue_min_interval_sec: 0.0
+  rescue_rate_window_sec: 0.0
+  rescue_rate_max_attempts: 0
   enabled: true
   failover_fail_streak: 6
   failsoft_r_inflate: 4.0
@@ -1517,6 +1526,11 @@ vps:
   temporal_consensus_max_dir_change_deg: 50.0
   temporal_consensus_max_rel_mag_change: 0.55
   temporal_consensus_max_hits: 5
+  quality_weight_inlier: 0.30
+  quality_weight_confidence: 0.30
+  quality_weight_reproj: 0.20
+  quality_weight_temporal: 0.10
+  quality_weight_locality: 0.10
   baro_scale_prune_enable: true
   baro_scale_prune_sigma_z_m: 12.0
   baro_scale_prune_min_band_frac: 0.10

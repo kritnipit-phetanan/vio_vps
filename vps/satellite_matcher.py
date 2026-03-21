@@ -75,6 +75,7 @@ class MatchResult:
     keypoints_drone: Optional[np.ndarray]     # Nx2 keypoints in drone image
     keypoints_sat: Optional[np.ndarray]       # Nx2 keypoints in satellite image
     rescue_trigger_reason: str = "none"       # ORB->rescue trigger classifier (R0 telemetry)
+    rescue_used: bool = False                 # LightGlue rescue was selected
 
 
 class SatelliteMatcher:
@@ -127,6 +128,7 @@ class SatelliteMatcher:
             "rescue_attempts": 0,
             "rescue_used": 0,
             "rescue_lightglue_fail": 0,
+            "rescue_blocked": 0,
             "image_resized_count": 0,
             "cache_clear_count": 0,
         }
@@ -722,7 +724,8 @@ class SatelliteMatcher:
     
     def match_with_homography(self, 
                               drone_img: np.ndarray, 
-                              sat_img: np.ndarray) -> MatchResult:
+                              sat_img: np.ndarray,
+                              rescue_allowed: bool = True) -> MatchResult:
         """
         Full matching pipeline: feature matching + homography estimation.
         
@@ -739,11 +742,17 @@ class SatelliteMatcher:
             orb_result = self._build_result_from_points(drone_img, sat_img, pts_orb_drone, pts_orb_sat)
             rescue_reason = self._rescue_trigger_reason(orb_result)
             orb_result.rescue_trigger_reason = str(rescue_reason)
-            if self._lightglue_ready and self._needs_lightglue_rescue(orb_result):
+            orb_result.rescue_used = False
+            need_rescue = self._needs_lightglue_rescue(orb_result)
+            if need_rescue and (not bool(rescue_allowed)):
+                self.stats["rescue_blocked"] = int(self.stats.get("rescue_blocked", 0)) + 1
+                return orb_result
+            if self._lightglue_ready and need_rescue:
                 self.stats["rescue_attempts"] = int(self.stats.get("rescue_attempts", 0)) + 1
                 pts_lg_drone, pts_lg_sat, _ = self.match_lightglue(drone_img, sat_img)
                 lg_result = self._build_result_from_points(drone_img, sat_img, pts_lg_drone, pts_lg_sat)
                 lg_result.rescue_trigger_reason = str(rescue_reason)
+                lg_result.rescue_used = True
                 if self._result_score(lg_result) > self._result_score(orb_result):
                     self.stats["rescue_used"] = int(self.stats.get("rescue_used", 0)) + 1
                     return lg_result
@@ -753,7 +762,9 @@ class SatelliteMatcher:
 
         # Standard single-backend mode.
         pts_drone, pts_sat, _ = self.match(drone_img, sat_img)
-        return self._build_result_from_points(drone_img, sat_img, pts_drone, pts_sat)
+        result = self._build_result_from_points(drone_img, sat_img, pts_drone, pts_sat)
+        result.rescue_used = False
+        return result
     
     def visualize_matches(self, 
                           drone_img: np.ndarray, 

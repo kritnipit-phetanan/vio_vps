@@ -1075,11 +1075,26 @@ class VPSPositionController:
                     applied_dp_xy = float(min(max(0.0, residual_xy), float(decision.bounded_clamp_m)))
                 else:
                     applied_dp_xy = float(max(0.0, residual_xy))
-            reject_reason = "" if bool(applied) else str(reason_code)
+            reason_txt = str(reason_code).strip()
+            if not reason_txt:
+                reason_txt = "applied_unspecified" if bool(applied) else "reject_unspecified"
+            reason_txt = str(reason_txt).replace(",", ";")
+            reject_reason = "" if bool(applied) else reason_txt
+            policy_note = str(getattr(decision, "policy_reject_note", "")).replace(",", ";")
+            hard_note = str(getattr(decision, "hard_reject_note", "")).replace(",", ";")
+            temporal_note = str(getattr(decision, "temporal_reject_note", "")).replace(",", ";")
+            direct_note = str(getattr(decision, "position_first_direct_xy_note", "")).replace(",", ";")
             rescue_trigger_reason = str(getattr(evidence, "rescue_trigger_reason", "none")).replace(",", ";")
             quality_subscores = str(getattr(evidence, "quality_subscores", "")).replace(",", ";")
             temporal_hits = int(getattr(evidence, "temporal_hits", 0))
             scale_pruned_band = str(getattr(evidence, "scale_pruned_band", "full")).replace(",", ";")
+            q_bucket = 1
+            try:
+                if self.vio_service is not None and hasattr(self.vio_service, "_trace_q_bucket"):
+                    q_bucket = int(self.vio_service._trace_q_bucket(float(evidence.t_cam)))
+            except Exception:
+                q_bucket = 1
+            q_bucket = int(np.clip(int(q_bucket), 1, 4))
             with open(csv_path, "a", newline="") as f:
                 f.write(
                     f"{float(evidence.t_cam):.6f},{int(evidence.frame_idx)},"
@@ -1091,11 +1106,12 @@ class VPSPositionController:
                     f"{int(decision.position_first_direct_xy_candidate)},{float(decision.hint_quality):.6f},"
                     f"{float(evidence.abs_offset_m):.3f},{int(evidence.vps_num_inliers)},"
                     f"{float(evidence.vps_conf):.6f},{float(evidence.vps_reproj):.6f},"
-                    f"{int(applied)},{reason_code},{reject_reason},"
+                    f"{int(applied)},{reason_txt},{reject_reason},"
                     f"{residual_xy:.6f},{applied_dp_xy:.6f},"
-                    f"{decision.policy_reject_note},{decision.hard_reject_note},"
-                    f"{decision.temporal_reject_note},{decision.position_first_direct_xy_note},"
-                    f"{rescue_trigger_reason},{quality_subscores},{temporal_hits},{scale_pruned_band}\n"
+                    f"{policy_note},{hard_note},"
+                    f"{temporal_note},{direct_note},"
+                    f"{rescue_trigger_reason},{quality_subscores},{temporal_hits},{scale_pruned_band},"
+                    f"{reason_txt},{int(q_bucket)}\n"
                 )
         except Exception:
             pass

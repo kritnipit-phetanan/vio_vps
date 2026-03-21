@@ -84,6 +84,12 @@ class VPSConfig:
     rescue_min_inliers: int = 8
     rescue_min_confidence: float = 0.12
     rescue_max_reproj_error: float = 2.5
+    rescue_local_only_enable: bool = True
+    rescue_local_topk_candidates: int = 2
+    rescue_disable_above_speed_m_s: float = 22.0
+    rescue_min_interval_sec: float = 0.0
+    rescue_rate_window_sec: float = 0.0
+    rescue_rate_max_attempts: int = 0
     max_image_side: int = 1024
     mps_cache_clear_interval: int = 0
     max_cached_tiles: int = 50
@@ -96,6 +102,11 @@ class VPSConfig:
     baro_scale_prune_min_band_frac: float = 0.10
     baro_scale_prune_max_band_frac: float = 0.30
     baro_scale_prune_speed_gain: float = 0.002
+    quality_weight_inlier: float = 0.30
+    quality_weight_confidence: float = 0.30
+    quality_weight_reproj: float = 0.20
+    quality_weight_temporal: float = 0.10
+    quality_weight_locality: float = 0.10
 
     # Accuracy-first controls
     accuracy_mode: bool = False
@@ -305,6 +316,8 @@ class VPSRunner:
         self._temporal_consensus_prev_offset = np.zeros(2, dtype=float)
         self._temporal_consensus_prev_valid = False
         self._last_scale_pruned_band = "full"
+        self._last_rescue_attempt_time = -1e9
+        self._rescue_attempt_times: List[float] = []
         self._budget_stop_streak = 0
         self._budget_escalation_level = 0
         self._budget_escalation_stop_streak = 0
@@ -356,6 +369,13 @@ class VPSRunner:
             'baro_scale_prune_applied_count': 0,
             'baro_scale_prune_fallback_count': 0,
             'anchor_failsoft_block_count': 0,
+            'anchor_rescue_block_count': 0,
+            'rescue_local_eligible_count': 0,
+            'rescue_block_nonlocal_count': 0,
+            'rescue_block_rank_count': 0,
+            'rescue_block_speed_count': 0,
+            'rescue_block_interval_count': 0,
+            'rescue_block_rate_count': 0,
         }
         
         print("[VPSRunner] Ready")
@@ -888,6 +908,12 @@ class VPSRunner:
                 rescue_min_inliers=int(vps_cfg.get("rescue_min_inliers", 8)),
                 rescue_min_confidence=float(vps_cfg.get("rescue_min_confidence", 0.12)),
                 rescue_max_reproj_error=float(vps_cfg.get("rescue_max_reproj_error", 2.5)),
+                rescue_local_only_enable=bool(vps_cfg.get("rescue_local_only_enable", True)),
+                rescue_local_topk_candidates=int(vps_cfg.get("rescue_local_topk_candidates", 2)),
+                rescue_disable_above_speed_m_s=float(vps_cfg.get("rescue_disable_above_speed_m_s", 22.0)),
+                rescue_min_interval_sec=float(vps_cfg.get("rescue_min_interval_sec", 0.0)),
+                rescue_rate_window_sec=float(vps_cfg.get("rescue_rate_window_sec", 0.0)),
+                rescue_rate_max_attempts=int(vps_cfg.get("rescue_rate_max_attempts", 0)),
                 max_image_side=int(vps_cfg.get("max_image_side", 1024)),
                 mps_cache_clear_interval=int(vps_cfg.get("mps_cache_clear_interval", 8)),
                 image_forward_axis=str(vps_cfg.get("image_forward_axis", vps_cfg.get("camera_forward_axis", "top"))),
@@ -903,6 +929,11 @@ class VPSRunner:
                 baro_scale_prune_min_band_frac=float(vps_cfg.get("baro_scale_prune_min_band_frac", 0.10)),
                 baro_scale_prune_max_band_frac=float(vps_cfg.get("baro_scale_prune_max_band_frac", 0.30)),
                 baro_scale_prune_speed_gain=float(vps_cfg.get("baro_scale_prune_speed_gain", 0.002)),
+                quality_weight_inlier=float(vps_cfg.get("quality_weight_inlier", 0.30)),
+                quality_weight_confidence=float(vps_cfg.get("quality_weight_confidence", 0.30)),
+                quality_weight_reproj=float(vps_cfg.get("quality_weight_reproj", 0.20)),
+                quality_weight_temporal=float(vps_cfg.get("quality_weight_temporal", 0.10)),
+                quality_weight_locality=float(vps_cfg.get("quality_weight_locality", 0.10)),
                 max_cached_tiles=int(vps_cfg.get("tile_cache_max_tiles", 50)),
                 yaw_hypotheses_deg=yaw_hyp if len(yaw_hyp) > 0 else (0.0, 180.0, 90.0, -90.0),
                 scale_hypotheses=scale_hyp if len(scale_hyp) > 0 else (1.0, 0.90, 1.10),
@@ -2057,10 +2088,61 @@ class VPSRunner:
                     continue
 
                 t_match_start = time.time()
+                rescue_allowed = True
+                hybrid_rescue_mode = str(self.config.matcher_mode).lower() == "orb_lightglue_rescue"
+                rescue_attempts_before = int(self.matcher.stats.get("rescue_attempts", 0)) if hybrid_rescue_mode else 0
+                if hybrid_rescue_mode:
+                    if bool(center_is_local):
+                        self.stats["rescue_local_eligible_count"] = int(
+                            self.stats.get("rescue_local_eligible_count", 0)
+                        ) + 1
+                    if bool(self.config.rescue_local_only_enable) and (not bool(center_is_local)):
+                        rescue_allowed = False
+                        self.stats["rescue_block_nonlocal_count"] = int(
+                            self.stats.get("rescue_block_nonlocal_count", 0)
+                        ) + 1
+                    rank_cap = int(max(0, self.config.rescue_local_topk_candidates))
+                    if rescue_allowed and rank_cap > 0 and int(cand_idx) >= int(rank_cap):
+                        rescue_allowed = False
+                        self.stats["rescue_block_rank_count"] = int(
+                            self.stats.get("rescue_block_rank_count", 0)
+                        ) + 1
+                    speed_cap = float(max(0.0, self.config.rescue_disable_above_speed_m_s))
+                    if rescue_allowed and speed_cap > 0.0 and np.isfinite(float(state_speed_val)) and float(state_speed_val) > speed_cap:
+                        rescue_allowed = False
+                        self.stats["rescue_block_speed_count"] = int(
+                            self.stats.get("rescue_block_speed_count", 0)
+                        ) + 1
+                    min_interval_sec = float(max(0.0, self.config.rescue_min_interval_sec))
+                    if (
+                        rescue_allowed
+                        and min_interval_sec > 0.0
+                        and np.isfinite(float(self._last_rescue_attempt_time))
+                        and (float(t_cam) - float(self._last_rescue_attempt_time)) < min_interval_sec
+                    ):
+                        rescue_allowed = False
+                        self.stats["rescue_block_interval_count"] = int(
+                            self.stats.get("rescue_block_interval_count", 0)
+                        ) + 1
+                    rate_window_sec = float(max(0.0, self.config.rescue_rate_window_sec))
+                    max_attempts = int(max(0, self.config.rescue_rate_max_attempts))
+                    if rescue_allowed and rate_window_sec > 0.0 and max_attempts > 0:
+                        cutoff_t = float(t_cam) - float(rate_window_sec)
+                        self._rescue_attempt_times = [
+                            float(ts)
+                            for ts in self._rescue_attempt_times
+                            if np.isfinite(float(ts)) and float(ts) >= cutoff_t
+                        ]
+                        if len(self._rescue_attempt_times) >= int(max_attempts):
+                            rescue_allowed = False
+                            self.stats["rescue_block_rate_count"] = int(
+                                self.stats.get("rescue_block_rate_count", 0)
+                            ) + 1
                 try:
                     match_result = self.matcher.match_with_homography(
                         drone_img=preprocess_result.image,
                         sat_img=sat_img,
+                        rescue_allowed=bool(rescue_allowed),
                     )
                 except Exception:
                     match_ms += (time.time() - t_match_start) * 1000.0
@@ -2076,6 +2158,11 @@ class VPSRunner:
                         )
                     continue
                 match_ms += (time.time() - t_match_start) * 1000.0
+                if hybrid_rescue_mode and bool(rescue_allowed):
+                    rescue_attempts_after = int(self.matcher.stats.get("rescue_attempts", 0))
+                    if rescue_attempts_after > rescue_attempts_before:
+                        self._last_rescue_attempt_time = float(t_cam)
+                        self._rescue_attempt_times.append(float(t_cam))
 
                 num_m = int(getattr(match_result, "num_matches", 0))
                 num_i = int(getattr(match_result, "num_inliers", 0))
@@ -2102,6 +2189,7 @@ class VPSRunner:
                     selected_map_patch = map_patch
 
                 strict_ok = bool(match_result.success)
+                rescue_used = bool(getattr(match_result, "rescue_used", False))
                 failsoft_ok = (not strict_ok) and self._should_accept_failsoft(match_result)
                 if failsoft_ok:
                     match_result.success = True
@@ -2150,7 +2238,7 @@ class VPSRunner:
                         and int(coarse_eval_limit) > 0
                         and int(evaluated_candidates) <= int(coarse_eval_limit)
                         and (
-                            bool(strict_ok)
+                            (bool(strict_ok) and (not rescue_used))
                             if bool(self.config.reloc_coarse_anchor_require_strict)
                             else bool(strict_ok or failsoft_ok)
                         )
@@ -2170,17 +2258,24 @@ class VPSRunner:
                         and int(coarse_eval_limit) > 0
                         and int(evaluated_candidates) <= int(coarse_eval_limit)
                         and bool(self.config.reloc_coarse_anchor_require_strict)
-                        and (not bool(strict_ok))
-                        and bool(failsoft_ok)
+                        and (
+                            ((not bool(strict_ok)) and bool(failsoft_ok))
+                            or (bool(strict_ok) and bool(rescue_used))
+                        )
                         and int(num_i) >= max(1, int(self.config.reloc_coarse_anchor_min_inliers))
                         and np.isfinite(conf)
                         and float(conf) >= float(self.config.reloc_coarse_anchor_min_confidence)
                     ):
-                        # R0 telemetry: failsoft match looked anchor-worthy but was blocked
+                        # R0 telemetry: non-strict source looked anchor-worthy but was blocked
                         # because anchor lane is strict-only.
-                        self.stats["anchor_failsoft_block_count"] = int(
-                            self.stats.get("anchor_failsoft_block_count", 0)
-                        ) + 1
+                        if bool(strict_ok) and bool(rescue_used):
+                            self.stats["anchor_rescue_block_count"] = int(
+                                self.stats.get("anchor_rescue_block_count", 0)
+                            ) + 1
+                        else:
+                            self.stats["anchor_failsoft_block_count"] = int(
+                                self.stats.get("anchor_failsoft_block_count", 0)
+                            ) + 1
                     if objective_mode != "accuracy" and not global_mode:
                         stop_search = True
                         break
@@ -2396,16 +2491,22 @@ class VPSRunner:
                 ) + 1
 
         # Strict-anchor only: failsoft must not advance anchor center when strict
-        # anchor policy is active.
+        # anchor policy is active (including rescue-sourced strict matches).
         strict_anchor_only = bool(self.config.reloc_coarse_anchor_require_strict)
         success_is_failsoft = bool(selected_reason == "matched_failsoft")
-        if (not strict_anchor_only) or (not success_is_failsoft):
+        success_is_rescue = bool(getattr(match_result, "rescue_used", False))
+        if (not strict_anchor_only) or (not success_is_failsoft and not success_is_rescue):
             self._last_success_center_lat = float(selected_center_lat)
             self._last_success_center_lon = float(selected_center_lon)
         else:
-            self.stats["anchor_failsoft_block_count"] = int(
-                self.stats.get("anchor_failsoft_block_count", 0)
-            ) + 1
+            if success_is_rescue:
+                self.stats["anchor_rescue_block_count"] = int(
+                    self.stats.get("anchor_rescue_block_count", 0)
+                ) + 1
+            else:
+                self.stats["anchor_failsoft_block_count"] = int(
+                    self.stats.get("anchor_failsoft_block_count", 0)
+                ) + 1
 
         # Temporal consensus tracker (source quality):
         # update directional/magnitude consistency streak from VPS offset sequence.
@@ -2451,20 +2552,45 @@ class VPSRunner:
                 "rescue_trigger_reason",
                 str(getattr(match_result, "rescue_trigger_reason", "none")),
             )
-            q_inlier = float(np.clip(float(match_result.num_inliers) / max(1.0, float(self.config.min_inliers)), 0.0, 2.0))
+            q_inlier = float(np.clip(float(match_result.num_inliers) / max(1.0, float(self.config.min_inliers)), 0.0, 1.0))
             q_conf = float(np.clip(float(match_result.confidence), 0.0, 1.0))
-            q_reproj = float(np.clip(float(self.config.max_reproj_error) / max(float(match_result.reproj_error), 1e-3), 0.0, 2.0))
+            q_reproj = float(
+                np.clip(
+                    float(self.config.max_reproj_error) / max(float(match_result.reproj_error), 1e-3),
+                    0.0,
+                    1.0,
+                )
+            )
+            q_temporal = float(
+                np.clip(
+                    float(getattr(self, "_temporal_consensus_hits", 0.0))
+                    / max(1.0, float(self.config.temporal_consensus_max_hits)),
+                    0.0,
+                    1.0,
+                )
+            )
             q_locality = 1.0 if (bool(local_first_split_enable) and ((round(float(selected_center_lat), 8), round(float(selected_center_lon), 8)) in local_center_keys)) else 0.0
+            w_inlier = max(0.0, float(self.config.quality_weight_inlier))
+            w_conf = max(0.0, float(self.config.quality_weight_confidence))
+            w_reproj = max(0.0, float(self.config.quality_weight_reproj))
+            w_temporal = max(0.0, float(self.config.quality_weight_temporal))
+            w_locality = max(0.0, float(self.config.quality_weight_locality))
+            w_sum = max(1e-9, w_inlier + w_conf + w_reproj + w_temporal + w_locality)
+            quality_total = float(
+                (w_inlier * q_inlier + w_conf * q_conf + w_reproj * q_reproj + w_temporal * q_temporal + w_locality * q_locality)
+                / w_sum
+            )
             # CSV-safe string (semicolon-delimited key=value pairs).
             setattr(
                 vps_measurement,
                 "quality_subscores",
                 (
                     f"inlier={q_inlier:.3f};conf={q_conf:.3f};reproj={q_reproj:.3f};"
-                    f"temporal={float(getattr(self, '_temporal_consensus_hits', 0.0)):.3f};"
-                    f"locality={q_locality:.3f}"
+                    f"temporal={q_temporal:.3f};locality={q_locality:.3f};"
+                    f"total={quality_total:.3f}"
                 ),
             )
+            setattr(vps_measurement, "quality_total", float(quality_total))
             setattr(vps_measurement, "temporal_hits", int(getattr(self, "_temporal_consensus_hits", 0)))
             setattr(vps_measurement, "scale_pruned_band", str(getattr(self, "_last_scale_pruned_band", "full")))
         except Exception:
@@ -2556,6 +2682,7 @@ class VPSRunner:
         mstats = getattr(self.matcher, "stats", {}) if hasattr(self, "matcher") else {}
         rescue_attempt = int(mstats.get("rescue_attempts", 0)) if isinstance(mstats, dict) else 0
         rescue_success = int(mstats.get("rescue_used", 0)) if isinstance(mstats, dict) else 0
+        rescue_blocked = int(mstats.get("rescue_blocked", 0)) if isinstance(mstats, dict) else 0
         return {
             "attempt_ms_p50": float(np.percentile(wall_vals, 50.0)) if wall_vals.size > 0 else float("nan"),
             "attempt_ms_p95": float(np.percentile(wall_vals, 95.0)) if wall_vals.size > 0 else float("nan"),
@@ -2591,6 +2718,25 @@ class VPSRunner:
             ),
             "rescue_attempt_count": float(rescue_attempt),
             "rescue_success_count": float(rescue_success),
+            "rescue_blocked_count": float(rescue_blocked),
+            "rescue_local_eligible_count": float(
+                int(self.stats.get("rescue_local_eligible_count", 0))
+            ),
+            "rescue_block_nonlocal_count": float(
+                int(self.stats.get("rescue_block_nonlocal_count", 0))
+            ),
+            "rescue_block_rank_count": float(
+                int(self.stats.get("rescue_block_rank_count", 0))
+            ),
+            "rescue_block_speed_count": float(
+                int(self.stats.get("rescue_block_speed_count", 0))
+            ),
+            "rescue_block_interval_count": float(
+                int(self.stats.get("rescue_block_interval_count", 0))
+            ),
+            "rescue_block_rate_count": float(
+                int(self.stats.get("rescue_block_rate_count", 0))
+            ),
             "baro_scale_prune_applied_count": float(
                 int(self.stats.get("baro_scale_prune_applied_count", 0))
             ),
@@ -2599,6 +2745,9 @@ class VPSRunner:
             ),
             "anchor_failsoft_block_count": float(
                 int(self.stats.get("anchor_failsoft_block_count", 0))
+            ),
+            "anchor_rescue_block_count": float(
+                int(self.stats.get("anchor_rescue_block_count", 0))
             ),
         }
 

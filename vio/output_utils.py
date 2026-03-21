@@ -1679,7 +1679,7 @@ def init_output_csvs(output_dir: str, save_debug_data: bool = False) -> Dict[str
             "apply_score,consensus_score,geometry_score,motion_score,bounded_clamp_m,allow_direct_xy_apply,"
             "direct_xy_candidate,hint_quality,offset_m,inliers,confidence,reproj_error,"
             "applied,reason_code,reject_reason,residual_xy,applied_dp_xy,policy_note,hard_note,temporal_note,direct_note,"
-            "rescue_trigger_reason,quality_subscores,temporal_hits,scale_pruned_band\n"
+            "rescue_trigger_reason,quality_subscores,temporal_hits,scale_pruned_band,reason,q_bucket\n"
         )
 
     # Single-authority policy traces
@@ -1803,7 +1803,7 @@ def init_output_csvs(output_dir: str, save_debug_data: bool = False) -> Dict[str
     paths['backend_apply_trace_csv'] = os.path.join(output_dir, "backend_apply_trace.csv")
     with open(paths['backend_apply_trace_csv'], "w", newline="") as f:
         f.write(
-            "t,source,state,reason,quality,residual_xy,dp_xy_in,dp_xy_applied,age_sec,t_ref,time_aligned_used\n"
+            "t,source,state,reason,quality,residual_xy,dp_xy_in,dp_xy_applied,age_sec,t_ref,time_aligned_used,q_bucket\n"
         )
 
     # Deterministic runtime signature (one-line JSON-like metadata)

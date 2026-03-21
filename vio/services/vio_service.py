@@ -2590,6 +2590,86 @@ class VIOService:
             runner._backend_reject_reason_counts = counts
         return counts
 
+    def _trace_q_bucket(self, t_now: float) -> int:
+        """
+        Deterministic run-progress bucket [1..4] for trace observability.
+
+        Falls back safely when runtime time-range is unavailable.
+        """
+        runner = self.runner
+        t_val = float(t_now) if np.isfinite(float(t_now)) else float("nan")
+        if not np.isfinite(t_val):
+            return 1
+
+        t_start = float(getattr(runner, "_trace_q_start_t", float("nan")))
+        t_end = float(getattr(runner, "_trace_q_end_t", float("nan")))
+        if not (np.isfinite(t_start) and np.isfinite(t_end) and t_end > t_start):
+            candidates: list[tuple[float, float]] = []
+            try:
+                imu_src = getattr(runner, "imu", None)
+                if imu_src is not None:
+                    imu_t = None
+                    if isinstance(imu_src, dict) and "t" in imu_src:
+                        imu_t = np.asarray(imu_src.get("t", []), dtype=float)
+                    else:
+                        try:
+                            imu_t = np.asarray(imu_src["t"], dtype=float)
+                        except Exception:
+                            imu_t = None
+                    if imu_t is None and isinstance(imu_src, (list, tuple)) and len(imu_src) > 1:
+                        vals = []
+                        for rec in imu_src:
+                            try:
+                                if hasattr(rec, "t"):
+                                    vals.append(float(getattr(rec, "t")))
+                                elif isinstance(rec, (list, tuple)) and len(rec) > 0:
+                                    vals.append(float(rec[0]))
+                            except Exception:
+                                continue
+                        if len(vals) > 1:
+                            imu_t = np.asarray(vals, dtype=float)
+                    if imu_t is not None and imu_t.size > 1:
+                        imu_t = imu_t[np.isfinite(imu_t)]
+                        if imu_t.size > 1:
+                            candidates.append((float(np.min(imu_t)), float(np.max(imu_t))))
+            except Exception:
+                pass
+            try:
+                imgs_src = getattr(runner, "imgs", None)
+                if imgs_src is not None:
+                    img_ts = []
+                    if isinstance(imgs_src, dict) and "t" in imgs_src:
+                        img_ts = np.asarray(imgs_src.get("t", []), dtype=float).tolist()
+                    else:
+                        for item in imgs_src:
+                            try:
+                                if hasattr(item, "t"):
+                                    img_ts.append(float(getattr(item, "t")))
+                                elif isinstance(item, (list, tuple)) and len(item) > 0:
+                                    img_ts.append(float(item[0]))
+                            except Exception:
+                                continue
+                    arr = np.asarray(img_ts, dtype=float)
+                    arr = arr[np.isfinite(arr)]
+                    if arr.size > 1:
+                        candidates.append((float(np.min(arr)), float(np.max(arr))))
+            except Exception:
+                pass
+            if len(candidates) == 0:
+                return 1
+            t_start = float(min(c[0] for c in candidates))
+            t_end = float(max(c[1] for c in candidates))
+            runner._trace_q_start_t = float(t_start)
+            runner._trace_q_end_t = float(t_end)
+
+        span = float(t_end - t_start)
+        if not np.isfinite(span) or span <= 1e-9:
+            return 1
+        ratio = float(np.clip((t_val - t_start) / span, 0.0, 1.0))
+        if ratio >= 1.0:
+            return 4
+        return int(1 + min(3, int(np.floor(ratio * 4.0))))
+
     def _backend_source_reliability_map(self) -> Dict[str, float]:
         """Return mutable source reliability map with defaults initialized."""
         runner = self.runner
@@ -2662,14 +2742,21 @@ class VIOService:
         if not trace_csv:
             return
         try:
+            reason_txt = str(record.reason).strip()
+            if not reason_txt:
+                reason_txt = f"{str(record.decision_state).strip().lower()}_unspecified"
+            reason_txt = reason_txt.replace(",", ";")
+            q_bucket = int(record.q_bucket)
+            if q_bucket <= 0:
+                q_bucket = int(self._trace_q_bucket(float(record.timestamp)))
             with open(trace_csv, "a", newline="") as f:
                 f.write(
                     f"{float(record.timestamp):.6f},{str(record.source)},"
-                    f"{str(record.decision_state)},{str(record.reason).replace(',', ';')},"
+                    f"{str(record.decision_state)},{reason_txt},"
                     f"{float(record.quality_score):.6f},{float(record.residual_xy):.6f},"
                     f"{float(record.dp_xy_in):.6f},{float(record.dp_xy_applied):.6f},"
                     f"{float(record.age_sec):.6f},{float(record.t_ref):.6f},"
-                    f"{int(bool(record.time_aligned_used))}\n"
+                    f"{int(bool(record.time_aligned_used))},{int(q_bucket)}\n"
                 )
         except Exception:
             pass
@@ -3021,7 +3108,7 @@ class VIOService:
             )
             if require_evidence and not innovation_evidence:
                 ok_now = False
-                fail_reason = "quality_reject"
+                fail_reason = "deferred_probation"
                 runner._backend_probation_evidence_fail_count = int(
                     getattr(runner, "_backend_probation_evidence_fail_count", 0)
                 ) + 1
@@ -3113,7 +3200,7 @@ class VIOService:
             )
         )
         soft_fail_reason = str(fail_reason) in {
-            "quality_reject",
+            "deferred_probation",
             "probation_residual_non_monotonic",
             "probation_evidence_insufficient",
         }
@@ -3130,7 +3217,8 @@ class VIOService:
             and ticks_seen < max_probation_ticks
         ):
             counts["probation_deferred"] = int(counts.get("probation_deferred", 0)) + 1
-            candidate["probation_defer_reason"] = str(fail_reason or "quality_reject")
+            counts["deferred_probation"] = int(counts.get("deferred_probation", 0)) + 1
+            candidate["probation_defer_reason"] = str(fail_reason or "deferred_probation")
             runner._backend_probation_candidate = candidate
             return
         if ticks_seen < required_ticks:
@@ -3253,7 +3341,13 @@ class VIOService:
                 )
             )
         else:
-            reason = fail_reason if str(fail_reason).strip() else "quality_reject"
+            reason = fail_reason if str(fail_reason).strip() else "hard_reject_quality"
+            if str(reason) in {
+                "deferred_probation",
+                "probation_residual_non_monotonic",
+                "probation_evidence_insufficient",
+            }:
+                reason = "hard_reject_quality"
             counts[str(reason)] = int(counts.get(str(reason), 0)) + 1
             runner._backend_probation_reject_count = int(getattr(runner, "_backend_probation_reject_count", 0)) + 1
             self._backend_update_source_reliability(
@@ -3364,34 +3458,81 @@ class VIOService:
         # to deterministic HINT_ONLY unless reliability recovers.
         source_rel_map = self._backend_source_reliability_map()
         source_rel = float(source_rel_map.get(source_name, 0.5))
+        deferred_probation_quality = False
         if bool(runner.global_config.get("BACKEND_SOURCE_RELIABILITY_ENABLE", True)):
             quarantine_th = float(np.clip(runner.global_config.get("BACKEND_SOURCE_RELIABILITY_QUARANTINE_TH", 0.20), 0.0, 1.0))
             hint_only_below = bool(runner.global_config.get("BACKEND_SOURCE_RELIABILITY_HINT_ONLY_BELOW_TH", True))
             if hint_only_below and np.isfinite(source_rel) and source_rel < quarantine_th:
                 counts = self._backend_reject_counts()
-                counts["quality_reject"] = int(counts.get("quality_reject", 0)) + 1
-                self._backend_update_source_reliability(
-                    source=source_name,
-                    quality_score=float(corr_quality),
-                    residual_xy=float(residual_xy_metric),
-                    committed=False,
-                )
-                self._log_backend_apply_trace(
-                    ApplyDecisionRecord(
-                        timestamp=state_t_now,
-                        source=source_name,
-                        decision_state="HINT_ONLY",
-                        reason="quality_reject",
-                        quality_score=float(corr_quality),
-                        residual_xy=float(residual_xy_metric),
-                        dp_xy_in=float(np.linalg.norm(dp[:2])),
-                        dp_xy_applied=0.0,
-                        age_sec=float(corr_age_sec),
-                        t_ref=float(contract.t_ref),
-                        time_aligned_used=False,
+                hard_quality_th = float(
+                    np.clip(
+                        runner.global_config.get("BACKEND_SUPERVISOR_QUALITY_HARD_REJECT_TH", 0.12),
+                        0.0,
+                        1.0,
                     )
                 )
-                return
+                hard_source_rel_th = float(
+                    np.clip(
+                        runner.global_config.get("BACKEND_SOURCE_RELIABILITY_HARD_REJECT_TH", 0.08),
+                        0.0,
+                        1.0,
+                    )
+                )
+                hard_quality_reject = bool(
+                    (np.isfinite(source_rel) and source_rel < hard_source_rel_th)
+                    or (np.isfinite(corr_quality) and corr_quality < hard_quality_th)
+                )
+                if hard_quality_reject:
+                    counts["hard_reject_quality"] = int(counts.get("hard_reject_quality", 0)) + 1
+                    self._backend_update_source_reliability(
+                        source=source_name,
+                        quality_score=float(corr_quality),
+                        residual_xy=float(residual_xy_metric),
+                        committed=False,
+                    )
+                    self._log_backend_apply_trace(
+                        ApplyDecisionRecord(
+                            timestamp=state_t_now,
+                            source=source_name,
+                            decision_state="REJECT",
+                            reason="hard_reject_quality",
+                            quality_score=float(corr_quality),
+                            residual_xy=float(residual_xy_metric),
+                            dp_xy_in=float(np.linalg.norm(dp[:2])),
+                            dp_xy_applied=0.0,
+                            age_sec=float(corr_age_sec),
+                            t_ref=float(contract.t_ref),
+                            time_aligned_used=False,
+                        )
+                    )
+                    return
+                if bool(supervisor_enable):
+                    deferred_probation_quality = True
+                    counts["deferred_probation"] = int(counts.get("deferred_probation", 0)) + 1
+                else:
+                    counts["deferred_probation"] = int(counts.get("deferred_probation", 0)) + 1
+                    self._backend_update_source_reliability(
+                        source=source_name,
+                        quality_score=float(corr_quality),
+                        residual_xy=float(residual_xy_metric),
+                        committed=False,
+                    )
+                    self._log_backend_apply_trace(
+                        ApplyDecisionRecord(
+                            timestamp=state_t_now,
+                            source=source_name,
+                            decision_state="HINT_ONLY",
+                            reason="deferred_probation",
+                            quality_score=float(corr_quality),
+                            residual_xy=float(residual_xy_metric),
+                            dp_xy_in=float(np.linalg.norm(dp[:2])),
+                            dp_xy_applied=0.0,
+                            age_sec=float(corr_age_sec),
+                            t_ref=float(contract.t_ref),
+                            time_aligned_used=False,
+                        )
+                    )
+                    return
 
         position_first_lane = bool(runner.global_config.get("POSITION_FIRST_LANE", False))
         max_dp = float(runner.global_config.get("BACKEND_MAX_APPLY_DP_XY_M", 25.0))
@@ -3518,7 +3659,7 @@ class VIOService:
                         yaw_auth_reason = f"apply:{auth_dec.reason}"
             if yaw_denied and not bool(runner.global_config.get("BACKEND_XY_YAW_DECOUPLE_ENABLE", True)):
                 counts = self._backend_reject_counts()
-                counts["quality_reject"] = int(counts.get("quality_reject", 0)) + 1
+                counts["hard_reject_quality"] = int(counts.get("hard_reject_quality", 0)) + 1
                 self._backend_update_source_reliability(
                     source=source_name,
                     quality_score=float(corr_quality),
@@ -3530,7 +3671,7 @@ class VIOService:
                         timestamp=state_t_now,
                         source=source_name,
                         decision_state="REJECT",
-                        reason="quality_reject",
+                        reason="hard_reject_quality",
                         quality_score=float(corr_quality),
                         residual_xy=float(residual_xy_metric),
                         dp_xy_in=float(np.linalg.norm(np.asarray(dp[:2], dtype=float))),
@@ -3856,13 +3997,18 @@ class VIOService:
                 "ticks_seen": 0,
                 "last_eval_t": -1e9,
                 "all_pass": True,
+                "quality_gate_deferred": bool(deferred_probation_quality),
             }
             self._log_backend_apply_trace(
                 ApplyDecisionRecord(
                     timestamp=state_t_now,
                     source=source_name,
                     decision_state="PROBATION",
-                    reason="probation_start",
+                    reason=(
+                        "probation_start_deferred_quality"
+                        if bool(deferred_probation_quality)
+                        else "probation_start"
+                    ),
                     quality_score=float(corr_quality),
                     residual_xy=float(residual_xy_metric),
                     dp_xy_in=float(np.linalg.norm(np.asarray(dp[:2], dtype=float))),

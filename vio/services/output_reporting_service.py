@@ -1195,6 +1195,7 @@ class OutputReportingService:
                 )
                 backend_reject_quality_reject_count = float(
                     int(reason_counts.get("quality_reject", 0))
+                    + int(reason_counts.get("hard_reject_quality", 0))
                 )
         except Exception:
             pass

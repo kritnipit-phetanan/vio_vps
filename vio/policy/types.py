@@ -147,3 +147,4 @@ class ApplyDecisionRecord:
     age_sec: float
     t_ref: float
     time_aligned_used: bool = False
+    q_bucket: int = 0
