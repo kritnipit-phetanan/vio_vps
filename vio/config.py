@@ -2685,6 +2685,18 @@ def load_config(config_path: str) -> VIOConfig:
     result['BACKEND_SOURCE_RELIABILITY_RESIDUAL_REF_M'] = float(
         max(0.1, source_reliability_cfg.get('residual_ref_m', 12.0))
     )
+    result['BACKEND_SOURCE_RELIABILITY_PENALIZE_HARD_ONLY'] = bool(
+        source_reliability_cfg.get('penalize_hard_only', True)
+    )
+    result['BACKEND_SOURCE_RELIABILITY_RECOVERY_BOOST_ENABLE'] = bool(
+        source_reliability_cfg.get('recovery_boost_enable', True)
+    )
+    result['BACKEND_SOURCE_RELIABILITY_RECOVERY_BOOST_STREAK'] = int(
+        max(1, source_reliability_cfg.get('recovery_boost_streak', 2))
+    )
+    result['BACKEND_SOURCE_RELIABILITY_RECOVERY_BOOST_VALUE'] = float(
+        np.clip(source_reliability_cfg.get('recovery_boost_value', 0.05), 0.0, 0.30)
+    )
     result['BACKEND_APPLY_TRACE_ENABLE'] = bool(
         backend_cfg.get('apply_trace_enable', True)
     )

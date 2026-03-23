@@ -476,6 +476,10 @@ backend:
     escalate_th: 0.75
     hint_only_below_th: true
     residual_ref_m: 12.0
+    penalize_hard_only: true
+    recovery_boost_enable: true
+    recovery_boost_streak: 2
+    recovery_boost_value: 0.05
   apply_trace_enable: true
   vps_yaw_hint_enable: true
   vps_yaw_hint_gain: 0.35

@@ -137,14 +137,16 @@ class VPSPositionController:
             return "xy_drift_recovery_hint_only"
         if "xy_drift_recovery" in status_lower and "applied" in status_lower:
             return "xy_drift_recovery_apply"
+        # Policy hold must take precedence over generic skipped_quality tagging.
+        # Status often contains both substrings (e.g. "SKIPPED_QUALITY,policy_mode_hold").
+        if "policy_mode_" in status_lower:
+            return "policy_hold"
         if "skipped_quality" in status_lower:
             if "soft_reject" in status_lower:
                 return "soft_reject"
             return "skip_low_quality"
         if "hard_reject" in status_lower:
             return "abs_corr_hard_reject"
-        if "policy_mode_" in status_lower:
-            return "policy_hold"
         if "large_offset_pending" in status_lower:
             return "abs_corr_temporal_wait"
         if str(quality_mode) == "failsoft" and "gated" in status_lower:

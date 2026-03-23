@@ -2695,6 +2695,18 @@ class VIOService:
                 hist_map[key] = []
         return hist_map
 
+    def _backend_source_commit_streak_map(self) -> Dict[str, int]:
+        """Return mutable per-source consecutive commit streak map."""
+        runner = self.runner
+        streak_map = getattr(runner, "_backend_source_commit_streak", None)
+        if not isinstance(streak_map, dict):
+            streak_map = {}
+            runner._backend_source_commit_streak = streak_map
+        for key in ("VPS", "LOOP", "BACKEND", "MAG"):
+            if key not in streak_map:
+                streak_map[key] = 0
+        return streak_map
+
     def _backend_update_source_reliability(
         self,
         *,
@@ -2702,12 +2714,14 @@ class VIOService:
         quality_score: float,
         residual_xy: float,
         committed: bool,
+        reason: str = "",
     ) -> float:
         """Update rolling source reliability after commit/reject decisions."""
         runner = self.runner
         source_u = str(source or "BACKEND").upper()
         rel_map = self._backend_source_reliability_map()
         hist_map = self._backend_source_reliability_hist_map()
+        streak_map = self._backend_source_commit_streak_map()
         prev = float(np.clip(rel_map.get(source_u, 0.5), 0.0, 1.0))
         if not bool(runner.global_config.get("BACKEND_SOURCE_RELIABILITY_ENABLE", True)):
             hist = hist_map.setdefault(source_u, [])
@@ -2718,14 +2732,60 @@ class VIOService:
 
         alpha = float(np.clip(runner.global_config.get("BACKEND_SOURCE_RELIABILITY_ALPHA", 0.10), 0.0, 1.0))
         penalty = float(np.clip(runner.global_config.get("BACKEND_SOURCE_RELIABILITY_REJECT_PENALTY", 0.12), 0.0, 1.0))
+        penalize_hard_only = bool(
+            runner.global_config.get("BACKEND_SOURCE_RELIABILITY_PENALIZE_HARD_ONLY", True)
+        )
+        recovery_boost_enable = bool(
+            runner.global_config.get("BACKEND_SOURCE_RELIABILITY_RECOVERY_BOOST_ENABLE", True)
+        )
+        recovery_boost_streak = int(
+            max(1, runner.global_config.get("BACKEND_SOURCE_RELIABILITY_RECOVERY_BOOST_STREAK", 2))
+        )
+        recovery_boost_value = float(
+            np.clip(
+                runner.global_config.get("BACKEND_SOURCE_RELIABILITY_RECOVERY_BOOST_VALUE", 0.05),
+                0.0,
+                0.30,
+            )
+        )
         residual_ref_m = float(max(0.1, runner.global_config.get("BACKEND_SOURCE_RELIABILITY_RESIDUAL_REF_M", 12.0)))
         q = float(np.clip(quality_score, 0.0, 1.0)) if np.isfinite(float(quality_score)) else 0.0
         r = float(residual_xy) if np.isfinite(float(residual_xy)) else residual_ref_m
         obs = float(np.clip(q * np.clip(1.0 / (1.0 + max(0.0, r) / residual_ref_m), 0.0, 1.0), 0.0, 1.0))
+        reason_l = str(reason or "").strip().lower()
+
+        def _is_hard_reject_reason(code: str) -> bool:
+            if not code:
+                return True
+            if code in (
+                "contract_violation",
+                "stale_reject",
+                "snap_reject",
+                "hard_reject_quality",
+                "kinematic_reject",
+            ):
+                return True
+            if code.startswith("kinematic_reject"):
+                return True
+            return False
+
         if committed:
             new_rel = float(np.clip((1.0 - alpha) * prev + alpha * obs, 0.0, 1.0))
+            streak_map[source_u] = int(max(0, int(streak_map.get(source_u, 0))) + 1)
+            if (
+                recovery_boost_enable
+                and int(streak_map.get(source_u, 0)) >= recovery_boost_streak
+                and recovery_boost_value > 0.0
+            ):
+                new_rel = float(np.clip(new_rel + recovery_boost_value, 0.0, 1.0))
         else:
-            new_rel = float(np.clip(prev * (1.0 - penalty), 0.0, 1.0))
+            streak_map[source_u] = 0
+            if reason_l == "deferred_probation":
+                new_rel = float(prev)
+            elif penalize_hard_only and (not _is_hard_reject_reason(reason_l)):
+                new_rel = float(prev)
+            else:
+                new_rel = float(np.clip(prev * (1.0 - penalty), 0.0, 1.0))
         rel_map[source_u] = new_rel
         hist = hist_map.setdefault(source_u, [])
         hist.append(new_rel)
@@ -3311,26 +3371,28 @@ class VIOService:
                 runner._backend_time_aligned_apply_count = int(
                     getattr(runner, "_backend_time_aligned_apply_count", 0)
                 ) + 1
+            commit_reason = (
+                "probation_commit_clamped_energy_shaped"
+                if bool(candidate.get("probation_clamped", False)) and bool(energy_shaped)
+                else "probation_commit_clamped"
+                if bool(candidate.get("probation_clamped", False))
+                else "probation_commit_energy_shaped"
+                if bool(energy_shaped)
+                else "probation_commit"
+            )
             self._backend_update_source_reliability(
                 source=source,
                 quality_score=quality,
                 residual_xy=float(candidate.get("residual_xy_metric", np.nan)),
                 committed=True,
+                reason=commit_reason,
             )
             self._log_backend_apply_trace(
                 ApplyDecisionRecord(
                     timestamp=float(t_now),
                     source=source,
                     decision_state="COMMIT",
-                    reason=(
-                        "probation_commit_clamped_energy_shaped"
-                        if bool(candidate.get("probation_clamped", False)) and bool(energy_shaped)
-                        else "probation_commit_clamped"
-                        if bool(candidate.get("probation_clamped", False))
-                        else "probation_commit_energy_shaped"
-                        if bool(energy_shaped)
-                        else "probation_commit"
-                    ),
+                    reason=commit_reason,
                     quality_score=quality,
                     residual_xy=float(candidate.get("residual_xy_metric", np.nan)),
                     dp_xy_in=float(np.linalg.norm(np.asarray(candidate.get("dp", np.zeros(3))[:2], dtype=float))),
@@ -3342,12 +3404,6 @@ class VIOService:
             )
         else:
             reason = fail_reason if str(fail_reason).strip() else "hard_reject_quality"
-            if str(reason) in {
-                "deferred_probation",
-                "probation_residual_non_monotonic",
-                "probation_evidence_insufficient",
-            }:
-                reason = "hard_reject_quality"
             counts[str(reason)] = int(counts.get(str(reason), 0)) + 1
             runner._backend_probation_reject_count = int(getattr(runner, "_backend_probation_reject_count", 0)) + 1
             self._backend_update_source_reliability(
@@ -3355,6 +3411,7 @@ class VIOService:
                 quality_score=quality,
                 residual_xy=float(candidate.get("residual_xy_metric", np.nan)),
                 committed=False,
+                reason=reason,
             )
             reject_to_hint = bool(runner.global_config.get("BACKEND_SUPERVISOR_REJECT_TO_HINT_ONLY", True))
             state_name = "HINT_ONLY" if reject_to_hint else "REJECT"
@@ -3489,6 +3546,7 @@ class VIOService:
                         quality_score=float(corr_quality),
                         residual_xy=float(residual_xy_metric),
                         committed=False,
+                        reason="hard_reject_quality",
                     )
                     self._log_backend_apply_trace(
                         ApplyDecisionRecord(
@@ -3516,6 +3574,7 @@ class VIOService:
                         quality_score=float(corr_quality),
                         residual_xy=float(residual_xy_metric),
                         committed=False,
+                        reason="deferred_probation",
                     )
                     self._log_backend_apply_trace(
                         ApplyDecisionRecord(
@@ -3665,6 +3724,7 @@ class VIOService:
                     quality_score=float(corr_quality),
                     residual_xy=float(residual_xy_metric),
                     committed=False,
+                    reason="hard_reject_quality",
                 )
                 self._log_backend_apply_trace(
                     ApplyDecisionRecord(
@@ -3791,6 +3851,7 @@ class VIOService:
                                 quality_score=float(corr_quality),
                                 residual_xy=float(residual_xy_metric),
                                 committed=False,
+                                reason="kinematic_reject",
                             )
                             self._log_backend_apply_trace(
                                 ApplyDecisionRecord(
@@ -3894,6 +3955,7 @@ class VIOService:
                 quality_score=float(corr_quality),
                 residual_xy=float(residual_xy_metric),
                 committed=False,
+                reason="stale_reject",
             )
             self._log_backend_apply_trace(
                 ApplyDecisionRecord(
@@ -4041,6 +4103,7 @@ class VIOService:
             quality_score=float(corr_quality),
             residual_xy=float(residual_xy_metric),
             committed=True,
+            reason="direct_commit",
         )
         self._log_backend_apply_trace(
             ApplyDecisionRecord(

@@ -48,6 +48,7 @@ class VPSConfig:
     
     # Processing
     output_size: tuple = (512, 512)
+    use_rectifier: bool = True
     patch_size_px: int = 512
     patch_size_failover_px: int = 768
     failover_fail_streak: int = 6
@@ -765,6 +766,7 @@ class VPSRunner:
         camera_yaw_offset_rad = 0.0
         vps_cfg: Dict[str, Any] = {}
         logging_cfg: Dict[str, Any] = {}
+        use_rectifier_cfg = True
         vps_config = VPSConfig(mbtiles_path=mbtiles_path, device=device)
         
         # Load camera intrinsics from config
@@ -793,24 +795,30 @@ class VPSRunner:
             logging_cfg = config_yaml.get("logging", {}) if isinstance(config_yaml, dict) else {}
             if not isinstance(logging_cfg, dict):
                 logging_cfg = {}
+            use_rectifier_cfg = bool(vps_cfg.get("use_rectifier", True))
             
-            # Create fisheye rectifier
-            try:
-                import sys
-                # Add parent for vio imports
-                sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-                from vio.fisheye_rectifier import create_rectifier_from_config
-                
-                rectifier_config = {'KB_PARAMS': camera_intrinsics}
-                src_size = (camera_intrinsics['w'], camera_intrinsics['h'])
-                fisheye_rectifier = create_rectifier_from_config(
-                    rectifier_config, 
-                    src_size=src_size,
-                    fov_deg=90.0
-                )
-                print(f"[VPSRunner] Fisheye rectifier created (FOV=90°)")
-            except Exception as e:
-                print(f"[VPSRunner] Warning: Fisheye rectifier failed: {e}")
+            if use_rectifier_cfg:
+                # Create fisheye rectifier
+                try:
+                    import sys
+                    # Add parent for vio imports
+                    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+                    from vio.fisheye_rectifier import create_rectifier_from_config
+
+                    if camera_intrinsics is None:
+                        raise RuntimeError("camera intrinsics unavailable")
+                    rectifier_config = {'KB_PARAMS': camera_intrinsics}
+                    src_size = (camera_intrinsics['w'], camera_intrinsics['h'])
+                    fisheye_rectifier = create_rectifier_from_config(
+                        rectifier_config, 
+                        src_size=src_size,
+                        fov_deg=90.0
+                    )
+                    print(f"[VPSRunner] Fisheye rectifier created (FOV=90°)")
+                except Exception as e:
+                    print(f"[VPSRunner] Warning: Fisheye rectifier failed: {e}")
+            else:
+                print("[VPSRunner] Fisheye rectifier disabled by config (vps.use_rectifier=false)")
             
             # Load extrinsics and calculate camera yaw offset
             try:
@@ -887,6 +895,7 @@ class VPSRunner:
             vps_config = VPSConfig(
                 mbtiles_path=mbtiles_path,
                 output_size=(int(output_size[0]), int(output_size[1])),
+                use_rectifier=bool(use_rectifier_cfg),
                 patch_size_px=int(vps_cfg.get("patch_size_px", output_size[0])),
                 patch_size_failover_px=int(vps_cfg.get("patch_size_failover_px", max(output_size[0], 768))),
                 failover_fail_streak=int(vps_cfg.get("failover_fail_streak", 6)),
@@ -1122,6 +1131,7 @@ class VPSRunner:
                 f"[VPSRunner] VPS cfg: patch={vps_config.patch_size_px}/{vps_config.patch_size_failover_px}, "
                 f"min_inliers={vps_config.min_inliers}, failsoft={vps_config.min_inliers_failsoft}, "
                 f"candidates<={vps_config.max_candidates}, matcher={vps_config.matcher_mode}, "
+                f"rectifier={int(bool(vps_config.use_rectifier))}, "
                 f"max_image_side={vps_config.max_image_side}, "
                 f"max_total_candidates={vps_config.max_total_candidates}, "
                 f"budget_ms(local/global)={vps_config.max_frame_time_ms_local:.0f}/{vps_config.max_frame_time_ms_global:.0f}, "
@@ -1132,9 +1142,10 @@ class VPSRunner:
             )
         
         # Create VPSRunner
+        active_rectifier = fisheye_rectifier if bool(vps_config.use_rectifier) else None
         return cls(
             mbtiles_path=mbtiles_path,
-            fisheye_rectifier=fisheye_rectifier,
+            fisheye_rectifier=active_rectifier,
             camera_intrinsics=camera_intrinsics,
             config=vps_config,
             device=vps_config.device,
