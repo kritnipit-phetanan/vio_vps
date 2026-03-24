@@ -90,6 +90,63 @@ class VPSPositionController:
     def __init__(self, runner: Any, vio_service: Any):
         self.runner = runner
         self.vio_service = vio_service
+        # Q3/Q4 temporal continuity buffers (source-only gate relaxation).
+        self._temporal_q34_window: dict[str, list[int]] = {
+            "failsoft": [],
+            "rescue": [],
+        }
+
+    def _trace_q_bucket(self, t_cam: float) -> int:
+        q_bucket = 1
+        try:
+            if self.vio_service is not None and hasattr(self.vio_service, "_trace_q_bucket"):
+                q_bucket = int(self.vio_service._trace_q_bucket(float(t_cam)))
+        except Exception:
+            q_bucket = 1
+        return int(np.clip(int(q_bucket), 1, 4))
+
+    def _temporal_q34_window_pass(
+        self,
+        *,
+        t_cam: float,
+        temporal_hits: int,
+        rescue_mode: bool,
+        default_min_hits_required: int,
+    ) -> tuple[bool, str, bool]:
+        """Q3/Q4-only temporal gate: 2-of-4 style window for failsoft/rescue."""
+        cfg = self.runner.global_config
+        enable = bool(cfg.get("VPS_TEMPORAL_CONSENSUS_Q34_WINDOW_ENABLE", False))
+        if not enable:
+            return bool(temporal_hits >= default_min_hits_required), "", False
+        q_bucket = self._trace_q_bucket(float(t_cam))
+        q34_start = int(np.clip(int(cfg.get("VPS_TEMPORAL_CONSENSUS_Q34_START_BUCKET", 3)), 1, 4))
+        if q_bucket < q34_start:
+            return bool(temporal_hits >= default_min_hits_required), "", False
+
+        lane = "rescue" if bool(rescue_mode) else "failsoft"
+        window = self._temporal_q34_window.setdefault(lane, [])
+        window_size = int(max(2, cfg.get("VPS_TEMPORAL_CONSENSUS_Q34_WINDOW_SIZE", 4)))
+        required_hits = int(np.clip(int(cfg.get("VPS_TEMPORAL_CONSENSUS_Q34_WINDOW_REQUIRED_HITS", 2)), 1, window_size))
+        unit_min_hits = int(max(1, cfg.get("VPS_TEMPORAL_CONSENSUS_Q34_UNIT_MIN_HITS", 2)))
+        is_hit = 1 if int(max(0, temporal_hits)) >= unit_min_hits else 0
+        window.append(is_hit)
+        if len(window) > window_size:
+            del window[:-window_size]
+        hits = int(sum(int(v) for v in window))
+        passes = bool(hits >= required_hits)
+        note = (
+            f"Q34_TEMPORAL_WINDOW:{hits}/{len(window)}"
+            f"|req={required_hits}|unit={unit_min_hits}|q={q_bucket}"
+        )
+        if passes:
+            self.runner._vps_temporal_q34_window_pass_count = int(
+                getattr(self.runner, "_vps_temporal_q34_window_pass_count", 0)
+            ) + 1
+        else:
+            self.runner._vps_temporal_q34_window_block_count = int(
+                getattr(self.runner, "_vps_temporal_q34_window_block_count", 0)
+            ) + 1
+        return passes, note, True
 
     @classmethod
     def is_soft_accept_reason(cls, reason_code: str) -> bool:
@@ -635,12 +692,24 @@ class VPSPositionController:
                 int(runner.global_config.get("VPS_TEMPORAL_CONSENSUS_MIN_HITS_RESCUE", 3)),
             )
             min_hits_required = int(min_hits_rescue if rescue_mode else min_hits_failsoft)
-            if temporal_hits < min_hits_required:
+            temporal_pass = bool(temporal_hits >= min_hits_required)
+            temporal_note_extra = ""
+            q34_window_used = False
+            if not temporal_pass:
+                temporal_pass, temporal_note_extra, q34_window_used = self._temporal_q34_window_pass(
+                    t_cam=float(evidence.t_cam),
+                    temporal_hits=temporal_hits,
+                    rescue_mode=bool(rescue_mode),
+                    default_min_hits_required=min_hits_required,
+                )
+            if not temporal_pass:
                 quality_mode = "reject"
                 temporal_reject_note = (
                     f"SOFT_REJECT_TEMPORAL_HITS:{temporal_hits}/{min_hits_required}"
                     + ("|rescue" if rescue_mode else "")
                 )
+                if str(temporal_note_extra):
+                    temporal_reject_note = f"{temporal_reject_note}|{temporal_note_extra}"
                 runner._vps_temporal_consensus_block_count = int(
                     getattr(runner, "_vps_temporal_consensus_block_count", 0)
                 ) + 1
@@ -648,6 +717,10 @@ class VPSPositionController:
                 runner._vps_temporal_consensus_pass_count = int(
                     getattr(runner, "_vps_temporal_consensus_pass_count", 0)
                 ) + 1
+                if q34_window_used:
+                    runner._vps_temporal_consensus_q34_window_used_count = int(
+                        getattr(runner, "_vps_temporal_consensus_q34_window_used_count", 0)
+                    ) + 1
 
         if quality_mode == "failsoft":
             skip_temporal = bool(

@@ -1961,6 +1961,21 @@ def load_config(config_path: str) -> VIOConfig:
             vps_cfg.get('temporal_consensus_min_hits_rescue', 3),
         )
     )
+    result['VPS_TEMPORAL_CONSENSUS_Q34_WINDOW_ENABLE'] = bool(
+        vps_cfg.get('temporal_consensus_q34_window_enable', False)
+    )
+    result['VPS_TEMPORAL_CONSENSUS_Q34_START_BUCKET'] = int(
+        np.clip(vps_cfg.get('temporal_consensus_q34_start_bucket', 3), 1, 4)
+    )
+    result['VPS_TEMPORAL_CONSENSUS_Q34_WINDOW_SIZE'] = int(
+        max(2, vps_cfg.get('temporal_consensus_q34_window_size', 4))
+    )
+    result['VPS_TEMPORAL_CONSENSUS_Q34_WINDOW_REQUIRED_HITS'] = int(
+        max(1, vps_cfg.get('temporal_consensus_q34_window_required_hits', 2))
+    )
+    result['VPS_TEMPORAL_CONSENSUS_Q34_UNIT_MIN_HITS'] = int(
+        max(1, vps_cfg.get('temporal_consensus_q34_unit_min_hits', 2))
+    )
     result['VPS_APPLY_FAILSOFT_ALLOW_WARNING'] = bool(
         vps_cfg.get('apply_failsoft_allow_warning', True)
     )
@@ -2566,6 +2581,42 @@ def load_config(config_path: str) -> VIOConfig:
     )
     result['BACKEND_SUPERVISOR_RESIDUAL_MONOTONIC_MIN_DROP'] = float(
         max(0.0, supervisor_cfg.get('residual_monotonic_min_drop', 0.0))
+    )
+    result['BACKEND_SUPERVISOR_Q34_CONTINUITY_COMMIT_ENABLE'] = bool(
+        supervisor_cfg.get('q34_continuity_commit_enable', False)
+    )
+    result['BACKEND_SUPERVISOR_Q34_CONTINUITY_START_BUCKET'] = int(
+        np.clip(supervisor_cfg.get('q34_continuity_start_bucket', 3), 1, 4)
+    )
+    result['BACKEND_SUPERVISOR_Q34_CONTINUITY_MIN_NO_COMMIT_STREAK'] = int(
+        max(1, supervisor_cfg.get('q34_continuity_min_no_commit_streak', 8))
+    )
+    result['BACKEND_SUPERVISOR_Q34_CONTINUITY_MIN_QUALITY'] = float(
+        np.clip(supervisor_cfg.get('q34_continuity_min_quality', 0.33), 0.0, 1.0)
+    )
+    result['BACKEND_SUPERVISOR_Q34_CONTINUITY_MIN_SOURCE_REL'] = float(
+        np.clip(supervisor_cfg.get('q34_continuity_min_source_rel', 0.28), 0.0, 1.0)
+    )
+    result['BACKEND_SUPERVISOR_Q34_CONTINUITY_MAX_DP_XY_M'] = float(
+        max(0.1, supervisor_cfg.get('q34_continuity_max_dp_xy_m', 6.0))
+    )
+    result['BACKEND_SUPERVISOR_Q34_CONTINUITY_REQUIRE_DIRECTION'] = bool(
+        supervisor_cfg.get('q34_continuity_require_direction', True)
+    )
+    result['BACKEND_SUPERVISOR_Q34_CONTINUITY_REQUIRE_MAGNITUDE'] = bool(
+        supervisor_cfg.get('q34_continuity_require_magnitude', True)
+    )
+    result['BACKEND_SUPERVISOR_SOURCE_QUALITY_COUPLING_ENABLE'] = bool(
+        supervisor_cfg.get('source_quality_coupling_enable', False)
+    )
+    result['BACKEND_SUPERVISOR_SOURCE_QUALITY_ROUTING_BLEND'] = float(
+        np.clip(supervisor_cfg.get('source_quality_routing_blend', 0.25), 0.0, 1.0)
+    )
+    result['BACKEND_SUPERVISOR_SOURCE_QUALITY_TEMPORAL_REF_HITS'] = float(
+        max(1.0, supervisor_cfg.get('source_quality_temporal_ref_hits', 3.0))
+    )
+    result['BACKEND_SUPERVISOR_SOURCE_QUALITY_TEMPORAL_BONUS_MAX'] = float(
+        np.clip(supervisor_cfg.get('source_quality_temporal_bonus_max', 0.08), 0.0, 0.25)
     )
     result['BACKEND_SUPERVISOR_PROXY_MAX_SPEED_M_S'] = float(
         max(0.0, supervisor_cfg.get('proxy_max_speed_m_s', 1.0e9))

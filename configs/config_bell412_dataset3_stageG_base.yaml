@@ -436,6 +436,18 @@ backend:
     defer_first_enable: true
     proxy_evidence_enable: true
     residual_monotonic_commit_enable: true
+    q34_continuity_commit_enable: true
+    q34_continuity_start_bucket: 3
+    q34_continuity_min_no_commit_streak: 8
+    q34_continuity_min_quality: 0.28
+    q34_continuity_min_source_rel: 0.28
+    q34_continuity_max_dp_xy_m: 6.0
+    q34_continuity_require_direction: true
+    q34_continuity_require_magnitude: true
+    source_quality_coupling_enable: false
+    source_quality_routing_blend: 0.25
+    source_quality_temporal_ref_hits: 3
+    source_quality_temporal_bonus_max: 0.08
     reject_to_hint_only: true
     defer_direction_gate: true
     replace_min_score_delta: 0.06
@@ -1482,6 +1494,11 @@ vps:
   apply_failsoft_large_offset_confirm_m: 60.0
   temporal_consensus_min_hits_failsoft: 2
   temporal_consensus_min_hits_rescue: 3
+  temporal_consensus_q34_window_enable: true
+  temporal_consensus_q34_start_bucket: 3
+  temporal_consensus_q34_window_size: 4
+  temporal_consensus_q34_window_required_hits: 2
+  temporal_consensus_q34_unit_min_hits: 2
   apply_failsoft_max_dir_change_deg: 55.0
   apply_failsoft_dir_gate_max_speed_m_s: 12.0
   apply_failsoft_dir_gate_max_yaw_rate_deg_s: 25.0

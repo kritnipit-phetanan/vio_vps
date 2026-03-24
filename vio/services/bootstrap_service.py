@@ -682,6 +682,14 @@ class BootstrapService:
         runner._backend_probation_commit_count = 0
         runner._backend_probation_reject_count = 0
         runner._backend_time_aligned_apply_count = 0
+        runner._backend_no_commit_streak = 0
+        runner._backend_no_commit_streak_max = 0
+        runner._backend_continuity_try_count = 0
+        runner._backend_continuity_bounded_commit_count = 0
+        runner._backend_commit_q1_count = 0
+        runner._backend_commit_q2_count = 0
+        runner._backend_commit_q3_count = 0
+        runner._backend_commit_q4_count = 0
         runner._backend_probation_candidate = None
         runner._backend_source_reliability = {}
         runner._backend_source_reliability_hist = {

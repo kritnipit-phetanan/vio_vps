@@ -587,6 +587,13 @@ def append_benchmark_health_summary(summary_csv: Optional[str],
                                     backend_probation_commit_count: float = float("nan"),
                                     backend_probation_reject_count: float = float("nan"),
                                     backend_time_aligned_apply_count: float = float("nan"),
+                                    backend_no_commit_streak_max: float = float("nan"),
+                                    backend_continuity_try_count: float = float("nan"),
+                                    backend_continuity_bounded_commit_count: float = float("nan"),
+                                    backend_commit_q1_count: float = float("nan"),
+                                    backend_commit_q2_count: float = float("nan"),
+                                    backend_commit_q3_count: float = float("nan"),
+                                    backend_commit_q4_count: float = float("nan"),
                                     backend_source_reliability_vps_p50: float = float("nan"),
                                     backend_source_reliability_loop_p50: float = float("nan"),
                                     backend_source_reliability_backend_p50: float = float("nan"),
@@ -691,6 +698,10 @@ def append_benchmark_health_summary(summary_csv: Optional[str],
                 f"{backend_proposed_count:.6f},{backend_probation_count:.6f},"
                 f"{backend_probation_commit_count:.6f},{backend_probation_reject_count:.6f},"
                 f"{backend_time_aligned_apply_count:.6f},"
+                f"{backend_no_commit_streak_max:.6f},{backend_continuity_try_count:.6f},"
+                f"{backend_continuity_bounded_commit_count:.6f},"
+                f"{backend_commit_q1_count:.6f},{backend_commit_q2_count:.6f},"
+                f"{backend_commit_q3_count:.6f},{backend_commit_q4_count:.6f},"
                 f"{backend_source_reliability_vps_p50:.6f},"
                 f"{backend_source_reliability_loop_p50:.6f},"
                 f"{backend_source_reliability_backend_p50:.6f},"
@@ -1787,6 +1798,9 @@ def init_output_csvs(output_dir: str, save_debug_data: bool = False) -> Dict[str
             "backend_snap_reject_count,backend_apply_latency_ms_p95,backend_contract_violation_count,"
             "backend_proposed_count,backend_probation_count,backend_probation_commit_count,"
             "backend_probation_reject_count,backend_time_aligned_apply_count,"
+            "backend_no_commit_streak_max,backend_continuity_try_count,"
+            "backend_continuity_bounded_commit_count,"
+            "backend_commit_q1_count,backend_commit_q2_count,backend_commit_q3_count,backend_commit_q4_count,"
             "backend_source_reliability_vps_p50,backend_source_reliability_loop_p50,"
             "backend_source_reliability_backend_p50,backend_source_reliability_mag_p50,"
             "backend_reject_contract_violation_count,backend_reject_stale_reject_count,"

@@ -2251,6 +2251,9 @@ class VIOService:
                                     dyaw_deg=0.0,
                                     quality_score=float(hint_quality),
                                     source="VPS",
+                                    quality_total=float(getattr(vps_result, "quality_total", np.nan)),
+                                    temporal_hits=int(getattr(vps_result, "temporal_hits", 0)),
+                                    quality_subscores=str(getattr(vps_result, "quality_subscores", "")),
                                 )
                                 vps_status = f"{vps_status} | XY_DRIFT_RECOVERY_HINT_ONLY"
                             except Exception:
@@ -2504,6 +2507,9 @@ class VIOService:
                                     dyaw_deg=float(dyaw_deg_hint),
                                     quality_score=quality_score,
                                     source="VPS",
+                                    quality_total=float(getattr(vps_result, "quality_total", np.nan)),
+                                    temporal_hits=int(getattr(vps_result, "temporal_hits", 0)),
+                                    quality_subscores=str(getattr(vps_result, "quality_subscores", "")),
                                 )
                             except Exception as exc:
                                 if bool(getattr(runner.config, "save_debug_data", False)):
@@ -2707,6 +2713,23 @@ class VIOService:
                 streak_map[key] = 0
         return streak_map
 
+    def _backend_inc_no_commit_streak(self) -> int:
+        """Increase no-commit streak and keep run-level max for scorecard."""
+        runner = self.runner
+        cur = int(max(0, int(getattr(runner, "_backend_no_commit_streak", 0)))) + 1
+        runner._backend_no_commit_streak = int(cur)
+        runner._backend_no_commit_streak_max = int(
+            max(int(getattr(runner, "_backend_no_commit_streak_max", 0)), int(cur))
+        )
+        return int(cur)
+
+    def _backend_record_commit_q_bucket(self, q_bucket: int) -> None:
+        """Record backend commit count by deterministic quarter bucket."""
+        runner = self.runner
+        q = int(np.clip(int(q_bucket), 1, 4))
+        key = f"_backend_commit_q{q}_count"
+        setattr(runner, key, int(getattr(runner, key, 0)) + 1)
+
     def _backend_update_source_reliability(
         self,
         *,
@@ -2877,6 +2900,9 @@ class VIOService:
         quality = float(candidate.get("corr_quality", np.nan))
         source_rel = float(self._backend_source_reliability_map().get(source, 0.5))
         counts = self._backend_reject_counts()
+        q_bucket = int(self._trace_q_bucket(float(candidate.get("t_ref", t_now))))
+        candidate["q_bucket"] = int(q_bucket)
+        no_commit_streak = int(max(0, int(getattr(runner, "_backend_no_commit_streak", 0))))
 
         def _shape_probation_payload(
             dp_in: np.ndarray,
@@ -2964,6 +2990,7 @@ class VIOService:
                     )
                 )
 
+            blend_steps_out = int(max(1, int(blend_steps_in)))
             dp_xy_local = float(np.linalg.norm(dp_shaped[:2]))
             if np.isfinite(dp_xy_local) and dp_xy_local > max_total_dp_xy and max_total_dp_xy > 1e-6:
                 scale = float(np.clip(max_total_dp_xy / max(dp_xy_local, 1e-9), 0.0, 1.0))
@@ -2975,7 +3002,6 @@ class VIOService:
                 shaped = True
 
             dp_xy_local = float(np.linalg.norm(dp_shaped[:2]))
-            blend_steps_out = int(max(1, int(blend_steps_in)))
             if step_cap_m > 1e-6 and np.isfinite(dp_xy_local) and dp_xy_local > 1e-9:
                 blend_steps_out = int(max(blend_steps_out, int(np.ceil(dp_xy_local / step_cap_m))))
             blend_steps_out = int(max(blend_steps_out, int(min_blend_steps)))
@@ -3264,6 +3290,67 @@ class VIOService:
             "probation_residual_non_monotonic",
             "probation_evidence_insufficient",
         }
+        continuity_enable = bool(
+            runner.global_config.get("BACKEND_SUPERVISOR_Q34_CONTINUITY_COMMIT_ENABLE", False)
+        )
+        continuity_start_bucket = int(
+            np.clip(
+                int(runner.global_config.get("BACKEND_SUPERVISOR_Q34_CONTINUITY_START_BUCKET", 3)),
+                1,
+                4,
+            )
+        )
+        continuity_min_streak = int(
+            max(1, runner.global_config.get("BACKEND_SUPERVISOR_Q34_CONTINUITY_MIN_NO_COMMIT_STREAK", 8))
+        )
+        continuity_min_quality = float(
+            np.clip(
+                runner.global_config.get("BACKEND_SUPERVISOR_Q34_CONTINUITY_MIN_QUALITY", 0.33),
+                0.0,
+                1.0,
+            )
+        )
+        continuity_min_source_rel = float(
+            np.clip(
+                runner.global_config.get("BACKEND_SUPERVISOR_Q34_CONTINUITY_MIN_SOURCE_REL", 0.28),
+                0.0,
+                1.0,
+            )
+        )
+        continuity_max_dp_xy = float(
+            max(0.1, runner.global_config.get("BACKEND_SUPERVISOR_Q34_CONTINUITY_MAX_DP_XY_M", 6.0))
+        )
+        continuity_require_direction = bool(
+            runner.global_config.get("BACKEND_SUPERVISOR_Q34_CONTINUITY_REQUIRE_DIRECTION", True)
+        )
+        continuity_require_magnitude = bool(
+            runner.global_config.get("BACKEND_SUPERVISOR_Q34_CONTINUITY_REQUIRE_MAGNITUDE", True)
+        )
+        continuity_eligible = bool(
+            continuity_enable
+            and bool(soft_fail_reason)
+            and int(q_bucket) >= int(continuity_start_bucket)
+            and int(no_commit_streak) >= int(continuity_min_streak)
+            and int(ticks_seen) >= int(required_ticks)
+            and np.isfinite(float(quality))
+            and float(quality) >= float(continuity_min_quality)
+            and np.isfinite(float(source_rel))
+            and float(source_rel) >= float(continuity_min_source_rel)
+            and np.isfinite(float(dp_xy_norm))
+            and float(dp_xy_norm) <= float(continuity_max_dp_xy)
+            and (
+                (not bool(continuity_require_direction))
+                or bool(direction_consistency_pass)
+            )
+            and (
+                (not bool(continuity_require_magnitude))
+                or bool(magnitude_consistency_pass)
+            )
+        )
+        if continuity_enable and int(q_bucket) >= int(continuity_start_bucket):
+            runner._backend_continuity_try_count = int(
+                getattr(runner, "_backend_continuity_try_count", 0)
+            ) + 1
         candidate["all_pass"] = bool(ok_now)
         candidate["probation_direction_consistent"] = bool(direction_consistency_pass)
         candidate["probation_magnitude_consistent"] = bool(magnitude_consistency_pass)
@@ -3275,16 +3362,19 @@ class VIOService:
             and bool(defer_first_enable)
             and bool(soft_fail_reason)
             and ticks_seen < max_probation_ticks
+            and (not bool(continuity_eligible))
         ):
             counts["probation_deferred"] = int(counts.get("probation_deferred", 0)) + 1
             counts["deferred_probation"] = int(counts.get("deferred_probation", 0)) + 1
             candidate["probation_defer_reason"] = str(fail_reason or "deferred_probation")
+            self._backend_inc_no_commit_streak()
             runner._backend_probation_candidate = candidate
             return
         if ticks_seen < required_ticks:
             return
 
         committed = bool(ok_now)
+        continuity_bounded_commit = False
         evidence_min_ticks = int(
             max(
                 1,
@@ -3300,6 +3390,13 @@ class VIOService:
             counts["probation_evidence_insufficient"] = int(
                 counts.get("probation_evidence_insufficient", 0)
             ) + 1
+        if (not committed) and bool(continuity_eligible):
+            committed = True
+            continuity_bounded_commit = True
+            fail_reason = "continuity_bounded_commit"
+            counts["continuity_bounded_commit"] = int(
+                counts.get("continuity_bounded_commit", 0)
+            ) + 1
         if committed:
             commit_energy_shaping_enable = bool(
                 runner.global_config.get(
@@ -3312,7 +3409,7 @@ class VIOService:
                     np.asarray(candidate.get("dp", np.zeros(3, dtype=float)), dtype=float),
                     float(candidate.get("dyaw_deg", 0.0)),
                     int(candidate.get("blend_steps", 1)),
-                    bounded=False,
+                    bounded=bool(continuity_bounded_commit),
                 )
             else:
                 shaped_dp = np.asarray(candidate.get("dp", np.zeros(3, dtype=float)), dtype=float).reshape(3,)
@@ -3371,7 +3468,12 @@ class VIOService:
                 runner._backend_time_aligned_apply_count = int(
                     getattr(runner, "_backend_time_aligned_apply_count", 0)
                 ) + 1
+            runner._backend_no_commit_streak = 0
+            self._backend_record_commit_q_bucket(int(candidate.get("q_bucket", q_bucket)))
             commit_reason = (
+                "continuity_bounded_commit"
+                if bool(continuity_bounded_commit)
+                else
                 "probation_commit_clamped_energy_shaped"
                 if bool(candidate.get("probation_clamped", False)) and bool(energy_shaped)
                 else "probation_commit_clamped"
@@ -3380,6 +3482,10 @@ class VIOService:
                 if bool(energy_shaped)
                 else "probation_commit"
             )
+            if bool(continuity_bounded_commit):
+                runner._backend_continuity_bounded_commit_count = int(
+                    getattr(runner, "_backend_continuity_bounded_commit_count", 0)
+                ) + 1
             self._backend_update_source_reliability(
                 source=source,
                 quality_score=quality,
@@ -3406,6 +3512,7 @@ class VIOService:
             reason = fail_reason if str(fail_reason).strip() else "hard_reject_quality"
             counts[str(reason)] = int(counts.get(str(reason), 0)) + 1
             runner._backend_probation_reject_count = int(getattr(runner, "_backend_probation_reject_count", 0)) + 1
+            self._backend_inc_no_commit_streak()
             self._backend_update_source_reliability(
                 source=source,
                 quality_score=quality,
@@ -3479,7 +3586,45 @@ class VIOService:
                 else "BACKEND"
             )
         direct_xy_lane = bool(float(resid.get("direct_xy_lane", 0.0)) >= 0.5)
-        corr_quality = float(np.clip(float(contract.quality_score), 0.0, 1.0))
+        corr_quality_raw = float(np.clip(float(contract.quality_score), 0.0, 1.0))
+        corr_quality = float(corr_quality_raw)
+        quality_total_hint = float(resid.get("quality_total_mean", np.nan))
+        temporal_hits_hint = float(resid.get("temporal_hits_p50", np.nan))
+        if bool(runner.global_config.get("BACKEND_SUPERVISOR_SOURCE_QUALITY_COUPLING_ENABLE", False)):
+            blend = float(
+                np.clip(
+                    runner.global_config.get("BACKEND_SUPERVISOR_SOURCE_QUALITY_ROUTING_BLEND", 0.25),
+                    0.0,
+                    1.0,
+                )
+            )
+            temporal_ref_hits = float(
+                max(
+                    1.0,
+                    runner.global_config.get("BACKEND_SUPERVISOR_SOURCE_QUALITY_TEMPORAL_REF_HITS", 3.0),
+                )
+            )
+            temporal_bonus_max = float(
+                np.clip(
+                    runner.global_config.get("BACKEND_SUPERVISOR_SOURCE_QUALITY_TEMPORAL_BONUS_MAX", 0.08),
+                    0.0,
+                    0.25,
+                )
+            )
+            if np.isfinite(quality_total_hint):
+                corr_quality = float(
+                    np.clip(
+                        (1.0 - blend) * corr_quality_raw + blend * float(np.clip(quality_total_hint, 0.0, 1.0)),
+                        0.0,
+                        1.0,
+                    )
+                )
+            if np.isfinite(temporal_hits_hint) and temporal_bonus_max > 0.0:
+                bonus = float(
+                    temporal_bonus_max
+                    * float(np.clip(float(temporal_hits_hint) / temporal_ref_hits, 0.0, 1.0))
+                )
+                corr_quality = float(np.clip(corr_quality + bonus, 0.0, 1.0))
         corr_age_sec = float(contract.age_sec)
         residual_xy_metric = float(
             resid.get(
@@ -4051,6 +4196,9 @@ class VIOService:
                 "dyaw_deg": float(dyaw_deg),
                 "blend_steps": int(blend_steps),
                 "corr_quality": float(corr_quality),
+                "corr_quality_raw": float(corr_quality_raw),
+                "quality_total_hint": float(quality_total_hint) if np.isfinite(quality_total_hint) else float("nan"),
+                "temporal_hits_hint": float(temporal_hits_hint) if np.isfinite(temporal_hits_hint) else float("nan"),
                 "corr_age_sec": float(corr_age_sec),
                 "residual_xy_metric": float(residual_xy_metric),
                 "source": str(source_name),

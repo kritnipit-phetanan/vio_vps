@@ -1149,6 +1149,15 @@ class OutputReportingService:
         backend_probation_commit_count = float(int(getattr(self.runner, "_backend_probation_commit_count", 0)))
         backend_probation_reject_count = float(int(getattr(self.runner, "_backend_probation_reject_count", 0)))
         backend_time_aligned_apply_count = float(int(getattr(self.runner, "_backend_time_aligned_apply_count", 0)))
+        backend_no_commit_streak_max = float(int(getattr(self.runner, "_backend_no_commit_streak_max", 0)))
+        backend_continuity_try_count = float(int(getattr(self.runner, "_backend_continuity_try_count", 0)))
+        backend_continuity_bounded_commit_count = float(
+            int(getattr(self.runner, "_backend_continuity_bounded_commit_count", 0))
+        )
+        backend_commit_q1_count = float(int(getattr(self.runner, "_backend_commit_q1_count", 0)))
+        backend_commit_q2_count = float(int(getattr(self.runner, "_backend_commit_q2_count", 0)))
+        backend_commit_q3_count = float(int(getattr(self.runner, "_backend_commit_q3_count", 0)))
+        backend_commit_q4_count = float(int(getattr(self.runner, "_backend_commit_q4_count", 0)))
         backend_source_reliability_vps_p50 = float("nan")
         backend_source_reliability_loop_p50 = float("nan")
         backend_source_reliability_backend_p50 = float("nan")
@@ -1377,6 +1386,13 @@ class OutputReportingService:
             backend_probation_commit_count=backend_probation_commit_count,
             backend_probation_reject_count=backend_probation_reject_count,
             backend_time_aligned_apply_count=backend_time_aligned_apply_count,
+            backend_no_commit_streak_max=backend_no_commit_streak_max,
+            backend_continuity_try_count=backend_continuity_try_count,
+            backend_continuity_bounded_commit_count=backend_continuity_bounded_commit_count,
+            backend_commit_q1_count=backend_commit_q1_count,
+            backend_commit_q2_count=backend_commit_q2_count,
+            backend_commit_q3_count=backend_commit_q3_count,
+            backend_commit_q4_count=backend_commit_q4_count,
             backend_source_reliability_vps_p50=backend_source_reliability_vps_p50,
             backend_source_reliability_loop_p50=backend_source_reliability_loop_p50,
             backend_source_reliability_backend_p50=backend_source_reliability_backend_p50,

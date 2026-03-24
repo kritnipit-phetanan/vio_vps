@@ -17,7 +17,7 @@ from __future__ import annotations
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Mapping, Optional
 
 import numpy as np
@@ -192,6 +192,9 @@ class _AbsHint:
     dyaw_deg: float
     quality: float
     source: str
+    quality_total: float = float("nan")
+    temporal_hits: int = 0
+    quality_subscores: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -378,17 +381,46 @@ class BackendOptimizer:
         dyaw_deg: float = 0.0,
         quality_score: float = 0.5,
         source: str = "ABS",
+        quality_total: float = float("nan"),
+        temporal_hits: int = 0,
+        quality_subscores: Optional[dict[str, float] | str] = None,
     ) -> None:
         """Report absolute correction hint (e.g., VPS, relocalization)."""
         dp = np.asarray(dp_enu, dtype=float).reshape(3,)
         if not np.all(np.isfinite(dp)):
             return
+        q_total = float(quality_total) if np.isfinite(float(quality_total)) else float("nan")
+        t_hits = int(max(0, int(temporal_hits)))
+        subs: dict[str, float] = {}
+        if isinstance(quality_subscores, dict):
+            for k, v in quality_subscores.items():
+                try:
+                    fv = float(v)
+                except Exception:
+                    continue
+                if np.isfinite(fv):
+                    subs[str(k)] = float(fv)
+        elif isinstance(quality_subscores, str):
+            for token in quality_subscores.replace(";", ",").split(","):
+                part = str(token).strip()
+                if "=" not in part:
+                    continue
+                k, v = part.split("=", 1)
+                try:
+                    fv = float(v)
+                except Exception:
+                    continue
+                if np.isfinite(fv):
+                    subs[str(k).strip()] = float(fv)
         hint = _AbsHint(
             t=float(t_ref),
             dp_enu=dp.copy(),
             dyaw_deg=float(dyaw_deg) if np.isfinite(dyaw_deg) else 0.0,
             quality=float(np.clip(quality_score, 0.0, 1.0)),
             source=str(source or "ABS"),
+            quality_total=q_total,
+            temporal_hits=t_hits,
+            quality_subscores=subs,
         )
         with self._lock:
             self._abs_hints.append(hint)
@@ -625,6 +657,52 @@ class BackendOptimizer:
             "residual_yaw_p50": residual_yaw_p50,
             "residual_yaw_p95": residual_yaw_p95,
         }
+
+        # Optional upstream source-quality telemetry for downstream routing.
+        try:
+            q_total_vals = np.asarray(
+                [float(getattr(h, "quality_total", np.nan)) for h in win_hints],
+                dtype=float,
+            )
+            mask_q_total = np.isfinite(q_total_vals)
+            if np.any(mask_q_total):
+                w_q = np.asarray(w, dtype=float)[mask_q_total]
+                w_q_sum = float(np.sum(w_q))
+                if w_q_sum > 1e-9:
+                    w_q = w_q / w_q_sum
+                    residual_summary["quality_total_mean"] = float(
+                        np.sum(q_total_vals[mask_q_total] * w_q)
+                    )
+            temporal_vals = np.asarray(
+                [float(getattr(h, "temporal_hits", np.nan)) for h in win_hints],
+                dtype=float,
+            )
+            temporal_vals = temporal_vals[np.isfinite(temporal_vals)]
+            if temporal_vals.size > 0:
+                residual_summary["temporal_hits_p50"] = float(np.percentile(temporal_vals, 50))
+            # Aggregate decomposed subscores if present.
+            sub_keys = ("inlier", "conf", "reproj", "temporal", "locality")
+            for key in sub_keys:
+                vals = []
+                w_vals = []
+                for wi, h in zip(w, win_hints):
+                    subs = getattr(h, "quality_subscores", {})
+                    if not isinstance(subs, dict):
+                        continue
+                    fv = float(subs.get(key, np.nan))
+                    if np.isfinite(fv):
+                        vals.append(float(fv))
+                        w_vals.append(float(wi))
+                if len(vals) <= 0:
+                    continue
+                va = np.asarray(vals, dtype=float)
+                wa = np.asarray(w_vals, dtype=float)
+                wsum = float(np.sum(wa))
+                if wsum > 1e-9:
+                    wa = wa / wsum
+                    residual_summary[f"quality_{key}_mean"] = float(np.sum(va * wa))
+        except Exception:
+            pass
         return BackendCorrection(
             t_ref=float(t_max),
             dp_enu=np.asarray(dp_est, dtype=float),
