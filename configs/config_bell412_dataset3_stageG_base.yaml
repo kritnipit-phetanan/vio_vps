@@ -441,7 +441,7 @@ backend:
     q34_continuity_min_no_commit_streak: 8
     q34_continuity_min_quality: 0.28
     q34_continuity_min_source_rel: 0.28
-    q34_continuity_max_dp_xy_m: 6.0
+    q34_continuity_max_dp_xy_m: 30.0
     q34_continuity_require_direction: true
     q34_continuity_require_magnitude: true
     source_quality_coupling_enable: false
