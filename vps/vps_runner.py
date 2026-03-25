@@ -2555,16 +2555,45 @@ class VPSRunner:
         # Keep this lightweight and deterministic so VIO can choose
         # strict/failsoft/direct lanes without re-deriving matcher intent.
         success_reason = "matched_failsoft" if selected_reason == "matched_failsoft" else "matched"
+        # Field-level guards: avoid dropping all metadata due to one bad field.
         try:
             setattr(vps_measurement, "match_reason", str(success_reason))
+        except Exception:
+            pass
+        try:
             setattr(vps_measurement, "match_is_failsoft", bool(success_reason == "matched_failsoft"))
+        except Exception:
+            pass
+        try:
             setattr(
                 vps_measurement,
                 "rescue_trigger_reason",
                 str(getattr(match_result, "rescue_trigger_reason", "none")),
             )
-            q_inlier = float(np.clip(float(match_result.num_inliers) / max(1.0, float(self.config.min_inliers)), 0.0, 1.0))
+        except Exception:
+            pass
+
+        q_inlier = float("nan")
+        q_conf = float("nan")
+        q_reproj = float("nan")
+        q_temporal = float("nan")
+        q_locality = float("nan")
+        quality_total = float("nan")
+        try:
+            q_inlier = float(
+                np.clip(
+                    float(match_result.num_inliers) / max(1.0, float(self.config.min_inliers)),
+                    0.0,
+                    1.0,
+                )
+            )
+        except Exception:
+            pass
+        try:
             q_conf = float(np.clip(float(match_result.confidence), 0.0, 1.0))
+        except Exception:
+            pass
+        try:
             q_reproj = float(
                 np.clip(
                     float(self.config.max_reproj_error) / max(float(match_result.reproj_error), 1e-3),
@@ -2572,6 +2601,9 @@ class VPSRunner:
                     1.0,
                 )
             )
+        except Exception:
+            pass
+        try:
             q_temporal = float(
                 np.clip(
                     float(getattr(self, "_temporal_consensus_hits", 0.0))
@@ -2580,29 +2612,72 @@ class VPSRunner:
                     1.0,
                 )
             )
-            q_locality = 1.0 if (bool(local_first_split_enable) and ((round(float(selected_center_lat), 8), round(float(selected_center_lon), 8)) in local_center_keys)) else 0.0
+        except Exception:
+            pass
+        try:
+            q_locality = (
+                1.0
+                if (
+                    bool(local_first_split_enable)
+                    and (
+                        (round(float(selected_center_lat), 8), round(float(selected_center_lon), 8))
+                        in local_center_keys
+                    )
+                )
+                else 0.0
+            )
+        except Exception:
+            pass
+        try:
             w_inlier = max(0.0, float(self.config.quality_weight_inlier))
             w_conf = max(0.0, float(self.config.quality_weight_confidence))
             w_reproj = max(0.0, float(self.config.quality_weight_reproj))
             w_temporal = max(0.0, float(self.config.quality_weight_temporal))
             w_locality = max(0.0, float(self.config.quality_weight_locality))
             w_sum = max(1e-9, w_inlier + w_conf + w_reproj + w_temporal + w_locality)
+            q_inlier_v = 0.0 if not np.isfinite(q_inlier) else float(q_inlier)
+            q_conf_v = 0.0 if not np.isfinite(q_conf) else float(q_conf)
+            q_reproj_v = 0.0 if not np.isfinite(q_reproj) else float(q_reproj)
+            q_temporal_v = 0.0 if not np.isfinite(q_temporal) else float(q_temporal)
+            q_locality_v = 0.0 if not np.isfinite(q_locality) else float(q_locality)
             quality_total = float(
-                (w_inlier * q_inlier + w_conf * q_conf + w_reproj * q_reproj + w_temporal * q_temporal + w_locality * q_locality)
+                (
+                    w_inlier * q_inlier_v
+                    + w_conf * q_conf_v
+                    + w_reproj * q_reproj_v
+                    + w_temporal * q_temporal_v
+                    + w_locality * q_locality_v
+                )
                 / w_sum
             )
+        except Exception:
+            pass
+
+        try:
             # CSV-safe string (semicolon-delimited key=value pairs).
             setattr(
                 vps_measurement,
                 "quality_subscores",
                 (
-                    f"inlier={q_inlier:.3f};conf={q_conf:.3f};reproj={q_reproj:.3f};"
-                    f"temporal={q_temporal:.3f};locality={q_locality:.3f};"
-                    f"total={quality_total:.3f}"
+                    f"inlier={q_inlier if np.isfinite(q_inlier) else float('nan'):.3f};"
+                    f"conf={q_conf if np.isfinite(q_conf) else float('nan'):.3f};"
+                    f"reproj={q_reproj if np.isfinite(q_reproj) else float('nan'):.3f};"
+                    f"temporal={q_temporal if np.isfinite(q_temporal) else float('nan'):.3f};"
+                    f"locality={q_locality if np.isfinite(q_locality) else float('nan'):.3f};"
+                    f"total={quality_total if np.isfinite(quality_total) else float('nan'):.3f}"
                 ),
             )
+        except Exception:
+            pass
+        try:
             setattr(vps_measurement, "quality_total", float(quality_total))
+        except Exception:
+            pass
+        try:
             setattr(vps_measurement, "temporal_hits", int(getattr(self, "_temporal_consensus_hits", 0)))
+        except Exception:
+            pass
+        try:
             setattr(vps_measurement, "scale_pruned_band", str(getattr(self, "_last_scale_pruned_band", "full")))
         except Exception:
             pass
