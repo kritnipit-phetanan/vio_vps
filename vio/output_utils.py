@@ -494,6 +494,9 @@ def append_benchmark_health_summary(summary_csv: Optional[str],
                                     vps_baro_scale_prune_fallback_count: float = float("nan"),
                                     vps_local_first_stage_attempts: float = float("nan"),
                                     vps_local_first_success_count: float = float("nan"),
+                                    vps_reloc_burst_count: float = float("nan"),
+                                    vps_hypothesis_commit_count: float = float("nan"),
+                                    vps_hypothesis_discard_count: float = float("nan"),
                                     abs_corr_apply_count: float = float("nan"),
                                     abs_corr_soft_count: float = float("nan"),
                                     backend_apply_count: float = float("nan"),
@@ -594,6 +597,7 @@ def append_benchmark_health_summary(summary_csv: Optional[str],
                                     backend_commit_q2_count: float = float("nan"),
                                     backend_commit_q3_count: float = float("nan"),
                                     backend_commit_q4_count: float = float("nan"),
+                                    backend_q4_continuity_commit_count: float = float("nan"),
                                     backend_source_reliability_vps_p50: float = float("nan"),
                                     backend_source_reliability_loop_p50: float = float("nan"),
                                     backend_source_reliability_backend_p50: float = float("nan"),
@@ -633,6 +637,7 @@ def append_benchmark_health_summary(summary_csv: Optional[str],
                     f"{vps_anchor_failsoft_block_count:.6f},"
                     f"{vps_baro_scale_prune_applied_count:.6f},{vps_baro_scale_prune_fallback_count:.6f},"
                     f"{vps_local_first_stage_attempts:.6f},{vps_local_first_success_count:.6f},"
+                    f"{vps_reloc_burst_count:.6f},{vps_hypothesis_commit_count:.6f},{vps_hypothesis_discard_count:.6f},"
                     f"{abs_corr_apply_count:.6f},{abs_corr_soft_count:.6f},"
                 f"{backend_apply_count:.6f},{backend_stale_drop_count:.6f},"
                 f"{backend_emit_stale_drop_count:.6f},{backend_overwrite_count:.6f},"
@@ -702,6 +707,7 @@ def append_benchmark_health_summary(summary_csv: Optional[str],
                 f"{backend_continuity_bounded_commit_count:.6f},"
                 f"{backend_commit_q1_count:.6f},{backend_commit_q2_count:.6f},"
                 f"{backend_commit_q3_count:.6f},{backend_commit_q4_count:.6f},"
+                f"{backend_q4_continuity_commit_count:.6f},"
                 f"{backend_source_reliability_vps_p50:.6f},"
                 f"{backend_source_reliability_loop_p50:.6f},"
                 f"{backend_source_reliability_backend_p50:.6f},"
@@ -1690,7 +1696,8 @@ def init_output_csvs(output_dir: str, save_debug_data: bool = False) -> Dict[str
             "apply_score,consensus_score,geometry_score,motion_score,bounded_clamp_m,allow_direct_xy_apply,"
             "direct_xy_candidate,hint_quality,offset_m,inliers,confidence,reproj_error,"
             "applied,reason_code,reject_reason,residual_xy,applied_dp_xy,policy_note,hard_note,temporal_note,direct_note,"
-            "rescue_trigger_reason,quality_subscores,temporal_hits,scale_pruned_band,reason,q_bucket\n"
+            "rescue_trigger_reason,quality_subscores,temporal_hits,scale_pruned_band,reason,q_bucket,"
+            "decision_state,candidate_mode,burst_active,hypothesis_id\n"
         )
 
     # Single-authority policy traces
@@ -1743,6 +1750,7 @@ def init_output_csvs(output_dir: str, save_debug_data: bool = False) -> Dict[str
             "vps_anchor_failsoft_block_count,"
             "vps_baro_scale_prune_applied_count,vps_baro_scale_prune_fallback_count,"
             "vps_local_first_stage_attempts,vps_local_first_success_count,"
+            "vps_reloc_burst_count,vps_hypothesis_commit_count,vps_hypothesis_discard_count,"
             "abs_corr_apply_count,abs_corr_soft_count,"
             "backend_apply_count,backend_stale_drop_count,backend_emit_stale_drop_count,"
             "backend_overwrite_count,backend_poll_count,"
@@ -1801,6 +1809,7 @@ def init_output_csvs(output_dir: str, save_debug_data: bool = False) -> Dict[str
             "backend_no_commit_streak_max,backend_continuity_try_count,"
             "backend_continuity_bounded_commit_count,"
             "backend_commit_q1_count,backend_commit_q2_count,backend_commit_q3_count,backend_commit_q4_count,"
+            "backend_q4_continuity_commit_count,"
             "backend_source_reliability_vps_p50,backend_source_reliability_loop_p50,"
             "backend_source_reliability_backend_p50,backend_source_reliability_mag_p50,"
             "backend_reject_contract_violation_count,backend_reject_stale_reject_count,"

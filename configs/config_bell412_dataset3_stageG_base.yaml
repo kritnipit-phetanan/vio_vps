@@ -444,6 +444,16 @@ backend:
     q34_continuity_max_dp_xy_m: 30.0
     q34_continuity_require_direction: true
     q34_continuity_require_magnitude: true
+    q4_continuity_enable: true
+    q4_continuity_min_no_commit_streak: 6
+    q4_continuity_min_quality: 0.28
+    q4_continuity_min_source_rel: 0.20
+    q4_continuity_max_dp_xy_m: 18.0
+    q4_continuity_require_direction: false
+    q4_continuity_require_magnitude: true
+    q4_continuity_step_cap_m: 0.6
+    q4_continuity_window_budget_m: 4.0
+    q4_continuity_window_sec: 4.0
     source_quality_coupling_enable: false
     source_quality_routing_blend: 0.25
     source_quality_temporal_ref_hits: 3
@@ -1619,6 +1629,17 @@ vps:
     local_first_min_candidates: 8
     local_first_min_time_ms: 220.0
     local_first_center_radius_m: 180.0
+    q2_reloc_burst_enable: false
+    q2_reloc_burst_trigger_streak: 3
+    q2_reloc_burst_offset_m: 25.0
+    q2_reloc_burst_frames: 3
+    q2_reloc_burst_cooldown_sec: 8.0
+    q2_reloc_burst_global_candidates: 8
+    q2_reloc_burst_extra_budget_ms: 250.0
+    q2_hypothesis_topk: 3
+    q2_hypothesis_repeat_frames: 2
+    q2_hypothesis_score_margin: 0.12
+    continuity_anchor_enable: true
     budget_escalator_enable: true
     budget_escalator_trigger_streak: 3
     budget_escalator_max_level: 3

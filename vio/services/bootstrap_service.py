@@ -686,6 +686,7 @@ class BootstrapService:
         runner._backend_no_commit_streak_max = 0
         runner._backend_continuity_try_count = 0
         runner._backend_continuity_bounded_commit_count = 0
+        runner._backend_q4_continuity_commit_count = 0
         runner._backend_commit_q1_count = 0
         runner._backend_commit_q2_count = 0
         runner._backend_commit_q3_count = 0
@@ -830,6 +831,8 @@ class BootstrapService:
                         print(f"[VPS] Match visualizations will be saved")
                     if getattr(runner, "vps_reloc_summary_csv", None):
                         runner.vps_runner.reloc_summary_csv = runner.vps_reloc_summary_csv
+                    runner.vps_runner.imgs = getattr(runner, "imgs", None)
+                    runner.vps_runner.imu = getattr(runner, "imu", None)
 
                     from vps import VPSDelayedUpdateManager
 

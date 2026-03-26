@@ -2147,6 +2147,9 @@ class VIOService:
                             )
                         ),
                         scale_pruned_band=str(getattr(vps_result, "scale_pruned_band", "full")),
+                        candidate_mode=str(getattr(vps_result, "candidate_mode", "local")),
+                        burst_active=bool(getattr(vps_result, "burst_active", False)),
+                        hypothesis_id=str(getattr(vps_result, "hypothesis_id", "none")),
                     )
                     pos_decision = self.vps_position_controller.decide_and_classify(evidence)
                     quality_mode = str(pos_decision.quality_mode)
@@ -2894,6 +2897,8 @@ class VIOService:
         fail_reason = ""
         magnitude_consistency_pass = True
         direction_consistency_pass = True
+        magnitude_bounded_for_continuity = False
+        direction_soft_fail = False
         dp = np.asarray(candidate.get("dp", np.zeros(3, dtype=float)), dtype=float).reshape(3,)
         dp_xy_norm = float(np.linalg.norm(dp[:2]))
         source = str(candidate.get("source", "BACKEND")).upper()
@@ -2910,6 +2915,7 @@ class VIOService:
             blend_steps_in: int,
             *,
             bounded: bool,
+            q4_mode: bool,
         ) -> tuple[np.ndarray, float, int, bool]:
             """Deterministic energy shaping for probation commits."""
             dp_shaped = np.asarray(dp_in, dtype=float).reshape(3,).copy()
@@ -2990,6 +2996,18 @@ class VIOService:
                     )
                 )
 
+            if bool(q4_mode):
+                step_cap_m = float(
+                    max(
+                        0.05,
+                        runner.global_config.get(
+                            "BACKEND_SUPERVISOR_Q4_CONTINUITY_STEP_CAP_M",
+                            0.6,
+                        ),
+                    )
+                )
+                max_dyaw_deg = 0.0
+
             blend_steps_out = int(max(1, int(blend_steps_in)))
             dp_xy_local = float(np.linalg.norm(dp_shaped[:2]))
             if np.isfinite(dp_xy_local) and dp_xy_local > max_total_dp_xy and max_total_dp_xy > 1e-6:
@@ -2997,11 +3015,52 @@ class VIOService:
                 dp_shaped[:2] *= scale
                 dyaw_shaped *= scale
                 shaped = True
-            if np.isfinite(dyaw_shaped) and abs(dyaw_shaped) > max_dyaw_deg:
+            if bool(q4_mode):
+                if abs(dyaw_shaped) > 1e-9:
+                    dyaw_shaped = 0.0
+                    shaped = True
+            elif np.isfinite(dyaw_shaped) and abs(dyaw_shaped) > max_dyaw_deg:
                 dyaw_shaped = float(np.clip(dyaw_shaped, -max_dyaw_deg, max_dyaw_deg))
                 shaped = True
 
             dp_xy_local = float(np.linalg.norm(dp_shaped[:2]))
+            if bool(q4_mode):
+                window_budget_m = float(
+                    max(
+                        0.1,
+                        runner.global_config.get(
+                            "BACKEND_SUPERVISOR_Q4_CONTINUITY_WINDOW_BUDGET_M",
+                            3.0,
+                        ),
+                    )
+                )
+                window_sec = float(
+                    max(
+                        0.1,
+                        runner.global_config.get(
+                            "BACKEND_SUPERVISOR_Q4_CONTINUITY_WINDOW_SEC",
+                            4.0,
+                        ),
+                    )
+                )
+                hist = getattr(runner, "_backend_q4_continuity_window_hist", [])
+                if not isinstance(hist, list):
+                    hist = []
+                hist = [
+                    (float(ts), float(val))
+                    for ts, val in hist
+                    if np.isfinite(float(ts))
+                    and np.isfinite(float(val))
+                    and (float(t_now) - float(ts)) <= float(window_sec)
+                ]
+                spent_m = float(sum(max(0.0, float(val)) for _, val in hist))
+                remaining_m = float(max(0.0, window_budget_m - spent_m))
+                if np.isfinite(dp_xy_local) and dp_xy_local > remaining_m and dp_xy_local > 1e-9:
+                    scale = float(np.clip(remaining_m / max(dp_xy_local, 1e-9), 0.0, 1.0))
+                    dp_shaped[:2] *= scale
+                    dp_xy_local = float(np.linalg.norm(dp_shaped[:2]))
+                    shaped = True
+                runner._backend_q4_continuity_window_hist = hist
             if step_cap_m > 1e-6 and np.isfinite(dp_xy_local) and dp_xy_local > 1e-9:
                 blend_steps_out = int(max(blend_steps_out, int(np.ceil(dp_xy_local / step_cap_m))))
             blend_steps_out = int(max(blend_steps_out, int(min_blend_steps)))
@@ -3078,6 +3137,9 @@ class VIOService:
                 runner._backend_kinematic_budget_clamp_count = int(
                     getattr(runner, "_backend_kinematic_budget_clamp_count", 0)
                 ) + 1
+                magnitude_bounded_for_continuity = bool(
+                    np.isfinite(dp_xy_norm) and float(dp_xy_norm) <= float(prob_max_allow_m + 1e-6)
+                )
             else:
                 ok_now = False
                 fail_reason = "kinematic_reject"
@@ -3102,6 +3164,7 @@ class VIOService:
             cos_dir = float(np.dot(np.asarray(dp[:2], dtype=float), vel_xy) / (speed_xy * dp_xy_norm))
             if np.isfinite(cos_dir) and cos_dir < float(min_cos):
                 direction_consistency_pass = False
+                direction_soft_fail = True
                 ok_now = False
                 fail_reason = "kinematic_reject"
 
@@ -3293,6 +3356,7 @@ class VIOService:
         continuity_enable = bool(
             runner.global_config.get("BACKEND_SUPERVISOR_Q34_CONTINUITY_COMMIT_ENABLE", False)
         )
+        continuity_mode = "q34"
         continuity_start_bucket = int(
             np.clip(
                 int(runner.global_config.get("BACKEND_SUPERVISOR_Q34_CONTINUITY_START_BUCKET", 3)),
@@ -3326,9 +3390,70 @@ class VIOService:
         continuity_require_magnitude = bool(
             runner.global_config.get("BACKEND_SUPERVISOR_Q34_CONTINUITY_REQUIRE_MAGNITUDE", True)
         )
+        continuity_reason_ok = bool(soft_fail_reason)
+        if bool(
+            runner.global_config.get("BACKEND_SUPERVISOR_Q4_CONTINUITY_ENABLE", False)
+        ) and int(q_bucket) == 4:
+            continuity_mode = "q4"
+            continuity_enable = True
+            continuity_start_bucket = 4
+            continuity_min_streak = int(
+                max(
+                    1,
+                    runner.global_config.get(
+                        "BACKEND_SUPERVISOR_Q4_CONTINUITY_MIN_NO_COMMIT_STREAK",
+                        6,
+                    ),
+                )
+            )
+            continuity_min_quality = float(
+                np.clip(
+                    runner.global_config.get(
+                        "BACKEND_SUPERVISOR_Q4_CONTINUITY_MIN_QUALITY",
+                        0.28,
+                    ),
+                    0.0,
+                    1.0,
+                )
+            )
+            continuity_min_source_rel = float(
+                np.clip(
+                    runner.global_config.get(
+                        "BACKEND_SUPERVISOR_Q4_CONTINUITY_MIN_SOURCE_REL",
+                        0.20,
+                    ),
+                    0.0,
+                    1.0,
+                )
+            )
+            continuity_max_dp_xy = float(
+                max(
+                    0.1,
+                    runner.global_config.get(
+                        "BACKEND_SUPERVISOR_Q4_CONTINUITY_MAX_DP_XY_M",
+                        18.0,
+                    ),
+                )
+            )
+            continuity_require_direction = bool(
+                runner.global_config.get(
+                    "BACKEND_SUPERVISOR_Q4_CONTINUITY_REQUIRE_DIRECTION",
+                    False,
+                )
+            )
+            continuity_require_magnitude = bool(
+                runner.global_config.get(
+                    "BACKEND_SUPERVISOR_Q4_CONTINUITY_REQUIRE_MAGNITUDE",
+                    True,
+                )
+            )
+            continuity_reason_ok = bool(soft_fail_reason) or bool(direction_soft_fail)
+        continuity_magnitude_ok = bool(
+            magnitude_consistency_pass or magnitude_bounded_for_continuity
+        )
         continuity_eligible = bool(
             continuity_enable
-            and bool(soft_fail_reason)
+            and bool(continuity_reason_ok)
             and int(q_bucket) >= int(continuity_start_bucket)
             and int(no_commit_streak) >= int(continuity_min_streak)
             and int(ticks_seen) >= int(required_ticks)
@@ -3344,7 +3469,7 @@ class VIOService:
             )
             and (
                 (not bool(continuity_require_magnitude))
-                or bool(magnitude_consistency_pass)
+                or bool(continuity_magnitude_ok)
             )
         )
         if continuity_enable and int(q_bucket) >= int(continuity_start_bucket):
@@ -3410,11 +3535,14 @@ class VIOService:
                     float(candidate.get("dyaw_deg", 0.0)),
                     int(candidate.get("blend_steps", 1)),
                     bounded=bool(continuity_bounded_commit),
+                    q4_mode=bool(continuity_bounded_commit and str(continuity_mode) == "q4"),
                 )
             else:
                 shaped_dp = np.asarray(candidate.get("dp", np.zeros(3, dtype=float)), dtype=float).reshape(3,)
                 shaped_dyaw = float(candidate.get("dyaw_deg", 0.0))
                 shaped_steps = int(max(1, int(candidate.get("blend_steps", 1))))
+                if bool(continuity_bounded_commit and str(continuity_mode) == "q4"):
+                    shaped_dyaw = 0.0
                 energy_shaped = False
             if bool(energy_shaped):
                 counts["probation_commit_energy_shaped"] = int(
@@ -3486,6 +3614,15 @@ class VIOService:
                 runner._backend_continuity_bounded_commit_count = int(
                     getattr(runner, "_backend_continuity_bounded_commit_count", 0)
                 ) + 1
+                if str(continuity_mode) == "q4":
+                    runner._backend_q4_continuity_commit_count = int(
+                        getattr(runner, "_backend_q4_continuity_commit_count", 0)
+                    ) + 1
+                    hist = getattr(runner, "_backend_q4_continuity_window_hist", [])
+                    if not isinstance(hist, list):
+                        hist = []
+                    hist.append((float(t_now), float(np.linalg.norm(np.asarray(shaped_dp[:2], dtype=float)))))
+                    runner._backend_q4_continuity_window_hist = hist
             self._backend_update_source_reliability(
                 source=source,
                 quality_score=quality,

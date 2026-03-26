@@ -2606,6 +2606,36 @@ def load_config(config_path: str) -> VIOConfig:
     result['BACKEND_SUPERVISOR_Q34_CONTINUITY_REQUIRE_MAGNITUDE'] = bool(
         supervisor_cfg.get('q34_continuity_require_magnitude', True)
     )
+    result['BACKEND_SUPERVISOR_Q4_CONTINUITY_ENABLE'] = bool(
+        supervisor_cfg.get('q4_continuity_enable', False)
+    )
+    result['BACKEND_SUPERVISOR_Q4_CONTINUITY_MIN_NO_COMMIT_STREAK'] = int(
+        max(1, supervisor_cfg.get('q4_continuity_min_no_commit_streak', 6))
+    )
+    result['BACKEND_SUPERVISOR_Q4_CONTINUITY_MIN_QUALITY'] = float(
+        np.clip(supervisor_cfg.get('q4_continuity_min_quality', 0.28), 0.0, 1.0)
+    )
+    result['BACKEND_SUPERVISOR_Q4_CONTINUITY_MIN_SOURCE_REL'] = float(
+        np.clip(supervisor_cfg.get('q4_continuity_min_source_rel', 0.20), 0.0, 1.0)
+    )
+    result['BACKEND_SUPERVISOR_Q4_CONTINUITY_MAX_DP_XY_M'] = float(
+        max(0.1, supervisor_cfg.get('q4_continuity_max_dp_xy_m', 18.0))
+    )
+    result['BACKEND_SUPERVISOR_Q4_CONTINUITY_REQUIRE_DIRECTION'] = bool(
+        supervisor_cfg.get('q4_continuity_require_direction', False)
+    )
+    result['BACKEND_SUPERVISOR_Q4_CONTINUITY_REQUIRE_MAGNITUDE'] = bool(
+        supervisor_cfg.get('q4_continuity_require_magnitude', True)
+    )
+    result['BACKEND_SUPERVISOR_Q4_CONTINUITY_STEP_CAP_M'] = float(
+        max(0.05, supervisor_cfg.get('q4_continuity_step_cap_m', 0.6))
+    )
+    result['BACKEND_SUPERVISOR_Q4_CONTINUITY_WINDOW_BUDGET_M'] = float(
+        max(0.1, supervisor_cfg.get('q4_continuity_window_budget_m', 3.0))
+    )
+    result['BACKEND_SUPERVISOR_Q4_CONTINUITY_WINDOW_SEC'] = float(
+        max(0.1, supervisor_cfg.get('q4_continuity_window_sec', 4.0))
+    )
     result['BACKEND_SUPERVISOR_SOURCE_QUALITY_COUPLING_ENABLE'] = bool(
         supervisor_cfg.get('source_quality_coupling_enable', False)
     )

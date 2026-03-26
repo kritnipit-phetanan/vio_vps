@@ -1067,9 +1067,12 @@ class OutputReportingService:
             )
         except Exception:
             pass
+        vps_runtime_metrics = {}
         if getattr(self.runner, "vps_runner", None) is not None and hasattr(self.runner.vps_runner, "get_runtime_metrics"):
             try:
                 vps_rt = self.runner.vps_runner.get_runtime_metrics()
+                if isinstance(vps_rt, dict):
+                    vps_runtime_metrics = vps_rt
                 vps_attempt_ms_p50 = float(vps_rt.get("attempt_ms_p50", float("nan")))
                 vps_attempt_ms_p95 = float(vps_rt.get("attempt_ms_p95", float("nan")))
                 vps_time_budget_stops = float(vps_rt.get("time_budget_stops", float("nan")))
@@ -1158,6 +1161,9 @@ class OutputReportingService:
         backend_commit_q2_count = float(int(getattr(self.runner, "_backend_commit_q2_count", 0)))
         backend_commit_q3_count = float(int(getattr(self.runner, "_backend_commit_q3_count", 0)))
         backend_commit_q4_count = float(int(getattr(self.runner, "_backend_commit_q4_count", 0)))
+        backend_q4_continuity_commit_count = float(
+            int(getattr(self.runner, "_backend_q4_continuity_commit_count", 0))
+        )
         backend_source_reliability_vps_p50 = float("nan")
         backend_source_reliability_loop_p50 = float("nan")
         backend_source_reliability_backend_p50 = float("nan")
@@ -1246,6 +1252,13 @@ class OutputReportingService:
         alignment_lock_violation_count = float(int(getattr(self.runner, "_alignment_lock_violation_count", 0)))
         alignment_lock_hint_only_count = float(int(getattr(self.runner, "_alignment_lock_hint_only_count", 0)))
         alignment_lock_reject_count = float(int(getattr(self.runner, "_alignment_lock_reject_count", 0)))
+        vps_reloc_burst_count = float(int(vps_runtime_metrics.get("reloc_burst_count", 0.0)))
+        vps_hypothesis_commit_count = float(
+            int(vps_runtime_metrics.get("hypothesis_commit_count", 0.0))
+        )
+        vps_hypothesis_discard_count = float(
+            int(vps_runtime_metrics.get("hypothesis_discard_count", 0.0))
+        )
         mag_accept_rate = float("nan")
         mag_total = int(getattr(self.runner.state, "mag_updates", 0)) + int(getattr(self.runner.state, "mag_rejects", 0))
         if mag_total > 0:
@@ -1293,6 +1306,9 @@ class OutputReportingService:
             vps_baro_scale_prune_fallback_count=vps_baro_scale_prune_fallback_count,
             vps_local_first_stage_attempts=vps_local_first_stage_attempts,
             vps_local_first_success_count=vps_local_first_success_count,
+            vps_reloc_burst_count=vps_reloc_burst_count,
+            vps_hypothesis_commit_count=vps_hypothesis_commit_count,
+            vps_hypothesis_discard_count=vps_hypothesis_discard_count,
             abs_corr_apply_count=abs_corr_apply_count,
             abs_corr_soft_count=abs_corr_soft_count,
             backend_apply_count=backend_apply_count,
@@ -1393,6 +1409,7 @@ class OutputReportingService:
             backend_commit_q2_count=backend_commit_q2_count,
             backend_commit_q3_count=backend_commit_q3_count,
             backend_commit_q4_count=backend_commit_q4_count,
+            backend_q4_continuity_commit_count=backend_q4_continuity_commit_count,
             backend_source_reliability_vps_p50=backend_source_reliability_vps_p50,
             backend_source_reliability_loop_p50=backend_source_reliability_loop_p50,
             backend_source_reliability_backend_p50=backend_source_reliability_backend_p50,

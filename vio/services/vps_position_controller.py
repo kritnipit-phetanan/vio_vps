@@ -35,6 +35,9 @@ class VpsMatchEvidence:
     quality_subscores: str = ""
     temporal_hits: int = 0
     scale_pruned_band: str = "full"
+    candidate_mode: str = "local"
+    burst_active: bool = False
+    hypothesis_id: str = "none"
 
 
 @dataclass(frozen=True)
@@ -1163,6 +1166,10 @@ class VPSPositionController:
             quality_subscores = str(getattr(evidence, "quality_subscores", "")).replace(",", ";")
             temporal_hits = int(getattr(evidence, "temporal_hits", 0))
             scale_pruned_band = str(getattr(evidence, "scale_pruned_band", "full")).replace(",", ";")
+            decision_state = str(getattr(decision, "decision_lane", "")).strip() or "UNKNOWN"
+            candidate_mode = str(getattr(evidence, "candidate_mode", "local")).strip() or "local"
+            burst_active = int(bool(getattr(evidence, "burst_active", False)))
+            hypothesis_id = str(getattr(evidence, "hypothesis_id", "none")).replace(",", ";").strip() or "none"
             q_bucket = 1
             try:
                 if self.vio_service is not None and hasattr(self.vio_service, "_trace_q_bucket"):
@@ -1186,7 +1193,7 @@ class VPSPositionController:
                     f"{policy_note},{hard_note},"
                     f"{temporal_note},{direct_note},"
                     f"{rescue_trigger_reason},{quality_subscores},{temporal_hits},{scale_pruned_band},"
-                    f"{reason_txt},{int(q_bucket)}\n"
+                    f"{reason_txt},{int(q_bucket)},{decision_state},{candidate_mode},{burst_active},{hypothesis_id}\n"
                 )
         except Exception:
             pass

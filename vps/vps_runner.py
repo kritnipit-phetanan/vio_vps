@@ -168,6 +168,17 @@ class VPSConfig:
     reloc_local_first_min_candidates: int = 8
     reloc_local_first_min_time_ms: float = 220.0
     reloc_local_first_center_radius_m: float = 180.0
+    q2_reloc_burst_enable: bool = False
+    q2_reloc_burst_trigger_streak: int = 3
+    q2_reloc_burst_offset_m: float = 25.0
+    q2_reloc_burst_frames: int = 3
+    q2_reloc_burst_cooldown_sec: float = 8.0
+    q2_reloc_burst_global_candidates: int = 8
+    q2_reloc_burst_extra_budget_ms: float = 250.0
+    q2_hypothesis_topk: int = 3
+    q2_hypothesis_repeat_frames: int = 2
+    q2_hypothesis_score_margin: float = 0.12
+    continuity_anchor_enable: bool = True
     reloc_no_coverage_radius_m: tuple = (25.0, 60.0)
     reloc_no_coverage_samples: int = 6
     reloc_no_coverage_max_centers: int = 6
@@ -256,6 +267,10 @@ class VPSRunner:
         self._runtime_quiet = self._runtime_verbosity in ("release", "quiet", "minimal")
         self._runtime_log_interval_sec = max(0.0, float(self.config.runtime_log_interval_sec))
         self._last_runtime_log_ts: Dict[str, float] = {}
+        self.imgs = None
+        self.imu = None
+        self._trace_q_start_t = float("nan")
+        self._trace_q_end_t = float("nan")
         
         # Initialize components
         print("[VPSRunner] Initializing...")
@@ -324,6 +339,14 @@ class VPSRunner:
         self._budget_escalation_stop_streak = 0
         self._budget_success_streak = 0
         self._altitude_gate_open = True
+        self._q2_local_soft_fail_streak = 0
+        self._q2_burst_until_attempt = -1
+        self._q2_burst_cooldown_until_t = -1e9
+        self._q2_hypothesis_scores: Dict[str, float] = {}
+        self._q2_hypothesis_last_winner = ""
+        self._q2_hypothesis_win_streak = 0
+        self._continuity_anchor_lat = float("nan")
+        self._continuity_anchor_lon = float("nan")
         self.reloc_summary_csv: Optional[str] = None
         
         # Debug logger (set via set_logger)
@@ -371,6 +394,9 @@ class VPSRunner:
             'baro_scale_prune_fallback_count': 0,
             'anchor_failsoft_block_count': 0,
             'anchor_rescue_block_count': 0,
+            'reloc_burst_count': 0,
+            'hypothesis_commit_count': 0,
+            'hypothesis_discard_count': 0,
             'rescue_local_eligible_count': 0,
             'rescue_block_nonlocal_count': 0,
             'rescue_block_rank_count': 0,
@@ -409,6 +435,135 @@ class VPSRunner:
                 f"reason={reason_tag}, duration={backoff_sec:.1f}s, "
                 f"fail_streak={int(self._fail_streak)}, until={self._global_backoff_until_t:.2f}",
             )
+
+    def _trace_q_bucket(self, t_now: float) -> int:
+        """Deterministic run-progress bucket [1..4] for VPS-side telemetry and routing."""
+        t_val = float(t_now) if np.isfinite(float(t_now)) else float("nan")
+        if not np.isfinite(t_val):
+            return 1
+
+        t_start = float(getattr(self, "_trace_q_start_t", float("nan")))
+        t_end = float(getattr(self, "_trace_q_end_t", float("nan")))
+        if not (np.isfinite(t_start) and np.isfinite(t_end) and t_end > t_start):
+            candidates: list[tuple[float, float]] = []
+            try:
+                imgs_src = getattr(self, "imgs", None)
+                if imgs_src is not None:
+                    img_ts = []
+                    if isinstance(imgs_src, dict) and "t" in imgs_src:
+                        img_ts = np.asarray(imgs_src.get("t", []), dtype=float).tolist()
+                    else:
+                        for item in imgs_src:
+                            try:
+                                if hasattr(item, "t"):
+                                    img_ts.append(float(getattr(item, "t")))
+                                elif isinstance(item, (list, tuple)) and len(item) > 0:
+                                    img_ts.append(float(item[0]))
+                            except Exception:
+                                continue
+                    arr = np.asarray(img_ts, dtype=float)
+                    arr = arr[np.isfinite(arr)]
+                    if arr.size > 1:
+                        candidates.append((float(np.min(arr)), float(np.max(arr))))
+            except Exception:
+                pass
+            try:
+                imu_src = getattr(self, "imu", None)
+                if imu_src is not None:
+                    imu_t = None
+                    if isinstance(imu_src, dict) and "t" in imu_src:
+                        imu_t = np.asarray(imu_src.get("t", []), dtype=float)
+                    if imu_t is not None and imu_t.size > 1:
+                        imu_t = imu_t[np.isfinite(imu_t)]
+                        if imu_t.size > 1:
+                            candidates.append((float(np.min(imu_t)), float(np.max(imu_t))))
+            except Exception:
+                pass
+            if len(candidates) == 0:
+                return 1
+            t_start = float(min(c[0] for c in candidates))
+            t_end = float(max(c[1] for c in candidates))
+            self._trace_q_start_t = float(t_start)
+            self._trace_q_end_t = float(t_end)
+
+        span = float(t_end - t_start)
+        if not np.isfinite(span) or span <= 1e-9:
+            return 1
+        ratio = float(np.clip((t_val - t_start) / span, 0.0, 1.0))
+        if ratio >= 1.0:
+            return 4
+        return int(1 + min(3, int(np.floor(ratio * 4.0))))
+
+    def _continuity_anchor_center(self, est_lat: float, est_lon: float) -> tuple[float, float]:
+        """Return local-first centering anchor without mutating strict anchor state."""
+        if (
+            bool(self.config.continuity_anchor_enable)
+            and np.isfinite(float(self._continuity_anchor_lat))
+            and np.isfinite(float(self._continuity_anchor_lon))
+        ):
+            return float(self._continuity_anchor_lat), float(self._continuity_anchor_lon)
+        if np.isfinite(float(self._last_success_center_lat)) and np.isfinite(
+            float(self._last_success_center_lon)
+        ):
+            return float(self._last_success_center_lat), float(self._last_success_center_lon)
+        return float(est_lat), float(est_lon)
+
+    def _q2_burst_active(self, *, q_bucket: int, attempt_idx: int, t_cam: float) -> bool:
+        """Return whether bounded Q2 relocalization burst is active for this attempt."""
+        if not bool(self.config.q2_reloc_burst_enable):
+            return False
+        if int(q_bucket) != 2:
+            return False
+        if float(t_cam) < float(self._q2_burst_cooldown_until_t) and int(attempt_idx) > int(
+            self._q2_burst_until_attempt
+        ):
+            return False
+        return int(attempt_idx) <= int(self._q2_burst_until_attempt)
+
+    def _q2_hypothesis_id(
+        self,
+        *,
+        center_lat: float,
+        center_lon: float,
+        yaw_deg: float,
+        scale_mult: float,
+    ) -> str:
+        return (
+            f"{round(float(center_lat), 6)}|{round(float(center_lon), 6)}|"
+            f"{round(float(yaw_deg), 1)}|{round(float(scale_mult), 3)}"
+        )
+
+    def _q2_hypothesis_score(
+        self,
+        *,
+        num_inliers: int,
+        confidence: float,
+        reproj_error: float,
+        locality: float,
+        temporal_hits: int,
+    ) -> float:
+        inlier_score = float(np.clip(float(num_inliers) / max(1.0, float(self.config.min_inliers)), 0.0, 1.0))
+        conf_score = float(np.clip(float(confidence), 0.0, 1.0)) if np.isfinite(float(confidence)) else 0.0
+        reproj_score = (
+            float(np.clip(float(self.config.max_reproj_error) / max(float(reproj_error), 1e-3), 0.0, 1.0))
+            if np.isfinite(float(reproj_error))
+            else 0.0
+        )
+        temporal_score = float(
+            np.clip(
+                float(max(0, int(temporal_hits))) / max(1.0, float(self.config.temporal_consensus_max_hits)),
+                0.0,
+                1.0,
+            )
+        )
+        locality_score = float(np.clip(float(locality), 0.0, 1.0))
+        return float(
+            0.35 * inlier_score
+            + 0.25 * conf_score
+            + 0.15 * reproj_score
+            + 0.15 * locality_score
+            + 0.10 * temporal_score
+        )
 
     def _resolve_relocalization_plan(
         self,
@@ -1053,6 +1208,39 @@ class VPSRunner:
                 reloc_local_first_center_radius_m=float(
                     reloc_cfg.get("local_first_center_radius_m", 180.0)
                 ),
+                q2_reloc_burst_enable=bool(
+                    reloc_cfg.get("q2_reloc_burst_enable", False)
+                ),
+                q2_reloc_burst_trigger_streak=int(
+                    reloc_cfg.get("q2_reloc_burst_trigger_streak", 3)
+                ),
+                q2_reloc_burst_offset_m=float(
+                    reloc_cfg.get("q2_reloc_burst_offset_m", 25.0)
+                ),
+                q2_reloc_burst_frames=int(
+                    reloc_cfg.get("q2_reloc_burst_frames", 3)
+                ),
+                q2_reloc_burst_cooldown_sec=float(
+                    reloc_cfg.get("q2_reloc_burst_cooldown_sec", 8.0)
+                ),
+                q2_reloc_burst_global_candidates=int(
+                    reloc_cfg.get("q2_reloc_burst_global_candidates", 8)
+                ),
+                q2_reloc_burst_extra_budget_ms=float(
+                    reloc_cfg.get("q2_reloc_burst_extra_budget_ms", 250.0)
+                ),
+                q2_hypothesis_topk=int(
+                    reloc_cfg.get("q2_hypothesis_topk", 3)
+                ),
+                q2_hypothesis_repeat_frames=int(
+                    reloc_cfg.get("q2_hypothesis_repeat_frames", 2)
+                ),
+                q2_hypothesis_score_margin=float(
+                    reloc_cfg.get("q2_hypothesis_score_margin", 0.12)
+                ),
+                continuity_anchor_enable=bool(
+                    reloc_cfg.get("continuity_anchor_enable", True)
+                ),
                 reloc_no_coverage_radius_m=(
                     reloc_no_cov_radius if len(reloc_no_cov_radius) > 0 else (25.0, 60.0)
                 ),
@@ -1473,6 +1661,8 @@ class VPSRunner:
         """
         t_start = time.time()
         self.stats['total_attempts'] += 1
+        attempt_idx = int(self.stats.get("total_attempts", 0))
+        q_bucket = int(self._trace_q_bucket(float(t_cam)))
         t_tile_start = t_start
         t_pose_start = t_start
         tile_ms = preprocess_ms = match_ms = pose_ms = 0.0
@@ -1494,6 +1684,8 @@ class VPSRunner:
         selected_center_lat = float(est_lat)
         selected_center_lon = float(est_lon)
         selected_map_patch: Optional[MapPatch] = None
+        selected_hypothesis_id = "none"
+        selected_candidate_mode = "local"
         stop_search = False
         stopped_by_time_budget = False
         stopped_by_candidate_budget = False
@@ -1512,6 +1704,8 @@ class VPSRunner:
         centers_in_cache = 0
         centers_with_patch = 0
         coverage_found = False
+        burst_active = bool(self._q2_burst_active(q_bucket=q_bucket, attempt_idx=attempt_idx, t_cam=float(t_cam)))
+        hypothesis_candidates: list[dict[str, Any]] = []
         state_speed_val = float(state_speed_m_s) if state_speed_m_s is not None else float("nan")
         if not np.isfinite(state_speed_val):
             state_speed_val = float("nan")
@@ -1665,6 +1859,22 @@ class VPSRunner:
         coverage_recovery_active = bool(reloc_plan.coverage_recovery_active)
         global_probe_allowed = bool(reloc_plan.global_probe_allowed)
         force_global_requested = bool(reloc_plan.force_global_requested)
+        if bool(burst_active) and not bool(force_local):
+            global_mode = True
+            force_global_requested = True
+            base_lat, base_lon = self._continuity_anchor_center(float(est_lat), float(est_lon))
+            search_centers = build_relocalization_centers(
+                est_lat=float(base_lat),
+                est_lon=float(base_lon),
+                max_centers=max(2, int(self.config.reloc_max_centers)),
+                ring_radius_m=list(self.config.reloc_ring_radius_m),
+                ring_samples=int(self.config.reloc_ring_samples),
+            )
+            trigger_reason = (
+                f"{trigger_reason}+q2_reloc_burst"
+                if str(trigger_reason).strip()
+                else "q2_reloc_burst"
+            )
         if global_mode:
             self.stats['global_search'] += 1
             self._last_global_search_time = float(t_cam)
@@ -1874,15 +2084,13 @@ class VPSRunner:
             bool(self.config.reloc_local_first_budget_split_enable)
             and (str(objective_mode).lower() == "accuracy" or bool(self.config.accuracy_mode))
             and len(search_centers) > 1
+            and (not bool(burst_active))
         )
         if local_first_split_enable:
-            anchor_lat = float(est_lat)
-            anchor_lon = float(est_lon)
-            if np.isfinite(float(self._last_success_center_lat)) and np.isfinite(
-                float(self._last_success_center_lon)
-            ):
-                anchor_lat = float(self._last_success_center_lat)
-                anchor_lon = float(self._last_success_center_lon)
+            anchor_lat, anchor_lon = self._continuity_anchor_center(
+                float(est_lat),
+                float(est_lon),
+            )
             radius_m = float(max(5.0, self.config.reloc_local_first_center_radius_m))
             local_centers = []
             global_centers = []
@@ -1916,6 +2124,16 @@ class VPSRunner:
         raw_num_candidates = int(budget_plan.raw_num_candidates)
         num_candidates = int(budget_plan.budget_num_candidates)
         frame_budget_ms = float(budget_plan.frame_budget_ms)
+        if bool(burst_active):
+            burst_cap = max(1, int(self.config.q2_reloc_burst_global_candidates))
+            if int(num_candidates) > 0:
+                num_candidates = int(min(int(num_candidates), int(burst_cap)))
+            else:
+                num_candidates = int(burst_cap)
+            if float(frame_budget_ms) > 0.0:
+                frame_budget_ms = float(frame_budget_ms) + float(
+                    max(0.0, float(self.config.q2_reloc_burst_extra_budget_ms))
+                )
         if local_first_split_enable and num_candidates > 0:
             frac = float(np.clip(self.config.reloc_local_first_budget_fraction, 0.05, 0.95))
             min_cands = max(1, int(self.config.reloc_local_first_min_candidates))
@@ -2227,6 +2445,33 @@ class VPSRunner:
                     )
 
                 if strict_ok or failsoft_ok:
+                    locality_score = 1.0 if bool(center_is_local) else 0.0
+                    hypothesis_id = self._q2_hypothesis_id(
+                        center_lat=float(map_patch.center_lat),
+                        center_lon=float(map_patch.center_lon),
+                        yaw_deg=float(np.degrees(yaw_used_rad)),
+                        scale_mult=float(scale_mult),
+                    )
+                    hypothesis_score = self._q2_hypothesis_score(
+                        num_inliers=int(num_i),
+                        confidence=float(conf),
+                        reproj_error=float(reproj),
+                        locality=float(locality_score),
+                        temporal_hits=int(getattr(self, "_temporal_consensus_hits", 0)),
+                    )
+                    hypothesis_candidates.append(
+                        {
+                            "id": str(hypothesis_id),
+                            "score": float(hypothesis_score),
+                            "locality": float(locality_score),
+                        }
+                    )
+                    if len(hypothesis_candidates) > max(1, int(self.config.q2_hypothesis_topk)):
+                        hypothesis_candidates = sorted(
+                            hypothesis_candidates,
+                            key=lambda item: float(item.get("score", 0.0)),
+                            reverse=True,
+                        )[: max(1, int(self.config.q2_hypothesis_topk))]
                     accepted_score = score + (120.0 if strict_ok else 90.0)
                     if accepted_score >= best_score:
                         best_score = accepted_score
@@ -2243,6 +2488,15 @@ class VPSRunner:
                         selected_center_lat = float(map_patch.center_lat)
                         selected_center_lon = float(map_patch.center_lon)
                         selected_map_patch = map_patch
+                        selected_hypothesis_id = str(hypothesis_id)
+                        if bool(burst_active):
+                            selected_candidate_mode = "q2_reloc_burst_global"
+                        elif bool(global_mode):
+                            selected_candidate_mode = "global"
+                        elif bool(local_first_split_enable) and bool(center_is_local):
+                            selected_candidate_mode = "local_first"
+                        else:
+                            selected_candidate_mode = "local"
                     if (
                         coarse_fine_enabled
                         and not coarse_anchor_locked
@@ -2484,6 +2738,109 @@ class VPSRunner:
             # Fail-soft matches carry higher uncertainty to avoid over-trusting weak geometry.
             inflate = max(1.0, float(self.config.failsoft_r_inflate))
             vps_measurement.R_vps = np.array(vps_measurement.R_vps, dtype=float) * inflate
+
+        selected_center_key = (round(float(selected_center_lat), 8), round(float(selected_center_lon), 8))
+        local_selected = bool(
+            bool(local_first_split_enable) and selected_center_key in local_center_keys
+        )
+        selected_offset = np.asarray(
+            getattr(vps_measurement, "offset_m", np.zeros(2, dtype=float)),
+            dtype=float,
+        ).reshape(-1,)
+        selected_offset_xy = (
+            np.asarray(selected_offset[:2], dtype=float)
+            if selected_offset.size >= 2
+            else np.zeros(2, dtype=float)
+        )
+        selected_offset_m = float(np.linalg.norm(selected_offset_xy))
+
+        burst_hypothesis_promoted = False
+        if bool(burst_active):
+            topk = sorted(
+                hypothesis_candidates,
+                key=lambda item: float(item.get("score", 0.0)),
+                reverse=True,
+            )[: max(1, int(self.config.q2_hypothesis_topk))]
+            if str(selected_hypothesis_id).strip() and len(topk) > 0:
+                for item in topk:
+                    hyp_id = str(item.get("id", ""))
+                    if not hyp_id:
+                        continue
+                    self._q2_hypothesis_scores[hyp_id] = float(
+                        self._q2_hypothesis_scores.get(hyp_id, 0.0)
+                    ) + float(item.get("score", 0.0))
+                if str(selected_hypothesis_id) == str(self._q2_hypothesis_last_winner):
+                    self._q2_hypothesis_win_streak = int(self._q2_hypothesis_win_streak) + 1
+                else:
+                    self._q2_hypothesis_last_winner = str(selected_hypothesis_id)
+                    self._q2_hypothesis_win_streak = 1
+                ranked = sorted(
+                    self._q2_hypothesis_scores.items(),
+                    key=lambda item: float(item[1]),
+                    reverse=True,
+                )
+                winner_id = str(ranked[0][0]) if len(ranked) > 0 else ""
+                winner_score = float(ranked[0][1]) if len(ranked) > 0 else 0.0
+                runner_up_score = float(ranked[1][1]) if len(ranked) > 1 else float("-inf")
+                margin = (
+                    float(winner_score - runner_up_score)
+                    if np.isfinite(runner_up_score)
+                    else float("inf")
+                )
+                burst_hypothesis_promoted = bool(
+                    str(winner_id) == str(selected_hypothesis_id)
+                    and (
+                        int(self._q2_hypothesis_win_streak)
+                        >= max(1, int(self.config.q2_hypothesis_repeat_frames))
+                        or float(margin) > float(self.config.q2_hypothesis_score_margin)
+                    )
+                )
+            if not burst_hypothesis_promoted:
+                if int(attempt_idx) >= int(self._q2_burst_until_attempt):
+                    self.stats["hypothesis_discard_count"] = int(
+                        self.stats.get("hypothesis_discard_count", 0)
+                    ) + 1
+                _log_attempt_and_profile(False, "hypothesis_delay_wait")
+                _log_reloc(False, "hypothesis_delay_wait")
+                return None
+            self.stats["hypothesis_commit_count"] = int(
+                self.stats.get("hypothesis_commit_count", 0)
+            ) + 1
+            self._q2_hypothesis_scores = {}
+            self._q2_hypothesis_last_winner = ""
+            self._q2_hypothesis_win_streak = 0
+        elif len(self._q2_hypothesis_scores) > 0:
+            self._q2_hypothesis_scores = {}
+            self._q2_hypothesis_last_winner = ""
+            self._q2_hypothesis_win_streak = 0
+
+        if int(q_bucket) == 2 and bool(local_selected):
+            soft_fail_like = bool(selected_reason == "matched_failsoft") or (
+                np.isfinite(float(selected_offset_m))
+                and float(selected_offset_m) > float(self.config.q2_reloc_burst_offset_m)
+            )
+            if bool(soft_fail_like):
+                self._q2_local_soft_fail_streak = int(self._q2_local_soft_fail_streak) + 1
+            else:
+                self._q2_local_soft_fail_streak = 0
+            if (
+                bool(self.config.q2_reloc_burst_enable)
+                and int(self._q2_local_soft_fail_streak)
+                >= max(1, int(self.config.q2_reloc_burst_trigger_streak))
+                and float(t_cam) >= float(self._q2_burst_cooldown_until_t)
+                and int(attempt_idx) > int(self._q2_burst_until_attempt)
+            ):
+                self._q2_burst_until_attempt = int(attempt_idx) + max(
+                    1, int(self.config.q2_reloc_burst_frames)
+                )
+                self._q2_burst_cooldown_until_t = float(t_cam) + max(
+                    0.0, float(self.config.q2_reloc_burst_cooldown_sec)
+                )
+                self.stats["reloc_burst_count"] = int(
+                    self.stats.get("reloc_burst_count", 0)
+                ) + 1
+        else:
+            self._q2_local_soft_fail_streak = 0
         
         # Success!
         self.stats['success'] += 1
@@ -2518,6 +2875,12 @@ class VPSRunner:
                 self.stats["anchor_failsoft_block_count"] = int(
                     self.stats.get("anchor_failsoft_block_count", 0)
                 ) + 1
+        if bool(self.config.continuity_anchor_enable) and (
+            ((not success_is_failsoft) and (not success_is_rescue))
+            or bool(burst_hypothesis_promoted)
+        ):
+            self._continuity_anchor_lat = float(selected_center_lat)
+            self._continuity_anchor_lon = float(selected_center_lon)
 
         # Temporal consensus tracker (source quality):
         # update directional/magnitude consistency streak from VPS offset sequence.
@@ -2681,6 +3044,18 @@ class VPSRunner:
             setattr(vps_measurement, "scale_pruned_band", str(getattr(self, "_last_scale_pruned_band", "full")))
         except Exception:
             pass
+        try:
+            setattr(vps_measurement, "candidate_mode", str(selected_candidate_mode or "local"))
+        except Exception:
+            pass
+        try:
+            setattr(vps_measurement, "burst_active", bool(burst_active))
+        except Exception:
+            pass
+        try:
+            setattr(vps_measurement, "hypothesis_id", str(selected_hypothesis_id or "none"))
+        except Exception:
+            pass
 
         # Optional yaw hint metadata for backend factor-lite.
         # This is a weak hint (not direct EKF apply) and must be quality-gated upstream.
@@ -2834,6 +3209,15 @@ class VPSRunner:
             ),
             "anchor_rescue_block_count": float(
                 int(self.stats.get("anchor_rescue_block_count", 0))
+            ),
+            "reloc_burst_count": float(
+                int(self.stats.get("reloc_burst_count", 0))
+            ),
+            "hypothesis_commit_count": float(
+                int(self.stats.get("hypothesis_commit_count", 0))
+            ),
+            "hypothesis_discard_count": float(
+                int(self.stats.get("hypothesis_discard_count", 0))
             ),
         }
 
