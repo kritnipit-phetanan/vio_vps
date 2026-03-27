@@ -2832,6 +2832,8 @@ class VIOService:
             if not reason_txt:
                 reason_txt = f"{str(record.decision_state).strip().lower()}_unspecified"
             reason_txt = reason_txt.replace(",", ";")
+            kinematic_stage_txt = str(getattr(record, "kinematic_stage", "")).strip().replace(",", ";")
+            continuity_mode_txt = str(getattr(record, "continuity_mode", "")).strip().replace(",", ";")
             q_bucket = int(record.q_bucket)
             if q_bucket <= 0:
                 q_bucket = int(self._trace_q_bucket(float(record.timestamp)))
@@ -2842,7 +2844,12 @@ class VIOService:
                     f"{float(record.quality_score):.6f},{float(record.residual_xy):.6f},"
                     f"{float(record.dp_xy_in):.6f},{float(record.dp_xy_applied):.6f},"
                     f"{float(record.age_sec):.6f},{float(record.t_ref):.6f},"
-                    f"{int(bool(record.time_aligned_used))},{int(q_bucket)}\n"
+                    f"{int(bool(record.time_aligned_used))},{int(q_bucket)},"
+                    f"{kinematic_stage_txt},{continuity_mode_txt},"
+                    f"{int(record.direction_consistency_pass)},{int(record.magnitude_consistency_pass)},"
+                    f"{int(record.magnitude_bounded_for_continuity)},{int(record.direction_soft_fail)},"
+                    f"{int(record.continuity_eligible)},{float(record.source_rel):.6f},"
+                    f"{float(record.kinematic_max_allow_m):.6f},{float(record.residual_eval_metric):.6f}\n"
                 )
         except Exception:
             pass
@@ -2899,6 +2906,7 @@ class VIOService:
         direction_consistency_pass = True
         magnitude_bounded_for_continuity = False
         direction_soft_fail = False
+        kinematic_stage = "probation"
         dp = np.asarray(candidate.get("dp", np.zeros(3, dtype=float)), dtype=float).reshape(3,)
         dp_xy_norm = float(np.linalg.norm(dp[:2]))
         source = str(candidate.get("source", "BACKEND")).upper()
@@ -3140,9 +3148,11 @@ class VIOService:
                 magnitude_bounded_for_continuity = bool(
                     np.isfinite(dp_xy_norm) and float(dp_xy_norm) <= float(prob_max_allow_m + 1e-6)
                 )
+                kinematic_stage = "probation_magnitude_clamped"
             else:
                 ok_now = False
                 fail_reason = "kinematic_reject"
+                kinematic_stage = "probation_magnitude_reject"
 
         # Motion consistency check in probation window.
         try:
@@ -3167,6 +3177,7 @@ class VIOService:
                 direction_soft_fail = True
                 ok_now = False
                 fail_reason = "kinematic_reject"
+                kinematic_stage = "probation_direction_reject"
 
         # Innovation evidence check in probation window.
         # Require either: (a) residual improvement vs running baseline, or
@@ -3643,6 +3654,16 @@ class VIOService:
                     age_sec=float(candidate.get("corr_age_sec", np.nan)),
                     t_ref=float(candidate.get("t_ref", np.nan)),
                     time_aligned_used=bool(candidate.get("time_aligned_used", False)),
+                    kinematic_stage=str(kinematic_stage),
+                    continuity_mode=str(continuity_mode),
+                    direction_consistency_pass=int(bool(direction_consistency_pass)),
+                    magnitude_consistency_pass=int(bool(magnitude_consistency_pass)),
+                    magnitude_bounded_for_continuity=int(bool(magnitude_bounded_for_continuity)),
+                    direction_soft_fail=int(bool(direction_soft_fail)),
+                    continuity_eligible=int(bool(continuity_eligible)),
+                    source_rel=float(source_rel),
+                    kinematic_max_allow_m=float(prob_max_allow_m),
+                    residual_eval_metric=float(residual_eval_metric),
                 )
             )
         else:
@@ -3672,6 +3693,16 @@ class VIOService:
                     age_sec=float(candidate.get("corr_age_sec", np.nan)),
                     t_ref=float(candidate.get("t_ref", np.nan)),
                     time_aligned_used=False,
+                    kinematic_stage=str(kinematic_stage),
+                    continuity_mode=str(continuity_mode),
+                    direction_consistency_pass=int(bool(direction_consistency_pass)),
+                    magnitude_consistency_pass=int(bool(magnitude_consistency_pass)),
+                    magnitude_bounded_for_continuity=int(bool(magnitude_bounded_for_continuity)),
+                    direction_soft_fail=int(bool(direction_soft_fail)),
+                    continuity_eligible=int(bool(continuity_eligible)),
+                    source_rel=float(source_rel),
+                    kinematic_max_allow_m=float(prob_max_allow_m),
+                    residual_eval_metric=float(residual_eval_metric),
                 )
             )
 
@@ -4042,6 +4073,12 @@ class VIOService:
             magnitude_enable = bool(
                 runner.global_config.get("BACKEND_KINEMATIC_CONSISTENCY_MAGNITUDE_ENABLE", True)
             )
+            schedule_kinematic_stage = "schedule"
+            schedule_direction_consistency_pass = True
+            schedule_magnitude_consistency_pass = True
+            schedule_magnitude_bounded = False
+            schedule_direction_soft_fail = False
+            schedule_max_allow = float("nan")
             magnitude_horizon_sec = float(
                 runner.global_config.get("BACKEND_KINEMATIC_CONSISTENCY_MAGNITUDE_HORIZON_SEC", 0.8)
             )
@@ -4074,7 +4111,9 @@ class VIOService:
                     if np.isfinite(magnitude_max_m) and magnitude_max_m > 0.0:
                         max_allow = float(min(max_allow, float(magnitude_max_m)))
                     max_allow = float(max(max(0.0, min_dp_xy), max_allow))
+                    schedule_max_allow = float(max_allow)
                     if np.isfinite(max_allow) and dp_xy_norm > max_allow:
+                        schedule_magnitude_consistency_pass = False
                         defer_mag_to_probation = bool(supervisor_enable) and bool(
                             runner.global_config.get(
                                 "BACKEND_SUPERVISOR_SKIP_SCHEDULE_MAG_CLAMP",
@@ -4082,6 +4121,7 @@ class VIOService:
                             )
                         )
                         if bool(defer_mag_to_probation):
+                            schedule_kinematic_stage = "schedule_magnitude_deferred"
                             counts["kinematic_clamp_magnitude_probation_deferred"] = int(
                                 counts.get("kinematic_clamp_magnitude_probation_deferred", 0)
                             ) + 1
@@ -4099,6 +4139,8 @@ class VIOService:
                             runner._backend_kinematic_magnitude_clamp_count = int(
                                 getattr(runner, "_backend_kinematic_magnitude_clamp_count", 0)
                             ) + 1
+                            schedule_magnitude_bounded = True
+                            schedule_kinematic_stage = "schedule_magnitude_clamped"
                             if bool(getattr(runner.config, "save_debug_data", False)):
                                 print(
                                     "[BACKEND] kinematic_clamp(magnitude):"
@@ -4111,9 +4153,12 @@ class VIOService:
                 if dp_xy_norm > 1e-6:
                     cos_dir = float(np.dot(dp_xy, vel_xy) / (speed_xy * dp_xy_norm))
                     if np.isfinite(cos_dir) and cos_dir < float(min_cos):
+                        schedule_direction_consistency_pass = False
                         if bool(supervisor_enable) and bool(
                             runner.global_config.get("BACKEND_SUPERVISOR_DEFER_DIRECTION_GATE", True)
                         ):
+                            schedule_direction_soft_fail = True
+                            schedule_kinematic_stage = "schedule_direction_deferred"
                             counts["kinematic_reject_direction_probation_deferred"] = int(
                                 counts.get("kinematic_reject_direction_probation_deferred", 0)
                             ) + 1
@@ -4148,6 +4193,16 @@ class VIOService:
                                     age_sec=float(corr_age_sec),
                                     t_ref=float(contract.t_ref),
                                     time_aligned_used=False,
+                                    kinematic_stage="schedule_direction_reject",
+                                    continuity_mode="",
+                                    direction_consistency_pass=int(bool(schedule_direction_consistency_pass)),
+                                    magnitude_consistency_pass=int(bool(schedule_magnitude_consistency_pass)),
+                                    magnitude_bounded_for_continuity=int(bool(schedule_magnitude_bounded)),
+                                    direction_soft_fail=int(bool(schedule_direction_soft_fail)),
+                                    continuity_eligible=-1,
+                                    source_rel=float(source_rel),
+                                    kinematic_max_allow_m=float(schedule_max_allow),
+                                    residual_eval_metric=float("nan"),
                                 )
                             )
                             if bool(getattr(runner.config, "save_debug_data", False)):

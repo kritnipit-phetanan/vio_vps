@@ -1826,7 +1826,10 @@ def init_output_csvs(output_dir: str, save_debug_data: bool = False) -> Dict[str
     paths['backend_apply_trace_csv'] = os.path.join(output_dir, "backend_apply_trace.csv")
     with open(paths['backend_apply_trace_csv'], "w", newline="") as f:
         f.write(
-            "t,source,state,reason,quality,residual_xy,dp_xy_in,dp_xy_applied,age_sec,t_ref,time_aligned_used,q_bucket\n"
+            "t,source,state,reason,quality,residual_xy,dp_xy_in,dp_xy_applied,age_sec,t_ref,time_aligned_used,q_bucket,"
+            "kinematic_stage,continuity_mode,direction_consistency_pass,magnitude_consistency_pass,"
+            "magnitude_bounded_for_continuity,direction_soft_fail,continuity_eligible,source_rel,"
+            "kinematic_max_allow_m,residual_eval_metric\n"
         )
 
     # Deterministic runtime signature (one-line JSON-like metadata)

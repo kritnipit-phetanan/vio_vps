@@ -148,3 +148,13 @@ class ApplyDecisionRecord:
     t_ref: float
     time_aligned_used: bool = False
     q_bucket: int = 0
+    kinematic_stage: str = ""
+    continuity_mode: str = ""
+    direction_consistency_pass: int = -1
+    magnitude_consistency_pass: int = -1
+    magnitude_bounded_for_continuity: int = -1
+    direction_soft_fail: int = -1
+    continuity_eligible: int = -1
+    source_rel: float = float("nan")
+    kinematic_max_allow_m: float = float("nan")
+    residual_eval_metric: float = float("nan")
