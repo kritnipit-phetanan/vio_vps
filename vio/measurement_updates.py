@@ -94,7 +94,10 @@ def apply_magnetometer_update(kf,
                               r_scale_extra: float = 1.0,
                               adaptive_info: Optional[Dict[str, Any]] = None,
                               policy_decision: Optional["SensorPolicyDecision"] = None,
-                              max_update_dyaw_override_deg: Optional[float] = None) -> Tuple[bool, str]:
+                              max_update_dyaw_override_deg: Optional[float] = None,
+                              yaw_auth_soft_spring_active: bool = False,
+                              yaw_auth_soft_spring_r_mult: float = 1.0,
+                              yaw_auth_soft_spring_residual_cap_deg: Optional[float] = None) -> Tuple[bool, str]:
     """
     Apply magnetometer heading update.
     
@@ -125,6 +128,10 @@ def apply_magnetometer_update(kf,
         use_estimated_bias: If True, include mag_bias in Jacobian. If False, freeze mag_bias states.
         max_update_dyaw_override_deg: Optional dynamic per-update yaw cap from
             heading arbitration layer.
+        yaw_auth_soft_spring_active: Clamp residual and heavily inflate R for
+            weak MAG spring updates.
+        yaw_auth_soft_spring_r_mult: Extra sigma multiplier for soft spring path.
+        yaw_auth_soft_spring_residual_cap_deg: Residual clamp for soft spring.
         
     Returns:
         Tuple of (update_applied: bool, rejection_reason: str)
@@ -173,6 +180,21 @@ def apply_magnetometer_update(kf,
         })
     from .magnetometer import compute_yaw_from_mag
     global_config = global_config or {}
+    soft_spring_active = bool(yaw_auth_soft_spring_active)
+    try:
+        soft_spring_r_mult = max(1.0, float(yaw_auth_soft_spring_r_mult))
+    except Exception:
+        soft_spring_r_mult = 1.0
+    try:
+        soft_spring_cap_deg = float(yaw_auth_soft_spring_residual_cap_deg)
+    except Exception:
+        soft_spring_cap_deg = float("nan")
+    if not np.isfinite(soft_spring_cap_deg) or soft_spring_cap_deg <= 0.0:
+        try:
+            soft_spring_cap_deg = float(global_config.get("YAW_AUTH_MAG_SOFT_SPRING_MAX_DYAW_DEG", np.nan))
+        except Exception:
+            soft_spring_cap_deg = float("nan")
+    soft_spring_cap_rad = np.radians(float(soft_spring_cap_deg)) if np.isfinite(soft_spring_cap_deg) and soft_spring_cap_deg > 0.0 else float("nan")
     
     # Track filter rejection reasons (v2.9.2)
     if filter_info is not None:
@@ -192,7 +214,7 @@ def apply_magnetometer_update(kf,
     # v3.4.0: Oscillation skip check - DISABLED during SPINUP phase!
     # v2.9.5: Oscillation detection (skip_count = 2, reduced from 10)
     # Check if we're in skip period - BUT NOT during SPINUP (phase 0)
-    if current_phase >= 2 and _MAG_STATE['skip_count'] > 0:
+    if (not soft_spring_active) and current_phase >= 2 and _MAG_STATE['skip_count'] > 0:
         _MAG_STATE['skip_count'] -= 1
         _set_adaptive_info(False, None, None, None, r_scale_extra)
         return False, f"Oscillation skip (remaining: {_MAG_STATE['skip_count']})"
@@ -228,8 +250,12 @@ def apply_magnetometer_update(kf,
     yaw_state = quaternion_to_yaw(q_state)
     
     # Compute innovation with angle wrapping
-    yaw_innov = yaw_mag - yaw_state
-    yaw_innov = np.arctan2(np.sin(yaw_innov), np.cos(yaw_innov))
+    raw_yaw_innov = yaw_mag - yaw_state
+    raw_yaw_innov = np.arctan2(np.sin(raw_yaw_innov), np.cos(raw_yaw_innov))
+    yaw_innov = float(raw_yaw_innov)
+    if soft_spring_active and np.isfinite(soft_spring_cap_rad) and soft_spring_cap_rad > 0.0:
+        yaw_innov = float(np.clip(yaw_innov, -soft_spring_cap_rad, soft_spring_cap_rad))
+        yaw_mag = float(yaw_state + yaw_innov)
     
     # =========================================================================
     # v2.9.10.13: Oscillation Detection - DISABLED during spinup!
@@ -243,7 +269,7 @@ def apply_magnetometer_update(kf,
     # When detected, skip 2 updates (minimal gap ~0.1s) to let system stabilize
     
     # v3.4.0: SKIP oscillation detection during SPINUP/EARLY phases!
-    if current_phase >= 2:  # ONLY in NORMAL phase
+    if current_phase >= 2 and not soft_spring_active:  # ONLY in NORMAL phase
         innovation_sign = 1 if yaw_innov > 0 else -1
         _MAG_STATE['innovation_history'].append(innovation_sign)
         
@@ -286,12 +312,12 @@ def apply_magnetometer_update(kf,
     else:
         innovation_threshold = np.radians(179.0)
     
-    if abs(yaw_innov) > innovation_threshold:
+    if (not soft_spring_active) and abs(raw_yaw_innov) > innovation_threshold:
         _MAG_STATE['reject_innovation'] += 1
         if _MAG_STATE['total_attempts'] % 100 == 0:
             print(f"[MAG-REJECT] Innovation: {_MAG_STATE['reject_innovation']}/{_MAG_STATE['total_attempts']} ({_MAG_STATE['reject_innovation']/_MAG_STATE['total_attempts']*100:.1f}%)")
         _set_adaptive_info(False, None, None, innovation_threshold, r_scale_extra)
-        return False, f"Innovation too large ({np.degrees(yaw_innov):.1f}°)"
+        return False, f"Innovation too large ({np.degrees(raw_yaw_innov):.1f}°)"
     
     # Apply oscillation R-scaling to measurement noise (v2.9.5)
     sigma_mag_yaw_scaled = sigma_mag_yaw * oscillation_r_scale * extra_scale
@@ -309,6 +335,9 @@ def apply_magnetometer_update(kf,
         sigma_mag_yaw_scaled *= float(warning_r_mult)
     elif health_key == "DEGRADED":
         sigma_mag_yaw_scaled *= float(degraded_r_mult)
+    if soft_spring_active:
+        sigma_mag_yaw_scaled *= float(soft_spring_r_mult)
+    adaptive_r_scale_used = float(max(1e-6, sigma_mag_yaw_scaled / max(1e-9, float(sigma_mag_yaw))))
     
     # Build measurement model
     _MAG_STATE['total_accepted'] += 1
@@ -435,15 +464,23 @@ def apply_magnetometer_update(kf,
             arb_cap_deg = float("nan")
         if np.isfinite(arb_cap_deg) and arb_cap_deg > 0.0:
             MAX_YAW_CORRECTION = min(MAX_YAW_CORRECTION, np.radians(arb_cap_deg))
+    if soft_spring_active:
+        try:
+            spring_k_min = float(global_config.get("YAW_AUTH_MAG_SOFT_SPRING_K_MIN", 0.02))
+        except Exception:
+            spring_k_min = 0.02
+        K_MIN = min(float(K_MIN), max(0.0, spring_k_min))
+        if np.isfinite(soft_spring_cap_rad) and soft_spring_cap_rad > 0.0:
+            MAX_YAW_CORRECTION = min(MAX_YAW_CORRECTION, float(soft_spring_cap_rad))
     
     # Compute current Kalman gain
     P_yaw = float(kf.P[theta_cov_idx, theta_cov_idx])
     if not np.isfinite(P_yaw) or P_yaw <= 0.0:
-        _set_adaptive_info(False, None, None, None, extra_scale)
+        _set_adaptive_info(False, None, None, None, adaptive_r_scale_used)
         return False, "Invalid P_yaw"
     S_yaw = float(P_yaw + sigma_mag_yaw_scaled**2)  # BUG FIX: Use scaled sigma!
     if not np.isfinite(S_yaw) or S_yaw <= 1e-12:
-        _set_adaptive_info(False, None, None, None, extra_scale)
+        _set_adaptive_info(False, None, None, None, adaptive_r_scale_used)
         return False, "Invalid S_yaw"
     K_yaw = P_yaw / S_yaw
     
@@ -472,7 +509,7 @@ def apply_magnetometer_update(kf,
         r_yaw = np.array([[max(R_inflated, sigma_mag_yaw_scaled**2)]], dtype=float)
 
     if not np.all(np.isfinite(r_yaw)) or float(r_yaw[0, 0]) <= 0.0:
-        _set_adaptive_info(False, None, None, None, extra_scale)
+        _set_adaptive_info(False, None, None, None, adaptive_r_scale_used)
         return False, "Invalid MAG covariance"
     
     # Decouple yaw from roll/pitch and velocity
@@ -483,7 +520,10 @@ def apply_magnetometer_update(kf,
     # Apply update with angle residual
     def angle_residual(a, b):
         res = a - b
-        return np.arctan2(np.sin(res), np.cos(res))
+        res = np.arctan2(np.sin(res), np.cos(res))
+        if soft_spring_active and np.isfinite(soft_spring_cap_rad) and soft_spring_cap_rad > 0.0:
+            res = np.clip(res, -soft_spring_cap_rad, soft_spring_cap_rad)
+        return res
     
     try:
         kf.update(
@@ -512,10 +552,10 @@ def apply_magnetometer_update(kf,
                 p_prior=getattr(kf, 'P_prior', kf.P)
             )
         m2 = mahalanobis_squared(np.array([yaw_innov]), np.array([[S_yaw]]))
-        _set_adaptive_info(True, m2, m2, np.inf, extra_scale)
+        _set_adaptive_info(True, m2, m2, np.inf, adaptive_r_scale_used)
         return True, ""
     except Exception as e:
-        _set_adaptive_info(False, None, None, None, extra_scale)
+        _set_adaptive_info(False, None, None, None, adaptive_r_scale_used)
         return False, f"Update failed: {e}"
 
 
@@ -1114,6 +1154,9 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
     delta_v_soft_enable = bool(global_config.get("VIO_VEL_DELTA_V_SOFT_ENABLE", True))
     delta_v_soft_factor = float(global_config.get("VIO_VEL_DELTA_V_SOFT_FACTOR", 2.0))
     delta_v_hard_factor = float(global_config.get("VIO_VEL_DELTA_V_HARD_FACTOR", 3.0))
+    innovation_hard_reject_enable = bool(
+        global_config.get("VIO_VEL_INNOVATION_HARD_REJECT_ENABLE", True)
+    )
     delta_v_soft_r_cap = float(global_config.get("VIO_VEL_DELTA_V_SOFT_MAX_R_MULT", 6.0))
     delta_v_clamp_enable = bool(global_config.get("VIO_VEL_DELTA_V_CLAMP_ENABLE", True))
     delta_v_clamp_max_ratio = float(global_config.get("VIO_VEL_DELTA_V_CLAMP_MAX_RATIO", 6.0))
@@ -1316,7 +1359,43 @@ def apply_vio_velocity_update(kf, r_vo_mat: np.ndarray, t_unit: np.ndarray,
                             except Exception:
                                 pass
                         return False
-        
+        if innovation_hard_reject_enable:
+            innovation_xy_norm = float(
+                np.linalg.norm(np.asarray(innovation[: min(2, innovation.shape[0])]).reshape(-1))
+            )
+            innovation_total_norm = float(np.linalg.norm(np.asarray(innovation).reshape(-1)))
+            innovation_xy_hard_reject = float(
+                max(
+                    float(max_delta_v_xy_base),
+                    min(
+                        float(max_delta_v_xy_high_speed),
+                        float(delta_v_hard_factor) * float(max_delta_v_xy_base),
+                    ),
+                )
+            )
+            innovation_total_hard_reject = float(max(12.0, innovation_xy_hard_reject * 1.5))
+            if (
+                (np.isfinite(innovation_xy_norm) and innovation_xy_norm > innovation_xy_hard_reject)
+                or (
+                    np.isfinite(innovation_total_norm)
+                    and innovation_total_norm > innovation_total_hard_reject
+                )
+            ):
+                _log_vio_vel_update(
+                    f"[VIO] Velocity REJECTED: innovation hard gate "
+                    f"(xy={innovation_xy_norm:.2f}/{innovation_xy_hard_reject:.2f}, "
+                    f"tot={innovation_total_norm:.2f}/{innovation_total_hard_reject:.2f})"
+                )
+                _set_adaptive_info(
+                    False,
+                    dof,
+                    None,
+                    None,
+                    extra_scale * max(1.0, speed_r_inflate),
+                    reason_code="hard_reject_innovation",
+                )
+                return False
+
         # Suppress numpy warnings - we handle explicitly with tripwires
         with np.errstate(all='ignore'):
             try:

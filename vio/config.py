@@ -1426,6 +1426,9 @@ def load_config(config_path: str) -> VIOConfig:
     result['VIO_VEL_DELTA_V_HARD_FACTOR'] = float(
         vio_vel_cfg.get('delta_v_hard_factor', 3.0)
     )
+    result['VIO_VEL_INNOVATION_HARD_REJECT_ENABLE'] = bool(
+        vio_vel_cfg.get('innovation_hard_reject_enable', True)
+    )
     result['VIO_VEL_DELTA_V_SOFT_MAX_R_MULT'] = float(
         vio_vel_cfg.get('delta_v_soft_max_r_mult', 6.0)
     )

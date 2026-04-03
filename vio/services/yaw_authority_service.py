@@ -26,7 +26,7 @@ class YawAuthorityDecision:
     source: str
     owner: str
     allow: bool
-    mode: str  # APPLY | SOFT_APPLY | HOLD | SKIP
+    mode: str  # APPLY | SOFT_APPLY | SOFT_SPRING | HOLD | SKIP
     reason: str
     r_mult: float = 1.0
     max_update_dyaw_deg: float = float("inf")
@@ -504,66 +504,128 @@ class YawAuthorityService:
 
         This prevents yaw free-run during long HOLD periods while keeping MAG authority soft.
         """
+        if not self._cfg_bool("YAW_AUTH_HOLD_MAG_ANCHOR_ENABLE", True):
+            return None
+        return self._build_mag_soft_spring_decision(
+            source=source,
+            t_now=t_now,
+            conf_raw=conf_raw,
+            conf_ema=conf_ema,
+            reason_prefix=reason_prefix if str(reason_prefix).strip() != "" else "hold_mag_anchor",
+            owner_hint="HOLD",
+        )
+
+    def _build_mag_ineligible_soft_decision(
+        self,
+        source: str,
+        t_now: float,
+        conf_raw: float,
+        conf_ema: float,
+        reason_prefix: str = "",
+    ) -> Optional[YawAuthorityDecision]:
+        """
+        Return bounded MAG soft-apply when MAG is not eligible to own yaw.
+
+        This keeps MAG available as a weak yaw anchor during position-first and
+        other owner-eligibility failures instead of dropping it completely.
+        """
+        return self._build_mag_soft_spring_decision(
+            source=source,
+            t_now=t_now,
+            conf_raw=conf_raw,
+            conf_ema=conf_ema,
+            reason_prefix=reason_prefix if str(reason_prefix).strip() != "" else "mag_owner_ineligible",
+            owner_hint="HOLD",
+            ineligible_hint=True,
+        )
+
+    def _build_mag_soft_spring_decision(
+        self,
+        source: str,
+        t_now: float,
+        conf_raw: float,
+        conf_ema: float,
+        reason_prefix: str = "",
+        owner_hint: Optional[str] = None,
+        blocked_hint: Optional[bool] = None,
+        ineligible_hint: Optional[bool] = None,
+    ) -> Optional[YawAuthorityDecision]:
+        """
+        Return an aggressively softened MAG ticket.
+
+        This is intentionally permissive: it keeps MAG alive as a weak yaw spring
+        even when arbitration would normally drop it, while relying on the update
+        path to clamp residuals and inflate R.
+        """
         src = str(source).upper()
         if src != "MAG":
             return None
-        if not self._cfg_bool("YAW_AUTH_HOLD_MAG_ANCHOR_ENABLE", True):
+        if not self._cfg_bool("YAW_AUTH_MAG_SOFT_SPRING_ENABLE", True):
             return None
-        if self._is_source_blocked("MAG", t_now=float(t_now)):
+        mag_blocked = bool(self._is_source_blocked("MAG", t_now=float(t_now))) if blocked_hint is None else bool(blocked_hint)
+        if mag_blocked and not self._cfg_bool("YAW_AUTH_MAG_SOFT_SPRING_ALLOW_WHEN_BLOCKED", True):
             return None
 
-        anchor_min_conf = self._clamp(
-            self._cfg("YAW_AUTH_HOLD_MAG_ANCHOR_MIN_CONFIDENCE", 0.55),
+        soft_conf = max(float(conf_raw), float(conf_ema))
+        min_conf = self._clamp(
+            self._cfg("YAW_AUTH_MAG_SOFT_SPRING_MIN_CONFIDENCE", 0.0),
             0.0,
             1.0,
         )
-        anchor_conf = max(float(conf_raw), float(conf_ema))
-        if anchor_conf < anchor_min_conf:
+        if soft_conf < min_conf:
             return None
 
-        anchor_require_quiet = self._cfg_bool(
-            "YAW_AUTH_HOLD_MAG_ANCHOR_REQUIRE_ALT_QUIET",
-            True,
+        owner_now = str(owner_hint if owner_hint is not None else self._owner).upper()
+        non_owner = bool(owner_now not in ("MAG", "HOLD"))
+        mag_ineligible = (
+            bool(ineligible_hint)
+            if ineligible_hint is not None
+            else (not self._mag_owner_eligible(float(t_now)))
         )
-        if anchor_require_quiet:
-            anchor_window_sec = max(
-                1.0,
-                self._cfg("YAW_AUTH_HOLD_MAG_ANCHOR_ALT_WINDOW_SEC", 8.0),
-            )
-            anchor_max_alt_applies = max(
-                0,
-                int(round(self._cfg("YAW_AUTH_HOLD_MAG_ANCHOR_MAX_ALT_APPLIES", 0.0))),
-            )
-            non_mag_recent = int(
-                self._count_recent_events(
-                    self._source_apply_hist,
-                    source="LOOP",
-                    t_now=float(t_now),
-                    window_sec=anchor_window_sec,
-                )
-                + self._count_recent_events(
-                    self._source_apply_hist,
-                    source="BACKEND",
-                    t_now=float(t_now),
-                    window_sec=anchor_window_sec,
-                )
-            )
-            if non_mag_recent > anchor_max_alt_applies:
-                return None
 
-        anchor_r_mult = max(1.0, self._cfg("YAW_AUTH_HOLD_MAG_ANCHOR_R_MULT", 4.0))
-        anchor_cap = max(0.05, self._cfg("YAW_AUTH_HOLD_MAG_ANCHOR_MAX_DYAW_DEG", 0.20))
-        reason = "hold_mag_anchor_soft"
+        base_r_mult = max(1.0, self._cfg("YAW_AUTH_MAG_SOFT_SPRING_R_MULT", 10.0))
+        if owner_now == "HOLD":
+            base_r_mult = max(base_r_mult, self._cfg("YAW_AUTH_MAG_SOFT_SPRING_HOLD_R_MULT", 8.0))
+        if non_owner:
+            base_r_mult = max(base_r_mult, self._cfg("YAW_AUTH_MAG_SOFT_SPRING_NONOWNER_R_MULT", 14.0))
+        if mag_blocked:
+            base_r_mult = max(base_r_mult, self._cfg("YAW_AUTH_MAG_SOFT_SPRING_BLOCKED_R_MULT", 18.0))
+        if mag_ineligible:
+            base_r_mult = max(base_r_mult, self._cfg("YAW_AUTH_MAG_SOFT_SPRING_INELIGIBLE_R_MULT", 12.0))
+
+        max_dyaw_deg = max(0.05, self._cfg("YAW_AUTH_MAG_SOFT_SPRING_MAX_DYAW_DEG", 0.22))
+        if owner_now == "HOLD":
+            max_dyaw_deg = min(
+                max_dyaw_deg,
+                max(0.05, self._cfg("YAW_AUTH_MAG_SOFT_SPRING_HOLD_MAX_DYAW_DEG", 0.18)),
+            )
+        if non_owner:
+            max_dyaw_deg = min(
+                max_dyaw_deg,
+                max(0.05, self._cfg("YAW_AUTH_MAG_SOFT_SPRING_NONOWNER_MAX_DYAW_DEG", 0.12)),
+            )
+        if mag_blocked:
+            max_dyaw_deg = min(
+                max_dyaw_deg,
+                max(0.03, self._cfg("YAW_AUTH_MAG_SOFT_SPRING_BLOCKED_MAX_DYAW_DEG", 0.08)),
+            )
+        if mag_ineligible:
+            max_dyaw_deg = min(
+                max_dyaw_deg,
+                max(0.04, self._cfg("YAW_AUTH_MAG_SOFT_SPRING_INELIGIBLE_MAX_DYAW_DEG", max_dyaw_deg)),
+            )
+
+        reason = "mag_soft_spring"
         if str(reason_prefix).strip() != "":
             reason = f"{str(reason_prefix)}|{reason}"
         return YawAuthorityDecision(
             source=src,
-            owner="HOLD",
+            owner=owner_now,
             allow=True,
-            mode="SOFT_APPLY",
+            mode="SOFT_SPRING",
             reason=reason,
-            r_mult=float(anchor_r_mult),
-            max_update_dyaw_deg=float(anchor_cap),
+            r_mult=float(base_r_mult),
+            max_update_dyaw_deg=float(max_dyaw_deg),
             confidence=float(conf_ema),
         )
 
@@ -1121,6 +1183,7 @@ class YawAuthorityService:
         src = str(source).upper()
         t_now = float(timestamp)
         switched = False
+        prev_score_ema = float(self._source_score_ema.get(src, np.nan))
         req_abs = max(0.0, self._finite_or(requested_abs_dyaw_deg, 0.0))
         backend_min_req = max(0.0, self._cfg("YAW_AUTH_BACKEND_MIN_REQUEST_DYAW_DEG", 0.12))
         backend_noop_req = bool(src == "BACKEND" and req_abs < backend_min_req)
@@ -1148,8 +1211,31 @@ class YawAuthorityService:
 
         if self._enabled() and src == "MAG":
             if not self._mag_owner_eligible(float(t_now)):
+                # Keep ineligible MAG usable as a weak anchor, but do not let its
+                # soft-path decisions build enough score to seize yaw ownership.
+                owner_score_cap = self._clamp(
+                    min(
+                        self._cfg("YAW_AUTH_HOLD_SCORE_THRESHOLD", 0.18),
+                        max(0.05, self._cfg("YAW_AUTH_MIN_SOURCE_SCORE", 0.35) - 0.02),
+                    ),
+                    0.0,
+                    1.0,
+                )
+                capped_score = min(float(conf), float(owner_score_cap))
+                if np.isfinite(prev_score_ema):
+                    capped_score = min(capped_score, float(prev_score_ema), float(owner_score_cap))
+                self._source_score_ema["MAG"] = float(capped_score)
                 if str(self._owner).upper() == "MAG":
                     self._set_owner("HOLD", float(t_now))
+                soft_dec = self._build_mag_ineligible_soft_decision(
+                    source=src,
+                    t_now=float(t_now),
+                    conf_raw=float(conf_raw),
+                    conf_ema=float(conf),
+                    reason_prefix="mag_owner_ineligible",
+                )
+                if soft_dec is not None:
+                    return soft_dec
                 return YawAuthorityDecision(
                     source=src,
                     owner=str(self._owner).upper(),
@@ -1475,6 +1561,17 @@ class YawAuthorityService:
                 )
 
         if src != owner:
+            if src == "MAG":
+                spring_dec = self._build_mag_soft_spring_decision(
+                    source=src,
+                    t_now=float(t_now),
+                    conf_raw=float(conf_raw),
+                    conf_ema=float(conf),
+                    reason_prefix=f"owner_is_{owner.lower()}",
+                    owner_hint=owner,
+                )
+                if spring_dec is not None:
+                    return spring_dec
             return YawAuthorityDecision(
                 source=src,
                 owner=owner,
@@ -1484,6 +1581,18 @@ class YawAuthorityService:
                 confidence=conf,
             )
         if self._is_source_blocked(owner, t_now=float(t_now)):
+            if src == "MAG":
+                spring_dec = self._build_mag_soft_spring_decision(
+                    source=src,
+                    t_now=float(t_now),
+                    conf_raw=float(conf_raw),
+                    conf_ema=float(conf),
+                    reason_prefix=f"owner_blocked_{owner.lower()}",
+                    owner_hint=owner,
+                    blocked_hint=True,
+                )
+                if spring_dec is not None:
+                    return spring_dec
             return YawAuthorityDecision(
                 source=src,
                 owner="HOLD",
@@ -1506,6 +1615,16 @@ class YawAuthorityService:
             low_min_rate = self._clamp(self._cfg("YAW_AUTH_MAG_OWNER_MIN_ACCEPT_RATE", 0.15), 0.0, 1.0)
             low_rate, low_samples = self._source_accept_rate("MAG", t_now=float(t_now), window_sec=low_win_sec)
             if low_samples >= low_min_samples and np.isfinite(low_rate) and float(low_rate) < float(low_min_rate):
+                spring_dec = self._build_mag_soft_spring_decision(
+                    source=src,
+                    t_now=float(t_now),
+                    conf_raw=float(conf_raw),
+                    conf_ema=float(conf),
+                    reason_prefix="mag_low_accept_soft_only",
+                    owner_hint=owner,
+                )
+                if spring_dec is not None:
+                    return spring_dec
                 mode = "SOFT_APPLY"
                 reason_codes.append("mag_low_accept_soft_only")
                 r_mult *= max(1.0, self._cfg("YAW_AUTH_MAG_LOW_ACCEPT_SOFT_R_MULT", 3.0))
@@ -1544,6 +1663,17 @@ class YawAuthorityService:
                 if src != "MAG":
                     hold_sec = max(0.1, self._cfg("YAW_AUTH_HOLD_SEC", 0.8))
                     self._hold_until_t = max(float(self._hold_until_t), float(t_now + hold_sec))
+                elif src == "MAG":
+                    spring_dec = self._build_mag_soft_spring_decision(
+                        source=src,
+                        t_now=float(t_now),
+                        conf_raw=float(conf_raw),
+                        conf_ema=float(conf),
+                        reason_prefix="budget_exhausted_mag",
+                        owner_hint=owner,
+                    )
+                    if spring_dec is not None:
+                        return spring_dec
                 return YawAuthorityDecision(
                     source=src,
                     owner=owner,

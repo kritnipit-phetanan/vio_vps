@@ -47,7 +47,7 @@ adaptive:
       health_sigma_mult:
         DEGRADED: 0.6
         HEALTHY: 1.0
-        RECOVERY: 0.9
+        RECOVERY: 0 .9
         WARNING: 0.8
       high_accept_backoff_factor: 1.6
       high_accept_r_scale: 1.05
@@ -1320,7 +1320,8 @@ vio:
       sigma_scale_z: 1.2
       use_vz_only: false
 vio_vel:
-  max_delta_v_xy_per_update_m_s: 4.0
+  max_delta_v_xy_per_update_m_s: 8.0
+  innovation_hard_reject_enable: false
   min_flow_px_high_speed: 0.5
   speed_r_inflate_breakpoints_m_s:
   - 30.0

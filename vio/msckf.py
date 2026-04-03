@@ -34,6 +34,236 @@ def _log_msckf_update(message: str):
         print(message)
 
 
+def _parse_debug_time_window(window_str: str) -> Optional[Tuple[float, float]]:
+    text = str(window_str).strip()
+    if not text:
+        return None
+    try:
+        parts = [float(part.strip()) for part in text.split(",", 1)]
+    except Exception:
+        return None
+    if len(parts) != 2:
+        return None
+    t0, t1 = float(parts[0]), float(parts[1])
+    if not np.isfinite(t0) or not np.isfinite(t1):
+        return None
+    if t1 < t0:
+        t0, t1 = t1, t0
+    return (t0, t1)
+
+
+_MSCKF_DEBUG_WINDOW = _parse_debug_time_window(os.getenv("MSCKF_DEBUG_WINDOW", ""))
+
+
+def _msckf_debug_enabled(timestamp: float) -> bool:
+    if _MSCKF_DEBUG_WINDOW is None or not np.isfinite(float(timestamp)):
+        return False
+    t0, t1 = _MSCKF_DEBUG_WINDOW
+    return t0 <= float(timestamp) <= t1
+
+
+def _log_msckf_debug(timestamp: float, **kwargs) -> None:
+    if not _msckf_debug_enabled(timestamp):
+        return
+    parts = [f"{key}={value}" for key, value in kwargs.items()]
+    print(f"[DEBUG MSCKF] t={float(timestamp):.4f} {' '.join(parts)}")
+
+
+def _project_msckf_depth_fallback(
+    p_c: np.ndarray,
+    obs: dict,
+    triangulated: Optional[dict],
+) -> Tuple[Optional[np.ndarray], bool]:
+    """Project a weak-depth observation to a small positive depth when explicitly marked."""
+    p_c = np.asarray(p_c, dtype=float).reshape(3,)
+    if not np.all(np.isfinite(p_c)):
+        return (None, False)
+    if p_c[2] > 0.1:
+        return (p_c, False)
+    if not isinstance(triangulated, dict) or not bool(triangulated.get("depth_fallback_active", False)):
+        return (None, False)
+    if not bool(obs.get("_msckf_depth_use_fallback", False) or obs.get("_msckf_depth_promoted", False)):
+        return (None, False)
+
+    depth_candidates = [0.10]
+    for key in ("depth_fallback_depth_m",):
+        val = float(triangulated.get(key, np.nan))
+        if np.isfinite(val):
+            depth_candidates.append(val)
+    obs_floor = float(obs.get("_msckf_depth_proj_floor", np.nan))
+    if np.isfinite(obs_floor):
+        depth_candidates.append(obs_floor)
+    fallback_depth = float(np.clip(max(depth_candidates), 0.10, 50.0))
+
+    if p_c[2] < -fallback_depth:
+        return (None, False)
+
+    p_c_proj = p_c.copy()
+    vec_norm = float(np.linalg.norm(p_c_proj))
+    if vec_norm > 1e-9:
+        ray_dir = p_c_proj / vec_norm
+        if ray_dir[2] > 1e-6:
+            p_c_proj = ray_dir * float(fallback_depth / ray_dir[2])
+        else:
+            p_c_proj[2] = fallback_depth
+    else:
+        p_c_proj[2] = fallback_depth
+
+    if (not np.all(np.isfinite(p_c_proj))) or p_c_proj[2] <= 1e-6:
+        return (None, False)
+    return (p_c_proj, True)
+
+
+def _seed_msckf_fixed_depth_point(
+    observations: List[dict],
+    cam_states: List[dict],
+    kf: Any,
+    global_config: Optional[Dict[str, Any]],
+    fixed_depth_m: float,
+) -> Optional[np.ndarray]:
+    """Seed a short-track feature on the latest camera ray at a fixed depth."""
+    if not observations:
+        return None
+    obs_ref = observations[-1]
+    cam_id = int(obs_ref.get("cam_id", -1))
+    if cam_id < 0 or cam_id >= len(cam_states):
+        return None
+    cs = cam_states[cam_id]
+    q_imu = np.asarray(kf.x[cs["q_idx"]:cs["q_idx"] + 4, 0], dtype=float)
+    p_imu = np.asarray(kf.x[cs["p_idx"]:cs["p_idx"] + 3, 0], dtype=float)
+    q_cam, p_cam = imu_pose_to_camera_pose(q_imu, p_imu, global_config=global_config)
+    q_xyzw = np.array([q_cam[1], q_cam[2], q_cam[3], q_cam[0]], dtype=float)
+    r_cw = R_scipy.from_quat(q_xyzw).as_matrix()
+    x_ref, y_ref = obs_ref["pt_norm"]
+    ray_c = normalized_to_unit_ray(float(x_ref), float(y_ref))
+    if (not np.all(np.isfinite(ray_c))) or float(ray_c[2]) <= 1e-6:
+        return None
+    p_c = ray_c * float(max(0.10, fixed_depth_m) / max(1e-6, float(ray_c[2])))
+    p_w = np.asarray(p_cam, dtype=float).reshape(3,) + r_cw @ np.asarray(p_c, dtype=float).reshape(3,)
+    if not np.all(np.isfinite(p_w)):
+        return None
+    return p_w
+
+
+def _msckf_partial_depth_noise_scale(triangulated: Optional[dict]) -> float:
+    """Inflate measurement noise for partially accepted weak-geometry features."""
+    if not isinstance(triangulated, dict):
+        return 1.0
+    total_obs = max(1, int(triangulated.get("num_obs_total", 0)))
+    pruned_obs = max(0, int(triangulated.get("depth_pruned_obs_count", 0)))
+    promoted_obs = max(0, int(triangulated.get("depth_promoted_obs_count", 0)))
+    fallback_obs = max(0, int(triangulated.get("depth_fallback_obs_count", 0)))
+    reproj_promoted_obs = max(0, int(triangulated.get("reproj_promoted_obs_count", 0)))
+    geometry_fallback_obs = max(0, int(triangulated.get("geometry_fallback_obs_count", 0)))
+    weak_update_obs = max(0, int(triangulated.get("reproj_weak_update_obs_count", 0)))
+    weak_update_overrun = float(triangulated.get("reproj_weak_update_overrun_ratio", np.nan))
+
+    scale = 1.0
+    if bool(triangulated.get("depth_partial_accept", False)):
+        scale += 2.5 * float(pruned_obs) / float(total_obs)
+    if promoted_obs > 0:
+        scale += 4.0 * float(promoted_obs) / float(total_obs)
+    if fallback_obs > 0 or bool(triangulated.get("depth_fallback_active", False)):
+        scale += 6.0 * float(max(1, fallback_obs)) / float(total_obs)
+    if bool(triangulated.get("reproj_partial_accept", False)):
+        scale += 2.0 * float(max(1, reproj_promoted_obs)) / float(total_obs)
+    if geometry_fallback_obs > 0 or bool(triangulated.get("geometry_fallback_active", False)):
+        scale += 3.5 * float(max(1, geometry_fallback_obs)) / float(total_obs)
+    if bool(triangulated.get("reproj_weak_update_active", False)):
+        weak_severity = 1.0
+        if np.isfinite(weak_update_overrun):
+            weak_severity = float(np.clip(weak_update_overrun, 1.0, 1.6))
+        scale += 4.0 * float(max(1, weak_update_obs)) / float(total_obs) * weak_severity
+    if bool(triangulated.get("reproj_adrenaline_active", False)):
+        scale += 1.5
+    if bool(triangulated.get("emergency_fast_track_active", False)):
+        scale += 2.5
+    if bool(triangulated.get("rescue_obs_set_used", False)):
+        scale *= 1.20
+    return float(np.clip(scale, 1.0, 25.0))
+
+
+def _compute_msckf_adrenaline_meta(
+    vio_fe: Any,
+    mature_track_count: int,
+    timestamp: float,
+    global_config: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Bound weak reprojection acceptance to a short post-collapse window."""
+    cfg = global_config if isinstance(global_config, dict) else {}
+    enabled = bool(cfg.get("MSCKF_ADRENALINE_GUARD_ENABLE", True))
+    critical_track_count = int(max(2, cfg.get("MSCKF_ADRENALINE_CRITICAL_TRACK_COUNT", 5)))
+    window_sec = float(max(0.10, cfg.get("MSCKF_ADRENALINE_WINDOW_SEC", 2.0)))
+    mature_track_count = int(max(0, mature_track_count))
+    critical_active = bool(enabled and mature_track_count < critical_track_count)
+
+    prev_state = getattr(vio_fe, "_msckf_adrenaline_state", {})
+    if not isinstance(prev_state, dict):
+        prev_state = {}
+    prev_critical = bool(prev_state.get("critical_active", False))
+    prev_exhausted = bool(prev_state.get("exhausted", False))
+    start_t = float(prev_state.get("critical_start_t", np.nan))
+
+    if not enabled:
+        state = {
+            "critical_active": False,
+            "active": False,
+            "exhausted": False,
+            "critical_start_t": np.nan,
+            "elapsed_sec": 0.0,
+            "critical_track_count": int(critical_track_count),
+            "window_sec": float(window_sec),
+            "mature_track_count": int(mature_track_count),
+        }
+        setattr(vio_fe, "_msckf_adrenaline_state", state)
+        return state
+
+    if not critical_active:
+        if prev_critical:
+            MSCKF_STATS["adrenaline_reset_count"] += 1
+        state = {
+            "critical_active": False,
+            "active": False,
+            "exhausted": False,
+            "critical_start_t": np.nan,
+            "elapsed_sec": 0.0,
+            "critical_track_count": int(critical_track_count),
+            "window_sec": float(window_sec),
+            "mature_track_count": int(mature_track_count),
+        }
+        setattr(vio_fe, "_msckf_adrenaline_state", state)
+        return state
+
+    if not np.isfinite(start_t):
+        start_t = float(timestamp) if np.isfinite(float(timestamp)) else 0.0
+        MSCKF_STATS["adrenaline_enter_count"] += 1
+
+    elapsed_sec = (
+        max(0.0, float(timestamp) - float(start_t))
+        if np.isfinite(float(timestamp)) and np.isfinite(float(start_t))
+        else 0.0
+    )
+    adrenaline_active = bool(elapsed_sec <= window_sec)
+    exhausted = bool(not adrenaline_active)
+    if adrenaline_active:
+        MSCKF_STATS["adrenaline_active_cycle_count"] += 1
+    if exhausted and not prev_exhausted:
+        MSCKF_STATS["adrenaline_exhausted_count"] += 1
+
+    state = {
+        "critical_active": True,
+        "active": bool(adrenaline_active),
+        "exhausted": bool(exhausted),
+        "critical_start_t": float(start_t),
+        "elapsed_sec": float(elapsed_sec),
+        "critical_track_count": int(critical_track_count),
+        "window_sec": float(window_sec),
+        "mature_track_count": int(mature_track_count),
+    }
+    setattr(vio_fe, "_msckf_adrenaline_state", state)
+    return state
+
+
 # =============================================================================
 # v2.9.10.0: Adaptive MSCKF Threshold (Priority 2)
 # =============================================================================
@@ -260,6 +490,18 @@ MSCKF_STATS = {
     'posttri_retry_recover_depth_fail_geometry_count': 0,
     'posttri_retry_recover_depth_fail_nonlinear_count': 0,
     'posttri_retry_recover_depth_fail_other_count': 0,
+    'partial_depth_prune_feature_count': 0,
+    'partial_depth_prune_obs_count': 0,
+    'partial_depth_prune_update_count': 0,
+    'partial_depth_fallback_feature_count': 0,
+    'partial_depth_fallback_update_count': 0,
+    'partial_depth_mahalanobis_reject_count': 0,
+    'adrenaline_enter_count': 0,
+    'adrenaline_active_cycle_count': 0,
+    'adrenaline_exhausted_count': 0,
+    'adrenaline_reset_count': 0,
+    'adrenaline_weak_update_accept_count': 0,
+    'adrenaline_weak_update_clamp_block_count': 0,
     'unstable_lane_count': 0,
     'stable_lane_used_count': 0,
     'fail_nonlinear': 0,
@@ -821,21 +1063,231 @@ def find_mature_features_for_msckf(vio_fe, cam_observations: List[dict],
     track_pack_max_tracks = int(cfg.get("MSCKF_TRACK_PACK_MAX_TRACKS", 0))
     track_pack_min_parallax_px = float(cfg.get("MSCKF_TRACK_PACK_MIN_PARALLAX_PX", 0.95))
     track_pack_min_time_span_sec = float(cfg.get("MSCKF_TRACK_PACK_MIN_TIME_SPAN_SEC", 0.10))
+    emergency_enable = bool(cfg.get("MSCKF_EMERGENCY_FASTTRACK_ENABLE", True))
+    emergency_trigger_track_count = int(
+        cfg.get("MSCKF_EMERGENCY_TRIGGER_TRACK_COUNT", max(4, int(min_observations) + 1))
+    )
+    emergency_target_track_count = int(
+        cfg.get(
+            "MSCKF_EMERGENCY_TARGET_TRACK_COUNT",
+            max(emergency_trigger_track_count + 2, int(cfg.get("MSCKF_QUALITY_GATE_TRACK_MIN", 10)) // 2),
+        )
+    )
+    emergency_min_observations = int(cfg.get("MSCKF_EMERGENCY_MIN_OBSERVATIONS", 2))
+    emergency_min_inlier_ratio = float(
+        cfg.get(
+            "MSCKF_EMERGENCY_MIN_INLIER_RATIO",
+            max(0.35, float(track_pack_min_inlier) - 0.15),
+        )
+    )
+    emergency_min_recent_inlier_ratio = float(
+        cfg.get(
+            "MSCKF_EMERGENCY_MIN_RECENT_INLIER_RATIO",
+            max(0.25, float(track_pack_recent_inlier) - 0.20),
+        )
+    )
+    emergency_min_quality_median = float(
+        cfg.get(
+            "MSCKF_EMERGENCY_MIN_QUALITY_MEDIAN",
+            max(0.18, float(track_pack_min_quality) - 0.10),
+        )
+    )
+    emergency_min_parallax_px = float(
+        cfg.get(
+            "MSCKF_EMERGENCY_MIN_PARALLAX_PX",
+            max(0.25, float(track_pack_min_parallax_px) * 0.45),
+        )
+    )
+    emergency_promote_min_track_length = int(
+        cfg.get("MSCKF_EMERGENCY_PROMOTE_MIN_TRACK_LENGTH", 2)
+    )
+    emergency_promote_max_track_length = int(
+        cfg.get("MSCKF_EMERGENCY_PROMOTE_MAX_TRACK_LENGTH", max(3, int(min_observations)))
+    )
+    emergency_pure_bearing_enable = bool(
+        cfg.get("MSCKF_EMERGENCY_PURE_BEARING_ENABLE", True)
+    )
+    emergency_pure_bearing_min_quality = float(
+        cfg.get(
+            "MSCKF_EMERGENCY_PURE_BEARING_MIN_QUALITY",
+            max(0.20, float(emergency_min_quality_median)),
+        )
+    )
+    emergency_pure_bearing_min_inlier = float(
+        cfg.get(
+            "MSCKF_EMERGENCY_PURE_BEARING_MIN_INLIER_RATIO",
+            max(0.50, float(emergency_min_inlier_ratio)),
+        )
+    )
+    emergency_max_time_span_sec = float(
+        cfg.get(
+            "MSCKF_EMERGENCY_MAX_TIME_SPAN_SEC",
+            max(0.08, float(track_pack_min_time_span_sec) * 1.2),
+        )
+    )
+    emergency_max_tracks = int(cfg.get("MSCKF_EMERGENCY_MAX_TRACKS", max(6, int(max_features) if int(max_features) > 0 else 12)))
     effective_max_tracks = int(max(0, max_features))
     if track_pack_max_tracks > 0 and (effective_max_tracks <= 0 or track_pack_max_tracks < effective_max_tracks):
         effective_max_tracks = int(track_pack_max_tracks)
+    emergency_max_tracks = int(max(2, emergency_max_tracks))
+    emergency_hint_cycles = int(max(0, getattr(vio_fe, "_msckf_emergency_boost", 0)))
+    base_quality_track_min = int(max(1, cfg.get("MSCKF_QUALITY_GATE_TRACK_MIN", 10)))
+    emergency_short_track_fids: set[int] = set()
 
-    mature_tracks: Dict[int, List[dict]]
-    if track_pack_enable:
-        mature_tracks = vio_fe.get_mature_tracks(
-            min_inlier_ratio=float(track_pack_min_inlier),
-            min_quality_median=float(track_pack_min_quality),
-            min_recent_inlier_ratio=float(track_pack_recent_inlier),
+    def _get_cell_key(obs: List[dict]) -> Tuple[int, int]:
+        grid_x = int(max(1, getattr(vio_fe, "grid_x", 1)))
+        grid_y = int(max(1, getattr(vio_fe, "grid_y", 1)))
+        img_w = float(max(1, getattr(vio_fe, "img_w", 1)))
+        img_h = float(max(1, getattr(vio_fe, "img_h", 1)))
+        pt_last = obs[-1].get("pt_pixel", obs[-1].get("pt_px", None)) if len(obs) > 0 else None
+        if pt_last is None:
+            return (-1, -1)
+        try:
+            px = float(pt_last[0])
+            py = float(pt_last[1])
+        except Exception:
+            return (-1, -1)
+        gx = int(np.clip(np.floor((px / img_w) * grid_x), 0, max(0, grid_x - 1)))
+        gy = int(np.clip(np.floor((py / img_h) * grid_y), 0, max(0, grid_y - 1)))
+        return (gx, gy)
+
+    def _collect_emergency_fast_tracks(existing_fids: List[int]) -> List[int]:
+        tracks = getattr(vio_fe, "tracks", {}) or {}
+        if not isinstance(tracks, dict) or len(tracks) == 0:
+            return []
+        existing = {int(fid) for fid in existing_fids}
+        per_cell_best: Dict[Tuple[int, int], Tuple[float, int]] = {}
+        scored_all: List[Tuple[float, int, Tuple[int, int]]] = []
+
+        for fid, hist in tracks.items():
+            fid_i = int(fid)
+            if fid_i in existing:
+                continue
+            if not isinstance(hist, list) or len(hist) < max(2, int(emergency_min_observations)):
+                continue
+            obs = get_feature_multi_view_observations(fid_i, cam_observations)
+            if len(obs) < max(2, int(emergency_min_observations)):
+                continue
+
+            hist_len = int(len(hist))
+            inlier_ratio = float(
+                sum(1 for item in hist if bool(item.get("is_inlier", False))) / float(max(1, hist_len))
+            )
+            if inlier_ratio < float(np.clip(emergency_min_inlier_ratio, 0.0, 1.0)):
+                continue
+
+            recent_window = int(max(1, min(hist_len, track_pack_recent_window if track_pack_recent_window > 0 else hist_len)))
+            recent_hist = hist[-recent_window:]
+            recent_inlier_ratio = float(
+                sum(1 for item in recent_hist if bool(item.get("is_inlier", False))) / float(max(1, len(recent_hist)))
+            )
+            if recent_inlier_ratio < float(np.clip(emergency_min_recent_inlier_ratio, 0.0, 1.0)):
+                continue
+
+            q_arr = np.asarray([float(o.get("quality", np.nan)) for o in obs], dtype=float)
+            q_med = float(np.nanmedian(q_arr)) if (q_arr.size > 0 and np.isfinite(q_arr).any()) else float("nan")
+            if np.isfinite(q_med) and q_med < float(np.clip(emergency_min_quality_median, 0.0, 1.0)):
+                continue
+
+            t_arr = np.asarray([float(o.get("t", np.nan)) for o in obs], dtype=float)
+            t_span = (
+                float(np.nanmax(t_arr) - np.nanmin(t_arr))
+                if (t_arr.size > 1 and np.isfinite(t_arr).any())
+                else float("nan")
+            )
+            parallax_px = _pairwise_parallax_med_px(obs, 120.0)
+            low_parallax_short_track = bool(
+                bool(emergency_pure_bearing_enable)
+                and hist_len <= int(max(2, emergency_promote_max_track_length))
+                and inlier_ratio >= float(np.clip(emergency_pure_bearing_min_inlier, 0.0, 1.0))
+                and recent_inlier_ratio >= float(np.clip(emergency_min_recent_inlier_ratio, 0.0, 1.0))
+                and ((not np.isfinite(q_med)) or q_med >= float(np.clip(emergency_pure_bearing_min_quality, 0.0, 1.0)))
+            )
+            if np.isfinite(parallax_px) and parallax_px < float(max(0.1, emergency_min_parallax_px)):
+                if not low_parallax_short_track:
+                    continue
+
+            short_span = bool((not np.isfinite(t_span)) or t_span <= float(max(1e-3, emergency_max_time_span_sec)))
+            short_hist = bool(hist_len < int(max(getattr(vio_fe, "min_track_length", 4), min_observations + 1)))
+            emergency_like = bool(short_span or short_hist or hist_len <= int(max(3, min_observations)))
+            if not emergency_like:
+                continue
+
+            parallax_term = 0.0
+            if np.isfinite(parallax_px):
+                parallax_term = float(np.clip(parallax_px / max(1.0, track_pack_min_parallax_px * 2.0), 0.0, 1.0))
+            q_term = float(np.clip(q_med, 0.0, 1.0)) if np.isfinite(q_med) else 0.0
+            recency_bonus = 1.0 if short_span else 0.65
+            short_bonus = 1.0 if short_hist else 0.55
+            bearing_bonus = 0.10 if low_parallax_short_track else 0.0
+            score = (
+                0.34 * float(np.clip(inlier_ratio, 0.0, 1.0))
+                + 0.24 * float(np.clip(recent_inlier_ratio, 0.0, 1.0))
+                + 0.20 * q_term
+                + 0.14 * parallax_term
+                + 0.05 * recency_bonus
+                + 0.03 * short_bonus
+                + bearing_bonus
+            )
+            cell_key = _get_cell_key(obs)
+            cur_best = per_cell_best.get(cell_key)
+            if cur_best is None or score > cur_best[0]:
+                per_cell_best[cell_key] = (score, fid_i)
+            scored_all.append((score, fid_i, cell_key))
+
+        promoted: List[int] = []
+        if len(per_cell_best) > 0:
+            for _, fid_i in sorted(per_cell_best.values(), key=lambda item: item[0], reverse=True):
+                if fid_i not in promoted:
+                    promoted.append(int(fid_i))
+        if len(scored_all) > 0:
+            for _, fid_i, _ in sorted(scored_all, key=lambda item: item[0], reverse=True):
+                if fid_i not in promoted:
+                    promoted.append(int(fid_i))
+                if len(promoted) >= int(emergency_max_tracks):
+                    break
+        return promoted
+
+    def _load_mature_tracks(
+        min_inlier_ratio: float,
+        min_quality_median: float,
+        min_recent_inlier_ratio: float,
+        emergency_mode: bool = False,
+    ) -> Dict[int, List[dict]]:
+        if not track_pack_enable:
+            return vio_fe.get_mature_tracks()
+        return vio_fe.get_mature_tracks(
+            min_inlier_ratio=float(np.clip(min_inlier_ratio, 0.0, 1.0)),
+            min_quality_median=float(np.clip(min_quality_median, 0.0, 1.0)),
+            min_recent_inlier_ratio=float(np.clip(min_recent_inlier_ratio, 0.0, 1.0)),
             recent_window=int(track_pack_recent_window),
             max_tracks=int(effective_max_tracks),
+            emergency_enable=bool(emergency_mode),
+            emergency_min_track_length=int(max(2, emergency_promote_min_track_length)),
         )
-    else:
-        mature_tracks = vio_fe.get_mature_tracks()
+
+    mature_tracks: Dict[int, List[dict]] = _load_mature_tracks(
+        min_inlier_ratio=float(track_pack_min_inlier),
+        min_quality_median=float(track_pack_min_quality),
+        min_recent_inlier_ratio=float(track_pack_recent_inlier),
+    )
+    if track_pack_enable and len(mature_tracks) == 0:
+        mature_tracks = _load_mature_tracks(
+            min_inlier_ratio=max(0.48, float(track_pack_min_inlier) - 0.10),
+            min_quality_median=max(0.24, float(track_pack_min_quality) - 0.08),
+            min_recent_inlier_ratio=max(0.38, float(track_pack_recent_inlier) - 0.10),
+        )
+    if emergency_enable and len(mature_tracks) < max(2, int(emergency_trigger_track_count)):
+        emergency_tracks = _load_mature_tracks(
+            min_inlier_ratio=max(0.35, float(emergency_min_inlier_ratio) - 0.05),
+            min_quality_median=max(0.16, float(emergency_min_quality_median) - 0.04),
+            min_recent_inlier_ratio=max(0.20, float(emergency_min_recent_inlier_ratio) - 0.05),
+            emergency_mode=True,
+        )
+        for fid, hist in emergency_tracks.items():
+            mature_tracks[int(fid)] = hist
+            if len(hist) <= int(max(2, emergency_promote_max_track_length)):
+                emergency_short_track_fids.add(int(fid))
     mature_features = []
     
     for fid in mature_tracks.keys():
@@ -844,10 +1296,16 @@ def find_mature_features_for_msckf(vio_fe, cam_observations: List[dict],
             if track_pack_enable and len(obs) >= 2:
                 parallax_px = _pairwise_parallax_med_px(obs, 120.0)
                 t_arr = np.asarray([float(o.get("t", np.nan)) for o in obs], dtype=float)
+                q_arr = np.asarray([float(o.get("quality", np.nan)) for o in obs], dtype=float)
                 if t_arr.size > 1 and np.isfinite(t_arr).any():
                     t_span = float(np.nanmax(t_arr) - np.nanmin(t_arr))
                 else:
                     t_span = float("nan")
+                q_med = (
+                    float(np.nanmedian(q_arr))
+                    if (q_arr.size > 0 and np.isfinite(q_arr).any())
+                    else float("nan")
+                )
                 low_parallax = bool(
                     np.isfinite(parallax_px)
                     and float(parallax_px) < float(max(0.1, track_pack_min_parallax_px))
@@ -856,11 +1314,65 @@ def find_mature_features_for_msckf(vio_fe, cam_observations: List[dict],
                     (not np.isfinite(t_span))
                     or float(t_span) < float(max(1e-3, track_pack_min_time_span_sec))
                 )
-                if low_parallax and short_span:
+                short_track = bool(len(obs) <= max(int(min_observations) + 1, 5))
+                low_quality = bool(
+                    np.isfinite(q_med)
+                    and float(q_med) < float(max(0.20, float(track_pack_min_quality) * 0.90))
+                )
+                emergency_short_track = bool(
+                    int(fid) in emergency_short_track_fids
+                    and bool(emergency_pure_bearing_enable)
+                    and len(obs) <= int(max(2, emergency_promote_max_track_length))
+                )
+                if (
+                    low_parallax
+                    and short_span
+                    and (short_track or low_quality)
+                    and (not emergency_short_track)
+                ):
                     continue
             mature_features.append(fid)
+    raw_mature_feature_count = int(len(mature_features))
     if effective_max_tracks > 0 and len(mature_features) > effective_max_tracks:
         mature_features = mature_features[:effective_max_tracks]
+
+    emergency_active = False
+    emergency_promoted_fids: List[int] = []
+    if bool(emergency_enable):
+        low_track_supply = bool(len(mature_features) < max(2, int(emergency_trigger_track_count)))
+        hinted_emergency = bool(emergency_hint_cycles > 0)
+        if low_track_supply or hinted_emergency:
+            emergency_active = True
+            emergency_promoted_fids = _collect_emergency_fast_tracks(mature_features)
+            emergency_target = max(
+                2,
+                int(emergency_target_track_count if (low_track_supply or hinted_emergency) else len(mature_features)),
+            )
+            for fid in emergency_promoted_fids:
+                if fid not in mature_features:
+                    mature_features.append(int(fid))
+                if len(mature_features) >= int(emergency_target):
+                    break
+            if effective_max_tracks > 0 and len(mature_features) > effective_max_tracks:
+                mature_features = mature_features[:effective_max_tracks]
+
+    effective_track_min = int(base_quality_track_min)
+    if emergency_active:
+        effective_track_min = int(
+            max(
+                2,
+                min(
+                    base_quality_track_min,
+                    max(3, len(mature_features)),
+                ),
+            )
+        )
+    setattr(vio_fe, "_msckf_emergency_active", bool(emergency_active))
+    setattr(vio_fe, "_msckf_emergency_promoted_count", int(len(emergency_promoted_fids)))
+    setattr(vio_fe, "_msckf_emergency_effective_track_min", int(effective_track_min))
+    setattr(vio_fe, "_msckf_emergency_last_mature_count", int(len(mature_features)))
+    setattr(vio_fe, "_msckf_raw_mature_count", int(raw_mature_feature_count))
+    setattr(vio_fe, "_msckf_emergency_short_track_fids", tuple(sorted(int(fid) for fid in emergency_short_track_fids)))
     
     return mature_features
 
@@ -963,6 +1475,9 @@ def triangulate_point_linear(observations: List[dict], cam_states: List[dict]) -
 def triangulate_point_nonlinear(observations: List[dict], cam_states: List[dict], 
                                 p_init: np.ndarray, kf: ExtendedKalmanFilter,
                                 max_iters: int = 10, debug: bool = False,
+                                step_tol: float = 1e-5,
+                                max_step_norm: float = 5.0,
+                                damping_scale: float = 1.0,
                                 global_config: Optional[dict] = None) -> Optional[np.ndarray]:
     """
     Nonlinear triangulation refinement using Gauss-Newton.
@@ -981,6 +1496,23 @@ def triangulate_point_nonlinear(observations: List[dict], cam_states: List[dict]
     
     p = p_init.copy()
     
+    try:
+        max_iters = max(2, int(max_iters))
+    except Exception:
+        max_iters = 10
+    try:
+        step_tol = float(max(step_tol, 1e-8))
+    except Exception:
+        step_tol = 1e-5
+    try:
+        max_step_norm = float(max(max_step_norm, 0.10))
+    except Exception:
+        max_step_norm = 5.0
+    try:
+        damping_scale = float(np.clip(damping_scale, 0.1, 50.0))
+    except Exception:
+        damping_scale = 1.0
+
     for iteration in range(max_iters):
         H = []
         r = []
@@ -1043,20 +1575,19 @@ def triangulate_point_nonlinear(observations: List[dict], cam_states: List[dict]
             
             # v2.9.9.9: More aggressive damping to improve convergence
             # Reduces fail_nonlinear (15.2%) by making optimizer more stable
-            lambda_lm = max(1e-2 * np.trace(HTH) / 3.0, 1e-5)  # 10× larger damping
+            lambda_lm = max(1e-2 * np.trace(HTH) / 3.0, 1e-5) * float(damping_scale)
             HTH_damped = HTH + lambda_lm * np.eye(3)
             
             dp = np.linalg.solve(HTH_damped, HTr)
             
             # Limit step size (more conservative)
             dp_norm = np.linalg.norm(dp)
-            if dp_norm > 5.0:  # Was 10.0, now 5.0 for stability
-                dp = dp * (5.0 / dp_norm)
+            if dp_norm > max_step_norm:
+                dp = dp * (float(max_step_norm) / dp_norm)
             
             p = p + dp.reshape(3,)
             
-            # v2.9.9.9: Relaxed convergence (1e-6 → 1e-5) for faster termination
-            if np.linalg.norm(dp) < 1e-5:
+            if np.linalg.norm(dp) < step_tol:
                 break
         except np.linalg.LinAlgError:
             return None
@@ -1142,7 +1673,9 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
                         reproj_scale: float = 1.0,
                         phase: int = 2,
                         health_state: str = "HEALTHY",
-                        retry_mode: str = "") -> Optional[dict]:
+                        retry_mode: str = "",
+                        adrenaline_meta: Optional[Dict[str, Any]] = None,
+                        emergency_track_mode: bool = False) -> Optional[dict]:
     """
     Triangulate a feature using multi-view observations.
     
@@ -1385,6 +1918,219 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
             2.5,
         )
     )
+    tri_nl_max_iters = int(
+        (global_config or {}).get("MSCKF_TRI_NL_MAX_ITERS", 10)
+        if isinstance(global_config, dict) else 10
+    )
+    tri_nl_step_tol = float(
+        (global_config or {}).get("MSCKF_TRI_NL_STEP_TOL", 1e-5)
+        if isinstance(global_config, dict) else 1e-5
+    )
+    tri_nl_max_step_norm = float(
+        (global_config or {}).get("MSCKF_TRI_NL_MAX_STEP_NORM_M", 5.0)
+        if isinstance(global_config, dict) else 5.0
+    )
+    tri_nl_damping_scale = float(
+        (global_config or {}).get("MSCKF_TRI_NL_DAMPING_SCALE", 1.0)
+        if isinstance(global_config, dict) else 1.0
+    )
+    tri_nl_recover_max_iters = int(
+        (global_config or {}).get("MSCKF_TRI_NL_RECOVER_MAX_ITERS", max(14, int(tri_nl_max_iters) + 4))
+        if isinstance(global_config, dict) else max(14, int(tri_nl_max_iters) + 4)
+    )
+    tri_nl_recover_step_tol = float(
+        (global_config or {}).get("MSCKF_TRI_NL_RECOVER_STEP_TOL", min(float(tri_nl_step_tol), 5e-6))
+        if isinstance(global_config, dict) else min(float(tri_nl_step_tol), 5e-6)
+    )
+    tri_nl_recover_max_step_norm = float(
+        (global_config or {}).get("MSCKF_TRI_NL_RECOVER_MAX_STEP_NORM_M", max(6.0, float(tri_nl_max_step_norm)))
+        if isinstance(global_config, dict) else max(6.0, float(tri_nl_max_step_norm))
+    )
+    tri_nl_recover_damping_scale = float(
+        (global_config or {}).get("MSCKF_TRI_NL_RECOVER_DAMPING_SCALE", 0.85)
+        if isinstance(global_config, dict) else 0.85
+    )
+    tri_pair_min_angle_deg = float(
+        (global_config or {}).get("MSCKF_TRI_MIN_PARALLAX_ANGLE_DEG", MIN_PARALLAX_ANGLE_DEG)
+        if isinstance(global_config, dict) else MIN_PARALLAX_ANGLE_DEG
+    )
+    tri_pair_recover_angle_mult = float(
+        (global_config or {}).get("MSCKF_TRI_RECOVER_PARALLAX_ANGLE_MULT", 0.72)
+        if isinstance(global_config, dict) else 0.72
+    )
+    reproj_partial_accept_enable = bool(
+        (global_config or {}).get("MSCKF_REPROJ_PARTIAL_ACCEPT_ENABLE", True)
+        if isinstance(global_config, dict) else True
+    )
+    reproj_partial_min_obs = int(
+        (global_config or {}).get(
+            "MSCKF_REPROJ_PARTIAL_MIN_OBS",
+            max(2, int(depth_sparse_recover_min_obs) - 1),
+        )
+        if isinstance(global_config, dict) else max(2, int(depth_sparse_recover_min_obs) - 1)
+    )
+    reproj_partial_min_parallax_px = float(
+        (global_config or {}).get(
+            "MSCKF_REPROJ_PARTIAL_MIN_PARALLAX_PX",
+            max(0.6, float(depth_sparse_recover_min_parallax_px) * 0.82),
+        )
+        if isinstance(global_config, dict) else max(0.6, float(depth_sparse_recover_min_parallax_px) * 0.82)
+    )
+    reproj_partial_min_quality = float(
+        (global_config or {}).get(
+            "MSCKF_REPROJ_PARTIAL_MIN_QUALITY",
+            max(0.22, float(depth_sparse_recover_min_quality) - 0.08),
+        )
+        if isinstance(global_config, dict) else max(0.22, float(depth_sparse_recover_min_quality) - 0.08)
+    )
+    reproj_partial_max_promote = int(
+        (global_config or {}).get("MSCKF_REPROJ_PARTIAL_MAX_PROMOTE", 3)
+        if isinstance(global_config, dict) else 3
+    )
+    reproj_partial_ray_mult = float(
+        (global_config or {}).get("MSCKF_REPROJ_PARTIAL_RAY_MULT", 1.40)
+        if isinstance(global_config, dict) else 1.40
+    )
+    reproj_partial_pixel_mult = float(
+        (global_config or {}).get("MSCKF_REPROJ_PARTIAL_PIXEL_MULT", 1.45)
+        if isinstance(global_config, dict) else 1.45
+    )
+    reproj_partial_error_mult = float(
+        (global_config or {}).get("MSCKF_REPROJ_PARTIAL_ERROR_MULT", 1.12)
+        if isinstance(global_config, dict) else 1.12
+    )
+    reproj_partial_retriangulate_enable = bool(
+        (global_config or {}).get("MSCKF_REPROJ_PARTIAL_RETRIANGULATE_ENABLE", True)
+        if isinstance(global_config, dict) else True
+    )
+    geometry_insuff_partial_accept_enable = bool(
+        (global_config or {}).get("MSCKF_GEOMETRY_INSUFF_PARTIAL_ACCEPT_ENABLE", True)
+        if isinstance(global_config, dict) else True
+    )
+    geometry_insuff_partial_min_obs = int(
+        (global_config or {}).get("MSCKF_GEOMETRY_INSUFF_PARTIAL_MIN_OBS", max(2, int(reproj_partial_min_obs)))
+        if isinstance(global_config, dict) else max(2, int(reproj_partial_min_obs))
+    )
+    geometry_insuff_partial_min_parallax_px = float(
+        (global_config or {}).get(
+            "MSCKF_GEOMETRY_INSUFF_PARTIAL_MIN_PARALLAX_PX",
+            max(0.5, float(reproj_partial_min_parallax_px) * 0.82),
+        )
+        if isinstance(global_config, dict) else max(0.5, float(reproj_partial_min_parallax_px) * 0.82)
+    )
+    geometry_insuff_partial_min_quality = float(
+        (global_config or {}).get(
+            "MSCKF_GEOMETRY_INSUFF_PARTIAL_MIN_QUALITY",
+            max(0.18, float(reproj_partial_min_quality) - 0.08),
+        )
+        if isinstance(global_config, dict) else max(0.18, float(reproj_partial_min_quality) - 0.08)
+    )
+    geometry_insuff_partial_max_promote = int(
+        (global_config or {}).get(
+            "MSCKF_GEOMETRY_INSUFF_PARTIAL_MAX_PROMOTE",
+            max(2, int(reproj_partial_max_promote) + 1),
+        )
+        if isinstance(global_config, dict) else max(2, int(reproj_partial_max_promote) + 1)
+    )
+    geometry_insuff_partial_retriangulate_enable = bool(
+        (global_config or {}).get("MSCKF_GEOMETRY_INSUFF_PARTIAL_RETRIANGULATE_ENABLE", True)
+        if isinstance(global_config, dict) else True
+    )
+    reproj_weak_update_enable = bool(
+        (global_config or {}).get("MSCKF_REPROJ_WEAK_UPDATE_ENABLE", True)
+        if isinstance(global_config, dict) else True
+    )
+    reproj_weak_update_min_obs = int(
+        (global_config or {}).get("MSCKF_REPROJ_WEAK_UPDATE_MIN_OBS", 6)
+        if isinstance(global_config, dict) else 6
+    )
+    reproj_weak_update_min_valid_obs_ratio = float(
+        (global_config or {}).get("MSCKF_REPROJ_WEAK_UPDATE_MIN_VALID_OBS_RATIO", 0.48)
+        if isinstance(global_config, dict) else 0.48
+    )
+    reproj_weak_update_max_borderline_ratio = float(
+        (global_config or {}).get("MSCKF_REPROJ_WEAK_UPDATE_MAX_BORDERLINE_RATIO", 0.32)
+        if isinstance(global_config, dict) else 0.32
+    )
+    reproj_weak_update_min_quality = float(
+        (global_config or {}).get("MSCKF_REPROJ_WEAK_UPDATE_MIN_QUALITY", 0.40)
+        if isinstance(global_config, dict) else 0.40
+    )
+    reproj_weak_update_max_avg_mult = float(
+        (global_config or {}).get("MSCKF_REPROJ_WEAK_UPDATE_MAX_AVG_MULT", 1.18)
+        if isinstance(global_config, dict) else 1.18
+    )
+    reproj_weak_update_max_median_mult = float(
+        (global_config or {}).get("MSCKF_REPROJ_WEAK_UPDATE_MAX_MEDIAN_MULT", 0.98)
+        if isinstance(global_config, dict) else 0.98
+    )
+    reproj_weak_update_max_p90_mult = float(
+        (global_config or {}).get("MSCKF_REPROJ_WEAK_UPDATE_MAX_P90_MULT", 1.22)
+        if isinstance(global_config, dict) else 1.22
+    )
+    reproj_weak_update_max_p95_mult = float(
+        (global_config or {}).get("MSCKF_REPROJ_WEAK_UPDATE_MAX_P95_MULT", 1.32)
+        if isinstance(global_config, dict) else 1.32
+    )
+    adrenaline_guard_enable = bool(
+        (global_config or {}).get("MSCKF_ADRENALINE_GUARD_ENABLE", True)
+        if isinstance(global_config, dict) else True
+    )
+    adrenaline_relaxed_min_obs = int(
+        (global_config or {}).get(
+            "MSCKF_ADRENALINE_REPROJ_WEAK_UPDATE_MIN_OBS",
+            max(3, int(reproj_weak_update_min_obs) - 2),
+        )
+        if isinstance(global_config, dict) else max(3, int(reproj_weak_update_min_obs) - 2)
+    )
+    adrenaline_relaxed_min_valid_obs_ratio = float(
+        (global_config or {}).get("MSCKF_ADRENALINE_REPROJ_WEAK_UPDATE_MIN_VALID_OBS_RATIO", 0.34)
+        if isinstance(global_config, dict) else 0.34
+    )
+    adrenaline_relaxed_max_borderline_ratio = float(
+        (global_config or {}).get("MSCKF_ADRENALINE_REPROJ_WEAK_UPDATE_MAX_BORDERLINE_RATIO", 0.55)
+        if isinstance(global_config, dict) else 0.55
+    )
+    adrenaline_relaxed_min_quality = float(
+        (global_config or {}).get("MSCKF_ADRENALINE_REPROJ_WEAK_UPDATE_MIN_QUALITY", 0.24)
+        if isinstance(global_config, dict) else 0.24
+    )
+    adrenaline_relaxed_max_avg_mult = float(
+        (global_config or {}).get("MSCKF_ADRENALINE_REPROJ_WEAK_UPDATE_MAX_AVG_MULT", 1.34)
+        if isinstance(global_config, dict) else 1.34
+    )
+    adrenaline_relaxed_max_median_mult = float(
+        (global_config or {}).get("MSCKF_ADRENALINE_REPROJ_WEAK_UPDATE_MAX_MEDIAN_MULT", 1.08)
+        if isinstance(global_config, dict) else 1.08
+    )
+    adrenaline_relaxed_max_p90_mult = float(
+        (global_config or {}).get("MSCKF_ADRENALINE_REPROJ_WEAK_UPDATE_MAX_P90_MULT", 1.46)
+        if isinstance(global_config, dict) else 1.46
+    )
+    adrenaline_relaxed_max_p95_mult = float(
+        (global_config or {}).get("MSCKF_ADRENALINE_REPROJ_WEAK_UPDATE_MAX_P95_MULT", 1.60)
+        if isinstance(global_config, dict) else 1.60
+    )
+    emergency_fast_track_enable = bool(
+        (global_config or {}).get("MSCKF_EMERGENCY_FASTTRACK_ENABLE", True)
+        if isinstance(global_config, dict) else True
+    )
+    emergency_fixed_depth_m = float(
+        (global_config or {}).get("MSCKF_EMERGENCY_FIXED_DEPTH_M", 50.0)
+        if isinstance(global_config, dict) else 50.0
+    )
+    emergency_short_track_max_obs = int(
+        (global_config or {}).get("MSCKF_EMERGENCY_PROMOTE_MAX_TRACK_LENGTH", 3)
+        if isinstance(global_config, dict) else 3
+    )
+    emergency_short_track_min_quality = float(
+        (global_config or {}).get("MSCKF_EMERGENCY_PURE_BEARING_MIN_QUALITY", 0.22)
+        if isinstance(global_config, dict) else 0.22
+    )
+    emergency_short_track_min_inlier_ratio = float(
+        (global_config or {}).get("MSCKF_EMERGENCY_PURE_BEARING_MIN_INLIER_RATIO", 0.50)
+        if isinstance(global_config, dict) else 0.50
+    )
     # Deterministic stable-geometry reproj lane (single canonical lane).
     # Legacy stable_norm keys are kept as fallback aliases for backward compatibility.
     stable_lane_enable = bool(
@@ -1535,10 +2281,33 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
         else float("nan")
     )
     q_med_init = float(np.nanmedian(q_arr_init)) if (q_arr_init.size > 0 and np.isfinite(q_arr_init).any()) else float("nan")
+    inlier_ratio_init = float(
+        sum(1 for obs in obs_list if bool(obs.get("is_inlier", False))) / float(max(1, len(obs_list)))
+    )
+    emergency_short_track_candidate = bool(
+        bool(emergency_fast_track_enable)
+        and bool(emergency_track_mode)
+        and len(obs_list) >= 2
+        and len(obs_list) <= int(max(2, emergency_short_track_max_obs))
+        and inlier_ratio_init >= float(np.clip(emergency_short_track_min_inlier_ratio, 0.0, 1.0))
+        and (
+            (not np.isfinite(q_med_init))
+            or float(q_med_init) >= float(np.clip(emergency_short_track_min_quality, 0.0, 1.0))
+        )
+    )
     unstable_geometry_init = bool(depth_gate_enable and (
         len(obs_list) < max(2, int(depth_gate_track_min))
         or (np.isfinite(parallax_med_px_init) and float(parallax_med_px_init) < float(depth_gate_parallax_min_px))
     ))
+    tri_pair_min_angle_deg_use = float(max(0.05, tri_pair_min_angle_deg))
+    if bool(unstable_geometry_init) or bool(protected_retry_context) or bool(emergency_short_track_candidate):
+        tri_pair_min_angle_deg_use = float(
+            max(0.05, float(tri_pair_min_angle_deg) * float(np.clip(tri_pair_recover_angle_mult, 0.35, 1.0)))
+        )
+    if bool(emergency_short_track_candidate):
+        tri_pair_min_angle_deg_use = float(min(tri_pair_min_angle_deg_use, 0.08))
+    emergency_pretri_bypass_active = False
+    emergency_fixed_depth_seed_active = False
     if pretri_gate_enable:
         low_obs = bool(len(obs_list) < max(2, int(pretri_min_obs)))
         low_parallax = bool(
@@ -1565,10 +2334,13 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
             )
         )
         if geometry_insufficient_pretri:
-            MSCKF_STATS['fail_geometry_insufficient_pretri'] += 1
-            MSCKF_STATS['fail_geometry_borderline'] += 1
-            MSCKF_STATS['reclass_to_geometry_count'] += 1
-            return None
+            if bool(emergency_short_track_candidate):
+                emergency_pretri_bypass_active = True
+            else:
+                MSCKF_STATS['fail_geometry_insufficient_pretri'] += 1
+                MSCKF_STATS['fail_geometry_borderline'] += 1
+                MSCKF_STATS['reclass_to_geometry_count'] += 1
+                return None
 
     for obs_idx0, obs_idx1 in candidate_pairs:
         obs0 = obs_list[obs_idx0]
@@ -1616,7 +2388,7 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
         ray0_w /= max(1e-9, np.linalg.norm(ray0_w))
         ray1_w /= max(1e-9, np.linalg.norm(ray1_w))
         ray_angle_deg = float(np.degrees(np.arccos(np.clip(np.dot(ray0_w, ray1_w), -1.0, 1.0))))
-        if ray_angle_deg < MIN_PARALLAX_ANGLE_DEG:
+        if ray_angle_deg < float(tri_pair_min_angle_deg_use):
             fail_counts["parallax"] += 1
             continue
 
@@ -1662,6 +2434,16 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
             p_init = p_candidate
 
     if p_init is None:
+        if bool(emergency_short_track_candidate):
+            p_init = _seed_msckf_fixed_depth_point(
+                obs_list,
+                cam_states,
+                kf,
+                global_config=global_config,
+                fixed_depth_m=float(emergency_fixed_depth_m),
+            )
+            if p_init is not None:
+                emergency_fixed_depth_seed_active = True
         if fail_counts["depth"] > 0:
             MSCKF_STATS['depth_init_fail_count'] += 1
             if len(obs_list) < int(max(2, depth_init_recover_min_obs)):
@@ -1716,7 +2498,8 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
             MSCKF_STATS['fail_solver'] += 1
         else:
             MSCKF_STATS['fail_other'] += 1
-        return None
+        if p_init is None:
+            return None
     
     # Nonlinear refinement
     p_refined = triangulate_point_nonlinear(
@@ -1724,13 +2507,21 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
         cam_states,
         p_init,
         kf,
+        max_iters=tri_nl_recover_max_iters if bool(protected_retry_context) else tri_nl_max_iters,
         debug=debug,
+        step_tol=tri_nl_recover_step_tol if bool(protected_retry_context) else tri_nl_step_tol,
+        max_step_norm=tri_nl_recover_max_step_norm if bool(protected_retry_context) else tri_nl_max_step_norm,
+        damping_scale=tri_nl_recover_damping_scale if bool(protected_retry_context) else tri_nl_damping_scale,
         global_config=global_config,
     )
     
     if p_refined is None:
-        MSCKF_STATS['fail_nonlinear'] += 1
-        return None
+        if bool(emergency_short_track_candidate) and p_init is not None:
+            p_refined = np.asarray(p_init, dtype=float).reshape(3,)
+            emergency_fixed_depth_seed_active = True
+        else:
+            MSCKF_STATS['fail_nonlinear'] += 1
+            return None
     
     # =========================================================================
     # NEW (Phase 2): MSCKF Reprojection Validation using kannala_brandt_project
@@ -1841,6 +2632,45 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
     depth_retry_promoted_obs = 0
     rescue_promoted_obs = 0
     rescue_obs_set_used = False
+    partial_depth_accept = False
+    depth_fallback_active = False
+    depth_fallback_obs_count = 0
+    depth_partial_reason = ""
+    reproj_partial_accept = False
+    geometry_fallback_active = False
+    geometry_fallback_obs_count = 0
+    reproj_promoted_obs_count = 0
+    reproj_partial_reason = ""
+    reproj_rescue_valid_obs: List[dict] = []
+    reproj_rescue_obs_error_norm_values: List[float] = []
+    reproj_rescue_total_error = 0.0
+    reproj_rescue_borderline_rejects = 0
+    reproj_weak_update_active = False
+    reproj_weak_update_obs_count = 0
+    reproj_weak_update_overrun_ratio = float("nan")
+    reproj_adrenaline_active = bool(
+        adrenaline_guard_enable
+        and isinstance(adrenaline_meta, dict)
+        and adrenaline_meta.get("active", False)
+    )
+    reproj_adrenaline_exhausted = bool(
+        adrenaline_guard_enable
+        and isinstance(adrenaline_meta, dict)
+        and adrenaline_meta.get("critical_active", False)
+        and (not adrenaline_meta.get("active", False))
+    )
+    reproj_adrenaline_elapsed_sec = float(
+        adrenaline_meta.get("elapsed_sec", np.nan)
+        if isinstance(adrenaline_meta, dict) else np.nan
+    )
+    emergency_fast_track_active = bool(emergency_short_track_candidate)
+    if bool(emergency_fast_track_active):
+        depth_fallback_active = True
+        depth_partial_reason = "emergency_fast_track"
+        depth_fallback_obs_count = max(
+            int(depth_fallback_obs_count),
+            min(int(len(obs_list)), int(max(2, emergency_short_track_max_obs))),
+        )
 
     norm_scale_px = 120.0
     try:
@@ -1981,6 +2811,67 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
             MSCKF_STATS['reclass_to_geometry_count'] += 1
             return None
 
+    def _obs_bundle_key(obs_data: dict) -> Tuple[int, float, float, float]:
+        cam_key = int(obs_data.get("cam_id", -1))
+        t_val = float(obs_data.get("t", np.nan))
+        pt_norm = obs_data.get("pt_norm", (np.nan, np.nan))
+        try:
+            x_val = float(pt_norm[0])
+            y_val = float(pt_norm[1])
+        except Exception:
+            x_val = float("nan")
+            y_val = float("nan")
+        return (
+            cam_key,
+            round(t_val, 6) if np.isfinite(t_val) else float("nan"),
+            round(x_val, 6) if np.isfinite(x_val) else float("nan"),
+            round(y_val, 6) if np.isfinite(y_val) else float("nan"),
+        )
+
+    def _dedup_obs_bundle(obs_seq: List[dict], err_seq: List[float]) -> Tuple[List[dict], List[float]]:
+        ordered_keys: List[Tuple[int, float, float, float]] = []
+        best_by_key: Dict[Tuple[int, float, float, float], Tuple[dict, float]] = {}
+        for obs_data, err_val in zip(obs_seq, err_seq):
+            if not isinstance(obs_data, dict):
+                continue
+            err_f = float(err_val)
+            if not np.isfinite(err_f):
+                continue
+            key = _obs_bundle_key(obs_data)
+            prev = best_by_key.get(key)
+            if prev is None:
+                ordered_keys.append(key)
+                best_by_key[key] = (obs_data, err_f)
+            elif err_f < prev[1]:
+                best_by_key[key] = (obs_data, err_f)
+        out_obs: List[dict] = []
+        out_err: List[float] = []
+        for key in ordered_keys:
+            obs_data, err_f = best_by_key[key]
+            out_obs.append(obs_data)
+            out_err.append(float(err_f))
+        return out_obs, out_err
+
+    def _append_reproj_rescue_candidate(obs_data: dict, obs_metric: float, source: str) -> bool:
+        nonlocal reproj_rescue_total_error, reproj_promoted_obs_count, reproj_rescue_borderline_rejects
+        if not bool(reproj_partial_accept_enable):
+            return False
+        if reproj_promoted_obs_count >= max(1, int(reproj_partial_max_promote)):
+            return False
+        if (not np.isfinite(obs_metric)) or float(obs_metric) <= 0.0:
+            return False
+        obs_partial = dict(obs_data)
+        obs_partial["_msckf_partial_promoted"] = True
+        obs_partial["_msckf_reproj_promoted"] = True
+        obs_partial["_msckf_reproj_rescue_source"] = str(source)
+        promoted_metric = float(obs_metric) * float(np.clip(reproj_partial_error_mult, 1.0, 3.0))
+        reproj_rescue_valid_obs.append(obs_partial)
+        reproj_rescue_obs_error_norm_values.append(promoted_metric)
+        reproj_rescue_total_error += float(promoted_metric)
+        reproj_promoted_obs_count += 1
+        reproj_rescue_borderline_rejects += 1
+        return True
+
     for obs in obs_list:
         cam_id = obs['cam_id']
         if cam_id >= len(cam_states):
@@ -2019,6 +2910,9 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
             and (retry_mode_key == "depth_sparse_same_cycle_rescue")
             and bool(protected_retry_context)
         )
+        soft_depth_threshold = float(min_depth_threshold)
+        same_cycle_rescue_threshold = float(min_depth_threshold)
+        same_cycle_retry_floor_threshold = float(min_depth_threshold)
         if p_c[2] < min_depth_threshold:
             soft_depth_threshold = max(
                 float(depth_gate_floor_m) * 0.5,
@@ -2053,6 +2947,24 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
             else:
                 depth_rejects += 1
                 continue
+
+        obs_selected = dict(obs)
+        obs_selected["_msckf_depth_promoted"] = bool(
+            promoted_by_depth_retry or promoted_by_same_cycle_rescue
+        )
+        obs_selected["_msckf_depth_use_fallback"] = bool(
+            promoted_by_depth_retry or promoted_by_same_cycle_rescue
+        )
+        obs_selected["_msckf_depth_proj_floor"] = float(
+            max(
+                float(depth_gate_floor_m),
+                float(
+                    same_cycle_retry_floor_threshold
+                    if promoted_by_same_cycle_rescue
+                    else (soft_depth_threshold if promoted_by_depth_retry else min_depth_threshold)
+                ),
+            )
+        )
         
         # Retry-mode same-cycle rescue lane:
         # use positive-depth clipped projection only for promoted observations to
@@ -2092,6 +3004,15 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
         has_pixel_obs = bool(use_pixel_reprojection and ('pt_px' in obs) and (obs['pt_px'] is not None))
         ray_gate = ray_threshold_deg * (ray_soft_factor if has_pixel_obs else 1.0)
         if ray_err_deg > ray_gate:
+            rescue_ray_gate = float(ray_gate) * float(np.clip(reproj_partial_ray_mult, 1.0, 3.0))
+            if ray_err_deg <= rescue_ray_gate:
+                rescue_metric = float(
+                    max(
+                        norm_error,
+                        norm_threshold * min(float(np.clip(reproj_partial_ray_mult, 1.0, 3.0)), ray_err_deg / max(ray_gate, 1e-6)),
+                    )
+                )
+                _append_reproj_rescue_candidate(obs_selected, rescue_metric, "ray")
             reproj_rejects += 1
             norm_rejects += 1
             continue
@@ -2112,6 +3033,12 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
 
                     pixel_soft = MAX_REPROJ_ERROR_PX * pixel_soft_factor
                     if pixel_error > pixel_soft:
+                        rescue_pixel_gate = float(pixel_soft) * float(np.clip(reproj_partial_pixel_mult, 1.0, 3.0))
+                        if pixel_error <= rescue_pixel_gate:
+                            rescue_metric = float(
+                                min(pixel_error, rescue_pixel_gate) / max(1e-6, norm_scale_px)
+                            )
+                            _append_reproj_rescue_candidate(obs_selected, rescue_metric, "pixel")
                         reproj_rejects += 1
                         pixel_rejects += 1
                         continue
@@ -2142,10 +3069,10 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
         else:
             total_error += float(strict_obs_metric)
             obs_error_norm_values.append(float(strict_obs_metric))
-            valid_obs.append(obs)
+            valid_obs.append(obs_selected)
         rescue_total_error += float(rescue_obs_metric)
         rescue_obs_error_norm_values.append(float(rescue_obs_metric))
-        rescue_valid_obs.append(obs)
+        rescue_valid_obs.append(obs_selected)
 
     if (
         use_depth_same_cycle_full_rescue
@@ -2158,7 +3085,11 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
             cam_states,
             p_refined,
             kf,
+            max_iters=tri_nl_recover_max_iters,
             debug=debug,
+            step_tol=tri_nl_recover_step_tol,
+            max_step_norm=tri_nl_recover_max_step_norm,
+            damping_scale=tri_nl_recover_damping_scale,
             global_config=global_config,
         )
         if p_rescue is not None:
@@ -2195,6 +3126,348 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
     same_cycle_rescue_direct_max_promoted = int(
         max(1, int(depth_retry_soft_max_promote_use) + 1)
     )
+    partial_prune_enable = bool(
+        (global_config or {}).get("MSCKF_FEATURE_PRUNE_PARTIAL_ACCEPT_ENABLE", True)
+        if isinstance(global_config, dict) else True
+    )
+    partial_prune_min_obs = int(
+        (global_config or {}).get("MSCKF_FEATURE_PRUNE_MIN_OBS", 2)
+        if isinstance(global_config, dict) else 2
+    )
+    partial_prune_min_strict_obs = int(
+        (global_config or {}).get("MSCKF_FEATURE_PRUNE_MIN_STRICT_OBS", 1)
+        if isinstance(global_config, dict) else 1
+    )
+    partial_prune_retriangulate_enable = bool(
+        (global_config or {}).get("MSCKF_FEATURE_PRUNE_RETRIANGULATE_ENABLE", True)
+        if isinstance(global_config, dict) else True
+    )
+    partial_depth_fallback_enable = bool(
+        (global_config or {}).get("MSCKF_FEATURE_PRUNE_DEPTH_FALLBACK_ENABLE", True)
+        if isinstance(global_config, dict) else True
+    )
+    partial_depth_fallback_floor_m = float(
+        (global_config or {}).get(
+            "MSCKF_FEATURE_PRUNE_DEPTH_FALLBACK_M",
+            max(0.10, float(depth_gate_floor_m) * 4.0),
+        )
+        if isinstance(global_config, dict) else max(0.10, float(depth_gate_floor_m) * 4.0)
+    )
+
+    def _activate_partial_depth_accept(use_rescue_set: bool, reason: str) -> bool:
+        nonlocal valid_obs, obs_error_norm_values, total_error, borderline_rejects
+        nonlocal p_refined, rescue_obs_set_used, partial_depth_accept
+        nonlocal depth_fallback_active, depth_fallback_obs_count, depth_partial_reason
+
+        candidate_obs = list(valid_obs)
+        candidate_errors = list(obs_error_norm_values)
+        candidate_total_error = float(total_error)
+        candidate_borderline = int(borderline_rejects)
+        prev_valid_n = int(len(valid_obs))
+        use_rescue_candidates = bool(
+            use_rescue_set
+            and len(rescue_valid_obs) >= max(2, int(partial_prune_min_obs))
+            and len(rescue_valid_obs) > prev_valid_n
+        )
+        if use_rescue_candidates:
+            candidate_obs = list(rescue_valid_obs)
+            candidate_errors = list(rescue_obs_error_norm_values)
+            candidate_total_error = float(rescue_total_error)
+            candidate_borderline = int(borderline_rejects + rescue_borderline_rejects)
+
+        if len(candidate_obs) < max(2, int(partial_prune_min_obs)):
+            return False
+
+        strict_obs_n = int(
+            sum(1 for o in candidate_obs if not bool(o.get("_msckf_depth_promoted", False)))
+        )
+        if strict_obs_n < max(0, int(partial_prune_min_strict_obs)):
+            return False
+
+        if partial_prune_retriangulate_enable and use_rescue_candidates:
+            p_partial = triangulate_point_nonlinear(
+                candidate_obs,
+                cam_states,
+                p_refined,
+                kf,
+                max_iters=tri_nl_recover_max_iters,
+                debug=debug,
+                step_tol=tri_nl_recover_step_tol,
+                max_step_norm=tri_nl_recover_max_step_norm,
+                damping_scale=tri_nl_recover_damping_scale,
+                global_config=global_config,
+            )
+            if p_partial is not None:
+                p_refined = p_partial
+
+        valid_obs = candidate_obs
+        obs_error_norm_values = candidate_errors
+        total_error = float(candidate_total_error)
+        borderline_rejects = int(candidate_borderline)
+        if use_rescue_candidates:
+            rescue_obs_set_used = True
+            depth_fallback_obs_count = max(
+                int(depth_fallback_obs_count),
+                int(len(candidate_obs) - prev_valid_n),
+            )
+        partial_depth_accept = True
+        depth_fallback_active = bool(
+            partial_depth_fallback_enable
+            and (
+                use_rescue_candidates
+                or any(bool(o.get("_msckf_depth_promoted", False)) for o in candidate_obs)
+            )
+        )
+        depth_partial_reason = str(reason)
+        return True
+
+    def _activate_reproj_partial_accept(reason: str, use_geometry_fallback: bool) -> bool:
+        nonlocal valid_obs, obs_error_norm_values, total_error, borderline_rejects
+        nonlocal p_refined, reproj_partial_accept, geometry_fallback_active
+        nonlocal geometry_fallback_obs_count, reproj_partial_reason
+
+        if not bool(reproj_partial_accept_enable):
+            return False
+        if len(reproj_rescue_valid_obs) <= 0:
+            return False
+        candidate_obs = list(valid_obs) + list(reproj_rescue_valid_obs)
+        candidate_errors = list(obs_error_norm_values) + list(reproj_rescue_obs_error_norm_values)
+        candidate_obs, candidate_errors = _dedup_obs_bundle(candidate_obs, candidate_errors)
+        if len(candidate_obs) < max(2, int(reproj_partial_min_obs)):
+            return False
+
+        parallax_ok = bool(
+            (not np.isfinite(parallax_med_px))
+            or float(parallax_med_px) >= float(max(0.1, reproj_partial_min_parallax_px))
+        )
+        quality_ok = bool(
+            (not np.isfinite(feature_quality))
+            or float(feature_quality) >= float(np.clip(reproj_partial_min_quality, 0.0, 1.0))
+        )
+        if not (parallax_ok and quality_ok):
+            return False
+
+        prev_valid_n = int(len(valid_obs))
+        strict_obs_n = int(
+            sum(1 for o in candidate_obs if not bool(o.get("_msckf_partial_promoted", False)))
+        )
+        if strict_obs_n < max(1, int(partial_prune_min_strict_obs)):
+            return False
+
+        if bool(reproj_partial_retriangulate_enable):
+            p_partial = triangulate_point_nonlinear(
+                candidate_obs,
+                cam_states,
+                p_refined,
+                kf,
+                max_iters=tri_nl_recover_max_iters,
+                debug=debug,
+                step_tol=tri_nl_recover_step_tol,
+                max_step_norm=tri_nl_recover_max_step_norm,
+                damping_scale=tri_nl_recover_damping_scale,
+                global_config=global_config,
+            )
+            if p_partial is not None:
+                p_refined = p_partial
+            elif not np.all(np.isfinite(p_refined)):
+                return False
+
+        valid_obs = candidate_obs
+        obs_error_norm_values = candidate_errors
+        total_error = float(np.sum(np.asarray(candidate_errors, dtype=float)))
+        borderline_rejects = int(borderline_rejects + reproj_rescue_borderline_rejects)
+        reproj_partial_accept = True
+        geometry_fallback_active = bool(use_geometry_fallback or len(reproj_rescue_valid_obs) > 0)
+        geometry_fallback_obs_count = max(int(geometry_fallback_obs_count), max(1, len(candidate_obs) - prev_valid_n))
+        reproj_partial_reason = str(reason)
+        return True
+
+    def _activate_geometry_weak_update(reason: str) -> bool:
+        nonlocal valid_obs, obs_error_norm_values, total_error, borderline_rejects
+        nonlocal p_refined, reproj_partial_accept, geometry_fallback_active
+        nonlocal geometry_fallback_obs_count, reproj_partial_reason
+
+        if not bool(geometry_insuff_partial_accept_enable):
+            return False
+
+        candidate_sets: List[Tuple[List[dict], List[float], int, str]] = []
+        if len(valid_obs) > 0 and len(obs_error_norm_values) > 0:
+            candidate_sets.append((list(valid_obs), list(obs_error_norm_values), int(borderline_rejects), "strict"))
+        if len(rescue_valid_obs) > 0 and len(rescue_obs_error_norm_values) > 0:
+            candidate_sets.append((
+                list(rescue_valid_obs),
+                list(rescue_obs_error_norm_values),
+                int(borderline_rejects + rescue_borderline_rejects),
+                "rescue",
+            ))
+        if len(reproj_rescue_valid_obs) > 0 and len(reproj_rescue_obs_error_norm_values) > 0:
+            candidate_sets.append((
+                list(valid_obs) + list(reproj_rescue_valid_obs),
+                list(obs_error_norm_values) + list(reproj_rescue_obs_error_norm_values),
+                int(borderline_rejects + reproj_rescue_borderline_rejects),
+                "reproj",
+            ))
+
+        best_candidate: Optional[Tuple[List[dict], List[float], int, int, str]] = None
+        for obs_seq, err_seq, border_ct, source in candidate_sets:
+            cand_obs, cand_err = _dedup_obs_bundle(obs_seq, err_seq)
+            if len(cand_obs) < max(2, int(geometry_insuff_partial_min_obs)):
+                continue
+            strict_obs_n = int(
+                sum(
+                    1
+                    for obs_data in cand_obs
+                    if not bool(
+                        obs_data.get("_msckf_partial_promoted", False)
+                        or obs_data.get("_msckf_depth_promoted", False)
+                        or obs_data.get("_msckf_reproj_promoted", False)
+                    )
+                )
+            )
+            promoted_obs_n = int(len(cand_obs) - strict_obs_n)
+            if strict_obs_n < max(1, int(partial_prune_min_strict_obs)):
+                continue
+            if promoted_obs_n > max(1, int(geometry_insuff_partial_max_promote)):
+                continue
+            parallax_ok = bool(
+                (not np.isfinite(parallax_med_px))
+                or float(parallax_med_px) >= float(max(0.1, geometry_insuff_partial_min_parallax_px))
+            )
+            quality_ok = bool(
+                (not np.isfinite(feature_quality))
+                or float(feature_quality) >= float(np.clip(geometry_insuff_partial_min_quality, 0.0, 1.0))
+            )
+            if not (parallax_ok and quality_ok):
+                continue
+            candidate_avg = float(np.nanmean(np.asarray(cand_err, dtype=float)))
+            if not np.isfinite(candidate_avg):
+                continue
+            if best_candidate is None:
+                best_candidate = (cand_obs, cand_err, int(border_ct), int(promoted_obs_n), str(source))
+                continue
+            prev_obs, prev_err, _, _, _ = best_candidate
+            prev_avg = float(np.nanmean(np.asarray(prev_err, dtype=float)))
+            if len(cand_obs) > len(prev_obs) or (
+                len(cand_obs) == len(prev_obs)
+                and candidate_avg < prev_avg
+            ):
+                best_candidate = (cand_obs, cand_err, int(border_ct), int(promoted_obs_n), str(source))
+
+        if best_candidate is None:
+            return False
+
+        candidate_obs, candidate_errors, candidate_borderline, promoted_obs_n, candidate_source = best_candidate
+        if bool(geometry_insuff_partial_retriangulate_enable) and candidate_source != "strict":
+            p_partial = triangulate_point_nonlinear(
+                candidate_obs,
+                cam_states,
+                p_refined,
+                kf,
+                max_iters=tri_nl_recover_max_iters,
+                debug=debug,
+                step_tol=tri_nl_recover_step_tol,
+                max_step_norm=tri_nl_recover_max_step_norm,
+                damping_scale=tri_nl_recover_damping_scale,
+                global_config=global_config,
+            )
+            if p_partial is not None:
+                p_refined = p_partial
+            elif not np.all(np.isfinite(p_refined)):
+                return False
+
+        valid_obs = candidate_obs
+        obs_error_norm_values = candidate_errors
+        total_error = float(np.sum(np.asarray(candidate_errors, dtype=float)))
+        borderline_rejects = int(candidate_borderline)
+        reproj_partial_accept = True
+        geometry_fallback_active = True
+        geometry_fallback_obs_count = max(int(geometry_fallback_obs_count), max(1, int(promoted_obs_n)))
+        reproj_partial_reason = str(reason)
+        return True
+
+    def _activate_reproj_weak_update(reason: str, avg_gate: float, avg_err: float) -> bool:
+        nonlocal reproj_partial_accept, reproj_partial_reason, reproj_quality_scale
+        nonlocal reproj_weak_update_active, reproj_weak_update_obs_count, reproj_weak_update_overrun_ratio
+
+        if not bool(reproj_weak_update_enable):
+            return False
+        if bool(reproj_adrenaline_exhausted):
+            MSCKF_STATS["adrenaline_weak_update_clamp_block_count"] += 1
+            return False
+        if (not np.isfinite(avg_gate)) or (not np.isfinite(avg_err)) or avg_gate <= 1e-9:
+            return False
+        weak_min_obs = int(reproj_weak_update_min_obs)
+        weak_min_valid_obs_ratio = float(reproj_weak_update_min_valid_obs_ratio)
+        weak_max_borderline_ratio = float(reproj_weak_update_max_borderline_ratio)
+        weak_min_quality = float(reproj_weak_update_min_quality)
+        weak_max_avg_mult = float(reproj_weak_update_max_avg_mult)
+        weak_max_median_mult = float(reproj_weak_update_max_median_mult)
+        weak_max_p90_mult = float(reproj_weak_update_max_p90_mult)
+        weak_max_p95_mult = float(reproj_weak_update_max_p95_mult)
+        if bool(reproj_adrenaline_active):
+            weak_min_obs = min(int(weak_min_obs), int(adrenaline_relaxed_min_obs))
+            weak_min_valid_obs_ratio = min(
+                float(weak_min_valid_obs_ratio),
+                float(np.clip(adrenaline_relaxed_min_valid_obs_ratio, 0.0, 1.0)),
+            )
+            weak_max_borderline_ratio = max(
+                float(weak_max_borderline_ratio),
+                float(np.clip(adrenaline_relaxed_max_borderline_ratio, 0.0, 1.0)),
+            )
+            weak_min_quality = min(
+                float(weak_min_quality),
+                float(np.clip(adrenaline_relaxed_min_quality, 0.0, 1.0)),
+            )
+            weak_max_avg_mult = max(float(weak_max_avg_mult), float(adrenaline_relaxed_max_avg_mult))
+            weak_max_median_mult = max(float(weak_max_median_mult), float(adrenaline_relaxed_max_median_mult))
+            weak_max_p90_mult = max(float(weak_max_p90_mult), float(adrenaline_relaxed_max_p90_mult))
+            weak_max_p95_mult = max(float(weak_max_p95_mult), float(adrenaline_relaxed_max_p95_mult))
+        weak_gate = float(avg_gate) * float(max(1.0, weak_max_avg_mult))
+        if float(avg_err) <= float(avg_gate) or float(avg_err) > weak_gate:
+            return False
+        if len(valid_obs) < max(2, int(weak_min_obs)):
+            return False
+        if float(stable_lane_valid_obs_ratio) < float(np.clip(weak_min_valid_obs_ratio, 0.0, 1.0)):
+            return False
+        if float(stable_lane_borderline_ratio) > float(np.clip(weak_max_borderline_ratio, 0.0, 1.0)):
+            return False
+        if (
+            reproj_policy.get("quality_band", "mid") == "low"
+            and bool(reproj_policy.get("low_quality_reject", True))
+        ):
+            return False
+        if np.isfinite(feature_quality) and float(feature_quality) < float(np.clip(weak_min_quality, 0.0, 1.0)):
+            return False
+
+        err_arr = np.asarray(obs_error_norm_values, dtype=float)
+        err_arr = err_arr[np.isfinite(err_arr)]
+        if err_arr.size < max(2, int(weak_min_obs)):
+            return False
+        med_err = float(np.median(err_arr))
+        p90_err = float(np.percentile(err_arr, 90))
+        p95_err = float(np.percentile(err_arr, 95))
+        if med_err > float(avg_gate) * float(max(0.5, weak_max_median_mult)):
+            return False
+        if p90_err > float(avg_gate) * float(max(1.0, weak_max_p90_mult)):
+            return False
+        if p95_err > float(avg_gate) * float(max(1.0, weak_max_p95_mult)):
+            return False
+
+        reproj_partial_accept = True
+        reproj_partial_reason = (
+            "reproj_normalized_adrenaline_weak_update"
+            if bool(reproj_adrenaline_active) else str(reason)
+        )
+        reproj_weak_update_active = True
+        reproj_weak_update_obs_count = int(len(valid_obs))
+        reproj_weak_update_overrun_ratio = float(np.clip(avg_err / max(avg_gate, 1e-9), 1.0, 3.0))
+        reproj_quality_scale = min(
+            float(reproj_quality_scale),
+            float(np.clip(avg_gate / max(avg_err, 1e-9), 0.14 if bool(reproj_adrenaline_active) else 0.18, 0.72)),
+        )
+        if bool(reproj_adrenaline_active):
+            MSCKF_STATS["adrenaline_weak_update_accept_count"] += 1
+        return True
 
     valid_obs_ratio_now = float(len(valid_obs)) / float(max(1, len(obs_list)))
     def _use_geometry_borderline_preagg(avg_gate: float, avg_err: Optional[float]) -> bool:
@@ -2364,20 +3637,40 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
                     MSCKF_STATS['posttri_retry_recover_depth_borderline_promote_count'] += 1
                     MSCKF_STATS['posttri_retry_recover_depth_relaxed_gate_used_count'] += 1
                 else:
-                    if (
-                        bool(depth_retry_gate_override_enable)
-                        and bool(use_depth_same_cycle_full_rescue)
-                        and (retry_mode_key == "depth_sparse_same_cycle_rescue")
-                    ):
-                        MSCKF_STATS['posttri_retry_recover_depth_gate_override_reject_count'] += 1
-                    if bool(depth_reclass_enable):
-                        MSCKF_STATS['fail_geometry_borderline'] += 1
-                        MSCKF_STATS['fail_depth_large'] += 1
-                        MSCKF_STATS['reclass_to_geometry_count'] += 1
-                    else:
-                        MSCKF_STATS['fail_depth_sign_post_refine'] += 1
-                        MSCKF_STATS['fail_depth_sign'] += 1
-                    return None
+                    partial_accept_bypass = bool(
+                        partial_prune_enable
+                        and valid_obs_n >= max(2, int(partial_prune_min_obs))
+                        and _activate_partial_depth_accept(
+                            use_rescue_set=bool(
+                                len(rescue_valid_obs) >= max(2, int(partial_prune_min_obs))
+                                and depth_rejects > 0
+                            ),
+                            reason="weak_depth_support",
+                        )
+                    )
+                    if not partial_accept_bypass:
+                        if (
+                            bool(depth_retry_gate_override_enable)
+                            and bool(use_depth_same_cycle_full_rescue)
+                            and (retry_mode_key == "depth_sparse_same_cycle_rescue")
+                        ):
+                            MSCKF_STATS['posttri_retry_recover_depth_gate_override_reject_count'] += 1
+                        if bool(depth_reclass_enable):
+                            MSCKF_STATS['fail_geometry_borderline'] += 1
+                            MSCKF_STATS['fail_depth_large'] += 1
+                            MSCKF_STATS['reclass_to_geometry_count'] += 1
+                        else:
+                            MSCKF_STATS['fail_depth_sign_post_refine'] += 1
+                            MSCKF_STATS['fail_depth_sign'] += 1
+                        return None
+
+    if (
+        partial_prune_enable
+        and len(valid_obs) < max(2, int(partial_prune_min_obs))
+        and len(rescue_valid_obs) >= max(2, int(partial_prune_min_obs))
+        and depth_rejects > 0
+    ):
+        _activate_partial_depth_accept(use_rescue_set=True, reason="depth_prune_rescue")
 
     if len(valid_obs) < 2:
         total_rejects = max(1, int(depth_rejects + reproj_rejects))
@@ -2393,11 +3686,16 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
                 valid_obs_ratio <= float(np.clip(geometry_insuff_max_valid_ratio, 0.0, 1.0))
                 and (low_track_geometry or low_parallax_geometry)
             ):
-                MSCKF_STATS['fail_geometry_insufficient_posttri'] += 1
-                MSCKF_STATS['fail_geometry_borderline'] += 1
-                MSCKF_STATS['reclass_to_geometry_count'] += 1
-                return None
-        if depth_rejects >= reproj_rejects:
+                geometry_partial_accept_bypass = bool(
+                    geometry_insuff_partial_accept_enable
+                    and _activate_geometry_weak_update("geometry_insufficient_posttri")
+                )
+                if not geometry_partial_accept_bypass:
+                    MSCKF_STATS['fail_geometry_insufficient_posttri'] += 1
+                    MSCKF_STATS['fail_geometry_borderline'] += 1
+                    MSCKF_STATS['reclass_to_geometry_count'] += 1
+                    return None
+        if len(valid_obs) < 2 and depth_rejects >= reproj_rejects:
             valid_obs_n = int(len(valid_obs))
             depth_dom_ratio = float(depth_rejects) / float(total_rejects)
             strict_depth_sign = bool(
@@ -2505,14 +3803,20 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
                     # Same-cycle full-rescue lane should not bounce back to
                     # fail_depth_sparse_recoverable. Keep it in geometry bucket
                     # so retry diagnostics can separate lane-entry from legacy depth-gate loops.
-                    MSCKF_STATS['fail_geometry_insufficient_posttri'] += 1
-                    MSCKF_STATS['fail_geometry_borderline'] += 1
-                    MSCKF_STATS['reclass_to_geometry_count'] += 1
+                    geometry_retry_bypass = bool(
+                        geometry_insuff_partial_accept_enable
+                        and _activate_geometry_weak_update("geometry_insufficient_posttri_retry")
+                    )
+                    if not geometry_retry_bypass:
+                        MSCKF_STATS['fail_geometry_insufficient_posttri'] += 1
+                        MSCKF_STATS['fail_geometry_borderline'] += 1
+                        MSCKF_STATS['reclass_to_geometry_count'] += 1
+                        return None
+                else:
+                    MSCKF_STATS['fail_depth_sparse_recoverable'] += 1
+                    if borderline_rejects > 0:
+                        MSCKF_STATS['fail_geometry_borderline'] += 1
                     return None
-                MSCKF_STATS['fail_depth_sparse_recoverable'] += 1
-                if borderline_rejects > 0:
-                    MSCKF_STATS['fail_geometry_borderline'] += 1
-                return None
             if depth_sparse_candidate and (not recoverable_depth_sparse):
                 MSCKF_STATS['depth_sparse_recover_gate_block_count'] += 1
             if (not strict_depth_sign) and bool(depth_reclass_enable):
@@ -2522,7 +3826,7 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
             else:
                 MSCKF_STATS['fail_depth_sign_post_refine'] += 1
                 MSCKF_STATS['fail_depth_sign'] += 1
-        else:
+        elif len(valid_obs) < 2:
             # Sparse post-tri path (len(valid_obs)<2): route recoverable reproj-sparse
             # cases to a retry lane before final rejection.
             depth_dom_ratio = float(depth_rejects) / float(total_rejects)
@@ -2545,15 +3849,25 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
                 and quality_recover_ok
             )
             if recoverable_sparse:
-                MSCKF_STATS['fail_reproj_sparse_recoverable'] += 1
-                if borderline_rejects > 0:
-                    MSCKF_STATS['fail_geometry_borderline'] += 1
+                reproj_partial_accept_bypass = bool(
+                    reproj_partial_accept_enable
+                    and _activate_reproj_partial_accept(
+                        reason="reproj_sparse_recoverable",
+                        use_geometry_fallback=False,
+                    )
+                )
+                if not reproj_partial_accept_bypass:
+                    MSCKF_STATS['fail_reproj_sparse_recoverable'] += 1
+                    if borderline_rejects > 0:
+                        MSCKF_STATS['fail_geometry_borderline'] += 1
             else:
                 MSCKF_STATS['fail_reproj_sparse'] += 1
                 if borderline_rejects > 0:
                     MSCKF_STATS['fail_geometry_borderline'] += 1
-        return None
+        if len(valid_obs) < 2:
+            return None
 
+    valid_obs_ratio_now = float(len(valid_obs)) / float(max(1, len(obs_list)))
     avg_error_raw = float(total_error / len(valid_obs))
     avg_error = float(avg_error_raw)
     stable_lane_used = False
@@ -2728,37 +4042,66 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
                 and np.isfinite(avg_error)
                 and avg_error <= (avg_reproj_gate * max(1.0, geometry_insuff_reclass_mult))
             )
+            dense_geometry_bypass = False
             if unstable_near_threshold or unstable_geometry_reclass:
-                MSCKF_STATS['preagg_callsite_dense_reclass_skip_count'] += 1
-                # Deterministic unstable-lane reclassification:
-                # keep "no update" behavior but classify near-threshold unstable
-                # failures as borderline geometry, not hard reproj failures.
-                MSCKF_STATS['fail_geometry_borderline'] += 1
-                MSCKF_STATS['reclass_to_geometry_count'] += 1
-                if unstable_geometry_reclass:
-                    MSCKF_STATS['fail_geometry_insufficient_posttri'] += 1
-                return None
-            MSCKF_STATS['preagg_callsite_dense_invoked_count'] += 1
-            if _use_geometry_borderline_preagg(
-                avg_gate=float(avg_reproj_gate),
-                avg_err=float(avg_error),
-            ):
-                MSCKF_STATS['fail_geometry_borderline'] += 1
-                MSCKF_STATS['reclass_to_geometry_count'] += 1
-                MSCKF_STATS['geometry_preagg_rebucket_count'] += 1
-                return None
-            MSCKF_STATS['fail_reproj_error'] += 1
-            MSCKF_STATS['fail_reproj_normalized'] += 1
-            if reproj_policy.get("quality_band", "mid") == "mid" or borderline_rejects > 0:
-                MSCKF_STATS['fail_geometry_borderline'] += 1
-            # [DIAGNOSTIC] Log reprojection failures to identify root cause
-            if MSCKF_STATS['fail_reproj_error'] % 500 == 1 and debug:
-                print(f"[MSCKF-DIAG] fail_reproj_error #{MSCKF_STATS['fail_reproj_error']}: fid={fid}, avg_norm_error={avg_error:.4f}, threshold={norm_threshold:.4f}")
-                print(f"  norm_scale_px={norm_scale_px:.2f}")
-            return None
+                dense_geometry_bypass = bool(
+                    unstable_geometry_reclass
+                    and geometry_insuff_partial_accept_enable
+                    and _activate_geometry_weak_update("geometry_insufficient_posttri_dense")
+                )
+                if dense_geometry_bypass:
+                    reproj_quality_scale = min(
+                        float(reproj_quality_scale),
+                        float(np.clip(avg_reproj_gate / max(avg_error, 1e-9), 0.16, 0.62)),
+                    )
+                else:
+                    MSCKF_STATS['preagg_callsite_dense_reclass_skip_count'] += 1
+                    # Deterministic unstable-lane reclassification:
+                    # keep "no update" behavior but classify near-threshold unstable
+                    # failures as borderline geometry, not hard reproj failures.
+                    MSCKF_STATS['fail_geometry_borderline'] += 1
+                    MSCKF_STATS['reclass_to_geometry_count'] += 1
+                    if unstable_geometry_reclass:
+                        MSCKF_STATS['fail_geometry_insufficient_posttri'] += 1
+                    return None
+            if not dense_geometry_bypass:
+                MSCKF_STATS['preagg_callsite_dense_invoked_count'] += 1
+                if _use_geometry_borderline_preagg(
+                    avg_gate=float(avg_reproj_gate),
+                    avg_err=float(avg_error),
+                ):
+                    MSCKF_STATS['fail_geometry_borderline'] += 1
+                    MSCKF_STATS['reclass_to_geometry_count'] += 1
+                    MSCKF_STATS['geometry_preagg_rebucket_count'] += 1
+                    return None
+                reproj_weak_update_bypass = bool(
+                    _activate_reproj_weak_update(
+                        reason="reproj_normalized_weak_update",
+                        avg_gate=float(avg_reproj_gate),
+                        avg_err=float(avg_error),
+                    )
+                )
+                if not reproj_weak_update_bypass:
+                    MSCKF_STATS['fail_reproj_error'] += 1
+                    MSCKF_STATS['fail_reproj_normalized'] += 1
+                    if reproj_policy.get("quality_band", "mid") == "mid" or borderline_rejects > 0:
+                        MSCKF_STATS['fail_geometry_borderline'] += 1
+                    # [DIAGNOSTIC] Log reprojection failures to identify root cause
+                    if MSCKF_STATS['fail_reproj_error'] % 500 == 1 and debug:
+                        print(f"[MSCKF-DIAG] fail_reproj_error #{MSCKF_STATS['fail_reproj_error']}: fid={fid}, avg_norm_error={avg_error:.4f}, threshold={norm_threshold:.4f}")
+                        print(f"  norm_scale_px={norm_scale_px:.2f}")
+                    return None
     
+    if partial_depth_accept:
+        MSCKF_STATS['partial_depth_prune_feature_count'] += 1
+        MSCKF_STATS['partial_depth_prune_obs_count'] += int(depth_rejects)
+    if depth_fallback_active:
+        MSCKF_STATS['partial_depth_fallback_feature_count'] += 1
+
     MSCKF_STATS['success'] += 1
     quality_base = 1.0 / (1.0 + avg_error * 100.0)
+    if bool(emergency_fast_track_active):
+        reproj_quality_scale = min(float(reproj_quality_scale), 0.45)
     result = {
         'p_w': p_refined,
         'observations': valid_obs,
@@ -2777,6 +4120,35 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
         'stable_reproj_lane_cap': float(stable_lane_cap) if np.isfinite(stable_lane_cap) else np.nan,
         'stable_reproj_lane_borderline_ratio': float(stable_lane_borderline_ratio),
         'stable_reproj_lane_valid_obs_ratio': float(stable_lane_valid_obs_ratio),
+        'depth_partial_accept': bool(partial_depth_accept),
+        'depth_partial_reason': str(depth_partial_reason),
+        'depth_fallback_active': bool(depth_fallback_active),
+        'depth_pruned_obs_count': int(depth_rejects),
+        'depth_promoted_obs_count': int(promoted_obs_total),
+        'depth_fallback_obs_count': int(depth_fallback_obs_count),
+        'reproj_partial_accept': bool(reproj_partial_accept),
+        'reproj_partial_reason': str(reproj_partial_reason),
+        'reproj_promoted_obs_count': int(reproj_promoted_obs_count),
+        'geometry_fallback_active': bool(geometry_fallback_active),
+        'geometry_fallback_obs_count': int(geometry_fallback_obs_count),
+        'reproj_weak_update_active': bool(reproj_weak_update_active),
+        'reproj_weak_update_obs_count': int(reproj_weak_update_obs_count),
+        'reproj_weak_update_overrun_ratio': float(reproj_weak_update_overrun_ratio)
+        if np.isfinite(reproj_weak_update_overrun_ratio) else np.nan,
+        'reproj_adrenaline_active': bool(reproj_adrenaline_active and reproj_weak_update_active),
+        'reproj_adrenaline_elapsed_sec': float(reproj_adrenaline_elapsed_sec)
+        if np.isfinite(reproj_adrenaline_elapsed_sec) else np.nan,
+        'emergency_fast_track_active': bool(emergency_fast_track_active),
+        'emergency_pretri_bypass_active': bool(emergency_pretri_bypass_active),
+        'emergency_fixed_depth_seed_active': bool(emergency_fixed_depth_seed_active),
+        'depth_fallback_depth_m': float(
+            max(
+                0.10,
+                float(partial_depth_fallback_floor_m),
+                float(depth_gate_floor_m),
+                float(emergency_fixed_depth_m) if bool(emergency_fixed_depth_seed_active) else 0.0,
+            )
+        ),
         'retry_mode_key': str(retry_mode_key),
         'rescue_obs_set_used': bool(rescue_obs_set_used),
         'rescue_promoted_obs_total': int(promoted_obs_total),
@@ -3012,6 +4384,8 @@ def msckf_measurement_update(fid: int, triangulated: dict, cam_observations: Lis
     
     if len(obs_list) < 2:
         return (False, np.nan, np.nan)
+
+    measurement_noise = float(measurement_noise) * _msckf_partial_depth_noise_scale(triangulated)
     
     err_state_size = kf.P.shape[0]
     
@@ -3019,6 +4393,7 @@ def msckf_measurement_update(fid: int, triangulated: dict, cam_observations: Lis
     residuals = []
     h_x_stack = []
     h_f_stack = []
+    fallback_obs_used = 0
     
     for obs in obs_list:
         cam_id = obs['cam_id']
@@ -3036,11 +4411,14 @@ def msckf_measurement_update(fid: int, triangulated: dict, cam_observations: Lis
         r_cw = R_scipy.from_quat(q_xyzw).as_matrix()
         r_wc = r_cw.T
         p_c = r_wc @ (p_w - p_cam)
-        
-        if p_c[2] <= 0.1:
+
+        p_c_eval, used_depth_fallback = _project_msckf_depth_fallback(p_c, obs, triangulated)
+        if p_c_eval is None:
             continue
-        
-        z_pred = np.array([p_c[0] / p_c[2], p_c[1] / p_c[2]])
+        if used_depth_fallback:
+            fallback_obs_used += 1
+
+        z_pred = np.array([p_c_eval[0] / p_c_eval[2], p_c_eval[1] / p_c_eval[2]])
         z_obs = np.array([obs['pt_norm'][0], obs['pt_norm'][1]])
         
         r = z_obs - z_pred
@@ -3184,6 +4562,9 @@ def msckf_measurement_update(fid: int, triangulated: dict, cam_observations: Lis
         chi2_threshold = max(1e-6, float(chi2_scale) * chi2_max_dof * dof)
         
         if chi2_test > chi2_threshold:
+            MSCKF_STATS['fail_chi2'] += 1
+            if bool(triangulated.get("depth_partial_accept", False) or triangulated.get("reproj_partial_accept", False)):
+                MSCKF_STATS['partial_depth_mahalanobis_reject_count'] += 1
             return (False, innovation_norm, chi2_test)
     except np.linalg.LinAlgError:
         return (False, innovation_norm, np.nan)
@@ -3240,6 +4621,11 @@ def msckf_measurement_update(fid: int, triangulated: dict, cam_observations: Lis
         kf.P_post = kf.P.copy()
         if hasattr(kf, "log_cov_health"):
             kf.log_cov_health(update_type="MSCKF", timestamp=float('nan'), stage="post_update")
+
+        if bool(triangulated.get("depth_partial_accept", False) or triangulated.get("reproj_partial_accept", False)):
+            MSCKF_STATS['partial_depth_prune_update_count'] += 1
+        if fallback_obs_used > 0 or bool(triangulated.get("geometry_fallback_active", False)):
+            MSCKF_STATS['partial_depth_fallback_update_count'] += 1
         
         return (True, innovation_norm, chi2_test)
     except (np.linalg.LinAlgError, ValueError):
@@ -3303,17 +4689,19 @@ def msckf_measurement_update_with_plane(fid: int, triangulated: dict,
     
     if len(obs_list) < 2:
         return (False, 0.0, 0.0)
+
+    bearing_noise = 1e-4 * _msckf_partial_depth_noise_scale(triangulated)
     
     # Build bearing Jacobian (same as standard MSCKF)
     # Dynamically compute error state size from actual covariance dimensions
     # This handles cases where state has additional elements (e.g., SLAM features)
     err_state_size = kf.P.shape[0]
-    meas_dim_bearing = 2 * len(obs_list)
+    h_bearing_rows: List[np.ndarray] = []
+    r_bearing_vals: List[float] = []
+    bearing_obs_used: List[dict] = []
+    fallback_obs_used = 0
     
-    h_bearing = np.zeros((meas_dim_bearing, err_state_size))
-    r_bearing = np.zeros(meas_dim_bearing)
-    
-    for i, obs_data in enumerate(obs_list):
+    for obs_data in obs_list:
         cam_id = obs_data['cam_id']
         if cam_id >= len(cam_states):
             continue
@@ -3328,34 +4716,46 @@ def msckf_measurement_update_with_plane(fid: int, triangulated: dict,
         R_wc = R_cw.T
         
         p_c = R_wc @ (point_world - p_cam)
-        
-        if p_c[2] < 0.1:
-            return (False, 0.0, 0.0)
+
+        p_c_eval, used_depth_fallback = _project_msckf_depth_fallback(p_c, obs_data, triangulated)
+        if p_c_eval is None:
+            continue
+        if used_depth_fallback:
+            fallback_obs_used += 1
         
         # Bearing measurement
-        xn_pred = p_c[0] / p_c[2]
-        yn_pred = p_c[1] / p_c[2]
+        xn_pred = p_c_eval[0] / p_c_eval[2]
+        yn_pred = p_c_eval[1] / p_c_eval[2]
         
         xn_obs, yn_obs = obs_data['pt_norm']
-        
-        r_bearing[2*i] = xn_obs - xn_pred
-        r_bearing[2*i+1] = yn_obs - yn_pred
+        bearing_obs_used.append(obs_data)
         
         # Jacobian (standard MSCKF)
-        z_inv = 1.0 / p_c[2]
+        z_inv = 1.0 / p_c_eval[2]
         z_inv2 = z_inv * z_inv
         
         J_proj = np.array([
-            [z_inv, 0, -p_c[0]*z_inv2],
-            [0, z_inv, -p_c[1]*z_inv2]
+            [z_inv, 0, -p_c_eval[0]*z_inv2],
+            [0, z_inv, -p_c_eval[1]*z_inv2]
         ])
         
-        J_q = -J_proj @ R_cw @ skew_symmetric(p_c)
+        J_q = -J_proj @ R_cw @ skew_symmetric(p_c_eval)
         J_p = -J_proj @ R_wc
         
         clone_idx_err = 18 + 6 * cam_id  # v3.9.7: 18 core error dim
-        h_bearing[2*i:2*i+2, clone_idx_err:clone_idx_err+3] = J_q
-        h_bearing[2*i:2*i+2, clone_idx_err+3:clone_idx_err+6] = J_p
+        h_row = np.zeros((2, err_state_size))
+        h_row[:, clone_idx_err:clone_idx_err+3] = J_q
+        h_row[:, clone_idx_err+3:clone_idx_err+6] = J_p
+        h_bearing_rows.append(h_row)
+        r_bearing_vals.extend([xn_obs - xn_pred, yn_obs - yn_pred])
+
+    if len(h_bearing_rows) < 2:
+        return (False, 0.0, 0.0)
+
+    h_bearing = np.vstack(h_bearing_rows)
+    r_bearing = np.asarray(r_bearing_vals, dtype=float)
+    meas_dim_bearing = int(r_bearing.shape[0])
+    plane_obs_list = list(bearing_obs_used)
     
     # =========================================================================
     # Part 2: Plane constraint measurement
@@ -3380,9 +4780,9 @@ def msckf_measurement_update_with_plane(fid: int, triangulated: dict,
     # Chain rule: ∂p_w/∂cam = ∂p_w/∂λ0 * ∂λ0/∂cam + ∂p_w/∂c0 * ∂c0/∂cam
     
     # Get first two views for triangulation sensitivity
-    if len(obs_list) >= 2:
-        obs0 = obs_list[0]
-        obs1 = obs_list[1]
+    if len(plane_obs_list) >= 2:
+        obs0 = plane_obs_list[0]
+        obs1 = plane_obs_list[1]
         cam_id0 = obs0['cam_id']
         cam_id1 = obs1['cam_id']
         
@@ -3464,7 +4864,7 @@ def msckf_measurement_update_with_plane(fid: int, triangulated: dict,
                 h_plane[0, clone_idx1+3:clone_idx1+6] = n @ dp_dc1
             else:
                 # Fallback: use simplified approximation if geometry is degenerate
-                for i, obs_data in enumerate(obs_list):
+                for obs_data in plane_obs_list:
                     cam_id = obs_data['cam_id']
                     if cam_id >= len(cam_states):
                         continue
@@ -3484,8 +4884,8 @@ def msckf_measurement_update_with_plane(fid: int, triangulated: dict,
                     J_p_theta = -R_wc @ skew_symmetric(p_c)
                     J_p_pos = -R_wc
                     
-                    h_plane[0, clone_idx_err:clone_idx_err+3] += n @ J_p_theta / len(obs_list)
-                    h_plane[0, clone_idx_err+3:clone_idx_err+6] += n @ J_p_pos / len(obs_list)
+                    h_plane[0, clone_idx_err:clone_idx_err+3] += n @ J_p_theta / len(plane_obs_list)
+                    h_plane[0, clone_idx_err+3:clone_idx_err+6] += n @ J_p_pos / len(plane_obs_list)
     
     # =========================================================================
     # Part 3: Stack measurements and update
@@ -3500,7 +4900,7 @@ def msckf_measurement_update_with_plane(fid: int, triangulated: dict,
         return (False, np.nan, np.nan)
     
     # Measurement noise
-    sigma_bearing = 1e-4  # Standard MSCKF bearing noise
+    sigma_bearing = float(bearing_noise)  # Inflate for partial weak-depth acceptance
     sigma_plane = plane_config.get('PLANE_SIGMA', 0.05)
     
     R_stacked = np.eye(meas_dim_total)
@@ -3562,6 +4962,9 @@ def msckf_measurement_update_with_plane(fid: int, triangulated: dict,
         chi2_threshold = max(1e-6, float(chi2_scale) * 15.36 * meas_dim_total)
         
         if chi2_test > chi2_threshold:
+            MSCKF_STATS['fail_chi2'] += 1
+            if bool(triangulated.get("depth_partial_accept", False) or triangulated.get("reproj_partial_accept", False)):
+                MSCKF_STATS['partial_depth_mahalanobis_reject_count'] += 1
             return (False, innovation_norm, chi2_test)
     except np.linalg.LinAlgError:
         return (False, innovation_norm, np.nan)
@@ -3610,6 +5013,11 @@ def msckf_measurement_update_with_plane(fid: int, triangulated: dict,
         kf.P_post = kf.P.copy()
         if hasattr(kf, "log_cov_health"):
             kf.log_cov_health(update_type="MSCKF_PLANE", timestamp=float('nan'), stage="post_update")
+
+        if bool(triangulated.get("depth_partial_accept", False) or triangulated.get("reproj_partial_accept", False)):
+            MSCKF_STATS['partial_depth_prune_update_count'] += 1
+        if fallback_obs_used > 0 or bool(triangulated.get("geometry_fallback_active", False)):
+            MSCKF_STATS['partial_depth_fallback_update_count'] += 1
         
         return (True, innovation_norm, chi2_test)
     except (np.linalg.LinAlgError, ValueError):
@@ -3664,9 +5072,29 @@ def perform_msckf_updates(vio_fe, cam_observations: List[dict],
         global_config=global_config,
         max_features=max_features,
     )
+    emergency_active = bool(getattr(vio_fe, "_msckf_emergency_active", False))
+    emergency_promoted_count = int(max(0, getattr(vio_fe, "_msckf_emergency_promoted_count", 0)))
+    emergency_effective_track_min = int(
+        max(1, getattr(vio_fe, "_msckf_emergency_effective_track_min", 0) or 0)
+    )
+    emergency_short_track_fids = {
+        int(fid) for fid in (getattr(vio_fe, "_msckf_emergency_short_track_fids", ()) or ())
+    }
+    raw_mature_count = int(max(0, getattr(vio_fe, "_msckf_raw_mature_count", len(mature_fids))))
+    adrenaline_meta = _compute_msckf_adrenaline_meta(
+        vio_fe,
+        mature_track_count=int(raw_mature_count),
+        timestamp=float(timestamp),
+        global_config=global_config,
+    )
+    setattr(vio_fe, "_msckf_adrenaline_active", bool(adrenaline_meta.get("active", False)))
+    setattr(vio_fe, "_msckf_adrenaline_exhausted", bool(adrenaline_meta.get("exhausted", False)))
+    setattr(vio_fe, "_msckf_adrenaline_elapsed_sec", float(adrenaline_meta.get("elapsed_sec", np.nan)))
+    debug_active = _msckf_debug_enabled(float(timestamp))
     
     num_successful = 0
     num_attempted = 0
+    partial_prune_count_before = int(MSCKF_STATS.get("partial_depth_prune_feature_count", 0))
     dof_samples: List[int] = []
     chi2_norm_samples: List[float] = []
     parallax_samples: List[float] = []
@@ -3687,6 +5115,13 @@ def perform_msckf_updates(vio_fe, cam_observations: List[dict],
     prefilter_min_quality = float(prefilter_cfg.get("MSCKF_L2_PREFILTER_MIN_QUALITY", 0.32))
     retry_lane_enable = bool(prefilter_cfg.get("MSCKF_RETRY_LANE_ENABLE", True))
     retry_lane_max_cycles = int(max(0, prefilter_cfg.get("MSCKF_RETRY_LANE_MAX_CYCLES", 2)))
+    emergency_boost_cycles = int(max(0, prefilter_cfg.get("MSCKF_EMERGENCY_BOOST_CYCLES", 2)))
+    emergency_refresh_on_partial_prune = bool(
+        prefilter_cfg.get("MSCKF_EMERGENCY_REFRESH_ON_PARTIAL_PRUNE", True)
+    )
+    emergency_refresh_low_attempts = int(
+        max(1, prefilter_cfg.get("MSCKF_EMERGENCY_REFRESH_LOW_ATTEMPTS", 4))
+    )
     retry_lane_sparse_track_max_obs = int(
         max(2, prefilter_cfg.get("MSCKF_RETRY_LANE_SPARSE_TRACK_MAX_OBS", max(4, int(min_observations) + 1)))
     )
@@ -3744,6 +5179,19 @@ def perform_msckf_updates(vio_fe, cam_observations: List[dict],
     posttri_retry_recover_depth_bounded_relax_enable = bool(
         prefilter_cfg.get("MSCKF_RETRY_LANE_POSTTRI_RECOVER_DEPTH_BOUNDED_RELAX_ENABLE", False)
     )
+    debug_counts: Dict[str, int] = {
+        "mature_input": int(len(mature_fids)),
+        "mature_after_cap": int(len(mature_fids)),
+        "protected_carried": 0,
+        "missing_obs": 0,
+        "retry_lane_defer": 0,
+        "prefilter_reject": 0,
+        "triangulated_ok": 0,
+        "triangulated_fail": 0,
+        "attempted": 0,
+        "accepted": 0,
+    }
+    debug_fail_reasons: Dict[str, int] = {}
     posttri_retry_recover_depth_bounded_relax_obs_delta = int(
         max(0, prefilter_cfg.get("MSCKF_RETRY_LANE_POSTTRI_RECOVER_DEPTH_BOUNDED_RELAX_OBS_DELTA", 1))
     )
@@ -3983,8 +5431,30 @@ def perform_msckf_updates(vio_fe, cam_observations: List[dict],
                 seen.add(fid_i)
                 merged.append(fid_i)
             mature_fids = merged
+    debug_counts["protected_carried"] = int(len(protected_retry_carried_fids))
 
     if len(mature_fids) == 0:
+        _log_msckf_debug(
+            float(timestamp),
+            stage="summary",
+            mature_input=debug_counts["mature_input"],
+            mature_after_cap=0,
+            protected_carried=debug_counts["protected_carried"],
+            missing_obs=debug_counts["missing_obs"],
+            retry_lane_defer=debug_counts["retry_lane_defer"],
+            prefilter_reject=debug_counts["prefilter_reject"],
+            triangulated_ok=debug_counts["triangulated_ok"],
+            triangulated_fail=debug_counts["triangulated_fail"],
+            attempted=0,
+            accepted=0,
+            fail_reasons="none",
+        )
+        if vio_fe is not None:
+            try:
+                boost_now = int(max(0, getattr(vio_fe, "_msckf_emergency_boost", 0)))
+                setattr(vio_fe, "_msckf_emergency_boost", max(0, boost_now - 1))
+            except Exception:
+                pass
         return 0
 
     if len(mature_fids) > max_features:
@@ -3993,6 +5463,7 @@ def perform_msckf_updates(vio_fe, cam_observations: List[dict],
         if truncated_protected:
             MSCKF_STATS['posttri_retry_recover_depth_protected_truncated_count'] += int(len(truncated_protected))
         mature_fids = mature_fids[:max_features]
+    debug_counts["mature_after_cap"] = int(len(mature_fids))
 
     # =========================================================================
     # Plane Detection (if enabled)
@@ -4034,6 +5505,7 @@ def perform_msckf_updates(vio_fe, cam_observations: List[dict],
         quick_obs = get_feature_multi_view_observations(fid, cam_observations)
         protected_retry_carried = bool(int(fid) in protected_retry_carried_fids)
         if len(quick_obs) == 0:
+            debug_counts["missing_obs"] += 1
             if protected_retry_carried:
                 MSCKF_STATS['posttri_retry_recover_depth_protected_missing_clone_count'] += 1
             retry_state.pop(int(fid), None)
@@ -4046,6 +5518,7 @@ def perform_msckf_updates(vio_fe, cam_observations: List[dict],
                 1 for o in quick_obs if 0 <= int(o.get("cam_id", -1)) < len(cam_states)
             )
             if valid_clone_obs < max(2, int(min_observations)):
+                debug_counts["missing_obs"] += 1
                 MSCKF_STATS['posttri_retry_recover_depth_protected_missing_clone_count'] += 1
                 retry_state.pop(int(fid), None)
                 posttri_retry_state.pop(int(fid), None)
@@ -4086,6 +5559,7 @@ def perform_msckf_updates(vio_fe, cam_observations: List[dict],
                 if cur_retry < int(retry_lane_max_cycles):
                     retry_state[int(fid)] = cur_retry + 1
                     MSCKF_STATS['retry_lane_defer_count'] += 1
+                    debug_counts["retry_lane_defer"] += 1
                     continue
             retry_state.pop(int(fid), None)
         if in_depth_sparse_retry_path:
@@ -4093,12 +5567,16 @@ def perform_msckf_updates(vio_fe, cam_observations: List[dict],
 
         # L2 (logic-first): prefilter weak geometry before triangulation so depth-sign
         # failures are concentrated to truly stable/strict cases only.
+        local_prefilter_min_obs = int(prefilter_min_obs)
+        if emergency_active:
+            local_prefilter_min_obs = max(2, min(local_prefilter_min_obs, int(min_observations)))
         if prefilter_enable and (not in_posttri_recover_retry):
-            if len(quick_obs) < max(2, prefilter_min_obs):
+            if len(quick_obs) < max(2, local_prefilter_min_obs):
                 MSCKF_STATS['fail_prefilter_geometry'] += 1
+                debug_counts["prefilter_reject"] += 1
                 continue
             weak_short_track = bool(
-                len(quick_obs) <= max(3, prefilter_min_obs)
+                len(quick_obs) <= max(3, local_prefilter_min_obs)
                 and (
                     (not np.isfinite(time_span_sec))
                     or time_span_sec < float(max(1e-3, prefilter_min_time_span_sec))
@@ -4124,6 +5602,7 @@ def perform_msckf_updates(vio_fe, cam_observations: List[dict],
             )
             if weak_short_track or weak_low_quality or weak_low_parallax:
                 MSCKF_STATS['fail_prefilter_geometry'] += 1
+                debug_counts["prefilter_reject"] += 1
                 continue
 
         stats_before = dict(MSCKF_STATS)
@@ -4156,7 +5635,9 @@ def perform_msckf_updates(vio_fe, cam_observations: List[dict],
                                           reproj_scale=reproj_scale,
                                           phase=phase,
                                           health_state=health_state,
-                                          retry_mode=retry_mode)
+                                          retry_mode=retry_mode,
+                                          adrenaline_meta=adrenaline_meta,
+                                          emergency_track_mode=bool(int(fid) in emergency_short_track_fids))
         
         if triangulated is None:
             fail_reason = "triangulation_failed"
@@ -4164,6 +5645,8 @@ def perform_msckf_updates(vio_fe, cam_observations: List[dict],
                 if int(MSCKF_STATS.get(key, 0)) > int(stats_before.get(key, 0)):
                     fail_reason = key
                     break
+            debug_counts["triangulated_fail"] += 1
+            debug_fail_reasons[fail_reason] = int(debug_fail_reasons.get(fail_reason, 0)) + 1
             if in_posttri_recover_retry and str(posttri_retry_source.get(int(fid), "")) == "depth_sparse":
                 _record_depth_retry_failure(fail_reason)
                 if bool(retry_mode_same_cycle_rescue_active):
@@ -4211,6 +5694,8 @@ def perform_msckf_updates(vio_fe, cam_observations: List[dict],
                         phase=phase,
                         health_state=health_state,
                         retry_mode=retry_mode_same_cycle,
+                        adrenaline_meta=adrenaline_meta,
+                        emergency_track_mode=bool(int(fid) in emergency_short_track_fids),
                     )
                     if triangulated_retry is not None:
                         triangulated = triangulated_retry
@@ -4326,6 +5811,7 @@ def perform_msckf_updates(vio_fe, cam_observations: List[dict],
                 with open(msckf_dbg_path, "a", newline="") as mf:
                     mf.write(f"{vio_fe.frame_idx},{fid},{num_obs},0,nan,nan,0,nan,{fail_reason}\n")
             continue
+        debug_counts["triangulated_ok"] += 1
 
         parallax_val = float(triangulated.get("parallax_med_px", np.nan))
         reproj_p95_val = float(triangulated.get("reproj_p95_norm", np.nan))
@@ -4426,6 +5912,7 @@ def perform_msckf_updates(vio_fe, cam_observations: List[dict],
         
         if success:
             num_successful += 1
+            debug_counts["accepted"] += 1
             retry_state.pop(int(fid), None)
             if int(posttri_retry_state.get(int(fid), 0)) > 0:
                 MSCKF_STATS['posttri_retry_recover_success_count'] += 1
@@ -4464,11 +5951,28 @@ def perform_msckf_updates(vio_fe, cam_observations: List[dict],
             setattr(vio_fe, "_msckf_posttri_retry_protect_state", posttri_retry_protect_state)
         except Exception:
             pass
+        try:
+            boost_now = int(max(0, getattr(vio_fe, "_msckf_emergency_boost", 0)))
+            boost_next = max(0, boost_now - 1)
+            partial_prune_count_after = int(MSCKF_STATS.get("partial_depth_prune_feature_count", 0))
+            partial_prune_seen = bool(
+                emergency_refresh_on_partial_prune
+                and partial_prune_count_after > partial_prune_count_before
+            )
+            low_attempts_seen = bool(int(num_attempted) < int(emergency_refresh_low_attempts))
+            if partial_prune_seen or low_attempts_seen or emergency_active:
+                boost_next = max(int(emergency_boost_cycles), boost_next)
+            setattr(vio_fe, "_msckf_emergency_boost", int(boost_next))
+        except Exception:
+            pass
     
     if len(chi2_norm_samples) > 0:
         nis_norm = float(np.mean(chi2_norm_samples))
     else:
         nis_norm = np.nan
+    quality_cfg = dict(global_config) if isinstance(global_config, dict) else {}
+    if emergency_active and emergency_effective_track_min > 0:
+        quality_cfg["MSCKF_QUALITY_GATE_TRACK_MIN"] = int(emergency_effective_track_min)
     quality_snap = _summarize_msckf_quality(
         t=float(timestamp),
         track_count=int(num_attempted),
@@ -4477,7 +5981,7 @@ def perform_msckf_updates(vio_fe, cam_observations: List[dict],
         reproj_p95_norm=reproj_p95_samples,
         depth_positive_ratio=depth_ratio_samples,
         feature_quality=feature_quality_samples,
-        global_config=global_config,
+        global_config=quality_cfg,
     )
 
     if stats_out is not None:
@@ -4501,10 +6005,40 @@ def perform_msckf_updates(vio_fe, cam_observations: List[dict],
             "conditioning_risk": float(quality_snap.conditioning_risk),
             "feature_track_health": float(quality_snap.feature_track_health),
             "unstable_reason_code": str(quality_snap.unstable_reason_code),
+            "emergency_active": float(bool(emergency_active)),
+            "emergency_promoted_count": int(emergency_promoted_count),
+            "adrenaline_active": float(bool(adrenaline_meta.get("active", False))),
+            "adrenaline_exhausted": float(bool(adrenaline_meta.get("exhausted", False))),
+            "adrenaline_elapsed_sec": float(adrenaline_meta.get("elapsed_sec", np.nan)),
         })
     if quality_out is not None:
         quality_out.clear()
         quality_out.update(quality_snap.as_dict())
+    debug_counts["attempted"] = int(num_attempted)
+    debug_counts["accepted"] = int(num_successful)
+    fail_reason_text = "none"
+    if debug_fail_reasons:
+        fail_reason_text = ";".join(
+            f"{key}:{debug_fail_reasons[key]}" for key in sorted(debug_fail_reasons.keys())
+        )
+    _log_msckf_debug(
+        float(timestamp),
+        stage="summary",
+        mature_input=debug_counts["mature_input"],
+        mature_after_cap=debug_counts["mature_after_cap"],
+        protected_carried=debug_counts["protected_carried"],
+        missing_obs=debug_counts["missing_obs"],
+        retry_lane_defer=debug_counts["retry_lane_defer"],
+        prefilter_reject=debug_counts["prefilter_reject"],
+        triangulated_ok=debug_counts["triangulated_ok"],
+        triangulated_fail=debug_counts["triangulated_fail"],
+        attempted=debug_counts["attempted"],
+        accepted=debug_counts["accepted"],
+        adrenaline_active=bool(adrenaline_meta.get("active", False)),
+        adrenaline_exhausted=bool(adrenaline_meta.get("exhausted", False)),
+        adrenaline_elapsed_sec=float(adrenaline_meta.get("elapsed_sec", np.nan)),
+        fail_reasons=fail_reason_text,
+    )
     
     return num_successful
 

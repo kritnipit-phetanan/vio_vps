@@ -24,6 +24,7 @@ class MagnetometerService:
         self._last_mag_t: float | None = None
         self._mag_chol_cooldown_until: float = -1e9
         self._mag_chol_fail_streak: int = 0
+        self._last_mag_soft_spring_bypass_t: float = -1e9
         self._heading_arb = HeadingArbitrationService(runner)
 
     @staticmethod
@@ -284,11 +285,11 @@ class MagnetometerService:
                                     p_max: float,
                                     p_cond: float,
                                     consistency_score: float,
-                                    max_update_dyaw_deg: Optional[float]) -> tuple[bool, float, str, Optional[float]]:
+                                    max_update_dyaw_deg: Optional[float]) -> tuple[bool, float, str, Optional[float], Optional[Dict[str, Any]]]:
         """Global single-owner yaw authority layer (MAG source)."""
         yaw_auth = getattr(self.runner, "yaw_authority_service", None)
         if yaw_auth is None:
-            return False, float(sigma_mag_scaled), "", max_update_dyaw_deg
+            return False, float(sigma_mag_scaled), "", max_update_dyaw_deg, None
 
         req_abs_deg = abs(np.degrees(self._wrap_angle(float(yaw_mag_filtered) - float(yaw_state))))
         if max_update_dyaw_deg is not None and np.isfinite(float(max_update_dyaw_deg)):
@@ -308,15 +309,31 @@ class MagnetometerService:
                 p_cond=float(p_cond),
             )
         except Exception:
-            return False, float(sigma_mag_scaled), "", max_update_dyaw_deg
+            return False, float(sigma_mag_scaled), "", max_update_dyaw_deg, None
 
         if (not bool(auth_dec.allow)) or str(auth_dec.mode).upper() in ("HOLD", "SKIP"):
-            return True, float(sigma_mag_scaled), f"yaw_auth_skip:{auth_dec.reason}", 0.0
+            return True, float(sigma_mag_scaled), f"yaw_auth_skip:{auth_dec.reason}", 0.0, None
 
         sigma_scaled = float(sigma_mag_scaled)
         cap = max_update_dyaw_deg
         reason = ""
-        if str(auth_dec.mode).upper() == "SOFT_APPLY":
+        spring_meta: Optional[Dict[str, Any]] = None
+        mode_u = str(auth_dec.mode).upper()
+        if mode_u == "SOFT_SPRING":
+            spring_cap_deg = float(auth_dec.max_update_dyaw_deg) if np.isfinite(float(auth_dec.max_update_dyaw_deg)) else float(
+                self.runner.global_config.get("YAW_AUTH_MAG_SOFT_SPRING_MAX_DYAW_DEG", 0.22)
+            )
+            reason = f"yaw_auth_spring:{auth_dec.reason}"
+            spring_meta = {
+                "active": True,
+                "r_mult": float(max(1.0, auth_dec.r_mult)),
+                "residual_cap_deg": float(max(0.03, spring_cap_deg)),
+                "override_local_skip": bool(
+                    self.runner.global_config.get("YAW_AUTH_MAG_SOFT_SPRING_OVERRIDE_LOCAL_SKIP_ENABLE", True)
+                ),
+                "reason": str(auth_dec.reason),
+            }
+        elif mode_u == "SOFT_APPLY":
             sigma_scaled *= max(1.0, float(auth_dec.r_mult))
             reason = f"yaw_auth_soft:{auth_dec.reason}"
         else:
@@ -326,7 +343,7 @@ class MagnetometerService:
             auth_cap = max(0.05, float(auth_dec.max_update_dyaw_deg))
             cap = auth_cap if cap is None else min(float(cap), auth_cap)
 
-        return False, float(sigma_scaled), reason, cap
+        return False, float(sigma_scaled), reason, cap, spring_meta
 
     def _register_mag_owner_observation(self, timestamp: float, accepted: bool) -> None:
         """Feed MAG accept/reject outcomes into global yaw-owner gating."""
@@ -394,6 +411,103 @@ class MagnetometerService:
             "owner_dead_timeout_",
         )
         return any(tag in reason_l for tag in owner_skip_tags)
+
+    def _soft_spring_can_override_skip(self, reason: str) -> bool:
+        """
+        Decide whether a MAG SOFT_SPRING ticket may override local skip flags.
+
+        Keep truly bad raw-magnetometer hygiene checks as hard stops, but let
+        owner/conditioning/vision mismatch paths degrade into weak yaw springs.
+        """
+        if not bool(self.runner.global_config.get("YAW_AUTH_MAG_SOFT_SPRING_OVERRIDE_LOCAL_SKIP_ENABLE", True)):
+            return False
+        reason_l = str(reason or "").strip().lower()
+        if reason_l == "":
+            return True
+        hard_blocks = (
+            "bad_skip",
+            "low quality",
+            "skip_preproc_norm_range",
+            "skip_preproc_norm_rolling_dev",
+            "skip_preproc_gyro_consistency",
+        )
+        if any(tag in reason_l for tag in hard_blocks):
+            return False
+        return True
+
+    def _apply_soft_spring_skip_override(
+        self,
+        skip_mag: bool,
+        consistency_reason: str,
+        yaw_auth_spring_meta: Optional[Dict[str, Any]],
+    ) -> tuple[bool, str]:
+        """Convert local MAG skip into a weak spring when yaw authority allows it."""
+        if not bool(skip_mag):
+            return False, consistency_reason
+        if not isinstance(yaw_auth_spring_meta, dict) or not bool(yaw_auth_spring_meta.get("active", False)):
+            return bool(skip_mag), consistency_reason
+        if not bool(yaw_auth_spring_meta.get("override_local_skip", True)):
+            return bool(skip_mag), consistency_reason
+        if not self._soft_spring_can_override_skip(consistency_reason):
+            return bool(skip_mag), consistency_reason
+        reason = str(consistency_reason or "")
+        override_tag = "yaw_auth_soft_spring_override"
+        if override_tag not in reason:
+            reason = f"{reason}|{override_tag}" if reason else override_tag
+        return False, reason
+
+    @staticmethod
+    def _spring_meta_active(yaw_auth_spring_meta: Optional[Dict[str, Any]]) -> bool:
+        return bool(isinstance(yaw_auth_spring_meta, dict) and yaw_auth_spring_meta.get("active", False))
+
+    def _apply_mag_chol_cooldown_gate(
+        self,
+        timestamp: float,
+        skip_mag: bool,
+        consistency_reason: str,
+        yaw_auth_spring_meta: Optional[Dict[str, Any]],
+    ) -> tuple[bool, str]:
+        """
+        Apply MAG conditioning cooldown, but let SOFT_SPRING bypass it.
+
+        The spring path already clamps residuals and inflates R heavily, so
+        skipping it defeats the intended weak continuous yaw pull.
+        """
+        if float(timestamp) >= float(self._mag_chol_cooldown_until):
+            return bool(skip_mag), consistency_reason
+        if self._spring_meta_active(yaw_auth_spring_meta) and bool(
+            self.runner.global_config.get("YAW_AUTH_MAG_SOFT_SPRING_BYPASS_CHOL_COOLDOWN_ENABLE", True)
+        ):
+            min_interval_sec = float(
+                max(
+                    0.0,
+                    self.runner.global_config.get(
+                        "YAW_AUTH_MAG_SOFT_SPRING_BYPASS_CHOL_COOLDOWN_MIN_INTERVAL_SEC",
+                        0.50,
+                    ),
+                )
+            )
+            time_since_last_spring = float(timestamp) - float(self._last_mag_soft_spring_bypass_t)
+            if np.isfinite(time_since_last_spring) and time_since_last_spring < float(min_interval_sec):
+                reason = str(consistency_reason or "")
+                decimate_tag = "yaw_auth_soft_spring_decimated"
+                if decimate_tag not in reason:
+                    reason = f"{reason}|{decimate_tag}" if reason else decimate_tag
+                skip_tag = "skip_chol_cooldown"
+                if skip_tag not in reason:
+                    reason = f"{reason}|{skip_tag}" if reason else skip_tag
+                return True, reason
+            reason = str(consistency_reason or "")
+            tag = "yaw_auth_soft_spring_bypass_chol_cooldown"
+            if tag not in reason:
+                reason = f"{reason}|{tag}" if reason else tag
+            self._last_mag_soft_spring_bypass_t = float(timestamp)
+            return bool(skip_mag), reason
+        reason = str(consistency_reason or "")
+        tag = "skip_chol_cooldown"
+        if tag not in reason:
+            reason = f"{reason}|{tag}" if reason else tag
+        return True, reason
 
     def _preprocess_mag_guard(self,
                               mag_norm: float,
@@ -590,7 +704,8 @@ class MagnetometerService:
                                   applied: bool,
                                   reason: str,
                                   chol_before: int,
-                                  proj_before: int):
+                                  proj_before: int,
+                                  soft_spring_active: bool = False):
         """
         Apply short MAG cooldown when this update triggers numerical conditioning.
 
@@ -600,6 +715,13 @@ class MagnetometerService:
         reason_l = str(reason).lower()
         chol_triggered = (chol_after > chol_before) or ("chol" in reason_l and "failed" in reason_l)
         projected = proj_after > proj_before
+
+        if bool(soft_spring_active) and bool(
+            self.runner.global_config.get("YAW_AUTH_MAG_SOFT_SPRING_BYPASS_CHOL_COOLDOWN_ENABLE", True)
+        ):
+            if applied:
+                self._mag_chol_fail_streak = max(0, self._mag_chol_fail_streak - 1)
+            return
 
         if chol_triggered:
             self._mag_chol_fail_streak += 1
@@ -768,30 +890,6 @@ class MagnetometerService:
                 self.runner.state.mag_rejects += 1
                 continue
 
-            # Temporary cooldown after MAG-triggered conditioning failures.
-            if float(mag_rec.t) < float(self._mag_chol_cooldown_until):
-                mag_adaptive_info = {
-                    "sensor": "MAG",
-                    "accepted": False,
-                    "attempted": 1,
-                    "dof": 1,
-                    "nis_norm": np.nan,
-                    "chi2": np.nan,
-                    "threshold": np.nan,
-                    "r_scale_used": float(max(1e-6, mag_policy_scales.get("r_scale", 1.0))),
-                    "reason_code": "skip_chol_cooldown",
-                }
-                self.runner.adaptive_service.record_adaptive_measurement(
-                    "MAG",
-                    adaptive_info=mag_adaptive_info,
-                    timestamp=float(mag_rec.t),
-                    policy_scales=mag_policy_scales,
-                )
-                if self._should_count_mag_owner_observation(accepted=False, reason="skip_chol_cooldown"):
-                    self._register_mag_owner_observation(timestamp=float(mag_rec.t), accepted=False)
-                self.runner.state.mag_rejects += 1
-                continue
-
             sync_threshold = float(self.runner.global_config.get("MAG_TIME_SYNC_THRESHOLD_SEC", 0.05))
             dt_sync = abs(float(t) - float(mag_rec.t))
             sync_status = "PASS" if dt_sync <= sync_threshold else "FAIL"
@@ -935,7 +1033,7 @@ class MagnetometerService:
                 skip_mag = True
             if arb_reason:
                 consistency_reason = arb_reason if consistency_reason == "" else f"{consistency_reason}|{arb_reason}"
-            gauth_skip, sigma_mag_scaled, gauth_reason, arb_max_update_dyaw_deg = self._apply_global_yaw_authority(
+            gauth_skip, sigma_mag_scaled, gauth_reason, arb_max_update_dyaw_deg, yaw_auth_spring_meta = self._apply_global_yaw_authority(
                 yaw_source="MAG",
                 yaw_mag_filtered=yaw_mag_filtered,
                 yaw_state=yaw_state_now,
@@ -951,11 +1049,27 @@ class MagnetometerService:
                 skip_mag = True
             if gauth_reason:
                 consistency_reason = gauth_reason if consistency_reason == "" else f"{consistency_reason}|{gauth_reason}"
+            skip_mag, consistency_reason = self._apply_soft_spring_skip_override(
+                skip_mag=skip_mag,
+                consistency_reason=consistency_reason,
+                yaw_auth_spring_meta=yaw_auth_spring_meta,
+            )
             decision = str(mag_quality.get("decision", "good"))
             if decision == "bad_skip":
                 skip_mag = True
                 if not consistency_reason:
                     consistency_reason = "skip_quality_bad"
+            skip_mag, consistency_reason = self._apply_soft_spring_skip_override(
+                skip_mag=skip_mag,
+                consistency_reason=consistency_reason,
+                yaw_auth_spring_meta=yaw_auth_spring_meta,
+            )
+            skip_mag, consistency_reason = self._apply_mag_chol_cooldown_gate(
+                timestamp=float(mag_rec.t),
+                skip_mag=skip_mag,
+                consistency_reason=consistency_reason,
+                yaw_auth_spring_meta=yaw_auth_spring_meta,
+            )
             log_mag_quality(
                 getattr(self.runner, "mag_quality_csv", None),
                 t=float(mag_rec.t),
@@ -1030,6 +1144,9 @@ class MagnetometerService:
                 r_scale_extra=float(mag_policy_scales.get("r_scale", 1.0)),
                 policy_decision=policy_decision,
                 max_update_dyaw_override_deg=arb_max_update_dyaw_deg,
+                yaw_auth_soft_spring_active=bool(isinstance(yaw_auth_spring_meta, dict) and yaw_auth_spring_meta.get("active", False)),
+                yaw_auth_soft_spring_r_mult=float(yaw_auth_spring_meta.get("r_mult", 1.0)) if isinstance(yaw_auth_spring_meta, dict) else 1.0,
+                yaw_auth_soft_spring_residual_cap_deg=float(yaw_auth_spring_meta.get("residual_cap_deg", np.nan)) if isinstance(yaw_auth_spring_meta, dict) else None,
                 adaptive_info=mag_adaptive_info,
             )
             self._update_mag_chol_cooldown(
@@ -1038,6 +1155,7 @@ class MagnetometerService:
                 reason=str(reason),
                 chol_before=chol_before,
                 proj_before=proj_before,
+                soft_spring_active=self._spring_meta_active(yaw_auth_spring_meta),
             )
             if consistency_reason:
                 mag_adaptive_info["reason_code"] = consistency_reason
@@ -1111,10 +1229,6 @@ class MagnetometerService:
                 policy_r_scale = 1.0
 
         if policy_decision is not None and str(policy_decision.mode).upper() in ("HOLD", "SKIP"):
-            self.runner.state.mag_rejects += 1
-            return
-
-        if float(mag_rec.t) < float(self._mag_chol_cooldown_until):
             self.runner.state.mag_rejects += 1
             return
 
@@ -1228,7 +1342,7 @@ class MagnetometerService:
             skip_mag = True
         if arb_reason:
             consistency_reason = arb_reason if consistency_reason == "" else f"{consistency_reason}|{arb_reason}"
-        gauth_skip, sigma_mag_scaled, gauth_reason, arb_max_update_dyaw_deg = self._apply_global_yaw_authority(
+        gauth_skip, sigma_mag_scaled, gauth_reason, arb_max_update_dyaw_deg, yaw_auth_spring_meta = self._apply_global_yaw_authority(
             yaw_source="MAG",
             yaw_mag_filtered=yaw_mag_filtered,
             yaw_state=yaw_state_now,
@@ -1244,6 +1358,17 @@ class MagnetometerService:
             skip_mag = True
         if gauth_reason:
             consistency_reason = gauth_reason if consistency_reason == "" else f"{consistency_reason}|{gauth_reason}"
+        skip_mag, consistency_reason = self._apply_soft_spring_skip_override(
+            skip_mag=skip_mag,
+            consistency_reason=consistency_reason,
+            yaw_auth_spring_meta=yaw_auth_spring_meta,
+        )
+        skip_mag, consistency_reason = self._apply_mag_chol_cooldown_gate(
+            timestamp=float(mag_rec.t),
+            skip_mag=skip_mag,
+            consistency_reason=consistency_reason,
+            yaw_auth_spring_meta=yaw_auth_spring_meta,
+        )
         log_mag_quality(
             getattr(self.runner, "mag_quality_csv", None),
             t=float(mag_rec.t),
@@ -1256,6 +1381,11 @@ class MagnetometerService:
             decision=str(mag_quality.get("decision", "good")) if consistency_reason == "" else f"{str(mag_quality.get('decision', 'good'))}+{consistency_reason}",
             r_scale=float(max(1e-6, sigma_mag_scaled / max(1e-6, sigma_mag))),
             reason=str(mag_quality.get("reason", "")),
+        )
+        skip_mag, consistency_reason = self._apply_soft_spring_skip_override(
+            skip_mag=skip_mag,
+            consistency_reason=consistency_reason,
+            yaw_auth_spring_meta=yaw_auth_spring_meta,
         )
         if skip_mag:
             if self._should_count_mag_owner_observation(accepted=False, reason=consistency_reason):
@@ -1296,6 +1426,9 @@ class MagnetometerService:
             r_scale_extra=float(policy_r_scale),
             policy_decision=policy_decision,
             max_update_dyaw_override_deg=arb_max_update_dyaw_deg,
+            yaw_auth_soft_spring_active=bool(isinstance(yaw_auth_spring_meta, dict) and yaw_auth_spring_meta.get("active", False)),
+            yaw_auth_soft_spring_r_mult=float(yaw_auth_spring_meta.get("r_mult", 1.0)) if isinstance(yaw_auth_spring_meta, dict) else 1.0,
+            yaw_auth_soft_spring_residual_cap_deg=float(yaw_auth_spring_meta.get("residual_cap_deg", np.nan)) if isinstance(yaw_auth_spring_meta, dict) else None,
         )
         self._update_mag_chol_cooldown(
             timestamp=float(mag_rec.t),
@@ -1303,6 +1436,7 @@ class MagnetometerService:
             reason=str(reason),
             chol_before=chol_before,
             proj_before=proj_before,
+            soft_spring_active=self._spring_meta_active(yaw_auth_spring_meta),
         )
 
         if applied:

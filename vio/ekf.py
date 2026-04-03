@@ -204,6 +204,37 @@ def ensure_covariance_valid(P: np.ndarray, label: str = "",
     return P
 
 
+def regularize_innovation_covariance(
+    S: np.ndarray,
+    base_epsilon: float = 1e-8,
+    rel_epsilon: float = 1e-9,
+    max_epsilon: float = 1e-3,
+) -> tuple[np.ndarray, float]:
+    """
+    Apply light diagonal loading to innovation covariance before solve/cholesky.
+
+    This keeps marginally ill-conditioned measurement updates numerically alive
+    without materially changing the filter when S is already healthy.
+    """
+    S = np.asarray(S, dtype=float)
+    if S.ndim != 2 or S.shape[0] != S.shape[1]:
+        return S, 0.0
+    S = 0.5 * (S + S.T)
+    if S.shape[0] == 0:
+        return S, 0.0
+
+    diag = np.abs(np.diag(S))
+    diag = diag[np.isfinite(diag)]
+    if diag.size > 0:
+        scale = float(max(1.0, np.median(diag), np.max(diag)))
+    else:
+        scale = 1.0
+    eps = float(min(max_epsilon, max(base_epsilon, rel_epsilon * scale)))
+    if not np.isfinite(eps) or eps <= 0.0:
+        eps = float(base_epsilon)
+    return S + np.eye(S.shape[0], dtype=float) * eps, eps
+
+
 def propagate_error_state_covariance(P: np.ndarray, Phi: np.ndarray,
                                       Q: np.ndarray, num_clones: int,
                                       conditioner: "ExtendedKalmanFilter" = None,
@@ -461,6 +492,10 @@ class ExtendedKalmanFilter:
             "first_projection_time": float("nan"),
             "max_cond_seen": 0.0,
         }
+        self.innovation_diag_loading_base = 1e-8
+        self.innovation_diag_loading_rel = 1e-9
+        self.innovation_diag_loading_retry_mult = 10.0
+        self.innovation_diag_loading_max = 1e-3
         self.verbose_yaw_debug = False
         self._cov_growth_stats = defaultdict(lambda: {
             "samples": 0,
@@ -734,6 +769,12 @@ class ExtendedKalmanFilter:
 
         PHT = dot(P, H.T)
         self.S = dot(H, PHT) + R
+        self.S, _ = regularize_innovation_covariance(
+            self.S,
+            base_epsilon=float(self.innovation_diag_loading_base),
+            rel_epsilon=float(self.innovation_diag_loading_rel),
+            max_epsilon=float(self.innovation_diag_loading_max),
+        )
         self.SI = safe_matrix_inverse(self.S, damping=1e-9, method='cholesky')
         self.K = dot(PHT, self.SI)
 
@@ -795,6 +836,12 @@ class ExtendedKalmanFilter:
         
         # NUMERICAL STABILITY: Symmetrize S (innovation covariance)
         self.S = (self.S + self.S.T) / 2.0
+        self.S, s_load = regularize_innovation_covariance(
+            self.S,
+            base_epsilon=float(self.innovation_diag_loading_base),
+            rel_epsilon=float(self.innovation_diag_loading_rel),
+            max_epsilon=float(self.innovation_diag_loading_max),
+        )
         
         # NUMERICAL STABILITY: Use solve() instead of inv() for Kalman gain
         # K = P @ H.T @ inv(S) is rewritten as K = solve(S.T, (H @ P).T).T
@@ -802,11 +849,21 @@ class ExtendedKalmanFilter:
         try:
             self.K = linalg.solve(self.S.T, PHT.T).T
         except np.linalg.LinAlgError:
-            print("[ESKF] WARNING: Singular S matrix, rejecting update")
-            self.z = deepcopy(z)
-            self.x_post = self.x.copy()
-            self.P_post = self.P.copy()
-            return
+            retry_eps = float(max(1e-7, s_load * float(max(2.0, self.innovation_diag_loading_retry_mult))))
+            self.S, _ = regularize_innovation_covariance(
+                dot(H, PHT) + R,
+                base_epsilon=retry_eps,
+                rel_epsilon=float(self.innovation_diag_loading_rel),
+                max_epsilon=float(max(self.innovation_diag_loading_max, retry_eps)),
+            )
+            try:
+                self.K = linalg.solve(self.S.T, PHT.T).T
+            except np.linalg.LinAlgError:
+                print("[ESKF] WARNING: Singular S matrix after diagonal loading, rejecting update")
+                self.z = deepcopy(z)
+                self.x_post = self.x.copy()
+                self.P_post = self.P.copy()
+                return
 
         hx = Hx(self.x, *hx_args)
         self.y = residual(z, hx)

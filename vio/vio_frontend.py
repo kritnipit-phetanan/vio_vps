@@ -118,6 +118,9 @@ class VIOFrontEnd:
         self.runtime_log_interval_sec = max(0.0, float(runtime_log_interval_sec))
         self._runtime_quiet = self.runtime_verbosity in ("release", "quiet", "minimal")
         self._last_runtime_log_ts: Dict[str, float] = {}
+        self._debug_time_window = self._parse_debug_time_window(
+            os.environ.get("VIO_FRONTEND_DEBUG_WINDOW", "")
+        )
 
     def _runtime_log(self, key: str, msg: str, force: bool = False):
         """Rate-limited runtime logging for non-critical per-frame messages."""
@@ -138,6 +141,71 @@ class VIOFrontEnd:
         if (now - last) >= self.runtime_log_interval_sec:
             print(msg)
             self._last_runtime_log_ts[key] = now
+
+    @staticmethod
+    def _parse_debug_time_window(window_str: str) -> Optional[Tuple[float, float]]:
+        text = str(window_str).strip()
+        if not text:
+            return None
+        try:
+            parts = [float(part.strip()) for part in text.split(",", 1)]
+        except Exception:
+            return None
+        if len(parts) != 2:
+            return None
+        t0, t1 = float(parts[0]), float(parts[1])
+        if not np.isfinite(t0) or not np.isfinite(t1):
+            return None
+        if t1 < t0:
+            t0, t1 = t1, t0
+        return (t0, t1)
+
+    def _frontend_debug_enabled(self, t: Optional[float]) -> bool:
+        if self._debug_time_window is None or t is None:
+            return False
+        t0, t1 = self._debug_time_window
+        return t0 <= float(t) <= t1
+
+    def _log_frontend_debug(
+        self,
+        t: float,
+        stage: str,
+        raw_tracks: int,
+        klt_good: int,
+        flow_valid: int,
+        pose_inliers: int,
+        final_inliers: int,
+        note: str = "",
+    ):
+        if not self._frontend_debug_enabled(t):
+            return
+        msg = (
+            f"[DEBUG FRONTEND] t={float(t):.4f} stage={stage} "
+            f"raw={int(raw_tracks)} klt_good={int(klt_good)} "
+            f"flow_valid={int(flow_valid)} pose_inliers={int(pose_inliers)} "
+            f"final_inliers={int(final_inliers)}"
+        )
+        if note:
+            msg = f"{msg} note={note}"
+        print(msg)
+
+    def _log_mature_debug(
+        self,
+        t: float,
+        eligible_len: int,
+        pass_inlier: int,
+        pass_quality: int,
+        pass_recent: int,
+        returned_count: int,
+    ):
+        if not self._frontend_debug_enabled(t):
+            return
+        print(
+            f"[DEBUG FRONTEND] t={float(t):.4f} stage=mature_tracks "
+            f"eligible_len={int(eligible_len)} pass_inlier={int(pass_inlier)} "
+            f"pass_quality={int(pass_quality)} pass_recent={int(pass_recent)} "
+            f"returned={int(returned_count)}"
+        )
 
     def _extract_grid_features(self, img_gray: np.ndarray) -> np.ndarray:
         """
@@ -403,11 +471,17 @@ class VIOFrontEnd:
         self.last_matches = None
         self.last_num_inliers = 0
         num_tracked_successfully = 0
+        raw_tracks_in = 0
+        klt_good_count = 0
+        flow_valid_count = 0
+        pose_inlier_count = 0
+        final_inlier_count = 0
         
         # KLT tracking
         try:
             if self.last_gray_for_klt is not None and self.last_pts_for_klt is not None and len(self.last_pts_for_klt) > 0:
                 p0 = self.last_pts_for_klt.reshape(-1, 1, 2)
+                raw_tracks_in = int(len(p0))
                 
                 # Forward tracking
                 p1, st, err = cv2.calcOpticalFlowPyrLK(self.last_gray_for_klt, img_gray, p0, None, **self.lk_params)
@@ -441,6 +515,7 @@ class VIOFrontEnd:
                     # FIX v3.9.3: Moved parallax computation to after RANSAC inlier filtering
                     # Previously computed here with outliers → inaccurate parallax
                     self.last_num_tracked = int(np.sum(good_mask))
+                    klt_good_count = int(self.last_num_tracked)
                     
                     st = st.reshape(-1) * good_mask
                     p1 = p1.reshape(-1, 2)
@@ -489,6 +564,15 @@ class VIOFrontEnd:
                             "track_all_features_lost",
                             f"[VIO][TRACK] Frame {self.frame_idx}: All features lost, will replenish next cycle",
                         )
+                        self._log_frontend_debug(
+                            t,
+                            "klt_all_lost",
+                            raw_tracks_in,
+                            klt_good_count,
+                            flow_valid_count,
+                            pose_inlier_count,
+                            final_inlier_count,
+                        )
         except Exception as e:
             print(f"[VIO] KLT tracking exception: {e}")
         
@@ -525,6 +609,16 @@ class VIOFrontEnd:
                 curr_pts.append(curr_obs['pt'])
         
         if len(prev_pts) < VO_MIN_INLIERS:
+            self._log_frontend_debug(
+                t,
+                "pre_ransac_track_count_low",
+                raw_tracks_in,
+                klt_good_count,
+                len(prev_pts),
+                pose_inlier_count,
+                final_inlier_count,
+                note=f"prev_pts={len(prev_pts)}",
+            )
             return False, len(prev_pts), None, None, dt_img
         
         q1 = np.array(prev_pts, dtype=np.float32)
@@ -539,8 +633,19 @@ class VIOFrontEnd:
         
         flow_threshold = min(300.0, max(50.0, np.median(flow_mag) + 5.0 * mad))
         flow_valid_mask = flow_mag < flow_threshold
+        flow_valid_count = int(np.sum(flow_valid_mask))
         
         if np.sum(flow_valid_mask) < VO_MIN_INLIERS:
+            self._log_frontend_debug(
+                t,
+                "flow_gate_low",
+                raw_tracks_in,
+                klt_good_count,
+                flow_valid_count,
+                pose_inlier_count,
+                final_inlier_count,
+                note=f"flow_threshold={float(flow_threshold):.3f}",
+            )
             return False, len(q1), None, None, dt_img
         
         q1 = q1[flow_valid_mask]
@@ -553,17 +658,45 @@ class VIOFrontEnd:
         
         # CRITICAL: Validate E matrix (Step 1: catch explosion early)
         if E is None or mask is None or not np.all(np.isfinite(E)):
+            self._log_frontend_debug(
+                t,
+                "essential_invalid",
+                raw_tracks_in,
+                klt_good_count,
+                flow_valid_count,
+                pose_inlier_count,
+                final_inlier_count,
+            )
             print(f"[VIO] WARNING: Essential matrix invalid or contains inf/nan")
             return False, len(q1), None, None, dt_img
         
         num_inl, R_vo, t_unit, pose_mask = cv2.recoverPose(E, q2n, q1n, mask=mask)
+        pose_inlier_count = int(num_inl)
         
         # Validate pose estimate
         if not np.all(np.isfinite(R_vo)) or not np.all(np.isfinite(t_unit)):
+            self._log_frontend_debug(
+                t,
+                "pose_invalid",
+                raw_tracks_in,
+                klt_good_count,
+                flow_valid_count,
+                pose_inlier_count,
+                final_inlier_count,
+            )
             print(f"[VIO] WARNING: Pose estimate contains inf/nan")
             return False, num_inl, None, None, dt_img
         
         if num_inl < VO_MIN_INLIERS:
+            self._log_frontend_debug(
+                t,
+                "recover_pose_low",
+                raw_tracks_in,
+                klt_good_count,
+                flow_valid_count,
+                pose_inlier_count,
+                final_inlier_count,
+            )
             return False, num_inl, None, None, dt_img
         
         # Epipolar error check
@@ -574,8 +707,19 @@ class VIOFrontEnd:
         epipolar_errors = self._compute_epipolar_error(q1n_inliers, q2n_inliers, E)
         final_inliers = epipolar_errors < self.epipolar_threshold
         num_final = np.sum(final_inliers)
+        final_inlier_count = int(num_final)
         
         if num_final < VO_MIN_INLIERS:
+            self._log_frontend_debug(
+                t,
+                "epipolar_low",
+                raw_tracks_in,
+                klt_good_count,
+                flow_valid_count,
+                pose_inlier_count,
+                final_inlier_count,
+                note=f"epi_thresh={float(self.epipolar_threshold):.3f}",
+            )
             return False, num_final, None, None, dt_img
         
         # Update inlier count (successful pose estimation)
@@ -641,6 +785,17 @@ class VIOFrontEnd:
             self.last_matches = (q1n_final.copy(), q2n_final.copy())
         except Exception:
             self.last_matches = None
+        
+        self._log_frontend_debug(
+            t,
+            "success",
+            raw_tracks_in,
+            klt_good_count,
+            flow_valid_count,
+            pose_inlier_count,
+            final_inlier_count,
+            note=f"dt_img={float(dt_img):.3f}",
+        )
         
         # Keyframe management
         should_keyframe, kf_reason = self._should_create_keyframe(img_gray)
@@ -785,7 +940,9 @@ class VIOFrontEnd:
                           min_quality_median: float = 0.0,
                           min_recent_inlier_ratio: float = 0.0,
                           recent_window: int = 0,
-                          max_tracks: int = 0) -> Dict[int, List[dict]]:
+                          max_tracks: int = 0,
+                          emergency_enable: bool = False,
+                          emergency_min_track_length: int = 2) -> Dict[int, List[dict]]:
         """Return tracks ready for MSCKF update (length >= min_track_length).
         
         FIX v3.9.3-C: Filter out tracks with inconsistent RANSAC inliers
@@ -799,10 +956,20 @@ class VIOFrontEnd:
         min_recent_inlier_ratio = float(np.clip(min_recent_inlier_ratio, 0.0, 1.0))
         recent_window = int(max(0, recent_window))
         max_tracks = int(max(0, max_tracks))
+        emergency_enable = bool(emergency_enable)
+        emergency_min_track_length = int(max(2, emergency_min_track_length))
+        effective_min_track_length = int(self.min_track_length)
+        if emergency_enable:
+            effective_min_track_length = min(int(self.min_track_length), int(emergency_min_track_length))
+        eligible_len = 0
+        pass_inlier = 0
+        pass_quality = 0
+        pass_recent = 0
 
         for fid, hist in self.tracks.items():
-            if len(hist) < self.min_track_length:
+            if len(hist) < effective_min_track_length:
                 continue
+            eligible_len += 1
             
             # Check inlier consistency (v3.9.3)
             # Require at least 60% of observations to be RANSAC inliers
@@ -811,12 +978,14 @@ class VIOFrontEnd:
             inlier_ratio = inlier_count / len(hist)
             if inlier_ratio < min_inlier_ratio:
                 continue
+            pass_inlier += 1
 
             q_vals = np.asarray([float(obs.get('quality', np.nan)) for obs in hist], dtype=float)
             q_vals = q_vals[np.isfinite(q_vals)]
             quality_median = float(np.median(q_vals)) if q_vals.size > 0 else float("nan")
             if np.isfinite(quality_median) and quality_median < min_quality_median:
                 continue
+            pass_quality += 1
 
             if recent_window > 0 and min_recent_inlier_ratio > 0.0:
                 recent = hist[-recent_window:]
@@ -825,15 +994,32 @@ class VIOFrontEnd:
                     recent_ratio = float(recent_inlier) / float(len(recent))
                     if recent_ratio < min_recent_inlier_ratio:
                         continue
+            pass_recent += 1
             
             # Score tracks so MSCKF sees geometry-strong pack first.
             # We bias toward inlier consistency and quality, then track depth.
             depth_term = float(np.clip(float(len(hist)) / 18.0, 0.0, 1.0))
             q_term = float(np.clip(quality_median, 0.0, 1.0)) if np.isfinite(quality_median) else 0.0
-            score = (0.58 * float(inlier_ratio)) + (0.32 * q_term) + (0.10 * depth_term)
+            emergency_short_bonus = 0.0
+            if emergency_enable and len(hist) < int(self.min_track_length):
+                emergency_short_bonus = 0.08
+            score = (
+                (0.58 * float(inlier_ratio))
+                + (0.32 * q_term)
+                + (0.10 * depth_term)
+                + emergency_short_bonus
+            )
             scored.append((score, int(fid), hist))
 
         if len(scored) == 0:
+            self._log_mature_debug(
+                float(self.last_frame_time) if self.last_frame_time is not None else float("nan"),
+                eligible_len,
+                pass_inlier,
+                pass_quality,
+                pass_recent,
+                0,
+            )
             return mature
 
         scored.sort(key=lambda item: item[0], reverse=True)
@@ -841,6 +1027,14 @@ class VIOFrontEnd:
             scored = scored[:max_tracks]
         for _, fid, hist in scored:
             mature[int(fid)] = hist
+        self._log_mature_debug(
+            float(self.last_frame_time) if self.last_frame_time is not None else float("nan"),
+            eligible_len,
+            pass_inlier,
+            pass_quality,
+            pass_recent,
+            len(mature),
+        )
         
         return mature
     
