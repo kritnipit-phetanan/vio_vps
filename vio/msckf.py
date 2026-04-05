@@ -18,7 +18,7 @@ import numpy as np
 from typing import Optional, Tuple, List, Dict, Any
 from scipy.spatial.transform import Rotation as R_scipy
 
-from .math_utils import skew_symmetric, safe_matrix_inverse
+from .math_utils import skew_symmetric, safe_matrix_inverse, quat_boxplus
 from .policy.types import MsckfQualitySnapshot
 
 
@@ -157,6 +157,8 @@ def _msckf_partial_depth_noise_scale(triangulated: Optional[dict]) -> float:
     geometry_fallback_obs = max(0, int(triangulated.get("geometry_fallback_obs_count", 0)))
     weak_update_obs = max(0, int(triangulated.get("reproj_weak_update_obs_count", 0)))
     weak_update_overrun = float(triangulated.get("reproj_weak_update_overrun_ratio", np.nan))
+    depth_partial_reason = str(triangulated.get("depth_partial_reason", ""))
+    depth_fallback_depth_m = float(triangulated.get("depth_fallback_depth_m", np.nan))
 
     scale = 1.0
     if bool(triangulated.get("depth_partial_accept", False)):
@@ -178,9 +180,21 @@ def _msckf_partial_depth_noise_scale(triangulated: Optional[dict]) -> float:
         scale += 1.5
     if bool(triangulated.get("emergency_fast_track_active", False)):
         scale += 2.5
+    if bool(triangulated.get("forced_init_rescue_active", False)):
+        scale += 10.0
+    if bool(triangulated.get("pure_bearing_candidate_active", False)):
+        scale += 8.0
+    if depth_partial_reason == "depth_sign_fallback":
+        scale += 12.0
+    if (
+        bool(triangulated.get("depth_fallback_active", False))
+        and np.isfinite(depth_fallback_depth_m)
+        and depth_fallback_depth_m >= 25.0
+    ):
+        scale += 4.0
     if bool(triangulated.get("rescue_obs_set_used", False)):
         scale *= 1.20
-    return float(np.clip(scale, 1.0, 25.0))
+    return float(np.clip(scale, 1.0, 96.0))
 
 
 def _compute_msckf_adrenaline_meta(
@@ -262,6 +276,66 @@ def _compute_msckf_adrenaline_meta(
     }
     setattr(vio_fe, "_msckf_adrenaline_state", state)
     return state
+
+
+def _compute_msckf_epipolar_governor(
+    vio_fe: Any,
+    effective_track_count: int,
+    track_count_low_pending: bool,
+    timestamp: float,
+    global_config: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Starvation-only governor for epipolar rescue with a hard burst limit."""
+    cfg = global_config if isinstance(global_config, dict) else {}
+    enabled = bool(cfg.get("MSCKF_EPIPOLAR_GOVERNOR_ENABLE", True))
+    enter_track_count = int(max(1, cfg.get("MSCKF_EPIPOLAR_GOVERNOR_ENTER_TRACK_COUNT", 5)))
+    exit_track_count = int(max(enter_track_count + 1, cfg.get("MSCKF_EPIPOLAR_GOVERNOR_EXIT_TRACK_COUNT", 6)))
+    max_per_frame = int(max(0, cfg.get("MSCKF_EPIPOLAR_MAX_PER_FRAME", 8)))
+    burst_window_sec = float(max(0.0, cfg.get("MSCKF_EPIPOLAR_BURST_WINDOW_SEC", 2.0)))
+    effective_track_count = int(max(0, effective_track_count))
+    starvation = bool(enabled and bool(track_count_low_pending) and effective_track_count <= enter_track_count)
+    prev_starvation = bool(getattr(vio_fe, "_msckf_epipolar_starvation_active", False))
+    prev_start_t = float(getattr(vio_fe, "_msckf_epipolar_burst_start_t", np.nan))
+    prev_exhausted = bool(getattr(vio_fe, "_msckf_epipolar_burst_exhausted", False))
+    elapsed_sec = 0.0
+    exhausted = False
+
+    if not starvation:
+        start_t = float("nan")
+        active = False
+    else:
+        if prev_starvation and np.isfinite(prev_start_t):
+            start_t = float(prev_start_t)
+        else:
+            start_t = float(timestamp) if np.isfinite(float(timestamp)) else 0.0
+        elapsed_sec = (
+            max(0.0, float(timestamp) - float(start_t))
+            if np.isfinite(float(timestamp)) and np.isfinite(float(start_t))
+            else 0.0
+        )
+        exhausted = bool(prev_exhausted or (burst_window_sec > 0.0 and elapsed_sec > burst_window_sec))
+        active = bool(not exhausted)
+
+    try:
+        setattr(vio_fe, "_msckf_epipolar_governor_active", bool(active))
+        setattr(vio_fe, "_msckf_epipolar_starvation_active", bool(starvation))
+        setattr(vio_fe, "_msckf_epipolar_burst_start_t", float(start_t))
+        setattr(vio_fe, "_msckf_epipolar_burst_exhausted", bool(exhausted))
+    except Exception:
+        pass
+    return {
+        "enabled": bool(enabled),
+        "active": bool(active),
+        "starvation": bool(starvation),
+        "track_count_low_pending": bool(track_count_low_pending),
+        "exhausted": bool(exhausted),
+        "elapsed_sec": float(elapsed_sec),
+        "burst_window_sec": float(burst_window_sec),
+        "max_per_frame": int(max_per_frame),
+        "enter_track_count": int(enter_track_count),
+        "exit_track_count": int(exit_track_count),
+        "effective_track_count": int(effective_track_count),
+    }
 
 
 # =============================================================================
@@ -420,6 +494,9 @@ MSCKF_STATS = {
     'depth_init_candidate_count': 0,
     'depth_init_routed_count': 0,
     'depth_init_gate_block_count': 0,
+    'depth_init_forced_rescue_count': 0,
+    'depth_init_forced_rescue_success_count': 0,
+    'depth_init_forced_rescue_seed_fail_count': 0,
     'depth_sparse_recover_candidate_count': 0,
     'depth_sparse_recover_gate_block_count': 0,
     'depth_sparse_recover_parallax_low_count': 0,
@@ -496,6 +573,16 @@ MSCKF_STATS = {
     'partial_depth_fallback_feature_count': 0,
     'partial_depth_fallback_update_count': 0,
     'partial_depth_mahalanobis_reject_count': 0,
+    'pure_bearing_candidate_count': 0,
+    'pure_bearing_seed_count': 0,
+    'pure_bearing_nonlinear_skip_count': 0,
+    'pure_bearing_success_count': 0,
+    'pure_bearing_update_count': 0,
+    'epipolar_candidate_count': 0,
+    'epipolar_attempt_count': 0,
+    'epipolar_success_count': 0,
+    'epipolar_fail_invalid_count': 0,
+    'epipolar_fail_chi2_count': 0,
     'adrenaline_enter_count': 0,
     'adrenaline_active_cycle_count': 0,
     'adrenaline_exhausted_count': 0,
@@ -625,7 +712,10 @@ def print_msckf_stats():
         f" quality_low={int(MSCKF_STATS.get('depth_init_quality_low_count', 0))},"
         f" candidate={int(MSCKF_STATS.get('depth_init_candidate_count', 0))},"
         f" routed={int(MSCKF_STATS.get('depth_init_routed_count', 0))},"
-        f" gate_block={int(MSCKF_STATS.get('depth_init_gate_block_count', 0))}"
+        f" gate_block={int(MSCKF_STATS.get('depth_init_gate_block_count', 0))},"
+        f" forced_rescue={int(MSCKF_STATS.get('depth_init_forced_rescue_count', 0))},"
+        f" forced_success={int(MSCKF_STATS.get('depth_init_forced_rescue_success_count', 0))},"
+        f" forced_seed_fail={int(MSCKF_STATS.get('depth_init_forced_rescue_seed_fail_count', 0))}"
     )
     print(
         "  preagg lanes:"
@@ -658,6 +748,14 @@ def print_msckf_stats():
         f" enough_signal={int(MSCKF_STATS.get('preagg_predicate_enough_signal_count', 0))},"
         f" quality_ok={int(MSCKF_STATS.get('preagg_predicate_quality_ok_count', 0))},"
         f" all_true={int(MSCKF_STATS.get('preagg_predicate_all_true_count', 0))}"
+    )
+    print(
+        "  epipolar lane:"
+        f" candidate={int(MSCKF_STATS.get('epipolar_candidate_count', 0))},"
+        f" attempted={int(MSCKF_STATS.get('epipolar_attempt_count', 0))},"
+        f" success={int(MSCKF_STATS.get('epipolar_success_count', 0))},"
+        f" fail_invalid={int(MSCKF_STATS.get('epipolar_fail_invalid_count', 0))},"
+        f" fail_chi2={int(MSCKF_STATS.get('epipolar_fail_chi2_count', 0))}"
     )
 
 
@@ -1843,6 +1941,26 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
         (global_config or {}).get("MSCKF_DEPTH_INIT_RECOVER_MIN_DEPTH_FAIL_RATIO", 0.60)
         if isinstance(global_config, dict) else 0.60
     )
+    depth_init_forced_rescue_enable = bool(
+        (global_config or {}).get("MSCKF_DEPTH_INIT_FORCED_RESCUE_ENABLE", True)
+        if isinstance(global_config, dict) else True
+    )
+    depth_init_forced_rescue_depth_m = float(
+        (global_config or {}).get("MSCKF_DEPTH_INIT_FORCED_RESCUE_DEPTH_M", 20.0)
+        if isinstance(global_config, dict) else 20.0
+    )
+    depth_init_forced_rescue_min_obs = int(
+        (global_config or {}).get("MSCKF_DEPTH_INIT_FORCED_RESCUE_MIN_OBS", 2)
+        if isinstance(global_config, dict) else 2
+    )
+    depth_init_forced_rescue_min_depth_fail_ratio = float(
+        (global_config or {}).get("MSCKF_DEPTH_INIT_FORCED_RESCUE_MIN_DEPTH_FAIL_RATIO", 0.50)
+        if isinstance(global_config, dict) else 0.50
+    )
+    depth_init_forced_rescue_quality_cap = float(
+        (global_config or {}).get("MSCKF_DEPTH_INIT_FORCED_RESCUE_QUALITY_CAP", 0.35)
+        if isinstance(global_config, dict) else 0.35
+    )
     depth_retry_soft_accept_enable = bool(
         (global_config or {}).get("MSCKF_RETRY_LANE_POSTTRI_RECOVER_DEPTH_SOFT_ACCEPT_ENABLE", False)
         if isinstance(global_config, dict) else False
@@ -2131,6 +2249,32 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
         (global_config or {}).get("MSCKF_EMERGENCY_PURE_BEARING_MIN_INLIER_RATIO", 0.50)
         if isinstance(global_config, dict) else 0.50
     )
+    emergency_pure_bearing_enable = bool(
+        (global_config or {}).get("MSCKF_EMERGENCY_PURE_BEARING_ENABLE", True)
+        if isinstance(global_config, dict) else True
+    )
+    emergency_pure_bearing_depth_m = float(
+        (global_config or {}).get(
+            "MSCKF_EMERGENCY_PURE_BEARING_DEPTH_M",
+            max(120.0, float(emergency_fixed_depth_m)),
+        )
+        if isinstance(global_config, dict) else max(120.0, float(emergency_fixed_depth_m))
+    )
+    emergency_pure_bearing_error_mult = float(
+        (global_config or {}).get("MSCKF_EMERGENCY_PURE_BEARING_ERROR_MULT", 1.60)
+        if isinstance(global_config, dict) else 1.60
+    )
+    emergency_pure_bearing_proj_floor_m = float(
+        (global_config or {}).get(
+            "MSCKF_EMERGENCY_PURE_BEARING_PROJ_FLOOR_M",
+            max(0.20, float(depth_gate_floor_m) * 10.0),
+        )
+        if isinstance(global_config, dict) else max(0.20, float(depth_gate_floor_m) * 10.0)
+    )
+    emergency_pure_bearing_quality_cap = float(
+        (global_config or {}).get("MSCKF_EMERGENCY_PURE_BEARING_QUALITY_CAP", 0.22)
+        if isinstance(global_config, dict) else 0.22
+    )
     # Deterministic stable-geometry reproj lane (single canonical lane).
     # Legacy stable_norm keys are kept as fallback aliases for backward compatibility.
     stable_lane_enable = bool(
@@ -2308,6 +2452,8 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
         tri_pair_min_angle_deg_use = float(min(tri_pair_min_angle_deg_use, 0.08))
     emergency_pretri_bypass_active = False
     emergency_fixed_depth_seed_active = False
+    pure_bearing_candidate_active = False
+    forced_init_rescue_active = False
     if pretri_gate_enable:
         low_obs = bool(len(obs_list) < max(2, int(pretri_min_obs)))
         low_parallax = bool(
@@ -2336,11 +2482,14 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
         if geometry_insufficient_pretri:
             if bool(emergency_short_track_candidate):
                 emergency_pretri_bypass_active = True
+                pure_bearing_candidate_active = bool(emergency_pure_bearing_enable)
             else:
                 MSCKF_STATS['fail_geometry_insufficient_pretri'] += 1
                 MSCKF_STATS['fail_geometry_borderline'] += 1
                 MSCKF_STATS['reclass_to_geometry_count'] += 1
                 return None
+    if bool(pure_bearing_candidate_active):
+        MSCKF_STATS['pure_bearing_candidate_count'] += 1
 
     for obs_idx0, obs_idx1 in candidate_pairs:
         obs0 = obs_list[obs_idx0]
@@ -2433,7 +2582,19 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
             best_pair_score = pair_score
             p_init = p_candidate
 
-    if p_init is None:
+    if bool(pure_bearing_candidate_active):
+        p_seed = _seed_msckf_fixed_depth_point(
+            obs_list,
+            cam_states,
+            kf,
+            global_config=global_config,
+            fixed_depth_m=float(emergency_pure_bearing_depth_m),
+        )
+        if p_seed is not None:
+            p_init = p_seed
+            emergency_fixed_depth_seed_active = True
+            MSCKF_STATS['pure_bearing_seed_count'] += 1
+    elif p_init is None:
         if bool(emergency_short_track_candidate):
             p_init = _seed_msckf_fixed_depth_point(
                 obs_list,
@@ -2464,6 +2625,25 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
                 (not np.isfinite(q_med_init))
                 or float(q_med_init) >= float(np.clip(depth_init_recover_min_quality, 0.0, 1.0))
             )
+            forced_init_rescue_candidate = bool(
+                bool(depth_init_forced_rescue_enable)
+                and len(obs_list) >= int(max(2, depth_init_forced_rescue_min_obs))
+                and depth_fail_ratio >= float(np.clip(depth_init_forced_rescue_min_depth_fail_ratio, 0.0, 1.0))
+            )
+            if forced_init_rescue_candidate:
+                p_seed = _seed_msckf_fixed_depth_point(
+                    obs_list,
+                    cam_states,
+                    kf,
+                    global_config=global_config,
+                    fixed_depth_m=float(depth_init_forced_rescue_depth_m),
+                )
+                if p_seed is not None:
+                    p_init = p_seed
+                    forced_init_rescue_active = True
+                    MSCKF_STATS['depth_init_forced_rescue_count'] += 1
+                else:
+                    MSCKF_STATS['depth_init_forced_rescue_seed_fail_count'] += 1
             init_recover_candidate = bool(
                 bool(depth_init_recover_enable)
                 and bool(depth_sparse_recover_enable)
@@ -2474,22 +2654,24 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
                 and quality_init_ok
             )
             if init_recover_candidate:
-                MSCKF_STATS['depth_init_candidate_count'] += 1
-                MSCKF_STATS['depth_init_routed_count'] += 1
-                MSCKF_STATS['depth_sparse_recover_candidate_count'] += 1
-                MSCKF_STATS['fail_depth_sparse_recoverable'] += 1
-                MSCKF_STATS['fail_geometry_borderline'] += 1
-                MSCKF_STATS['reclass_to_geometry_count'] += 1
-                return None
+                if not bool(forced_init_rescue_active):
+                    MSCKF_STATS['depth_init_candidate_count'] += 1
+                    MSCKF_STATS['depth_init_routed_count'] += 1
+                    MSCKF_STATS['depth_sparse_recover_candidate_count'] += 1
+                    MSCKF_STATS['fail_depth_sparse_recoverable'] += 1
+                    MSCKF_STATS['fail_geometry_borderline'] += 1
+                    MSCKF_STATS['reclass_to_geometry_count'] += 1
+                    return None
             MSCKF_STATS['depth_init_gate_block_count'] += 1
-            MSCKF_STATS['fail_depth_sign_init'] += 1
-            # Taxonomy split:
-            # - init-stage depth failures are tracked as depth_large/init-specific,
-            #   not as post-refine depth-sign failures.
-            MSCKF_STATS['fail_depth_large'] += 1
-            if bool(unstable_geometry_init) and bool(depth_reclass_enable):
-                MSCKF_STATS['fail_geometry_borderline'] += 1
-                MSCKF_STATS['reclass_to_geometry_count'] += 1
+            if not bool(forced_init_rescue_active):
+                MSCKF_STATS['fail_depth_sign_init'] += 1
+                # Taxonomy split:
+                # - init-stage depth failures are tracked as depth_large/init-specific,
+                #   not as post-refine depth-sign failures.
+                MSCKF_STATS['fail_depth_large'] += 1
+                if bool(unstable_geometry_init) and bool(depth_reclass_enable):
+                    MSCKF_STATS['fail_geometry_borderline'] += 1
+                    MSCKF_STATS['reclass_to_geometry_count'] += 1
         elif fail_counts["parallax"] > 0:
             MSCKF_STATS['fail_parallax'] += 1
         elif fail_counts["baseline"] > 0:
@@ -2502,18 +2684,22 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
             return None
     
     # Nonlinear refinement
-    p_refined = triangulate_point_nonlinear(
-        obs_list,
-        cam_states,
-        p_init,
-        kf,
-        max_iters=tri_nl_recover_max_iters if bool(protected_retry_context) else tri_nl_max_iters,
-        debug=debug,
-        step_tol=tri_nl_recover_step_tol if bool(protected_retry_context) else tri_nl_step_tol,
-        max_step_norm=tri_nl_recover_max_step_norm if bool(protected_retry_context) else tri_nl_max_step_norm,
-        damping_scale=tri_nl_recover_damping_scale if bool(protected_retry_context) else tri_nl_damping_scale,
-        global_config=global_config,
-    )
+    if bool(pure_bearing_candidate_active):
+        p_refined = np.asarray(p_init, dtype=float).reshape(3,)
+        MSCKF_STATS['pure_bearing_nonlinear_skip_count'] += 1
+    else:
+        p_refined = triangulate_point_nonlinear(
+            obs_list,
+            cam_states,
+            p_init,
+            kf,
+            max_iters=tri_nl_recover_max_iters if bool(protected_retry_context) else tri_nl_max_iters,
+            debug=debug,
+            step_tol=tri_nl_recover_step_tol if bool(protected_retry_context) else tri_nl_step_tol,
+            max_step_norm=tri_nl_recover_max_step_norm if bool(protected_retry_context) else tri_nl_max_step_norm,
+            damping_scale=tri_nl_recover_damping_scale if bool(protected_retry_context) else tri_nl_damping_scale,
+            global_config=global_config,
+        )
     
     if p_refined is None:
         if bool(emergency_short_track_candidate) and p_init is not None:
@@ -2631,6 +2817,7 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
     rescue_borderline_rejects = 0
     depth_retry_promoted_obs = 0
     rescue_promoted_obs = 0
+    pure_bearing_promoted_obs = 0
     rescue_obs_set_used = False
     partial_depth_accept = False
     depth_fallback_active = False
@@ -2671,6 +2858,18 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
             int(depth_fallback_obs_count),
             min(int(len(obs_list)), int(max(2, emergency_short_track_max_obs))),
         )
+    if bool(pure_bearing_candidate_active):
+        depth_fallback_active = True
+        geometry_fallback_active = True
+        depth_partial_reason = "pure_bearing_candidate"
+        depth_fallback_obs_count = max(int(depth_fallback_obs_count), int(min(len(obs_list), max(2, emergency_short_track_max_obs))))
+        geometry_fallback_obs_count = max(int(geometry_fallback_obs_count), int(min(len(obs_list), max(2, emergency_short_track_max_obs))))
+    if bool(forced_init_rescue_active):
+        depth_fallback_active = True
+        geometry_fallback_active = True
+        depth_partial_reason = "forced_init_rescue"
+        depth_fallback_obs_count = max(int(depth_fallback_obs_count), int(len(obs_list)))
+        geometry_fallback_obs_count = max(int(geometry_fallback_obs_count), int(len(obs_list)))
 
     norm_scale_px = 120.0
     try:
@@ -2905,6 +3104,7 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
         
         promoted_by_depth_retry = False
         promoted_by_same_cycle_rescue = False
+        promoted_by_pure_bearing = False
         same_cycle_retry_mode = bool(
             bool(use_depth_same_cycle_full_rescue)
             and (retry_mode_key == "depth_sparse_same_cycle_rescue")
@@ -2926,7 +3126,9 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
                 float(depth_gate_floor_m) * 0.12,
                 float(min_depth_threshold) * 0.22,
             )
-            if (
+            if bool(pure_bearing_candidate_active):
+                promoted_by_pure_bearing = True
+            elif (
                 use_depth_retry_soft_accept
                 and depth_retry_promoted_obs < int(depth_retry_soft_max_promote_use)
                 and p_c[2] >= soft_depth_threshold
@@ -2947,21 +3149,28 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
             else:
                 depth_rejects += 1
                 continue
+        elif bool(pure_bearing_candidate_active):
+            promoted_by_pure_bearing = True
 
         obs_selected = dict(obs)
         obs_selected["_msckf_depth_promoted"] = bool(
-            promoted_by_depth_retry or promoted_by_same_cycle_rescue
+            promoted_by_depth_retry or promoted_by_same_cycle_rescue or promoted_by_pure_bearing
         )
         obs_selected["_msckf_depth_use_fallback"] = bool(
-            promoted_by_depth_retry or promoted_by_same_cycle_rescue
+            promoted_by_depth_retry or promoted_by_same_cycle_rescue or promoted_by_pure_bearing
         )
+        obs_selected["_msckf_pure_bearing_candidate"] = bool(promoted_by_pure_bearing)
         obs_selected["_msckf_depth_proj_floor"] = float(
             max(
                 float(depth_gate_floor_m),
                 float(
                     same_cycle_retry_floor_threshold
                     if promoted_by_same_cycle_rescue
-                    else (soft_depth_threshold if promoted_by_depth_retry else min_depth_threshold)
+                    else (
+                        emergency_pure_bearing_proj_floor_m
+                        if promoted_by_pure_bearing
+                        else (soft_depth_threshold if promoted_by_depth_retry else min_depth_threshold)
+                    )
                 ),
             )
         )
@@ -2971,11 +3180,18 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
         # avoid near-zero depth blow-ups while keeping legacy depth-gate behavior
         # unchanged for normal lanes.
         p_c_proj = p_c
-        if promoted_by_same_cycle_rescue and bool(same_cycle_retry_mode):
+        clip_depth_floor = None
+        if promoted_by_pure_bearing:
+            clip_depth_floor = max(
+                float(emergency_pure_bearing_proj_floor_m),
+                float(min_depth_threshold) * 0.85,
+            )
+        elif promoted_by_same_cycle_rescue and bool(same_cycle_retry_mode):
             clip_depth_floor = max(
                 float(depth_gate_floor_m) * 0.14,
                 float(min_depth_threshold) * 0.35,
             )
+        if clip_depth_floor is not None:
             if p_c[2] < clip_depth_floor:
                 p_c_proj = p_c.copy()
                 vec_norm = float(np.linalg.norm(p_c_proj))
@@ -2987,7 +3203,8 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
                         p_c_proj[2] = clip_depth_floor
                 else:
                     p_c_proj[2] = clip_depth_floor
-                MSCKF_STATS['posttri_retry_recover_depth_same_cycle_clip_proj_count'] += 1
+                if promoted_by_same_cycle_rescue and bool(same_cycle_retry_mode):
+                    MSCKF_STATS['posttri_retry_recover_depth_same_cycle_clip_proj_count'] += 1
 
         # Compute normalized coordinates
         x_pred = p_c_proj[0] / p_c_proj[2]
@@ -3066,6 +3283,13 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
                 min(2.75, depth_retry_soft_error_mult_use * 1.12)
             )
             MSCKF_STATS['posttri_retry_recover_depth_soft_accept_count'] += 1
+        if promoted_by_pure_bearing:
+            pure_bearing_promoted_obs += 1
+            borderline_rejects += 1
+            strict_obs_metric = float(strict_obs_metric) * float(
+                np.clip(emergency_pure_bearing_error_mult, 1.0, 4.0)
+            )
+            rescue_obs_metric = float(strict_obs_metric)
         else:
             total_error += float(strict_obs_metric)
             obs_error_norm_values.append(float(strict_obs_metric))
@@ -3153,6 +3377,22 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
         )
         if isinstance(global_config, dict) else max(0.10, float(depth_gate_floor_m) * 4.0)
     )
+    depth_sign_fallback_enable = bool(
+        (global_config or {}).get("MSCKF_DEPTHSIGN_FALLBACK_ENABLE", True)
+        if isinstance(global_config, dict) else True
+    )
+    depth_sign_fallback_depth_m = float(
+        (global_config or {}).get("MSCKF_DEPTHSIGN_FALLBACK_DEPTH_M", 50.0)
+        if isinstance(global_config, dict) else 50.0
+    )
+    depth_sign_fallback_min_obs = int(
+        (global_config or {}).get("MSCKF_DEPTHSIGN_FALLBACK_MIN_OBS", 2)
+        if isinstance(global_config, dict) else 2
+    )
+    depth_sign_fallback_error_mult = float(
+        (global_config or {}).get("MSCKF_DEPTHSIGN_FALLBACK_ERROR_MULT", 2.5)
+        if isinstance(global_config, dict) else 2.5
+    )
 
     def _activate_partial_depth_accept(use_rescue_set: bool, reason: str) -> bool:
         nonlocal valid_obs, obs_error_norm_values, total_error, borderline_rejects
@@ -3218,6 +3458,74 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
                 or any(bool(o.get("_msckf_depth_promoted", False)) for o in candidate_obs)
             )
         )
+        depth_partial_reason = str(reason)
+        return True
+
+    def _activate_depth_sign_fallback(reason: str) -> bool:
+        nonlocal valid_obs, obs_error_norm_values, total_error, borderline_rejects
+        nonlocal p_refined, partial_depth_accept, depth_fallback_active
+        nonlocal depth_fallback_obs_count, depth_partial_reason
+        nonlocal geometry_fallback_active, geometry_fallback_obs_count
+
+        if not bool(depth_sign_fallback_enable):
+            return False
+
+        fallback_obs: List[dict] = []
+        fallback_err: List[float] = []
+        fallback_proj_floor = float(
+            max(
+                0.10,
+                float(partial_depth_fallback_floor_m),
+                float(depth_gate_floor_m),
+                float(depth_sign_fallback_depth_m),
+            )
+        )
+        fallback_metric = float(max(1.0, depth_sign_fallback_error_mult))
+
+        for obs_data in obs_list:
+            if not isinstance(obs_data, dict):
+                continue
+            try:
+                cam_id = int(obs_data.get("cam_id", -1))
+                x_n, y_n = obs_data.get("pt_norm", (np.nan, np.nan))
+                if cam_id < 0 or cam_id >= len(cam_states):
+                    continue
+                if not (np.isfinite(float(x_n)) and np.isfinite(float(y_n))):
+                    continue
+            except Exception:
+                continue
+            obs_promoted = dict(obs_data)
+            obs_promoted["_msckf_depth_promoted"] = True
+            obs_promoted["_msckf_depth_use_fallback"] = True
+            obs_promoted["_msckf_depth_sign_fallback"] = True
+            obs_promoted["_msckf_depth_proj_floor"] = float(fallback_proj_floor)
+            fallback_obs.append(obs_promoted)
+            fallback_err.append(float(fallback_metric))
+
+        fallback_obs, fallback_err = _dedup_obs_bundle(fallback_obs, fallback_err)
+        if len(fallback_obs) < max(2, int(depth_sign_fallback_min_obs)):
+            return False
+
+        p_seed = _seed_msckf_fixed_depth_point(
+            fallback_obs,
+            cam_states,
+            kf,
+            global_config=global_config,
+            fixed_depth_m=float(depth_sign_fallback_depth_m),
+        )
+        if p_seed is None:
+            return False
+
+        p_refined = p_seed
+        valid_obs = fallback_obs
+        obs_error_norm_values = fallback_err
+        total_error = float(sum(fallback_err))
+        borderline_rejects = max(int(borderline_rejects), int(len(fallback_obs)))
+        partial_depth_accept = True
+        depth_fallback_active = True
+        depth_fallback_obs_count = max(int(depth_fallback_obs_count), int(len(fallback_obs)))
+        geometry_fallback_active = True
+        geometry_fallback_obs_count = max(int(geometry_fallback_obs_count), int(len(fallback_obs)))
         depth_partial_reason = str(reason)
         return True
 
@@ -3535,7 +3843,7 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
             MSCKF_STATS['preagg_predicate_all_true_count'] += 1
         return all_true
 
-    if bool(depth_state_gate_enable) and bool(unstable_geometry_depth_gate):
+    if bool(depth_state_gate_enable) and bool(unstable_geometry_depth_gate) and (not bool(pure_bearing_candidate_active)):
         total_obs = max(1, int(len(obs_list)))
         valid_obs_n = int(len(valid_obs))
         depth_pos_ratio = float(valid_obs_n) / float(total_obs)
@@ -3648,7 +3956,11 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
                             reason="weak_depth_support",
                         )
                     )
-                    if not partial_accept_bypass:
+                    depth_sign_fallback_bypass = bool(
+                        (not partial_accept_bypass)
+                        and _activate_depth_sign_fallback("depth_sign_fallback")
+                    )
+                    if not partial_accept_bypass and not depth_sign_fallback_bypass:
                         if (
                             bool(depth_retry_gate_override_enable)
                             and bool(use_depth_same_cycle_full_rescue)
@@ -3819,13 +4131,17 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
                     return None
             if depth_sparse_candidate and (not recoverable_depth_sparse):
                 MSCKF_STATS['depth_sparse_recover_gate_block_count'] += 1
-            if (not strict_depth_sign) and bool(depth_reclass_enable):
-                MSCKF_STATS['fail_geometry_borderline'] += 1
-                MSCKF_STATS['fail_depth_large'] += 1
-                MSCKF_STATS['reclass_to_geometry_count'] += 1
-            else:
-                MSCKF_STATS['fail_depth_sign_post_refine'] += 1
-                MSCKF_STATS['fail_depth_sign'] += 1
+            depth_sign_fallback_bypass = bool(
+                _activate_depth_sign_fallback("depth_sign_fallback")
+            )
+            if not depth_sign_fallback_bypass:
+                if (not strict_depth_sign) and bool(depth_reclass_enable):
+                    MSCKF_STATS['fail_geometry_borderline'] += 1
+                    MSCKF_STATS['fail_depth_large'] += 1
+                    MSCKF_STATS['reclass_to_geometry_count'] += 1
+                else:
+                    MSCKF_STATS['fail_depth_sign_post_refine'] += 1
+                    MSCKF_STATS['fail_depth_sign'] += 1
         elif len(valid_obs) < 2:
             # Sparse post-tri path (len(valid_obs)<2): route recoverable reproj-sparse
             # cases to a retry lane before final rejection.
@@ -3866,6 +4182,25 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
                     MSCKF_STATS['fail_geometry_borderline'] += 1
         if len(valid_obs) < 2:
             return None
+
+    if bool(forced_init_rescue_active) and len(valid_obs) >= 2:
+        forced_proj_floor = float(
+            max(
+                0.10,
+                float(partial_depth_fallback_floor_m),
+                float(depth_gate_floor_m),
+                float(depth_init_forced_rescue_depth_m),
+            )
+        )
+        for idx, obs_data in enumerate(valid_obs):
+            obs_force = dict(obs_data)
+            obs_force["_msckf_depth_use_fallback"] = True
+            obs_force["_msckf_forced_init_rescue"] = True
+            obs_force["_msckf_depth_proj_floor"] = float(
+                max(float(obs_force.get("_msckf_depth_proj_floor", 0.0)), float(forced_proj_floor))
+            )
+            valid_obs[idx] = obs_force
+        depth_fallback_obs_count = max(int(depth_fallback_obs_count), int(len(valid_obs)))
 
     valid_obs_ratio_now = float(len(valid_obs)) / float(max(1, len(obs_list)))
     avg_error_raw = float(total_error / len(valid_obs))
@@ -4099,9 +4434,23 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
         MSCKF_STATS['partial_depth_fallback_feature_count'] += 1
 
     MSCKF_STATS['success'] += 1
+    if bool(forced_init_rescue_active):
+        MSCKF_STATS['depth_init_forced_rescue_success_count'] += 1
+    if bool(pure_bearing_candidate_active):
+        MSCKF_STATS['pure_bearing_success_count'] += 1
     quality_base = 1.0 / (1.0 + avg_error * 100.0)
     if bool(emergency_fast_track_active):
         reproj_quality_scale = min(float(reproj_quality_scale), 0.45)
+    if bool(forced_init_rescue_active):
+        reproj_quality_scale = min(
+            float(reproj_quality_scale),
+            float(np.clip(depth_init_forced_rescue_quality_cap, 0.10, 0.45)),
+        )
+    if bool(pure_bearing_candidate_active):
+        reproj_quality_scale = min(
+            float(reproj_quality_scale),
+            float(np.clip(emergency_pure_bearing_quality_cap, 0.08, 0.35)),
+        )
     result = {
         'p_w': p_refined,
         'observations': valid_obs,
@@ -4139,6 +4488,9 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
         'reproj_adrenaline_elapsed_sec': float(reproj_adrenaline_elapsed_sec)
         if np.isfinite(reproj_adrenaline_elapsed_sec) else np.nan,
         'emergency_fast_track_active': bool(emergency_fast_track_active),
+        'forced_init_rescue_active': bool(forced_init_rescue_active),
+        'pure_bearing_candidate_active': bool(pure_bearing_candidate_active),
+        'pure_bearing_obs_count': int(pure_bearing_promoted_obs),
         'emergency_pretri_bypass_active': bool(emergency_pretri_bypass_active),
         'emergency_fixed_depth_seed_active': bool(emergency_fixed_depth_seed_active),
         'depth_fallback_depth_m': float(
@@ -4146,6 +4498,9 @@ def triangulate_feature(fid: int, cam_observations: List[dict], cam_states: List
                 0.10,
                 float(partial_depth_fallback_floor_m),
                 float(depth_gate_floor_m),
+                float(depth_init_forced_rescue_depth_m) if bool(forced_init_rescue_active) else 0.0,
+                float(depth_sign_fallback_depth_m) if str(depth_partial_reason) == "depth_sign_fallback" else 0.0,
+                float(emergency_pure_bearing_depth_m) if bool(pure_bearing_candidate_active) else 0.0,
                 float(emergency_fixed_depth_m) if bool(emergency_fixed_depth_seed_active) else 0.0,
             )
         ),
@@ -4335,6 +4690,440 @@ def compute_observability_nullspace(kf: ExtendedKalmanFilter,
             U_ortho[:, j] = u_j / norm
     
     return U_ortho
+
+
+def _extract_epipolar_track_endpoints(observations: List[dict]) -> Optional[Tuple[dict, dict]]:
+    """Pick the latest valid two-view pair for an epipolar-only short-track update."""
+    valid_obs: List[dict] = []
+    for obs in observations:
+        try:
+            cam_id = int(obs.get("cam_id", -1))
+            x_n, y_n = obs.get("pt_norm", (np.nan, np.nan))
+            if cam_id < 0:
+                continue
+            if not (np.isfinite(float(x_n)) and np.isfinite(float(y_n))):
+                continue
+            valid_obs.append(obs)
+        except Exception:
+            continue
+    if len(valid_obs) < 2:
+        return None
+    obs1 = valid_obs[-1]
+    obs0 = valid_obs[-2]
+    if int(obs0.get("cam_id", -1)) == int(obs1.get("cam_id", -1)):
+        return None
+    return (obs0, obs1)
+
+
+def _compute_epipolar_sampson_measurement(
+    obs0: dict,
+    obs1: dict,
+    q_imu0: np.ndarray,
+    p_imu0: np.ndarray,
+    q_imu1: np.ndarray,
+    p_imu1: np.ndarray,
+    global_config: Optional[Dict[str, Any]] = None,
+    min_baseline_m: float = 1e-4,
+    imu_translation_guard_m: float = 0.01,
+) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    """
+    Compute scale-free Sampson-style epipolar measurement for a short track.
+
+    Returns:
+        measurement_value: Predicted measurement h(x). Ideal value is 0.
+        baseline_norm_m: Relative camera baseline norm.
+        imu_baseline_norm_m: Relative IMU clone translation norm.
+    """
+    q_cam0, p_cam0 = imu_pose_to_camera_pose(q_imu0, p_imu0, global_config=global_config)
+    q_cam1, p_cam1 = imu_pose_to_camera_pose(q_imu1, p_imu1, global_config=global_config)
+
+    q0_xyzw = np.array([q_cam0[1], q_cam0[2], q_cam0[3], q_cam0[0]], dtype=float)
+    q1_xyzw = np.array([q_cam1[1], q_cam1[2], q_cam1[3], q_cam1[0]], dtype=float)
+    r_cw0 = R_scipy.from_quat(q0_xyzw).as_matrix()
+    r_cw1 = R_scipy.from_quat(q1_xyzw).as_matrix()
+
+    r_21 = r_cw1.T @ r_cw0
+    t_21 = r_cw1.T @ (np.asarray(p_cam0, dtype=float).reshape(3,) - np.asarray(p_cam1, dtype=float).reshape(3,))
+    baseline_norm = float(np.linalg.norm(t_21))
+    imu_baseline_norm = float(
+        np.linalg.norm(
+            np.asarray(p_imu1, dtype=float).reshape(3,) - np.asarray(p_imu0, dtype=float).reshape(3,)
+        )
+    )
+    if (not np.isfinite(imu_baseline_norm)) or imu_baseline_norm < float(max(1e-8, imu_translation_guard_m)):
+        return (None, baseline_norm, imu_baseline_norm)
+    if (not np.isfinite(baseline_norm)) or baseline_norm < float(max(1e-8, min_baseline_m)):
+        return (None, baseline_norm, imu_baseline_norm)
+
+    t_hat = t_21 / baseline_norm
+    e_mat = skew_symmetric(t_hat) @ r_21
+
+    x0, y0 = obs0["pt_norm"]
+    x1, y1 = obs1["pt_norm"]
+    x_h0 = np.array([float(x0), float(y0), 1.0], dtype=float)
+    x_h1 = np.array([float(x1), float(y1), 1.0], dtype=float)
+
+    ex1 = e_mat @ x_h0
+    etx2 = e_mat.T @ x_h1
+    denom = float(
+        ex1[0] * ex1[0]
+        + ex1[1] * ex1[1]
+        + etx2[0] * etx2[0]
+        + etx2[1] * etx2[1]
+    )
+    if (not np.isfinite(denom)) or denom < 1e-9:
+        return (None, baseline_norm, imu_baseline_norm)
+
+    numer = float(x_h1.T @ e_mat @ x_h0)
+    if not np.isfinite(numer):
+        return (None, baseline_norm, imu_baseline_norm)
+    return (float(numer / np.sqrt(denom)), baseline_norm, imu_baseline_norm)
+
+
+def _compute_epipolar_numeric_jacobian(
+    obs0: dict,
+    obs1: dict,
+    cs0: dict,
+    cs1: dict,
+    kf: ExtendedKalmanFilter,
+    err_state_size: int,
+    global_config: Optional[Dict[str, Any]] = None,
+    min_baseline_m: float = 1e-4,
+    imu_translation_guard_m: float = 0.01,
+    rot_eps: float = 1e-6,
+    pos_eps: float = 1e-4,
+) -> Tuple[Optional[np.ndarray], Optional[float]]:
+    """Numerically differentiate the epipolar measurement w.r.t. the two involved clone poses."""
+    q_imu0 = np.asarray(kf.x[cs0["q_idx"]:cs0["q_idx"] + 4, 0], dtype=float)
+    p_imu0 = np.asarray(kf.x[cs0["p_idx"]:cs0["p_idx"] + 3, 0], dtype=float)
+    q_imu1 = np.asarray(kf.x[cs1["q_idx"]:cs1["q_idx"] + 4, 0], dtype=float)
+    p_imu1 = np.asarray(kf.x[cs1["p_idx"]:cs1["p_idx"] + 3, 0], dtype=float)
+
+    base_meas, baseline_norm, _ = _compute_epipolar_sampson_measurement(
+        obs0,
+        obs1,
+        q_imu0,
+        p_imu0,
+        q_imu1,
+        p_imu1,
+        global_config=global_config,
+        min_baseline_m=min_baseline_m,
+        imu_translation_guard_m=imu_translation_guard_m,
+    )
+    if base_meas is None or not np.isfinite(float(base_meas)):
+        return (None, baseline_norm)
+
+    def _safe_meas(q0: np.ndarray, p0: np.ndarray, q1: np.ndarray, p1: np.ndarray) -> Optional[float]:
+        meas, _, _ = _compute_epipolar_sampson_measurement(
+            obs0,
+            obs1,
+            q0,
+            p0,
+            q1,
+            p1,
+            global_config=global_config,
+            min_baseline_m=min_baseline_m,
+            imu_translation_guard_m=imu_translation_guard_m,
+        )
+        if meas is None or not np.isfinite(float(meas)):
+            return None
+        return float(meas)
+
+    def _derivative(eval_plus, eval_minus, eps: float) -> float:
+        meas_plus = eval_plus()
+        meas_minus = eval_minus()
+        if meas_plus is not None and meas_minus is not None:
+            return float((meas_plus - meas_minus) / (2.0 * eps))
+        if meas_plus is not None:
+            return float((meas_plus - float(base_meas)) / eps)
+        if meas_minus is not None:
+            return float((float(base_meas) - meas_minus) / eps)
+        return float("nan")
+
+    h_row = np.zeros((1, err_state_size), dtype=float)
+
+    for axis in range(3):
+        dtheta = np.zeros(3, dtype=float)
+        dtheta[axis] = float(rot_eps)
+        deriv = _derivative(
+            lambda dq=dtheta: _safe_meas(quat_boxplus(q_imu0, dq), p_imu0, q_imu1, p_imu1),
+            lambda dq=dtheta: _safe_meas(quat_boxplus(q_imu0, -dq), p_imu0, q_imu1, p_imu1),
+            float(rot_eps),
+        )
+        h_row[0, cs0["err_q_idx"] + axis] = deriv
+
+    for axis in range(3):
+        dp = np.zeros(3, dtype=float)
+        dp[axis] = float(pos_eps)
+        deriv = _derivative(
+            lambda delta=dp: _safe_meas(q_imu0, p_imu0 + delta, q_imu1, p_imu1),
+            lambda delta=dp: _safe_meas(q_imu0, p_imu0 - delta, q_imu1, p_imu1),
+            float(pos_eps),
+        )
+        h_row[0, cs0["err_p_idx"] + axis] = deriv
+
+    for axis in range(3):
+        dtheta = np.zeros(3, dtype=float)
+        dtheta[axis] = float(rot_eps)
+        deriv = _derivative(
+            lambda dq=dtheta: _safe_meas(q_imu0, p_imu0, quat_boxplus(q_imu1, dq), p_imu1),
+            lambda dq=dtheta: _safe_meas(q_imu0, p_imu0, quat_boxplus(q_imu1, -dq), p_imu1),
+            float(rot_eps),
+        )
+        h_row[0, cs1["err_q_idx"] + axis] = deriv
+
+    for axis in range(3):
+        dp = np.zeros(3, dtype=float)
+        dp[axis] = float(pos_eps)
+        deriv = _derivative(
+            lambda delta=dp: _safe_meas(q_imu0, p_imu0, q_imu1, p_imu1 + delta),
+            lambda delta=dp: _safe_meas(q_imu0, p_imu0, q_imu1, p_imu1 - delta),
+            float(pos_eps),
+        )
+        h_row[0, cs1["err_p_idx"] + axis] = deriv
+
+    if not np.all(np.isfinite(h_row)):
+        return (None, baseline_norm)
+    return (h_row, baseline_norm)
+
+
+def msckf_epipolar_measurement_update(
+    candidate_fids: List[int],
+    observations_cache: Dict[int, List[dict]],
+    cam_states: List[dict],
+    kf: ExtendedKalmanFilter,
+    measurement_noise: float = 2.5e-3,
+    huber_threshold: float = 1.345,
+    chi2_max_dof: float = 15.36,
+    chi2_scale: float = 1.0,
+    min_triangulate_length: int = 4,
+    global_config: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Apply a batched short-track epipolar-only EKF update using the latest two views per track."""
+    result = {
+        "success": False,
+        "attempted_fids": [],
+        "accepted_fids": [],
+        "innovation_norm": np.nan,
+        "chi2_test": np.nan,
+    }
+    if not candidate_fids:
+        return result
+    if not np.all(np.isfinite(kf.P)):
+        return result
+
+    cfg = global_config if isinstance(global_config, dict) else {}
+    min_baseline_m = float(max(1e-5, cfg.get("MSCKF_EPIPOLAR_MIN_BASELINE_M", 1e-4)))
+    imu_translation_guard_m = float(
+        max(1e-4, cfg.get("MSCKF_EPIPOLAR_IMU_TRANSLATION_GUARD_M", 0.01))
+    )
+    baseline_ref_m = float(
+        max(imu_translation_guard_m, cfg.get("MSCKF_EPIPOLAR_BASELINE_REF_M", 0.05))
+    )
+    row_norm_guard = float(max(1.0, cfg.get("MSCKF_EPIPOLAR_ROW_NORM_GUARD", 1e4)))
+    err_state_size = int(kf.P.shape[0])
+    row_fids: List[int] = []
+    h_rows: List[np.ndarray] = []
+    meas_vals: List[float] = []
+    meas_vars: List[float] = []
+
+    for fid in candidate_fids:
+        obs_list = list(observations_cache.get(int(fid), []) or [])
+        endpoints = _extract_epipolar_track_endpoints(obs_list)
+        if endpoints is None:
+            MSCKF_STATS["epipolar_fail_invalid_count"] += 1
+            continue
+        obs0, obs1 = endpoints
+        cam_id0 = int(obs0.get("cam_id", -1))
+        cam_id1 = int(obs1.get("cam_id", -1))
+        if (
+            cam_id0 < 0
+            or cam_id1 < 0
+            or cam_id0 >= len(cam_states)
+            or cam_id1 >= len(cam_states)
+            or cam_id0 == cam_id1
+        ):
+            MSCKF_STATS["epipolar_fail_invalid_count"] += 1
+            continue
+
+        cs0 = cam_states[cam_id0]
+        cs1 = cam_states[cam_id1]
+        meas_val, baseline_norm, imu_baseline_norm = _compute_epipolar_sampson_measurement(
+            obs0,
+            obs1,
+            np.asarray(kf.x[cs0["q_idx"]:cs0["q_idx"] + 4, 0], dtype=float),
+            np.asarray(kf.x[cs0["p_idx"]:cs0["p_idx"] + 3, 0], dtype=float),
+            np.asarray(kf.x[cs1["q_idx"]:cs1["q_idx"] + 4, 0], dtype=float),
+            np.asarray(kf.x[cs1["p_idx"]:cs1["p_idx"] + 3, 0], dtype=float),
+            global_config=global_config,
+            min_baseline_m=min_baseline_m,
+            imu_translation_guard_m=imu_translation_guard_m,
+        )
+        if meas_val is None or not np.isfinite(float(meas_val)):
+            MSCKF_STATS["epipolar_fail_invalid_count"] += 1
+            continue
+
+        h_row, _ = _compute_epipolar_numeric_jacobian(
+            obs0,
+            obs1,
+            cs0,
+            cs1,
+            kf,
+            err_state_size,
+            global_config=global_config,
+            min_baseline_m=min_baseline_m,
+            imu_translation_guard_m=imu_translation_guard_m,
+        )
+        if h_row is None:
+            MSCKF_STATS["epipolar_fail_invalid_count"] += 1
+            continue
+        h_norm = float(np.linalg.norm(h_row))
+        if (not np.isfinite(h_norm)) or h_norm < 1e-10 or np.max(np.abs(h_row)) > 1e6:
+            MSCKF_STATS["epipolar_fail_invalid_count"] += 1
+            continue
+
+        q_vals = np.asarray(
+            [float(obs.get("quality", np.nan)) for obs in obs_list if np.isfinite(float(obs.get("quality", np.nan)))],
+            dtype=float,
+        )
+        q_med = float(np.nanmedian(q_vals)) if q_vals.size > 0 else float("nan")
+        noise_scale = 1.0
+        noise_scale += 0.8 * float(max(0, int(min_triangulate_length) - len(obs_list)))
+        if len(obs_list) <= 2:
+            noise_scale += 1.5
+        if np.isfinite(q_med):
+            noise_scale *= float(np.clip(1.0 + max(0.0, 0.45 - q_med) * 3.0, 1.0, 3.0))
+        baseline_for_noise = float(
+            min(
+                baseline_norm if np.isfinite(baseline_norm) else baseline_ref_m,
+                imu_baseline_norm if np.isfinite(imu_baseline_norm) else baseline_ref_m,
+            )
+        )
+        if np.isfinite(baseline_for_noise):
+            baseline_for_noise = float(np.clip(baseline_for_noise, imu_translation_guard_m, baseline_ref_m))
+            noise_scale *= float(np.clip((baseline_ref_m / max(imu_translation_guard_m, baseline_for_noise)) ** 2, 1.0, 64.0))
+
+        row_scale = float(max(1.0, h_norm))
+        if (not np.isfinite(row_scale)) or row_scale > row_norm_guard:
+            MSCKF_STATS["epipolar_fail_invalid_count"] += 1
+            continue
+
+        row_fids.append(int(fid))
+        h_rows.append(h_row / row_scale)
+        # Innovation is z - h(x) with z := 0 for epipolar consistency.
+        meas_vals.append(float(-meas_val) / row_scale)
+        meas_vars.append(
+            float(measurement_noise) * float(np.clip(noise_scale, 1.0, 64.0)) / float(row_scale * row_scale)
+        )
+
+    if len(row_fids) == 0:
+        return result
+
+    MSCKF_STATS["epipolar_attempt_count"] += int(len(row_fids))
+    result["attempted_fids"] = list(row_fids)
+
+    h_stack = np.vstack(h_rows)
+    r_stack = np.asarray(meas_vals, dtype=float).reshape(-1, 1)
+    r_diag = np.asarray(meas_vars, dtype=float)
+
+    if not np.all(np.isfinite(h_stack)) or not np.all(np.isfinite(r_stack)) or not np.all(np.isfinite(r_diag)):
+        MSCKF_STATS["epipolar_fail_invalid_count"] += int(len(row_fids))
+        return result
+
+    num_clones = (err_state_size - 18) // 6
+    try:
+        u_obs = compute_observability_nullspace(kf, num_clones)
+        if np.all(np.isfinite(u_obs)) and u_obs.shape[0] == err_state_size:
+            with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
+                projection_matrix = np.eye(err_state_size) - u_obs @ u_obs.T
+            if np.all(np.isfinite(projection_matrix)):
+                with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
+                    h_stack = h_stack @ projection_matrix
+    except Exception:
+        pass
+
+    if (not np.all(np.isfinite(h_stack))) or float(np.max(np.abs(h_stack))) > row_norm_guard:
+        MSCKF_STATS["epipolar_fail_invalid_count"] += int(len(row_fids))
+        return result
+
+    measurement_std = np.sqrt(np.clip(r_diag, 1e-12, np.inf)).reshape(-1, 1)
+    r_normalized = r_stack / measurement_std
+    weights = compute_huber_weights(r_normalized.flatten(), threshold=huber_threshold)
+    weight_matrix = np.diag(np.sqrt(weights))
+    with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
+        h_weighted = weight_matrix @ h_stack
+        r_weighted = weight_matrix @ r_stack
+    r_cov_original = np.diag(r_diag)
+    with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
+        r_cov = weight_matrix @ r_cov_original @ weight_matrix.T
+
+    if not np.all(np.isfinite(h_weighted)) or not np.all(np.isfinite(r_weighted)) or not np.all(np.isfinite(r_cov)):
+        MSCKF_STATS["epipolar_fail_invalid_count"] += int(len(row_fids))
+        return result
+
+    try:
+        with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
+            s_mat = h_weighted @ kf.P @ h_weighted.T + r_cov
+    except Exception:
+        MSCKF_STATS["epipolar_fail_invalid_count"] += int(len(row_fids))
+        return result
+    if not np.all(np.isfinite(s_mat)):
+        MSCKF_STATS["epipolar_fail_invalid_count"] += int(len(row_fids))
+        return result
+
+    innovation_norm = float(np.linalg.norm(r_weighted))
+    result["innovation_norm"] = innovation_norm
+
+    try:
+        s_inv = safe_matrix_inverse(s_mat, damping=1e-9, method="cholesky")
+        with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
+            chi2_test = float(r_weighted.T @ s_inv @ r_weighted)
+    except np.linalg.LinAlgError:
+        MSCKF_STATS["epipolar_fail_invalid_count"] += int(len(row_fids))
+        return result
+    result["chi2_test"] = chi2_test
+
+    chi2_threshold = max(1e-6, float(chi2_scale) * float(chi2_max_dof) * float(len(row_fids)))
+    if (not np.isfinite(chi2_test)) or chi2_test > chi2_threshold:
+        MSCKF_STATS["epipolar_fail_chi2_count"] += int(len(row_fids))
+        return result
+
+    try:
+        with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
+            k_gain = kf.P @ h_weighted.T @ s_inv
+            delta_x = k_gain @ r_weighted
+        if not np.all(np.isfinite(k_gain)) or not np.all(np.isfinite(delta_x)):
+            MSCKF_STATS["epipolar_fail_invalid_count"] += int(len(row_fids))
+            return result
+        kf._apply_error_state_correction(delta_x)
+        with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
+            i_kh = np.eye(err_state_size) - k_gain @ h_weighted
+            kf.P = i_kh @ kf.P @ i_kh.T + k_gain @ r_cov @ k_gain.T
+        if not np.all(np.isfinite(i_kh)) or not np.all(np.isfinite(kf.P)):
+            MSCKF_STATS["epipolar_fail_invalid_count"] += int(len(row_fids))
+            return result
+        kf.P = ensure_covariance_valid(
+            kf.P,
+            label="MSCKF-Epipolar-Update",
+            symmetrize=True,
+            check_psd=True,
+            max_value=getattr(kf, "covariance_max_value", 1e8),
+            conditioner=kf,
+            timestamp=float("nan"),
+            stage="MSCKF_EPIPOLAR_UPDATE",
+        )
+        kf.x_post = kf.x.copy()
+        kf.P_post = kf.P.copy()
+        if hasattr(kf, "log_cov_health"):
+            kf.log_cov_health(update_type="MSCKF_EPIPOLAR", timestamp=float("nan"), stage="post_update")
+    except (np.linalg.LinAlgError, ValueError):
+        MSCKF_STATS["epipolar_fail_invalid_count"] += int(len(row_fids))
+        return result
+
+    MSCKF_STATS["epipolar_success_count"] += int(len(row_fids))
+    result["success"] = True
+    result["accepted_fids"] = list(row_fids)
+    return result
 
 
 def msckf_measurement_update(fid: int, triangulated: dict, cam_observations: List[dict],
@@ -4626,6 +5415,8 @@ def msckf_measurement_update(fid: int, triangulated: dict, cam_observations: Lis
             MSCKF_STATS['partial_depth_prune_update_count'] += 1
         if fallback_obs_used > 0 or bool(triangulated.get("geometry_fallback_active", False)):
             MSCKF_STATS['partial_depth_fallback_update_count'] += 1
+        if bool(triangulated.get("pure_bearing_candidate_active", False)):
+            MSCKF_STATS['pure_bearing_update_count'] += 1
         
         return (True, innovation_norm, chi2_test)
     except (np.linalg.LinAlgError, ValueError):
@@ -5018,6 +5809,8 @@ def msckf_measurement_update_with_plane(fid: int, triangulated: dict,
             MSCKF_STATS['partial_depth_prune_update_count'] += 1
         if fallback_obs_used > 0 or bool(triangulated.get("geometry_fallback_active", False)):
             MSCKF_STATS['partial_depth_fallback_update_count'] += 1
+        if bool(triangulated.get("pure_bearing_candidate_active", False)):
+            MSCKF_STATS['pure_bearing_update_count'] += 1
         
         return (True, innovation_norm, chi2_test)
     except (np.linalg.LinAlgError, ValueError):
@@ -5113,6 +5906,7 @@ def perform_msckf_updates(vio_fe, cam_observations: List[dict],
     prefilter_min_parallax_px = float(prefilter_cfg.get("MSCKF_L2_PREFILTER_MIN_PARALLAX_PX", 1.15))
     prefilter_min_time_span_sec = float(prefilter_cfg.get("MSCKF_L2_PREFILTER_MIN_TIME_SPAN_SEC", 0.085))
     prefilter_min_quality = float(prefilter_cfg.get("MSCKF_L2_PREFILTER_MIN_QUALITY", 0.32))
+    emergency_pure_bearing_enable = bool(prefilter_cfg.get("MSCKF_EMERGENCY_PURE_BEARING_ENABLE", True))
     retry_lane_enable = bool(prefilter_cfg.get("MSCKF_RETRY_LANE_ENABLE", True))
     retry_lane_max_cycles = int(max(0, prefilter_cfg.get("MSCKF_RETRY_LANE_MAX_CYCLES", 2)))
     emergency_boost_cycles = int(max(0, prefilter_cfg.get("MSCKF_EMERGENCY_BOOST_CYCLES", 2)))
@@ -5179,9 +5973,44 @@ def perform_msckf_updates(vio_fe, cam_observations: List[dict],
     posttri_retry_recover_depth_bounded_relax_enable = bool(
         prefilter_cfg.get("MSCKF_RETRY_LANE_POSTTRI_RECOVER_DEPTH_BOUNDED_RELAX_ENABLE", False)
     )
+    epipolar_short_track_enable = bool(
+        prefilter_cfg.get("MSCKF_EPIPOLAR_SHORT_TRACK_ENABLE", True)
+    )
+    epipolar_min_triangulate_length = int(
+        max(
+            3,
+            prefilter_cfg.get(
+                "MSCKF_EPIPOLAR_MIN_TRIANGULATE_LENGTH",
+                max(4, int(min_observations) + 1),
+            ),
+        )
+    )
+    epipolar_measurement_noise = float(
+        max(1e-6, prefilter_cfg.get("MSCKF_EPIPOLAR_MEASUREMENT_NOISE", 2.5e-3))
+    )
+    epipolar_governor: Dict[str, Any] = {
+        "enabled": bool(epipolar_short_track_enable),
+        "active": False,
+        "enter_track_count": int(
+            max(2, prefilter_cfg.get("MSCKF_EPIPOLAR_GOVERNOR_ENTER_TRACK_COUNT", 8))
+        ),
+        "exit_track_count": int(
+            max(
+                int(max(2, prefilter_cfg.get("MSCKF_EPIPOLAR_GOVERNOR_ENTER_TRACK_COUNT", 8))) + 1,
+                prefilter_cfg.get("MSCKF_EPIPOLAR_GOVERNOR_EXIT_TRACK_COUNT", 12),
+            )
+        ),
+        "effective_track_count": int(len(mature_fids)),
+    }
     debug_counts: Dict[str, int] = {
         "mature_input": int(len(mature_fids)),
         "mature_after_cap": int(len(mature_fids)),
+        "epipolar_candidates": 0,
+        "epipolar_budget": 0,
+        "epipolar_selected": 0,
+        "epipolar_attempted": 0,
+        "epipolar_accepted": 0,
+        "epipolar_deferred": 0,
         "protected_carried": 0,
         "missing_obs": 0,
         "retry_lane_defer": 0,
@@ -5465,6 +6294,79 @@ def perform_msckf_updates(vio_fe, cam_observations: List[dict],
         mature_fids = mature_fids[:max_features]
     debug_counts["mature_after_cap"] = int(len(mature_fids))
 
+    observations_cache: Dict[int, List[dict]] = {}
+    epipolar_short_track_fids: List[int] = []
+    epipolar_rescue_failed_fids: List[int] = []
+    epipolar_rescue_seen: set[int] = set()
+    surviving_triangulated_fids: List[int] = []
+    triangulation_candidate_fids: List[int] = []
+
+    def _queue_epipolar_rescue(fid_local: int) -> None:
+        if not bool(epipolar_short_track_enable):
+            return
+        fid_i = int(fid_local)
+        if fid_i in epipolar_rescue_seen:
+            return
+        obs_local = observations_cache.get(fid_i, [])
+        if len(obs_local) < 2:
+            return
+        epipolar_rescue_seen.add(fid_i)
+        epipolar_rescue_failed_fids.append(fid_i)
+
+    def _score_epipolar_rescue_candidate(fid_local: int) -> Optional[Tuple[float, float, float, int]]:
+        obs_local = observations_cache.get(int(fid_local), [])
+        endpoints = _extract_epipolar_track_endpoints(obs_local)
+        if endpoints is None:
+            return None
+        obs0, obs1 = endpoints
+        cam_id0 = int(obs0.get("cam_id", -1))
+        cam_id1 = int(obs1.get("cam_id", -1))
+        if (
+            cam_id0 < 0
+            or cam_id1 < 0
+            or cam_id0 >= len(cam_states)
+            or cam_id1 >= len(cam_states)
+            or cam_id0 == cam_id1
+        ):
+            return None
+        cs0 = cam_states[cam_id0]
+        cs1 = cam_states[cam_id1]
+        _, baseline_norm, imu_baseline_norm = _compute_epipolar_sampson_measurement(
+            obs0,
+            obs1,
+            np.asarray(kf.x[cs0["q_idx"]:cs0["q_idx"] + 4, 0], dtype=float),
+            np.asarray(kf.x[cs0["p_idx"]:cs0["p_idx"] + 3, 0], dtype=float),
+            np.asarray(kf.x[cs1["q_idx"]:cs1["q_idx"] + 4, 0], dtype=float),
+            np.asarray(kf.x[cs1["p_idx"]:cs1["p_idx"] + 3, 0], dtype=float),
+            global_config=global_config,
+        )
+        baseline_rank = 0.0
+        if np.isfinite(float(baseline_norm)):
+            baseline_rank = max(baseline_rank, float(baseline_norm))
+        if np.isfinite(float(imu_baseline_norm)):
+            baseline_rank = max(baseline_rank, float(imu_baseline_norm))
+        q_vals = np.asarray(
+            [float(o.get("quality", np.nan)) for o in obs_local if np.isfinite(float(o.get("quality", np.nan)))],
+            dtype=float,
+        )
+        q_med = float(np.nanmedian(q_vals)) if q_vals.size > 0 else float("nan")
+        q_rank = float(q_med) if np.isfinite(q_med) else -1.0
+        parallax_rank = _pairwise_parallax_med_px(obs_local, 120.0)
+        if not np.isfinite(parallax_rank):
+            parallax_rank = -1.0
+        return (float(baseline_rank), float(q_rank), float(parallax_rank), int(len(obs_local)))
+
+    for fid in mature_fids:
+        obs_cache = get_feature_multi_view_observations(int(fid), cam_observations)
+        observations_cache[int(fid)] = obs_cache
+        is_short_track = bool(2 <= len(obs_cache) < int(epipolar_min_triangulate_length))
+        if is_short_track:
+            epipolar_short_track_fids.append(int(fid))
+            debug_counts["epipolar_deferred"] += 1
+            retry_state.pop(int(fid), None)
+            continue
+        triangulation_candidate_fids.append(int(fid))
+
     # =========================================================================
     # Plane Detection (if enabled)
     # =========================================================================
@@ -5473,7 +6375,7 @@ def perform_msckf_updates(vio_fe, cam_observations: List[dict],
     
     if plane_detector is not None and plane_config is not None:
         # First pass: triangulate all mature features to build point cloud
-        for fid in mature_fids:
+        for fid in triangulation_candidate_fids:
             tri_result = triangulate_feature(fid, cam_observations, cam_states, kf,
                                             use_plane_constraint=True, ground_altitude=0.0,
                                             debug=False,
@@ -5501,8 +6403,14 @@ def perform_msckf_updates(vio_fe, cam_observations: List[dict],
     # =========================================================================
     # MSCKF Updates with Optional Plane Constraints
     # =========================================================================
-    for i, fid in enumerate(mature_fids):
-        quick_obs = get_feature_multi_view_observations(fid, cam_observations)
+    for i, fid in enumerate(triangulation_candidate_fids):
+        quick_obs = observations_cache.get(int(fid))
+        if quick_obs is None:
+            quick_obs = get_feature_multi_view_observations(fid, cam_observations)
+            observations_cache[int(fid)] = quick_obs
+        emergency_pure_bearing_fid = bool(
+            emergency_pure_bearing_enable and int(fid) in emergency_short_track_fids
+        )
         protected_retry_carried = bool(int(fid) in protected_retry_carried_fids)
         if len(quick_obs) == 0:
             debug_counts["missing_obs"] += 1
@@ -5554,12 +6462,18 @@ def perform_msckf_updates(vio_fe, cam_observations: List[dict],
             depth_sparse_retry_source and (in_posttri_recover_retry or protected_retry_carried)
         )
         if retry_lane_enable and retry_lane_max_cycles > 0:
-            if (not in_depth_sparse_retry_path) and sparse_short_track and (sparse_low_parallax or sparse_short_span):
+            if (
+                (not emergency_pure_bearing_fid)
+                and (not in_depth_sparse_retry_path)
+                and sparse_short_track
+                and (sparse_low_parallax or sparse_short_span)
+            ):
                 cur_retry = int(retry_state.get(int(fid), 0))
                 if cur_retry < int(retry_lane_max_cycles):
                     retry_state[int(fid)] = cur_retry + 1
                     MSCKF_STATS['retry_lane_defer_count'] += 1
                     debug_counts["retry_lane_defer"] += 1
+                    _queue_epipolar_rescue(int(fid))
                     continue
             retry_state.pop(int(fid), None)
         if in_depth_sparse_retry_path:
@@ -5570,10 +6484,13 @@ def perform_msckf_updates(vio_fe, cam_observations: List[dict],
         local_prefilter_min_obs = int(prefilter_min_obs)
         if emergency_active:
             local_prefilter_min_obs = max(2, min(local_prefilter_min_obs, int(min_observations)))
+        if emergency_pure_bearing_fid:
+            local_prefilter_min_obs = min(int(local_prefilter_min_obs), 2)
         if prefilter_enable and (not in_posttri_recover_retry):
             if len(quick_obs) < max(2, local_prefilter_min_obs):
                 MSCKF_STATS['fail_prefilter_geometry'] += 1
                 debug_counts["prefilter_reject"] += 1
+                _queue_epipolar_rescue(int(fid))
                 continue
             weak_short_track = bool(
                 len(quick_obs) <= max(3, local_prefilter_min_obs)
@@ -5600,9 +6517,10 @@ def perform_msckf_updates(vio_fe, cam_observations: List[dict],
                     or time_span_sec < float(max(1e-3, prefilter_min_time_span_sec * 1.6))
                 )
             )
-            if weak_short_track or weak_low_quality or weak_low_parallax:
+            if (not emergency_pure_bearing_fid) and (weak_short_track or weak_low_quality or weak_low_parallax):
                 MSCKF_STATS['fail_prefilter_geometry'] += 1
                 debug_counts["prefilter_reject"] += 1
+                _queue_epipolar_rescue(int(fid))
                 continue
 
         stats_before = dict(MSCKF_STATS)
@@ -5645,6 +6563,16 @@ def perform_msckf_updates(vio_fe, cam_observations: List[dict],
                 if int(MSCKF_STATS.get(key, 0)) > int(stats_before.get(key, 0)):
                     fail_reason = key
                     break
+            epipolar_rescue_reason = bool(
+                fail_reason in (
+                    "fail_geometry_insufficient_pretri",
+                    "fail_geometry_insufficient_posttri",
+                    "fail_reproj_sparse",
+                    "fail_reproj_sparse_recoverable",
+                    "fail_reproj_normalized",
+                    "fail_depth_sparse_recoverable",
+                )
+            )
             debug_counts["triangulated_fail"] += 1
             debug_fail_reasons[fail_reason] = int(debug_fail_reasons.get(fail_reason, 0)) + 1
             if in_posttri_recover_retry and str(posttri_retry_source.get(int(fid), "")) == "depth_sparse":
@@ -5733,6 +6661,8 @@ def perform_msckf_updates(vio_fe, cam_observations: List[dict],
                         posttri_retry_source.pop(int(fid), None)
                         posttri_retry_state.pop(int(fid), None)
                         posttri_retry_protect_state.pop(int(fid), None)
+                        if epipolar_rescue_reason:
+                            _queue_epipolar_rescue(int(fid))
                         if msckf_dbg_path:
                             num_obs = sum(
                                 1 for cam_obs in cam_observations
@@ -5742,8 +6672,8 @@ def perform_msckf_updates(vio_fe, cam_observations: List[dict],
                             with open(msckf_dbg_path, "a", newline="") as mf:
                                 mf.write(
                                     f"{vio_fe.frame_idx},{fid},{num_obs},0,nan,nan,0,nan,posttri_retry_depth_gate_reject\n"
-                                )
-                        continue
+                            )
+                    continue
                 cur_retry = abs(int(posttri_retry_state.get(int(fid), 0)))
                 if cur_retry < int(posttri_retry_recover_max_cycles):
                     posttri_retry_state[int(fid)] = cur_retry + 1
@@ -5773,6 +6703,8 @@ def perform_msckf_updates(vio_fe, cam_observations: List[dict],
                             mf.write(
                                 f"{vio_fe.frame_idx},{fid},{num_obs},0,nan,nan,0,nan,posttri_retry_recover_defer\n"
                             )
+                    if epipolar_rescue_reason:
+                        _queue_epipolar_rescue(int(fid))
                     continue
                 MSCKF_STATS['posttri_retry_recover_exhausted_count'] += 1
                 if str(posttri_retry_source.get(int(fid), "")) == "depth_sparse":
@@ -5800,10 +6732,14 @@ def perform_msckf_updates(vio_fe, cam_observations: List[dict],
                             mf.write(
                                 f"{vio_fe.frame_idx},{fid},{num_obs},0,nan,nan,0,nan,posttri_retry_defer\n"
                             )
+                    if epipolar_rescue_reason:
+                        _queue_epipolar_rescue(int(fid))
                     continue
             posttri_retry_state.pop(int(fid), None)
             posttri_retry_source.pop(int(fid), None)
             posttri_retry_protect_state.pop(int(fid), None)
+            if epipolar_rescue_reason:
+                _queue_epipolar_rescue(int(fid))
             if msckf_dbg_path:
                 num_obs = sum(1 for cam_obs in cam_observations 
                              for obs in cam_obs.get('observations', []) 
@@ -5812,6 +6748,7 @@ def perform_msckf_updates(vio_fe, cam_observations: List[dict],
                     mf.write(f"{vio_fe.frame_idx},{fid},{num_obs},0,nan,nan,0,nan,{fail_reason}\n")
             continue
         debug_counts["triangulated_ok"] += 1
+        surviving_triangulated_fids.append(int(fid))
 
         parallax_val = float(triangulated.get("parallax_med_px", np.nan))
         reproj_p95_val = float(triangulated.get("reproj_p95_norm", np.nan))
@@ -5927,6 +6864,140 @@ def perform_msckf_updates(vio_fe, cam_observations: List[dict],
             _record_same_cycle_retry_failure("fail_reproj_sparse_recoverable")
             _record_depth_retry_failure("fail_reproj_sparse_recoverable")
 
+    effective_track_count = int(len(surviving_triangulated_fids))
+    quality_track_min = int(
+        emergency_effective_track_min
+        if (emergency_active and emergency_effective_track_min > 0)
+        else max(1, prefilter_cfg.get("MSCKF_QUALITY_GATE_TRACK_MIN", 10))
+    )
+    track_count_low_pending = bool(effective_track_count < int(max(1, quality_track_min)))
+    if bool(epipolar_short_track_enable):
+        epipolar_governor = _compute_msckf_epipolar_governor(
+            vio_fe,
+            effective_track_count=effective_track_count,
+            track_count_low_pending=track_count_low_pending,
+            timestamp=float(timestamp),
+            global_config=global_config,
+        )
+    else:
+        try:
+            setattr(vio_fe, "_msckf_epipolar_governor_active", False)
+            setattr(vio_fe, "_msckf_epipolar_starvation_active", False)
+            setattr(vio_fe, "_msckf_epipolar_burst_start_t", float("nan"))
+            setattr(vio_fe, "_msckf_epipolar_burst_exhausted", False)
+        except Exception:
+            pass
+        epipolar_governor = {
+            "enabled": False,
+            "active": False,
+            "starvation": False,
+            "track_count_low_pending": bool(track_count_low_pending),
+            "exhausted": False,
+            "elapsed_sec": 0.0,
+            "burst_window_sec": 0.0,
+            "max_per_frame": 0,
+            "enter_track_count": int(epipolar_governor.get("enter_track_count", 0)),
+            "exit_track_count": int(epipolar_governor.get("exit_track_count", 0)),
+            "effective_track_count": int(effective_track_count),
+        }
+
+    surviving_triangulated_fid_set = {int(fid) for fid in surviving_triangulated_fids}
+    epipolar_candidate_fids: List[int] = []
+    epipolar_candidate_seen: set[int] = set()
+    for fid in epipolar_rescue_failed_fids + epipolar_short_track_fids:
+        fid_i = int(fid)
+        if fid_i in surviving_triangulated_fid_set or fid_i in epipolar_candidate_seen:
+            continue
+        obs_cache = observations_cache.get(fid_i, [])
+        if len(obs_cache) < 2:
+            continue
+        epipolar_candidate_seen.add(fid_i)
+        epipolar_candidate_fids.append(fid_i)
+    debug_counts["epipolar_candidates"] = int(len(epipolar_candidate_fids))
+    MSCKF_STATS["epipolar_candidate_count"] += int(len(epipolar_candidate_fids))
+    epipolar_budget = 0
+    if bool(epipolar_governor.get("active", False)):
+        epipolar_budget = int(
+            max(
+                0,
+                min(
+                    int(epipolar_governor.get("max_per_frame", 0)),
+                    int(epipolar_governor.get("max_per_frame", 0)) - int(effective_track_count),
+                ),
+            )
+        )
+    debug_counts["epipolar_budget"] = int(epipolar_budget)
+    selected_epipolar_fids: List[int] = []
+    if epipolar_candidate_fids and epipolar_budget > 0:
+        ranked_candidates: List[Tuple[Tuple[float, float, float, int], int]] = []
+        for fid in epipolar_candidate_fids:
+            score = _score_epipolar_rescue_candidate(int(fid))
+            if score is None:
+                continue
+            ranked_candidates.append((score, int(fid)))
+        ranked_candidates.sort(key=lambda item: item[0], reverse=True)
+        selected_epipolar_fids = [int(fid) for _, fid in ranked_candidates[:epipolar_budget]]
+    debug_counts["epipolar_selected"] = int(len(selected_epipolar_fids))
+
+    if bool(epipolar_governor.get("active", False)) and selected_epipolar_fids:
+        epipolar_result = msckf_epipolar_measurement_update(
+            selected_epipolar_fids,
+            observations_cache,
+            cam_states,
+            kf,
+            measurement_noise=epipolar_measurement_noise,
+            chi2_scale=chi2_scale,
+            min_triangulate_length=epipolar_min_triangulate_length,
+            global_config=global_config,
+        )
+        epipolar_attempted_fids = list(epipolar_result.get("attempted_fids", []) or [])
+        epipolar_accepted_fids = list(epipolar_result.get("accepted_fids", []) or [])
+        epipolar_accepted_fid_set = {int(fid) for fid in epipolar_accepted_fids}
+        debug_counts["epipolar_attempted"] = int(len(epipolar_attempted_fids))
+        debug_counts["epipolar_accepted"] = int(len(epipolar_accepted_fids))
+        num_attempted += int(len(epipolar_attempted_fids))
+        num_successful += int(len(epipolar_accepted_fids))
+        if epipolar_attempted_fids:
+            dof_samples.extend([1] * int(len(epipolar_attempted_fids)))
+            chi2_epi = float(epipolar_result.get("chi2_test", np.nan))
+            if np.isfinite(chi2_epi):
+                chi2_norm_samples.append(chi2_epi / float(max(1, len(epipolar_attempted_fids))))
+        for fid in epipolar_attempted_fids:
+            obs_cache = observations_cache.get(int(fid), [])
+            quick_parallax = _pairwise_parallax_med_px(obs_cache, 120.0)
+            q_vals = [float(o.get("quality", np.nan)) for o in obs_cache]
+            q_arr = np.asarray(q_vals, dtype=float)
+            q_med = float(np.nanmedian(q_arr)) if (q_arr.size > 0 and np.isfinite(q_arr).any()) else float("nan")
+            if np.isfinite(quick_parallax):
+                parallax_samples.append(quick_parallax)
+            if np.isfinite(q_med):
+                feature_quality_samples.append(q_med)
+            if int(fid) in epipolar_accepted_fid_set:
+                retry_state.pop(int(fid), None)
+                posttri_retry_state.pop(int(fid), None)
+                posttri_retry_source.pop(int(fid), None)
+                posttri_retry_protect_state.pop(int(fid), None)
+        if msckf_dbg_path and epipolar_attempted_fids:
+            epi_success = bool(epipolar_result.get("success", False))
+            epi_innovation = float(epipolar_result.get("innovation_norm", np.nan))
+            epi_chi2 = float(epipolar_result.get("chi2_test", np.nan))
+            for fid in epipolar_attempted_fids:
+                num_obs = len(observations_cache.get(int(fid), []))
+                status_reason = "epipolar_success" if int(fid) in epipolar_accepted_fid_set else "epipolar_reject"
+                with open(msckf_dbg_path, "a", newline="") as mf:
+                    mf.write(
+                        f"{vio_fe.frame_idx},{fid},{num_obs},1,nan,{epi_innovation:.3f},"
+                        f"{int(epi_success and int(fid) in epipolar_accepted_fid_set)},{epi_chi2:.3f},{status_reason}\n"
+                    )
+        if epipolar_attempted_fids and not epipolar_accepted_fids:
+            debug_fail_reasons["epipolar_update_reject"] = int(
+                debug_fail_reasons.get("epipolar_update_reject", 0)
+            ) + int(len(epipolar_attempted_fids))
+        elif len(selected_epipolar_fids) > 0 and len(epipolar_attempted_fids) == 0:
+            debug_fail_reasons["epipolar_invalid"] = int(
+                debug_fail_reasons.get("epipolar_invalid", 0)
+            ) + int(len(selected_epipolar_fids))
+
     if posttri_retry_protect_state:
         posttri_retry_protect_state = {
             int(fid): int(cnt) - 1
@@ -6026,6 +7097,19 @@ def perform_msckf_updates(vio_fe, cam_observations: List[dict],
         stage="summary",
         mature_input=debug_counts["mature_input"],
         mature_after_cap=debug_counts["mature_after_cap"],
+        epipolar_candidates=debug_counts["epipolar_candidates"],
+        epipolar_budget=debug_counts["epipolar_budget"],
+        epipolar_selected=debug_counts["epipolar_selected"],
+        epipolar_attempted=debug_counts["epipolar_attempted"],
+        epipolar_accepted=debug_counts["epipolar_accepted"],
+        epipolar_deferred=debug_counts["epipolar_deferred"],
+        epipolar_governor_active=bool(epipolar_governor.get("active", False)),
+        epipolar_governor_starvation=bool(epipolar_governor.get("starvation", False)),
+        epipolar_governor_exhausted=bool(epipolar_governor.get("exhausted", False)),
+        epipolar_governor_elapsed_sec=float(epipolar_governor.get("elapsed_sec", np.nan)),
+        epipolar_governor_track_count_low=bool(epipolar_governor.get("track_count_low_pending", False)),
+        epipolar_governor_enter=int(epipolar_governor.get("enter_track_count", 0)),
+        epipolar_governor_exit=int(epipolar_governor.get("exit_track_count", 0)),
         protected_carried=debug_counts["protected_carried"],
         missing_obs=debug_counts["missing_obs"],
         retry_lane_defer=debug_counts["retry_lane_defer"],
