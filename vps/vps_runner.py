@@ -82,6 +82,9 @@ class VPSConfig:
     device: str = 'cuda'
     max_keypoints: int = 2048
     matcher_mode: str = "orb"  # auto|orb|lightglue|orb_lightglue_rescue
+    strict_min_inlier_ratio: float = 0.60
+    failsoft_min_inlier_ratio: float = 0.60
+    strict_max_reproj_error: float = 2.0
     rescue_min_inliers: int = 8
     rescue_min_confidence: float = 0.12
     rescue_max_reproj_error: float = 2.5
@@ -103,6 +106,10 @@ class VPSConfig:
     baro_scale_prune_min_band_frac: float = 0.10
     baro_scale_prune_max_band_frac: float = 0.30
     baro_scale_prune_speed_gain: float = 0.002
+    scale_guided_matching_enable: bool = True
+    scale_guided_max_band_frac: float = 0.16
+    scale_guided_low_alt_max_band_frac: float = 0.10
+    scale_guided_low_alt_m: float = 30.0
     quality_weight_inlier: float = 0.30
     quality_weight_confidence: float = 0.30
     quality_weight_reproj: float = 0.20
@@ -119,6 +126,7 @@ class VPSConfig:
     # AGL gate fail-soft / hysteresis
     agl_gate_failsoft_enabled: bool = True
     min_altitude_floor: float = 8.0
+    hard_disable_below_m: float = 10.0
     min_altitude_phase_early: float = 12.0
     min_altitude_low_speed: float = 10.0
     min_altitude_unknown_speed: float = 12.0
@@ -294,6 +302,8 @@ class VPSRunner:
             device=config.device,
             max_keypoints=config.max_keypoints,
             min_inliers=config.min_inliers,
+            strict_min_inlier_ratio=config.strict_min_inlier_ratio,
+            strict_max_reproj_error=config.strict_max_reproj_error,
             match_mode=config.matcher_mode,
             rescue_min_inliers=config.rescue_min_inliers,
             rescue_min_confidence=config.rescue_min_confidence,
@@ -1069,6 +1079,11 @@ class VPSRunner:
                 device=str(vps_cfg.get("device", device)),
                 max_keypoints=int(vps_cfg.get("max_keypoints", 2048)),
                 matcher_mode=str(vps_cfg.get("matcher_mode", "orb")),
+                strict_min_inlier_ratio=float(vps_cfg.get("strict_min_inlier_ratio", 0.60)),
+                failsoft_min_inlier_ratio=float(
+                    vps_cfg.get("failsoft_min_inlier_ratio", vps_cfg.get("strict_min_inlier_ratio", 0.60))
+                ),
+                strict_max_reproj_error=float(vps_cfg.get("strict_max_reproj_error", 2.0)),
                 rescue_min_inliers=int(vps_cfg.get("rescue_min_inliers", 8)),
                 rescue_min_confidence=float(vps_cfg.get("rescue_min_confidence", 0.12)),
                 rescue_max_reproj_error=float(vps_cfg.get("rescue_max_reproj_error", 2.5)),
@@ -1093,6 +1108,12 @@ class VPSRunner:
                 baro_scale_prune_min_band_frac=float(vps_cfg.get("baro_scale_prune_min_band_frac", 0.10)),
                 baro_scale_prune_max_band_frac=float(vps_cfg.get("baro_scale_prune_max_band_frac", 0.30)),
                 baro_scale_prune_speed_gain=float(vps_cfg.get("baro_scale_prune_speed_gain", 0.002)),
+                scale_guided_matching_enable=bool(vps_cfg.get("scale_guided_matching_enable", True)),
+                scale_guided_max_band_frac=float(vps_cfg.get("scale_guided_max_band_frac", 0.16)),
+                scale_guided_low_alt_max_band_frac=float(
+                    vps_cfg.get("scale_guided_low_alt_max_band_frac", 0.10)
+                ),
+                scale_guided_low_alt_m=float(vps_cfg.get("scale_guided_low_alt_m", 30.0)),
                 quality_weight_inlier=float(vps_cfg.get("quality_weight_inlier", 0.30)),
                 quality_weight_confidence=float(vps_cfg.get("quality_weight_confidence", 0.30)),
                 quality_weight_reproj=float(vps_cfg.get("quality_weight_reproj", 0.20)),
@@ -1108,6 +1129,7 @@ class VPSRunner:
                 max_frame_time_ms_global=float(vps_cfg.get("max_frame_time_ms_global", 0.0)),
                 agl_gate_failsoft_enabled=bool(vps_cfg.get("agl_gate_failsoft_enabled", True)),
                 min_altitude_floor=float(vps_cfg.get("min_altitude_floor", 8.0)),
+                hard_disable_below_m=float(vps_cfg.get("hard_disable_below_m", 10.0)),
                 min_altitude_phase_early=float(vps_cfg.get("min_altitude_phase_early", 12.0)),
                 min_altitude_low_speed=float(vps_cfg.get("min_altitude_low_speed", 10.0)),
                 min_altitude_unknown_speed=float(vps_cfg.get("min_altitude_unknown_speed", 12.0)),
@@ -1425,6 +1447,30 @@ class VPSRunner:
                 self.stats.get("baro_scale_prune_fallback_count", 0)
             ) + 1
 
+        if (
+            bool(self.config.scale_guided_matching_enable)
+            and not bool(global_mode)
+            and len(scale_list) > 1
+            and np.isfinite(float(est_alt))
+            and float(est_alt) > 1.0
+        ):
+            max_band = float(max(0.02, self.config.scale_guided_max_band_frac))
+            low_alt_thresh = float(max(1.0, self.config.scale_guided_low_alt_m))
+            if float(est_alt) <= float(low_alt_thresh):
+                max_band = min(
+                    max_band,
+                    float(max(0.02, self.config.scale_guided_low_alt_max_band_frac)),
+                )
+            lo = float(1.0 - max_band)
+            hi = float(1.0 + max_band)
+            guided = [float(sc) for sc in scale_list if lo <= float(sc) <= hi]
+            if 1.0 not in guided:
+                guided.append(1.0)
+            guided = sorted(set(float(v) for v in guided))
+            if len(guided) >= 1:
+                scale_list = guided
+                self._last_scale_pruned_band = f"{max(lo, 0.0):.3f}:{hi:.3f}"
+
         # Prioritize primary candidate first, then yaw fix, then scale jitter.
         ordered: List[Tuple[float, float]] = [(0.0, 1.0)]
         for yaw_d in yaw_list:
@@ -1536,6 +1582,9 @@ class VPSRunner:
         if int(match_result.num_inliers) < int(self.config.min_inliers_failsoft):
             return False
         if int(match_result.num_matches) < max(12, 2 * int(self.config.min_inliers_failsoft)):
+            return False
+        inlier_ratio = float(int(match_result.num_inliers)) / float(max(1, int(match_result.num_matches)))
+        if float(inlier_ratio) < float(self.config.failsoft_min_inlier_ratio):
             return False
         if not np.isfinite(float(match_result.reproj_error)):
             return False
@@ -2006,12 +2055,19 @@ class VPSRunner:
             return None
         
         # 2. Check altitude limits (AGL fail-soft + hysteresis).
+        est_alt_f = float(est_alt)
+        hard_disable_below_m = float(getattr(self.config, "hard_disable_below_m", 10.0))
+        if np.isfinite(est_alt_f) and est_alt_f < float(hard_disable_below_m):
+            self._altitude_gate_open = False
+            self.stats["altitude_hard_disable"] = int(self.stats.get("altitude_hard_disable", 0)) + 1
+            _log_reloc(False, "altitude_hard_disable")
+            _record_runtime_stats_once()
+            return None
         if not altitude_ok:
             pos_first_bypass = bool(
                 bool(self.config.position_first_altitude_bypass_enable)
                 and (str(objective_mode).lower() == "accuracy" or bool(self.config.accuracy_mode))
             )
-            est_alt_f = float(est_alt)
             if (
                 pos_first_bypass
                 and np.isfinite(est_alt_f)

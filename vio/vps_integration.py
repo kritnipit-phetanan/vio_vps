@@ -13,13 +13,70 @@ import numpy as np
 from typing import Tuple, Optional
 from scipy.spatial.transform import Rotation as R_scipy
 
-from .ekf import ExtendedKalmanFilter
+from .ekf import ExtendedKalmanFilter, regularize_innovation_covariance
 from .data_loaders import VPSItem, ProjectionCache
+from .math_utils import safe_matrix_inverse
+
+
+def _sanitize_vps_covariance(
+    R_vps: np.ndarray,
+    *,
+    min_sigma_xy_m: float = 0.0,
+) -> np.ndarray:
+    """Return a finite symmetric 2x2 VPS covariance with a configurable XY floor."""
+    R_vps = np.asarray(R_vps, dtype=float)
+    if R_vps.shape != (2, 2) or not np.all(np.isfinite(R_vps)):
+        raise ValueError("invalid VPS covariance")
+    R_vps = 0.5 * (R_vps + R_vps.T)
+    diag_floor = float(max(1e-6, float(min_sigma_xy_m) ** 2))
+    diag = np.clip(np.diag(R_vps), diag_floor, 1e8)
+    offdiag = float(R_vps[0, 1]) if np.isfinite(R_vps[0, 1]) else 0.0
+    offdiag_limit = 0.95 * float(np.sqrt(max(diag[0] * diag[1], 1e-12)))
+    offdiag = float(np.clip(offdiag, -offdiag_limit, offdiag_limit))
+    return np.array(
+        [
+            [float(diag[0]), offdiag],
+            [offdiag, float(diag[1])],
+        ],
+        dtype=float,
+    )
+
+
+def _compute_vps_mahalanobis_gate(
+    *,
+    xy_ref: np.ndarray,
+    p_xy: np.ndarray,
+    z_xy: np.ndarray,
+    R_vps: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray, float]:
+    """Compute innovation, innovation covariance, and Mahalanobis distance for VPS XY."""
+    xy_ref = np.asarray(xy_ref, dtype=float).reshape(2,)
+    z_xy = np.asarray(z_xy, dtype=float).reshape(2,)
+    p_xy = np.asarray(p_xy, dtype=float)
+    if p_xy.shape != (2, 2) or not np.all(np.isfinite(p_xy)):
+        raise ValueError("invalid VPS covariance block")
+    p_xy = 0.5 * (p_xy + p_xy.T)
+    evals, evecs = np.linalg.eigh(np.clip(p_xy, -1e8, 1e8))
+    evals = np.clip(evals, 1e-9, 1e8)
+    p_xy = evecs @ np.diag(evals) @ evecs.T
+    innovation = (z_xy - xy_ref).reshape(-1, 1)
+    S = p_xy + np.asarray(R_vps, dtype=float)
+    S, _ = regularize_innovation_covariance(
+        S,
+        base_epsilon=1e-8,
+        rel_epsilon=1e-9,
+        max_epsilon=1e-3,
+    )
+    S_inv = safe_matrix_inverse(S, damping=1e-9, method="cholesky")
+    mahalanobis_sq = float((innovation.T @ S_inv @ innovation).item())
+    return innovation, S, mahalanobis_sq
 
 
 def compute_vps_innovation(vps: VPSItem, kf: ExtendedKalmanFilter,
                            lat0: float, lon0: float,
-                           proj_cache: ProjectionCache) -> Tuple[np.ndarray, np.ndarray, float]:
+                           proj_cache: ProjectionCache,
+                           sigma_vps: float = 1.0,
+                           min_sigma_xy_m: float = 0.0) -> Tuple[np.ndarray, np.ndarray, float]:
     """
     Compute VPS innovation and S matrix for gating.
     
@@ -46,9 +103,12 @@ def compute_vps_innovation(vps: VPSItem, kf: ExtendedKalmanFilter,
     
     # Adaptive measurement noise based on speed
     speed_xy = float(np.hypot(kf.x[3, 0], kf.x[4, 0]))
-    sigma_vps = 1.0  # Base sigma
+    sigma_vps = float(max(float(sigma_vps), float(min_sigma_xy_m), 1e-3))
     scale = 1.0 + max(0.0, (speed_xy - 10.0) / 10.0) if speed_xy > 10 else 1.0
-    r_mat = np.diag([(sigma_vps**2) * scale, (sigma_vps**2) * scale])
+    r_mat = _sanitize_vps_covariance(
+        np.diag([(sigma_vps**2) * scale, (sigma_vps**2) * scale]),
+        min_sigma_xy_m=min_sigma_xy_m,
+    )
     
     # Innovation
     s_mat = h_xy @ kf.P @ h_xy.T + r_mat
@@ -56,9 +116,14 @@ def compute_vps_innovation(vps: VPSItem, kf: ExtendedKalmanFilter,
     innovation = (vps_xy - xy_pred).reshape(-1, 1)
     
     try:
-        from .math_utils import safe_matrix_inverse
+        s_mat, _ = regularize_innovation_covariance(
+            s_mat,
+            base_epsilon=1e-8,
+            rel_epsilon=1e-9,
+            max_epsilon=1e-3,
+        )
         s_inv = safe_matrix_inverse(s_mat, damping=1e-9, method='cholesky')
-        m2_test = float(innovation.T @ s_inv @ innovation)
+        m2_test = float((innovation.T @ s_inv @ innovation).item())
     except (np.linalg.LinAlgError, ValueError):
         m2_test = np.inf
     
@@ -143,7 +208,10 @@ def apply_vps_update(kf: ExtendedKalmanFilter, vps_xy: np.ndarray,
     def hx_fun(x, h=h_xy):
         return x[0:2].reshape(2, 1)
     
-    r_mat = np.diag([(sigma_vps * r_scale)**2, (sigma_vps * r_scale)**2])
+    r_mat = _sanitize_vps_covariance(
+        np.diag([(sigma_vps * r_scale)**2, (sigma_vps * r_scale)**2]),
+        min_sigma_xy_m=sigma_vps,
+    )
     
     try:
         kf.update(
@@ -347,8 +415,20 @@ def apply_vps_delayed_update(
     lat0: float,
     lon0: float,
     time_since_last_vps: float = 0.0,
-    verbose: bool = False
-) -> Tuple[bool, Optional[float], str]:
+    verbose: bool = False,
+    mahalanobis_gate_enable: bool = True,
+    mahalanobis_chi2_threshold: float = 9.21,
+    mahalanobis_min_sigma_xy_m: float = 5.0,
+    force_feed_enable: bool = False,
+    bounded_correction_enable: bool = True,
+    bounded_correction_pull_gain: float = 0.10,
+    bounded_correction_min_pull_m: float = 1.0,
+    bounded_correction_max_pull_m: float = 2.0,
+    bounded_correction_r_inflate_min_mult: float = 1.5,
+    bounded_correction_r_inflate_max_mult: float = 4.0,
+    bounded_correction_p_xy_cap_m2: float = 25.0,
+    bounded_correction_max_position_correction_m: float = 2.0,
+) -> Tuple[bool, Optional[float], str, float]:
     """
     Apply delayed VPS update using Stochastic Cloning.
     
@@ -374,6 +454,7 @@ def apply_vps_delayed_update(
             - success: True if update was applied
             - innovation_mag: Innovation magnitude in meters (or None)
             - status: Status message for logging
+            - mahalanobis_sq: Squared Mahalanobis distance used by the gate
             
     Example:
         from vps import VPSDelayedUpdateManager
@@ -396,16 +477,15 @@ def apply_vps_delayed_update(
     """
     # Check if clone exists
     if not clone_manager.has_pending_clone(image_id):
-        return False, None, f"REJECTED: Clone '{image_id}' not found (expired?)"
+        return False, None, f"REJECTED: Clone '{image_id}' not found (expired?)", np.nan
 
     try:
-        r_check = np.array(R_vps, dtype=float)
-        if r_check.shape != (2, 2) or not np.all(np.isfinite(r_check)):
-            return False, None, "REJECTED: Invalid R_vps"
-        if float(np.min(np.diag(r_check))) <= 0.0:
-            return False, None, "REJECTED: Non-positive R_vps diag"
+        r_check = _sanitize_vps_covariance(
+            np.array(R_vps, dtype=float),
+            min_sigma_xy_m=mahalanobis_min_sigma_xy_m,
+        )
     except Exception:
-        return False, None, "REJECTED: Bad R_vps"
+        return False, None, "REJECTED: Bad R_vps", np.nan
     
     # Get clone age for logging
     clone_age = clone_manager.get_clone_age(image_id, t_now=0.0)  # Relative age
@@ -416,7 +496,7 @@ def apply_vps_delayed_update(
     pre_innovation = np.linalg.norm(vps_xy - current_xy)
     if not np.isfinite(pre_innovation):
         clone_manager.clones.pop(image_id, None)
-        return False, None, "REJECTED: Non-finite innovation"
+        return False, None, "REJECTED: Non-finite innovation", np.nan
     
     # Adaptive gating based on time since last VPS
     max_innovation_m, r_scale, tier_name = compute_vps_acceptance_threshold(
@@ -425,28 +505,129 @@ def apply_vps_delayed_update(
     
     # Gate check
     if pre_innovation > max_innovation_m:
-        clone_manager.clones.pop(image_id, None)  # Remove the useless clone
-        return False, pre_innovation, f"GATED: Innovation {pre_innovation:.1f}m > {max_innovation_m:.1f}m ({tier_name})"
+        if not bool(force_feed_enable):
+            clone_manager.clones.pop(image_id, None)  # Remove the useless clone
+            return False, pre_innovation, f"GATED: Innovation {pre_innovation:.1f}m > {max_innovation_m:.1f}m ({tier_name})", np.nan
     
     # Scale R_vps if needed
-    R_vps_scaled = R_vps * r_scale
+    R_vps_scaled = _sanitize_vps_covariance(
+        np.asarray(r_check, dtype=float) * float(r_scale),
+        min_sigma_xy_m=mahalanobis_min_sigma_xy_m,
+    )
+
+    mahalanobis_sq = np.nan
+    status_notes: list[str] = []
+    vps_lat_apply = float(vps_lat)
+    vps_lon_apply = float(vps_lon)
+    R_vps_apply = np.array(R_vps_scaled, dtype=float, copy=True)
+    position_correction_cap_apply = (
+        float(bounded_correction_max_position_correction_m)
+        if bool(bounded_correction_enable)
+        else None
+    )
+    if bool(mahalanobis_gate_enable):
+        try:
+            clone = clone_manager.clones.get(image_id)
+            if clone is None:
+                raise ValueError("clone disappeared")
+            clone_xy = np.asarray(clone.x_clone[0:2, 0], dtype=float).reshape(2,)
+            clone_p_xy = np.asarray(clone.P_clone[0:2, 0:2], dtype=float)
+            clone_innovation, _, mahalanobis_sq = _compute_vps_mahalanobis_gate(
+                xy_ref=clone_xy,
+                p_xy=clone_p_xy,
+                z_xy=vps_xy,
+                R_vps=R_vps_scaled,
+            )
+            clone_innovation_mag = float(np.linalg.norm(clone_innovation))
+            if bool(bounded_correction_enable):
+                pull_gain = float(np.clip(float(bounded_correction_pull_gain), 1e-3, 1.0))
+                min_pull = float(max(0.1, float(bounded_correction_min_pull_m)))
+                max_pull = float(max(min_pull, float(bounded_correction_max_pull_m)))
+                applied_pull = float(
+                    np.clip(float(clone_innovation_mag) * pull_gain, min_pull, max_pull)
+                )
+                if np.isfinite(clone_innovation_mag):
+                    position_correction_cap_apply = min(
+                        float(position_correction_cap_apply or max_pull),
+                        float(max(0.1, min(float(clone_innovation_mag), max_pull))),
+                    )
+                if np.isfinite(clone_innovation_mag) and clone_innovation_mag > applied_pull:
+                    pull_scale = float(applied_pull / max(clone_innovation_mag, 1e-9))
+                    bounded_xy = clone_xy + np.asarray(clone_innovation[:, 0], dtype=float) * pull_scale
+                    vps_lat_apply, vps_lon_apply = proj_cache.xy_to_latlon(
+                        float(bounded_xy[0]),
+                        float(bounded_xy[1]),
+                        lat0,
+                        lon0,
+                    )
+                    position_correction_cap_apply = float(applied_pull)
+                    inflate_min = float(
+                        max(1.0, float(bounded_correction_r_inflate_min_mult))
+                    )
+                    inflate_mult = float(
+                        np.clip(
+                            clone_innovation_mag / max(applied_pull, 1e-6),
+                            inflate_min,
+                            max(1.0, float(bounded_correction_r_inflate_max_mult)),
+                        )
+                    )
+                    R_vps_apply = _sanitize_vps_covariance(
+                        np.asarray(R_vps_scaled, dtype=float) * inflate_mult,
+                        min_sigma_xy_m=mahalanobis_min_sigma_xy_m,
+                    )
+                    status_notes.append(
+                        "ELASTIC_BOUND("
+                        f"raw={clone_innovation_mag:.2f}m->used={applied_pull:.2f}m,"
+                        f"gain={pull_gain:.2f},r*={inflate_mult:.2f})"
+                    )
+            if (not np.isfinite(mahalanobis_sq)) or mahalanobis_sq > float(mahalanobis_chi2_threshold):
+                if not bool(force_feed_enable):
+                    clone_manager.clones.pop(image_id, None)
+                    gate_innovation_mag = float(np.linalg.norm(clone_innovation))
+                    return (
+                        False,
+                        gate_innovation_mag,
+                        (
+                            "GATED_MAHALANOBIS: "
+                            f"chi2={mahalanobis_sq:.2f} > {float(mahalanobis_chi2_threshold):.2f}, "
+                            f"innov={gate_innovation_mag:.2f}m ({tier_name})"
+                        ),
+                        float(mahalanobis_sq),
+                    )
+                status_notes.append(
+                    f"FORCE_ACCEPT_MAHALANOBIS(chi2={mahalanobis_sq:.2f}>{float(mahalanobis_chi2_threshold):.2f})"
+                )
+        except Exception:
+            clone_manager.clones.pop(image_id, None)
+            return False, pre_innovation, "REJECTED: Mahalanobis gate failure", np.nan
     
     # Apply the delayed update
     success, innovation_mag = clone_manager.apply_delayed_update(
         kf=kf,
         image_id=image_id,
-        vps_lat=vps_lat,
-        vps_lon=vps_lon,
-        R_vps=R_vps_scaled,
+        vps_lat=vps_lat_apply,
+        vps_lon=vps_lon_apply,
+        R_vps=R_vps_apply,
         proj_cache=proj_cache,
         lat0=lat0,
-        lon0=lon0
+        lon0=lon0,
+        p_xy_cap_m2=float(bounded_correction_p_xy_cap_m2) if bool(bounded_correction_enable) else None,
+        max_position_correction_m_override=(
+            float(position_correction_cap_apply)
+            if bool(bounded_correction_enable) and position_correction_cap_apply is not None
+            else None
+        ),
     )
     
     if success:
         status = f"APPLIED: Innovation {innovation_mag:.2f}m, R_scale={r_scale:.1f} ({tier_name})"
+        if status_notes:
+            status = f"{status} | {' | '.join(status_notes)}"
         if verbose:
             print(f"[VPS_DELAYED] {status}")
-        return True, innovation_mag, status
+        return True, innovation_mag, status, float(mahalanobis_sq)
     else:
-        return False, innovation_mag, f"FAILED: Update computation failed ({tier_name})"
+        status = f"FAILED: Update computation failed ({tier_name})"
+        if status_notes:
+            status = f"{status} | {' | '.join(status_notes)}"
+        return False, innovation_mag, status, float(mahalanobis_sq)

@@ -2207,6 +2207,10 @@ class VIOService:
                     except Exception:
                         pass
 
+                    vps_mahalanobis_sq = np.nan
+                    vps_chi2_threshold = float(
+                        runner.global_config.get("VPS_MAHALANOBIS_CHI2_THRESHOLD", 9.21)
+                    )
                     if quality_mode == "reject":
                         if hasattr(runner, "vps_clone_manager"):
                             runner.vps_clone_manager.clones.pop(clone_id, None)
@@ -2301,63 +2305,127 @@ class VIOService:
                                             1.8,
                                         )
                                     )
-                        vps_lat_apply = float(vps_result.lat)
-                        vps_lon_apply = float(vps_result.lon)
-                        clamp_scale = 1.0
-                        if quality_mode == "failsoft":
-                            clamp_override = None
-                            if drift_recovery_active:
-                                clamp_override = float(
-                                    runner.global_config.get(
-                                        "VPS_XY_DRIFT_RECOVERY_MAX_APPLY_DP_XY_M",
-                                        runner.global_config.get("VPS_ABS_MAX_APPLY_DP_XY_M", 25.0),
-                                    )
-                                )
-                            if position_first_soft_active:
-                                clamp_override = float(
-                                    runner.global_config.get(
-                                        "VPS_POSITION_FIRST_SOFT_MAX_APPLY_DP_XY_M",
+                        shield_ok, shield_note = self.vps_position_controller.evaluate_temporal_shield(
+                            evidence=evidence,
+                            decision_lane=str(decision_lane),
+                        )
+                        if not bool(shield_ok):
+                            if hasattr(runner, "vps_clone_manager"):
+                                runner.vps_clone_manager.clones.pop(clone_id, None)
+                            vps_applied, vps_innovation_m = False, None
+                            vps_status = (
+                                f"{shield_note} | SKIPPED_QUALITY: inliers={vps_num_inliers}/{min_inliers_apply}, "
+                                f"conf={vps_conf:.3f}/{min_conf_apply:.3f}, "
+                                f"reproj={vps_reproj:.3f}/{max_reproj_apply:.3f}, "
+                                f"speed={speed_now:.2f}/{max_speed_apply:.2f}, "
+                                f"offset={abs_offset_m:.1f}/{fs_max_offset_m:.1f}"
+                            )
+                            if hard_reject_note:
+                                vps_status = f"{hard_reject_note} | {vps_status}"
+                            if temporal_reject_note:
+                                vps_status = f"{temporal_reject_note} | {vps_status}"
+                            if policy_reject_note:
+                                vps_status = f"{policy_reject_note} | {vps_status}"
+                        else:
+                            vps_lat_apply = float(vps_result.lat)
+                            vps_lon_apply = float(vps_result.lon)
+                            clamp_scale = 1.0
+                            if quality_mode == "failsoft":
+                                clamp_override = None
+                                if drift_recovery_active:
+                                    clamp_override = float(
                                         runner.global_config.get(
                                             "VPS_XY_DRIFT_RECOVERY_MAX_APPLY_DP_XY_M",
                                             runner.global_config.get("VPS_ABS_MAX_APPLY_DP_XY_M", 25.0),
-                                        ),
+                                        )
                                     )
+                                if position_first_soft_active:
+                                    clamp_override = float(
+                                        runner.global_config.get(
+                                            "VPS_POSITION_FIRST_SOFT_MAX_APPLY_DP_XY_M",
+                                            runner.global_config.get(
+                                                "VPS_XY_DRIFT_RECOVERY_MAX_APPLY_DP_XY_M",
+                                                runner.global_config.get("VPS_ABS_MAX_APPLY_DP_XY_M", 25.0),
+                                            ),
+                                        )
+                                    )
+                                if str(decision_lane) == "BOUNDED_SOFT_APPLY":
+                                    bounded_clamp = float(getattr(pos_decision, "bounded_clamp_m", np.nan))
+                                    if np.isfinite(bounded_clamp) and bounded_clamp > 0.0:
+                                        if clamp_override is None:
+                                            clamp_override = float(bounded_clamp)
+                                        else:
+                                            clamp_override = min(float(clamp_override), float(bounded_clamp))
+                                vps_lat_apply, vps_lon_apply, clamp_scale = self._clamp_vps_latlon(
+                                    current_xy=current_xy,
+                                    vps_lat=vps_lat_apply,
+                                    vps_lon=vps_lon_apply,
+                                    max_apply_dp_xy_override=clamp_override,
                                 )
-                            if str(decision_lane) == "BOUNDED_SOFT_APPLY":
-                                bounded_clamp = float(getattr(pos_decision, "bounded_clamp_m", np.nan))
-                                if np.isfinite(bounded_clamp) and bounded_clamp > 0.0:
-                                    if clamp_override is None:
-                                        clamp_override = float(bounded_clamp)
-                                    else:
-                                        clamp_override = min(float(clamp_override), float(bounded_clamp))
-                            vps_lat_apply, vps_lon_apply, clamp_scale = self._clamp_vps_latlon(
-                                current_xy=current_xy,
+                            vps_applied, vps_innovation_m, vps_status, vps_mahalanobis_sq = apply_vps_delayed_update(
+                                kf=runner.kf,
+                                clone_manager=runner.vps_clone_manager,
+                                image_id=clone_id,
                                 vps_lat=vps_lat_apply,
                                 vps_lon=vps_lon_apply,
-                                max_apply_dp_xy_override=clamp_override,
+                                R_vps=np.array(vps_result.R_vps, dtype=float) * float(r_scale_apply),
+                                proj_cache=runner.proj_cache,
+                                lat0=runner.lat0,
+                                lon0=runner.lon0,
+                                time_since_last_vps=(t_cam - runner.last_vps_update_time),
+                                mahalanobis_gate_enable=bool(
+                                    runner.global_config.get("VPS_MAHALANOBIS_GATE_ENABLE", True)
+                                ),
+                                mahalanobis_chi2_threshold=vps_chi2_threshold,
+                                mahalanobis_min_sigma_xy_m=float(
+                                    runner.global_config.get("VPS_MAHALANOBIS_MIN_SIGMA_XY_M", 5.0)
+                                ),
+                                force_feed_enable=bool(
+                                    runner.global_config.get("VPS_FORCE_ACCEPT_ENABLE", False)
+                                ),
+                                bounded_correction_enable=bool(
+                                    runner.global_config.get("VPS_BOUNDED_CORRECTION_ENABLE", True)
+                                ),
+                                bounded_correction_pull_gain=float(
+                                    runner.global_config.get("VPS_BOUNDED_CORRECTION_PULL_GAIN", 0.10)
+                                ),
+                                bounded_correction_min_pull_m=float(
+                                    runner.global_config.get("VPS_BOUNDED_CORRECTION_MIN_PULL_M", 1.0)
+                                ),
+                                bounded_correction_max_pull_m=float(
+                                    runner.global_config.get("VPS_BOUNDED_CORRECTION_MAX_PULL_M", 2.0)
+                                ),
+                                bounded_correction_r_inflate_min_mult=float(
+                                    runner.global_config.get(
+                                        "VPS_BOUNDED_CORRECTION_R_INFLATE_MIN_MULT",
+                                        1.5,
+                                    )
+                                ),
+                                bounded_correction_r_inflate_max_mult=float(
+                                    runner.global_config.get("VPS_BOUNDED_CORRECTION_R_INFLATE_MAX_MULT", 4.0)
+                                ),
+                                bounded_correction_p_xy_cap_m2=float(
+                                    runner.global_config.get("VPS_BOUNDED_CORRECTION_P_XY_CAP_M2", 25.0)
+                                ),
+                                bounded_correction_max_position_correction_m=float(
+                                    runner.global_config.get(
+                                        "VPS_BOUNDED_CORRECTION_MAX_POSITION_CORRECTION_M",
+                                        2.0,
+                                    )
+                                ),
                             )
-                        vps_applied, vps_innovation_m, vps_status = apply_vps_delayed_update(
-                            kf=runner.kf,
-                            clone_manager=runner.vps_clone_manager,
-                            image_id=clone_id,
-                            vps_lat=vps_lat_apply,
-                            vps_lon=vps_lon_apply,
-                            R_vps=np.array(vps_result.R_vps, dtype=float) * float(r_scale_apply),
-                            proj_cache=runner.proj_cache,
-                            lat0=runner.lat0,
-                            lon0=runner.lon0,
-                            time_since_last_vps=(t_cam - runner.last_vps_update_time),
-                        )
-                        if vps_applied and clamp_scale < 0.999:
-                            vps_status = f"{vps_status} | CLAMPED(scale={clamp_scale:.3f})"
-                        if drift_recovery_active:
-                            vps_status = f"{vps_status} | XY_DRIFT_RECOVERY"
-                        if position_first_soft_active:
-                            vps_status = f"{vps_status} | POSITION_FIRST_SOFT"
-                        if str(decision_lane) == "BOUNDED_SOFT_APPLY":
-                            vps_status = f"{vps_status} | BOUNDED_SOFT_APPLY"
-                        if bool(late_reclaim_active) and str(late_reclaim_note).strip():
-                            vps_status = f"{vps_status} | {late_reclaim_note}"
+                            if str(policy_reject_note).strip():
+                                vps_status = f"{policy_reject_note} | {vps_status}"
+                            if vps_applied and clamp_scale < 0.999:
+                                vps_status = f"{vps_status} | CLAMPED(scale={clamp_scale:.3f})"
+                            if drift_recovery_active:
+                                vps_status = f"{vps_status} | XY_DRIFT_RECOVERY"
+                            if position_first_soft_active:
+                                vps_status = f"{vps_status} | POSITION_FIRST_SOFT"
+                            if str(decision_lane) == "BOUNDED_SOFT_APPLY":
+                                vps_status = f"{vps_status} | BOUNDED_SOFT_APPLY"
+                            if bool(late_reclaim_active) and str(late_reclaim_note).strip():
+                                vps_status = f"{vps_status} | {late_reclaim_note}"
                         bounded_missing_clone_reclaim = bool(
                             str(decision_lane) == "BOUNDED_SOFT_APPLY"
                             and bool(
@@ -2371,6 +2439,7 @@ class VIOService:
                         if (
                             not bool(vps_applied)
                             and bool(quality_mode == "failsoft")
+                            and ("temporal_shield_reject" not in str(vps_status).lower())
                             and (
                                 bool(position_first_soft_active)
                                 or bool(drift_recovery_active)
@@ -2409,6 +2478,8 @@ class VIOService:
                         position_first_soft_active=bool(position_first_soft_active),
                     )
                     nis_norm_vps = np.nan
+                    if np.isfinite(float(vps_mahalanobis_sq)) and np.isfinite(float(vps_chi2_threshold)):
+                        nis_norm_vps = float(vps_mahalanobis_sq) / max(float(vps_chi2_threshold), 1e-9)
                     try:
                         self.vps_position_controller.log_trace(
                             evidence=evidence,
@@ -2424,8 +2495,8 @@ class VIOService:
                         "attempted": 1,
                         "dof": 2,
                         "nis_norm": nis_norm_vps,
-                        "chi2": float(vps_innovation_m) if vps_innovation_m is not None and np.isfinite(float(vps_innovation_m)) else np.nan,
-                        "threshold": np.nan,
+                        "chi2": float(vps_mahalanobis_sq) if np.isfinite(float(vps_mahalanobis_sq)) else np.nan,
+                        "threshold": float(vps_chi2_threshold),
                         "r_scale_used": float(r_scale_apply),
                         "reason_code": reason_code,
                         "decision_lane": str(decision_lane),

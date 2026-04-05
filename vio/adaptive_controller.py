@@ -21,7 +21,7 @@ WARNING = "WARNING"
 DEGRADED = "DEGRADED"
 RECOVERY = "RECOVERY"
 
-_KNOWN_SENSORS = ("MAG", "DEM", "VIO_VEL", "MSCKF", "ZUPT", "VPS", "GRAVITY_RP", "YAW_AID", "BIAS_GUARD")
+_KNOWN_SENSORS = ("MAG", "ALT", "DEM", "VIO_VEL", "MSCKF", "ZUPT", "VPS", "GRAVITY_RP", "YAW_AID", "BIAS_GUARD")
 
 
 def _clamp(value: float, lo: float, hi: float) -> float:

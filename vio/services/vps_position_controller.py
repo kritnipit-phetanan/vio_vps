@@ -98,6 +98,7 @@ class VPSPositionController:
             "failsoft": [],
             "rescue": [],
         }
+        self._temporal_shield_buffer: list[dict[str, Any]] = []
 
     def _trace_q_bucket(self, t_cam: float) -> int:
         q_bucket = 1
@@ -191,8 +192,12 @@ class VPSPositionController:
             return "position_first_soft_apply"
         if "position_first_direct_xy_applied" in status_lower:
             return "position_first_direct_xy_apply"
+        if "force_accept" in status_lower and "applied" in status_lower:
+            return "force_accept_bounded_soft_apply"
         if "bounded_soft_apply" in status_lower:
             return "bounded_soft_apply"
+        if "temporal_shield_reject" in status_lower:
+            return "soft_reject_temporal_shield"
         if "xy_drift_recovery_hint_only" in status_lower:
             return "xy_drift_recovery_hint_only"
         if "xy_drift_recovery" in status_lower and "applied" in status_lower:
@@ -209,6 +214,8 @@ class VPSPositionController:
             return "abs_corr_hard_reject"
         if "large_offset_pending" in status_lower:
             return "abs_corr_temporal_wait"
+        if "mahalanobis" in status_lower:
+            return "gated_mahalanobis"
         if str(quality_mode) == "failsoft" and "gated" in status_lower:
             return "soft_reject"
         if "gated" in status_lower:
@@ -577,6 +584,137 @@ class VPSPositionController:
                 f"spd={float(speed_xy):.1f},off={float(vps_norm):.1f}",
             )
         return True, ""
+
+    def evaluate_temporal_shield(
+        self,
+        *,
+        evidence: VpsMatchEvidence,
+        decision_lane: str,
+    ) -> tuple[bool, str]:
+        """Guard delayed VPS updates with short-horizon consensus on recent offsets."""
+        cfg = self.runner.global_config
+        if not bool(cfg.get("VPS_TEMPORAL_SHIELD_ENABLE", False)):
+            return True, ""
+        if str(decision_lane) not in (
+            self.DECISION_STRICT_APPLY,
+            self.DECISION_FAILSOFT_APPLY,
+            self.DECISION_BOUNDED_SOFT_APPLY,
+        ):
+            return True, ""
+
+        vec = np.asarray(evidence.abs_offset_vec, dtype=float).reshape(-1,)
+        if vec.size < 2 or not np.all(np.isfinite(vec[:2])):
+            return False, "TEMPORAL_SHIELD_REJECT:invalid_offset"
+        cur = np.asarray(vec[:2], dtype=float).reshape(2,)
+        cur_norm = float(np.linalg.norm(cur))
+        if (not np.isfinite(cur_norm)) or cur_norm <= 1e-6:
+            return False, "TEMPORAL_SHIELD_REJECT:zero_offset"
+
+        always_accept_below = max(
+            0.0,
+            float(cfg.get("VPS_TEMPORAL_SHIELD_ALWAYS_ACCEPT_BELOW_M", 6.0)),
+        )
+        if float(cur_norm) <= float(always_accept_below):
+            return True, f"TEMPORAL_SHIELD_BYPASS:offset={float(cur_norm):.1f}m"
+
+        t_now = float(evidence.t_cam)
+        window_sec = max(0.2, float(cfg.get("VPS_TEMPORAL_SHIELD_WINDOW_SEC", 2.5)))
+        max_samples = max(2, int(cfg.get("VPS_TEMPORAL_SHIELD_MAX_SAMPLES", 5)))
+        min_samples = max(1, int(cfg.get("VPS_TEMPORAL_SHIELD_MIN_SAMPLES", 3)))
+        require_hits = max(
+            1,
+            int(cfg.get("VPS_TEMPORAL_SHIELD_REQUIRE_TEMPORAL_HITS", 2)),
+        )
+        max_xy_std_m = max(0.1, float(cfg.get("VPS_TEMPORAL_SHIELD_MAX_XY_STD_M", 18.0)))
+        max_rel_mag_std = max(
+            0.01,
+            float(cfg.get("VPS_TEMPORAL_SHIELD_MAX_REL_MAG_STD", 0.35)),
+        )
+        max_dir_spread_deg = float(
+            np.clip(
+                cfg.get("VPS_TEMPORAL_SHIELD_MAX_DIR_SPREAD_DEG", 20.0),
+                1.0,
+                179.0,
+            )
+        )
+
+        cutoff = float(t_now) - float(window_sec)
+        hist: list[dict[str, Any]] = []
+        for item in self._temporal_shield_buffer:
+            try:
+                t_item = float(item.get("t", float("nan")))
+                vec_item = np.asarray(item.get("vec", np.zeros(2, dtype=float)), dtype=float).reshape(2,)
+            except Exception:
+                continue
+            if (not np.isfinite(t_item)) or t_item < cutoff:
+                continue
+            if not np.all(np.isfinite(vec_item)):
+                continue
+            hist.append({"t": t_item, "vec": vec_item})
+        hist.append({"t": float(t_now), "vec": cur.copy()})
+        if len(hist) > max_samples:
+            hist = hist[-max_samples:]
+        self._temporal_shield_buffer = hist
+
+        temporal_hits = int(max(0, getattr(evidence, "temporal_hits", 0)))
+        if len(hist) < min_samples or temporal_hits < require_hits:
+            self.runner._vps_temporal_consensus_block_count = int(
+                getattr(self.runner, "_vps_temporal_consensus_block_count", 0)
+            ) + 1
+            return (
+                False,
+                f"TEMPORAL_SHIELD_REJECT:warmup={len(hist)}/{min_samples},hits={temporal_hits}/{require_hits}",
+            )
+
+        arr = np.asarray([np.asarray(item["vec"], dtype=float).reshape(2,) for item in hist], dtype=float)
+        med_vec = np.nanmedian(arr, axis=0)
+        med_norm = float(np.linalg.norm(med_vec))
+        if (not np.isfinite(med_norm)) or med_norm <= 1e-6:
+            self.runner._vps_temporal_consensus_block_count = int(
+                getattr(self.runner, "_vps_temporal_consensus_block_count", 0)
+            ) + 1
+            return False, "TEMPORAL_SHIELD_REJECT:degenerate_center"
+
+        residual = arr - med_vec.reshape(1, 2)
+        xy_std_m = float(np.sqrt(np.mean(np.sum(residual * residual, axis=1))))
+        mags = np.linalg.norm(arr, axis=1)
+        mag_ref = float(max(1e-3, np.nanmedian(mags)))
+        rel_mag_std = float(np.nanstd(mags) / mag_ref)
+        ref_dir = med_vec / med_norm
+        dir_spread_deg = 0.0
+        for row, mag in zip(arr, mags):
+            if (not np.isfinite(float(mag))) or float(mag) <= 1e-6:
+                continue
+            row_dir = row / float(mag)
+            cosang = float(np.clip(np.dot(row_dir, ref_dir), -1.0, 1.0))
+            dir_spread_deg = max(dir_spread_deg, float(np.degrees(np.arccos(cosang))))
+
+        if (
+            (not np.isfinite(xy_std_m))
+            or (not np.isfinite(rel_mag_std))
+            or float(xy_std_m) > float(max_xy_std_m)
+            or float(rel_mag_std) > float(max_rel_mag_std)
+            or float(dir_spread_deg) > float(max_dir_spread_deg)
+        ):
+            self.runner._vps_temporal_consensus_block_count = int(
+                getattr(self.runner, "_vps_temporal_consensus_block_count", 0)
+            ) + 1
+            return (
+                False,
+                "TEMPORAL_SHIELD_REJECT:"
+                f"xy_std={float(xy_std_m):.1f}>{float(max_xy_std_m):.1f}|"
+                f"rel_mag={float(rel_mag_std):.2f}>{float(max_rel_mag_std):.2f}|"
+                f"dir={float(dir_spread_deg):.1f}>{float(max_dir_spread_deg):.1f}",
+            )
+
+        self.runner._vps_temporal_consensus_pass_count = int(
+            getattr(self.runner, "_vps_temporal_consensus_pass_count", 0)
+        ) + 1
+        return (
+            True,
+            "TEMPORAL_SHIELD_PASS:"
+            f"n={len(hist)},xy_std={float(xy_std_m):.1f},rel_mag={float(rel_mag_std):.2f},dir={float(dir_spread_deg):.1f}",
+        )
 
     def decide_and_classify(self, evidence: VpsMatchEvidence) -> VpsPositionDecision:
         runner = self.runner
@@ -1065,6 +1203,72 @@ class VPSPositionController:
                     if str(temporal_reject_note).strip()
                     else motion_note
                 )
+
+        if bool(runner.global_config.get("VPS_FORCE_ACCEPT_ENABLE", False)):
+            allow_hard_reject = bool(
+                runner.global_config.get("VPS_FORCE_ACCEPT_ALLOW_HARD_REJECT", False)
+            )
+            hard_block = bool(str(hard_reject_note).strip()) and (not bool(allow_hard_reject))
+            min_inliers_force = max(
+                1,
+                int(runner.global_config.get("VPS_FORCE_ACCEPT_MIN_INLIERS", 3)),
+            )
+            min_conf_force = float(
+                runner.global_config.get("VPS_FORCE_ACCEPT_MIN_CONFIDENCE", 0.03)
+            )
+            max_reproj_force = float(
+                runner.global_config.get("VPS_FORCE_ACCEPT_MAX_REPROJ_ERROR", 3.0)
+            )
+            max_speed_force = float(
+                runner.global_config.get("VPS_FORCE_ACCEPT_MAX_SPEED_M_S", 120.0)
+            )
+            force_accept_candidate = bool(
+                decision_lane in (self.DECISION_REJECT, self.DECISION_HINT_ONLY)
+                and not bool(hard_block)
+                and int(evidence.vps_num_inliers) >= int(min_inliers_force)
+                and np.isfinite(float(evidence.vps_conf))
+                and float(evidence.vps_conf) >= float(min_conf_force)
+                and np.isfinite(float(evidence.vps_reproj))
+                and float(evidence.vps_reproj) <= float(max_reproj_force)
+                and (
+                    (not np.isfinite(float(evidence.speed_m_s)))
+                    or float(evidence.speed_m_s) <= float(max_speed_force)
+                )
+            )
+            if bool(force_accept_candidate):
+                decision_lane = self.DECISION_BOUNDED_SOFT_APPLY
+                quality_mode = "failsoft"
+                note = "force_accept_bounded_soft_apply"
+                bounded_clamp_m = float(
+                    runner.global_config.get(
+                        "VPS_APPLY_GATE_BOUNDED_SOFT_MAX_APPLY_DP_XY_M",
+                        12.0,
+                    )
+                )
+                if np.isfinite(float(evidence.speed_m_s)):
+                    hs_th = float(
+                        runner.global_config.get(
+                            "VPS_APPLY_GATE_BOUNDED_SOFT_HIGH_SPEED_M_S",
+                            20.0,
+                        )
+                    )
+                    if float(evidence.speed_m_s) >= hs_th:
+                        bounded_clamp_m = min(
+                            float(bounded_clamp_m),
+                            float(
+                                runner.global_config.get(
+                                    "VPS_APPLY_GATE_BOUNDED_SOFT_HIGH_SPEED_MAX_APPLY_DP_XY_M",
+                                    7.0,
+                                )
+                            ),
+                        )
+                if str(policy_reject_note).strip():
+                    policy_reject_note = f"{policy_reject_note}|{note}"
+                else:
+                    policy_reject_note = note
+                runner._vps_force_accept_count = int(
+                    getattr(runner, "_vps_force_accept_count", 0)
+                ) + 1
 
         force_hint_only = bool(decision_lane == self.DECISION_HINT_ONLY)
         allow_direct_xy_apply = False

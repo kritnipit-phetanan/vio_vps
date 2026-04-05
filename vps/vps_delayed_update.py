@@ -191,7 +191,9 @@ class VPSDelayedUpdateManager:
                              R_vps: np.ndarray,
                              proj_cache,
                              lat0: float,
-                             lon0: float) -> Tuple[bool, Optional[float]]:
+                             lon0: float,
+                             p_xy_cap_m2: Optional[float] = None,
+                             max_position_correction_m_override: Optional[float] = None) -> Tuple[bool, Optional[float]]:
         """
         Apply delayed VPS update using stochastic cloning.
         
@@ -247,7 +249,11 @@ class VPSDelayedUpdateManager:
             p_xy = 0.5 * (p_xy + p_xy.T)
             p_xy = np.clip(p_xy, -1e8, 1e8)
             eigvals, eigvecs = np.linalg.eigh(p_xy)
-            eigvals = np.clip(eigvals, 1e-9, 1e8)
+            p_xy_cap = float(p_xy_cap_m2) if p_xy_cap_m2 is not None else float("nan")
+            if np.isfinite(p_xy_cap) and p_xy_cap > 1e-9:
+                eigvals = np.clip(eigvals, 1e-9, p_xy_cap)
+            else:
+                eigvals = np.clip(eigvals, 1e-9, 1e8)
             p_xy = eigvecs @ np.diag(eigvals) @ eigvecs.T
 
             S = p_xy + r_vps_safe
@@ -284,8 +290,13 @@ class VPSDelayedUpdateManager:
         pos_corr_norm = float(np.linalg.norm(dx_current[0:2, 0])) if dx_current.shape[0] >= 2 else 0.0
         vel_corr_norm = float(np.linalg.norm(dx_current[3:5, 0])) if dx_current.shape[0] >= 5 else 0.0
         corr_scale = 1.0
-        if np.isfinite(pos_corr_norm) and self.max_position_correction_m > 1e-6:
-            corr_scale = min(corr_scale, self.max_position_correction_m / max(pos_corr_norm, 1e-9))
+        pos_corr_cap = (
+            float(max_position_correction_m_override)
+            if max_position_correction_m_override is not None
+            else float(self.max_position_correction_m)
+        )
+        if np.isfinite(pos_corr_norm) and pos_corr_cap > 1e-6:
+            corr_scale = min(corr_scale, pos_corr_cap / max(pos_corr_norm, 1e-9))
         if np.isfinite(vel_corr_norm) and self.max_velocity_correction_m_s > 1e-6:
             corr_scale = min(corr_scale, self.max_velocity_correction_m_s / max(vel_corr_norm, 1e-9))
         if corr_scale < 0.05:

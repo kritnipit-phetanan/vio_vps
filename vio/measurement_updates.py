@@ -3,7 +3,8 @@ Measurement Updates for VIO+EKF System
 
 This module contains measurement update functions for:
 - Magnetometer heading updates (MAG)
-- DEM height updates (altitude constraint)
+- DEM height updates (terrain/AGL constraint)
+- Absolute altitude anchor updates (ALT/MSL constraint)
 - ZUPT (Zero Velocity Update)
 - Generic EKF update helpers
 
@@ -780,6 +781,236 @@ def apply_dem_height_update(kf,
             p_prior=getattr(kf, 'P_prior', kf.P)
         )
     _set_adaptive_info(True, m2_test, m2_test, threshold, extra_scale)
+    return True, ""
+
+
+def apply_altitude_anchor_update(kf,
+                                 altitude_measurement: float,
+                                 sigma_altitude: float,
+                                 no_vision_corrections: bool = False,
+                                 save_debug: bool = False,
+                                 residual_csv: Optional[str] = None,
+                                 timestamp: float = 0.0,
+                                 frame: int = -1,
+                                 threshold_scale: float = 1.0,
+                                 r_scale_extra: float = 1.0,
+                                 soft_gate_enable: bool = True,
+                                 soft_gate_max_r_inflation: float = 16.0,
+                                 base_threshold: float = 12.0,
+                                 no_vision_threshold: float = 60.0,
+                                 bias_estimation_enable: bool = False,
+                                 bias_alpha: float = 1e-4,
+                                 bias_max_abs_m: float = 20.0,
+                                 bias_update_gate_m: float = 12.0,
+                                 bias_freeze_no_vision: bool = True,
+                                 max_abs_innovation_m: float = 25.0,
+                                 adaptive_info: Optional[Dict[str, Any]] = None) -> Tuple[bool, str]:
+    """
+    Apply absolute altitude anchor update (direct MSL/barometer/GNSS-Z).
+
+    This is a dedicated 1D EKF lane that constrains only the translation-Z
+    state. Unlike DEM height updates, this path does not depend on XY lookup
+    uncertainty. A slow bias estimate may be attached to the EKF object to
+    absorb long-term offset between VIO altitude and direct MSL altitude.
+    """
+
+    def _set_adaptive_info(accepted: bool,
+                           nis_norm: Optional[float],
+                           chi2: Optional[float],
+                           threshold: Optional[float],
+                           r_scale_used: float):
+        if adaptive_info is None:
+            return
+        adaptive_info.clear()
+        adaptive_info.update({
+            "sensor": "ALT",
+            "accepted": bool(accepted),
+            "dof": 1,
+            "nis_norm": float(nis_norm) if nis_norm is not None and np.isfinite(nis_norm) else np.nan,
+            "chi2": float(chi2) if chi2 is not None and np.isfinite(chi2) else np.nan,
+            "threshold": float(threshold) if threshold is not None and np.isfinite(threshold) else np.nan,
+            "r_scale_used": float(r_scale_used),
+        })
+
+    if np.isnan(altitude_measurement):
+        _set_adaptive_info(False, None, None, None, r_scale_extra)
+        return False, "Invalid altitude measurement"
+
+    num_clones = (kf.x.shape[0] - 19) // 7
+    err_dim = 18 + 6 * num_clones
+
+    H_alt = np.zeros((1, err_dim), dtype=float)
+    H_alt[0, 2] = 1.0
+
+    def h_fun(x, h=H_alt):
+        return h
+
+    bias_estimate = 0.0
+    if bias_estimation_enable:
+        bias_estimate = float(getattr(kf, "alt_bias_m", 0.0))
+        if not np.isfinite(bias_estimate):
+            bias_estimate = 0.0
+            setattr(kf, "alt_bias_m", bias_estimate)
+
+    def hx_fun(x, h=H_alt, b=float(bias_estimate)):
+        return np.array([[float(x[2, 0]) + b]], dtype=float)
+
+    extra_scale = max(1e-3, float(r_scale_extra))
+    r_mat = np.array([[max(1e-6, float(sigma_altitude)) ** 2 * (extra_scale ** 2)]], dtype=float)
+
+    has_invalid_p = np.any(np.isinf(kf.P)) or np.any(np.isnan(kf.P))
+    if has_invalid_p:
+        _set_adaptive_info(False, None, None, None, extra_scale)
+        return False, "Invalid P matrix (contains inf/nan)"
+
+    P_max = np.max(np.abs(kf.P))
+    if P_max > 1e10:
+        scale_factor = 1e8 / P_max
+        kf.P = kf.P * scale_factor
+        _set_adaptive_info(False, None, None, None, extra_scale)
+        return False, f"P matrix overflow clamped (max={P_max:.2e})"
+
+    from .numerical_checks import assert_finite
+
+    if not assert_finite("alt_H", H_alt, extra_info={"H_norm": np.linalg.norm(H_alt)}):
+        _set_adaptive_info(False, None, None, None, extra_scale)
+        return False, "H_alt contains inf/nan"
+
+    if not assert_finite("alt_kf_P", kf.P, extra_info={
+        "P_max": np.max(np.abs(kf.P)),
+        "P_trace": np.trace(kf.P)
+    }):
+        _set_adaptive_info(False, None, None, None, extra_scale)
+        return False, "kf.P contains inf/nan before altitude update"
+
+    with np.errstate(all='ignore'):
+        try:
+            S_mat = H_alt @ kf.P @ H_alt.T + r_mat
+        except Exception as e:
+            _set_adaptive_info(False, None, None, None, extra_scale)
+            return False, f"S_mat computation failed: {e}"
+
+    if not assert_finite("alt_S_mat", S_mat, extra_info={
+        "S_mat_max": np.max(np.abs(S_mat)),
+        "r_mat_val": r_mat[0, 0] if r_mat.size > 0 else 0.0,
+        "H_norm": np.linalg.norm(H_alt),
+        "P_max": np.max(np.abs(kf.P)),
+    }):
+        _set_adaptive_info(False, None, None, None, extra_scale)
+        return False, "S_mat contains inf/nan after computation"
+
+    predicted_altitude = float(kf.x[2, 0]) + float(bias_estimate)
+    innovation = np.array([[float(altitude_measurement) - predicted_altitude]], dtype=float)
+    raw_innovation_m = float(altitude_measurement) - float(kf.x[2, 0])
+
+    abs_innovation_limit = max(1e-3, float(max_abs_innovation_m))
+    if not np.isfinite(raw_innovation_m) or abs(raw_innovation_m) > abs_innovation_limit:
+        if residual_csv:
+            log_measurement_update(
+                residual_csv, timestamp, frame, 'ALT',
+                innovation=innovation.flatten(),
+                mahalanobis_dist=float('nan'),
+                chi2_threshold=float('nan'),
+                accepted=False,
+                s_matrix=S_mat,
+            )
+        _set_adaptive_info(False, None, None, None, extra_scale)
+        if adaptive_info is not None:
+            adaptive_info["reason_code"] = "abs_innovation_gate_reject"
+        return False, f"Absolute innovation gate reject ({raw_innovation_m:.2f}m)"
+
+    try:
+        m2_test = _mahalanobis2(innovation, S_mat)
+    except Exception:
+        m2_test = float('inf')
+
+    base_threshold = max(1e-6, float(base_threshold))
+    no_vision_threshold = max(base_threshold, float(no_vision_threshold))
+    threshold = no_vision_threshold if no_vision_corrections else base_threshold
+    threshold = max(1e-6, threshold * max(1e-3, float(threshold_scale)))
+
+    if soft_gate_enable and m2_test >= threshold:
+        inflation_factor = m2_test / threshold
+        inflation_factor = min(
+            max(1.0, float(inflation_factor)),
+            max(1.0, float(soft_gate_max_r_inflation)),
+        )
+        r_mat_inflated = r_mat * inflation_factor
+
+        kf.update(
+            z=np.array([[altitude_measurement]], dtype=float),
+            HJacobian=h_fun,
+            Hx=hx_fun,
+            R=r_mat_inflated,
+            update_type="ALT",
+            timestamp=timestamp
+        )
+
+        if residual_csv:
+            log_measurement_update(
+                residual_csv, timestamp, frame, 'ALT',
+                innovation=innovation.flatten(),
+                mahalanobis_dist=np.sqrt(m2_test),
+                chi2_threshold=threshold,
+                accepted=True,
+                s_matrix=S_mat,
+            )
+        _set_adaptive_info(True, m2_test, m2_test, threshold, extra_scale)
+        if adaptive_info is not None:
+            adaptive_info["reason_code"] = "soft_gate_accept"
+        if bias_estimation_enable:
+            alpha = float(np.clip(bias_alpha, 0.0, 1.0))
+            gate_m = max(1e-3, float(bias_update_gate_m))
+            freeze_bias = bool(bias_freeze_no_vision and no_vision_corrections)
+            if alpha > 0.0 and (not freeze_bias) and np.isfinite(raw_innovation_m) and abs(raw_innovation_m) <= gate_m:
+                new_bias = (1.0 - alpha) * float(bias_estimate) + alpha * float(raw_innovation_m)
+                setattr(kf, "alt_bias_m", float(np.clip(new_bias, -bias_max_abs_m, bias_max_abs_m)))
+        return True, f"Soft gating (m2={m2_test:.2f}, inflated R by {inflation_factor:.1f}x)"
+
+    if m2_test >= threshold and not soft_gate_enable:
+        if residual_csv:
+            log_measurement_update(
+                residual_csv, timestamp, frame, 'ALT',
+                innovation=innovation.flatten(),
+                mahalanobis_dist=np.sqrt(m2_test),
+                chi2_threshold=threshold,
+                accepted=False,
+                s_matrix=S_mat,
+            )
+        _set_adaptive_info(False, m2_test, m2_test, threshold, extra_scale)
+        if adaptive_info is not None:
+            adaptive_info["reason_code"] = "chi2_gate_reject"
+        return False, f"Hard reject (m2={m2_test:.2f} >= {threshold:.2f})"
+
+    kf.update(
+        z=np.array([[altitude_measurement]], dtype=float),
+        HJacobian=h_fun,
+        Hx=hx_fun,
+        R=r_mat,
+        update_type="ALT",
+        timestamp=timestamp
+    )
+
+    if residual_csv:
+        log_measurement_update(
+            residual_csv, timestamp, frame, 'ALT',
+            innovation=innovation.flatten(),
+            mahalanobis_dist=np.sqrt(m2_test),
+            chi2_threshold=threshold,
+            accepted=True,
+            s_matrix=S_mat,
+            p_prior=getattr(kf, 'P_prior', kf.P)
+        )
+    _set_adaptive_info(True, m2_test, m2_test, threshold, extra_scale)
+    if adaptive_info is not None:
+        adaptive_info["reason_code"] = "normal_accept"
+    if bias_estimation_enable:
+        alpha = float(np.clip(bias_alpha, 0.0, 1.0))
+        gate_m = max(1e-3, float(bias_update_gate_m))
+        freeze_bias = bool(bias_freeze_no_vision and no_vision_corrections)
+        if alpha > 0.0 and (not freeze_bias) and np.isfinite(raw_innovation_m) and abs(raw_innovation_m) <= gate_m:
+            new_bias = (1.0 - alpha) * float(bias_estimate) + alpha * float(raw_innovation_m)
+            setattr(kf, "alt_bias_m", float(np.clip(new_bias, -bias_max_abs_m, bias_max_abs_m)))
     return True, ""
 
 

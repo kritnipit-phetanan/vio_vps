@@ -91,6 +91,8 @@ class SatelliteMatcher:
                  max_keypoints: int = 2048,
                  min_inliers: int = 20,
                  reproj_threshold: float = 3.0,
+                 strict_min_inlier_ratio: float = 0.60,
+                 strict_max_reproj_error: float = 2.0,
                  match_mode: str = "auto",
                  rescue_min_inliers: int = 8,
                  rescue_min_confidence: float = 0.12,
@@ -110,6 +112,8 @@ class SatelliteMatcher:
         self.max_keypoints = max_keypoints
         self.min_inliers = min_inliers
         self.reproj_threshold = reproj_threshold
+        self.strict_min_inlier_ratio = float(np.clip(strict_min_inlier_ratio, 0.0, 1.0))
+        self.strict_max_reproj_error = max(0.1, float(strict_max_reproj_error))
         self.match_mode = str(match_mode).strip().lower()
         if self.match_mode not in ("auto", "orb", "lightglue", "orb_lightglue_rescue"):
             self.match_mode = "auto"
@@ -604,6 +608,23 @@ class SatelliteMatcher:
                 offset_px=(0.0, 0.0),
                 keypoints_drone=pts_drone,
                 keypoints_sat=pts_sat
+            )
+
+        if (
+            float(inlier_ratio) < float(self.strict_min_inlier_ratio)
+            or (not np.isfinite(float(reproj_error)))
+            or float(reproj_error) > float(self.strict_max_reproj_error)
+        ):
+            return MatchResult(
+                success=False,
+                H=H,
+                num_matches=num_matches,
+                num_inliers=num_inliers,
+                reproj_error=reproj_error,
+                confidence=confidence,
+                offset_px=offset_px,
+                keypoints_drone=inlier_pts_drone if len(inlier_pts_drone) > 0 else pts_drone,
+                keypoints_sat=inlier_pts_sat if len(inlier_pts_sat) > 0 else pts_sat
             )
 
         # Check minimum inliers after geometric sanity checks.

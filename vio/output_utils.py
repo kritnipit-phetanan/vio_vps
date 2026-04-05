@@ -109,7 +109,7 @@ def log_measurement_update(residual_csv: Optional[str], t: float, frame: int,
         residual_csv: Path to residual debug CSV file
         t: Current timestamp
         frame: Current VIO frame index (-1 if not applicable)
-        update_type: Type of update ('VPS', 'VIO_VEL', 'MAG', 'DEM', 'MSCKF', 'ZUPT')
+        update_type: Type of update ('VPS', 'VIO_VEL', 'MAG', 'ALT', 'DEM', 'MSCKF', 'ZUPT')
         innovation: Innovation vector (residual) - can be 1D or 2D (Nx1)
         mahalanobis_dist: Mahalanobis distance (for gating)
         chi2_threshold: Chi-square threshold for acceptance
@@ -159,7 +159,7 @@ def log_measurement_update(residual_csv: Optional[str], t: float, frame: int,
         innov_flat = innovation.flatten()
         
         # Map innovation to correct axes based on update type
-        # DEM: altitude update → Z-axis
+        # ALT/DEM: altitude update → Z-axis
         # MAG: yaw update → Z-axis (rotation around Z)
         # VIO_VEL: velocity (vx,vy,vz) → X,Y,Z axes
         # VPS: position (x,y,z) → X,Y,Z axes
@@ -169,7 +169,7 @@ def log_measurement_update(residual_csv: Optional[str], t: float, frame: int,
         
         if len(innov_flat) == 1:
             # 1D measurement
-            if update_type in ['DEM', 'MAG', 'ZUPT']:
+            if update_type in ['ALT', 'DEM', 'MAG', 'ZUPT']:
                 # Altitude/Yaw → Z-axis
                 innov_z = float(innov_flat[0])
             else:

@@ -994,6 +994,38 @@ def load_config(config_path: str) -> VIOConfig:
     result['SIGMA_VPS_XY'] = pn['sigma_vps_xy']
     result['SIGMA_AGL_Z'] = pn['sigma_agl_z']
     result['SIGMA_MAG_YAW'] = pn['sigma_mag_yaw']
+    altitude_anchor = config.get('altitude_anchor', {})
+    result['ALT_ANCHOR_ENABLE'] = bool(altitude_anchor.get('enabled', True))
+    result['ALT_ANCHOR_USE_DIRECT_MSL'] = bool(altitude_anchor.get('use_direct_msl', True))
+    result['ALT_ANCHOR_SIGMA_Z_M'] = float(altitude_anchor.get('sigma_z_m', 1.5))
+    result['ALT_ANCHOR_BASE_THRESHOLD'] = float(altitude_anchor.get('base_threshold', 12.0))
+    result['ALT_ANCHOR_NO_VISION_THRESHOLD'] = float(
+        altitude_anchor.get('no_vision_threshold', 60.0)
+    )
+    result['ALT_ANCHOR_SOFT_GATE_ENABLE'] = bool(
+        altitude_anchor.get('soft_gate_enable', True)
+    )
+    result['ALT_ANCHOR_SOFT_GATE_MAX_R_INFLATION'] = float(
+        altitude_anchor.get('soft_gate_max_r_inflation', 16.0)
+    )
+    result['ALT_ANCHOR_BIAS_ESTIMATION_ENABLE'] = bool(
+        altitude_anchor.get('bias_estimation_enable', True)
+    )
+    result['ALT_ANCHOR_BIAS_ALPHA'] = float(
+        altitude_anchor.get('bias_alpha', 1e-4)
+    )
+    result['ALT_ANCHOR_BIAS_MAX_ABS_M'] = float(
+        altitude_anchor.get('bias_max_abs_m', 20.0)
+    )
+    result['ALT_ANCHOR_BIAS_UPDATE_GATE_M'] = float(
+        altitude_anchor.get('bias_update_gate_m', 12.0)
+    )
+    result['ALT_ANCHOR_BIAS_FREEZE_NO_VISION'] = bool(
+        altitude_anchor.get('bias_freeze_no_vision', True)
+    )
+    result['ALT_ANCHOR_MAX_ABS_INNOVATION_M'] = float(
+        altitude_anchor.get('max_abs_innovation_m', 25.0)
+    )
     result['SIGMA_UNMODELED_GYR'] = pn.get('sigma_unmodeled_gyr', 0.002)
     result['MIN_YAW_PROCESS_NOISE_DEG'] = pn.get('min_yaw_process_noise_deg', 3.0)
     
@@ -1909,6 +1941,54 @@ def load_config(config_path: str) -> VIOConfig:
     result['VPS_APPLY_DEGRADED_CONF_MULT'] = float(vps_cfg.get('apply_degraded_conf_mult', 1.30))
     result['VPS_APPLY_WARNING_REPROJ_MULT'] = float(vps_cfg.get('apply_warning_reproj_mult', 0.90))
     result['VPS_APPLY_DEGRADED_REPROJ_MULT'] = float(vps_cfg.get('apply_degraded_reproj_mult', 0.80))
+    result['VPS_MAHALANOBIS_GATE_ENABLE'] = bool(vps_cfg.get('mahalanobis_gate_enable', True))
+    result['VPS_MAHALANOBIS_CHI2_THRESHOLD'] = float(vps_cfg.get('mahalanobis_chi2_threshold', 9.21))
+    result['VPS_MAHALANOBIS_MIN_SIGMA_XY_M'] = float(vps_cfg.get('mahalanobis_min_sigma_xy_m', 5.0))
+    result['VPS_FORCE_ACCEPT_ENABLE'] = bool(vps_cfg.get('force_accept_enable', False))
+    result['VPS_FORCE_ACCEPT_ALLOW_HARD_REJECT'] = bool(vps_cfg.get('force_accept_allow_hard_reject', False))
+    result['VPS_FORCE_ACCEPT_MIN_INLIERS'] = int(vps_cfg.get('force_accept_min_inliers', 3))
+    result['VPS_FORCE_ACCEPT_MIN_CONFIDENCE'] = float(vps_cfg.get('force_accept_min_confidence', 0.03))
+    result['VPS_FORCE_ACCEPT_MAX_REPROJ_ERROR'] = float(vps_cfg.get('force_accept_max_reproj_error', 3.0))
+    result['VPS_FORCE_ACCEPT_MAX_SPEED_M_S'] = float(vps_cfg.get('force_accept_max_speed_m_s', 120.0))
+    result['VPS_BOUNDED_CORRECTION_ENABLE'] = bool(vps_cfg.get('bounded_correction_enable', True))
+    result['VPS_BOUNDED_CORRECTION_PULL_GAIN'] = float(
+        vps_cfg.get('bounded_correction_pull_gain', 0.10)
+    )
+    result['VPS_BOUNDED_CORRECTION_MIN_PULL_M'] = float(
+        vps_cfg.get('bounded_correction_min_pull_m', 1.0)
+    )
+    result['VPS_BOUNDED_CORRECTION_MAX_PULL_M'] = float(vps_cfg.get('bounded_correction_max_pull_m', 2.0))
+    result['VPS_BOUNDED_CORRECTION_R_INFLATE_MIN_MULT'] = float(
+        vps_cfg.get('bounded_correction_r_inflate_min_mult', 1.5)
+    )
+    result['VPS_BOUNDED_CORRECTION_R_INFLATE_MAX_MULT'] = float(
+        vps_cfg.get('bounded_correction_r_inflate_max_mult', 4.0)
+    )
+    result['VPS_BOUNDED_CORRECTION_P_XY_CAP_M2'] = float(
+        vps_cfg.get('bounded_correction_p_xy_cap_m2', 25.0)
+    )
+    result['VPS_BOUNDED_CORRECTION_MAX_POSITION_CORRECTION_M'] = float(
+        vps_cfg.get('bounded_correction_max_position_correction_m', 2.0)
+    )
+    result['VPS_TEMPORAL_SHIELD_ENABLE'] = bool(vps_cfg.get('temporal_shield_enable', False))
+    result['VPS_TEMPORAL_SHIELD_WINDOW_SEC'] = float(vps_cfg.get('temporal_shield_window_sec', 2.5))
+    result['VPS_TEMPORAL_SHIELD_MAX_SAMPLES'] = int(max(2, vps_cfg.get('temporal_shield_max_samples', 5)))
+    result['VPS_TEMPORAL_SHIELD_MIN_SAMPLES'] = int(max(1, vps_cfg.get('temporal_shield_min_samples', 3)))
+    result['VPS_TEMPORAL_SHIELD_REQUIRE_TEMPORAL_HITS'] = int(
+        max(1, vps_cfg.get('temporal_shield_require_temporal_hits', 2))
+    )
+    result['VPS_TEMPORAL_SHIELD_MAX_XY_STD_M'] = float(
+        vps_cfg.get('temporal_shield_max_xy_std_m', 18.0)
+    )
+    result['VPS_TEMPORAL_SHIELD_MAX_REL_MAG_STD'] = float(
+        vps_cfg.get('temporal_shield_max_rel_mag_std', 0.35)
+    )
+    result['VPS_TEMPORAL_SHIELD_MAX_DIR_SPREAD_DEG'] = float(
+        vps_cfg.get('temporal_shield_max_dir_spread_deg', 20.0)
+    )
+    result['VPS_TEMPORAL_SHIELD_ALWAYS_ACCEPT_BELOW_M'] = float(
+        vps_cfg.get('temporal_shield_always_accept_below_m', 6.0)
+    )
     result['VPS_APPLY_FAILSOFT_ENABLE'] = bool(vps_cfg.get('apply_failsoft_enable', True))
     result['VPS_APPLY_FAILSOFT_MIN_INLIERS'] = int(
         vps_cfg.get('apply_failsoft_min_inliers', vps_cfg.get('min_inliers_failsoft', 5))
@@ -3003,6 +3083,7 @@ def load_config(config_path: str) -> VIOConfig:
         'measurement': {
             'sensor_defaults': {
                 'MAG': {'r_scale': 1.0},
+                'ALT': {'r_scale': 1.0, 'threshold_scale': 1.0},
                 'DEM': {'r_scale': 1.0, 'threshold_scale': 1.0},
                 'VIO_VEL': {'r_scale': 1.0, 'chi2_scale': 1.0},
                 'MSCKF': {'chi2_scale': 1.0, 'reproj_scale': 1.0},
@@ -3325,6 +3406,19 @@ SIGMA_ACCEL = 0.8
 # REMOVED: SIGMA_VO_VEL (was dead code - never referenced, use _raw_config['SIGMA_VO'] instead)
 SIGMA_VPS_XY = 1.0
 SIGMA_AGL_Z = 2.5
+ALT_ANCHOR_ENABLE = True
+ALT_ANCHOR_USE_DIRECT_MSL = True
+ALT_ANCHOR_SIGMA_Z_M = 1.5
+ALT_ANCHOR_BASE_THRESHOLD = 12.0
+ALT_ANCHOR_NO_VISION_THRESHOLD = 60.0
+ALT_ANCHOR_SOFT_GATE_ENABLE = True
+ALT_ANCHOR_SOFT_GATE_MAX_R_INFLATION = 16.0
+ALT_ANCHOR_BIAS_ESTIMATION_ENABLE = True
+ALT_ANCHOR_BIAS_ALPHA = 1e-4
+ALT_ANCHOR_BIAS_MAX_ABS_M = 20.0
+ALT_ANCHOR_BIAS_UPDATE_GATE_M = 12.0
+ALT_ANCHOR_BIAS_FREEZE_NO_VISION = True
+ALT_ANCHOR_MAX_ABS_INNOVATION_M = 25.0
 SIGMA_MAG_YAW = 0.15  # ~9° measurement noise
 
 # Adaptive policy defaults (compiled from YAML adaptive section)

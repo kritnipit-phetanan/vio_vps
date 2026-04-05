@@ -28,6 +28,7 @@ class PolicyRuntimeService:
 
     _SENSORS = (
         "MAG",
+        "ALT",
         "DEM",
         "VIO_VEL",
         "MSCKF",

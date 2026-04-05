@@ -184,6 +184,9 @@ adaptive:
           max_v_scale: 1.0
           r_scale: 1.0
     sensor_defaults:
+      ALT:
+        r_scale: 1.0
+        threshold_scale: 1.0
       BIAS_GUARD:
         chi2_scale: 1.0
         r_scale: 1.0
@@ -1109,6 +1112,20 @@ process_noise:
   sigma_agl_z: 1.0
   sigma_mag_yaw: 0.1
   sigma_vps_xy: 0.8
+altitude_anchor:
+  base_threshold: 4.0
+  bias_alpha: 0.0001
+  bias_estimation_enable: true
+  bias_freeze_no_vision: true
+  bias_max_abs_m: 20.0
+  bias_update_gate_m: 12.0
+  enabled: true
+  max_abs_innovation_m: 25.0
+  no_vision_threshold: 6.0
+  sigma_z_m: 4.5
+  soft_gate_enable: false
+  soft_gate_max_r_inflation: 16.0
+  use_direct_msl: true
 rectification:
   rectify_fov_deg: 90.0
   use_rectifier: false
@@ -1333,6 +1350,32 @@ vio_vel:
   - 2.0
   xy_only_chi2_scale: 1.1
 vps:
+  mahalanobis_gate_enable: true
+  mahalanobis_chi2_threshold: 9.21
+  mahalanobis_min_sigma_xy_m: 5.0
+  force_accept_enable: false
+  force_accept_allow_hard_reject: false
+  force_accept_min_inliers: 3
+  force_accept_min_confidence: 0.03
+  force_accept_max_reproj_error: 3.0
+  force_accept_max_speed_m_s: 110.0
+  bounded_correction_enable: true
+  bounded_correction_pull_gain: 0.10
+  bounded_correction_min_pull_m: 1.0
+  bounded_correction_max_pull_m: 10.0
+  bounded_correction_r_inflate_min_mult: 1.6
+  bounded_correction_r_inflate_max_mult: 6.0
+  bounded_correction_p_xy_cap_m2: 25.0
+  bounded_correction_max_position_correction_m: 10.0
+  temporal_shield_enable: true
+  temporal_shield_window_sec: 2.0
+  temporal_shield_max_samples: 4
+  temporal_shield_min_samples: 2
+  temporal_shield_require_temporal_hits: 1
+  temporal_shield_max_xy_std_m: 30.0
+  temporal_shield_max_rel_mag_std: 0.80
+  temporal_shield_max_dir_spread_deg: 50.0
+  temporal_shield_always_accept_below_m: 10.0
   abs_hard_reject_dir_change_deg: 75.0
   abs_hard_reject_dir_change_max_speed_m_s: 12.0
   abs_hard_reject_dir_change_max_yaw_rate_deg_s: 25.0
@@ -1518,15 +1561,15 @@ vps:
   apply_failsoft_dir_gate_disable_speed_m_s: 24.0
   apply_failsoft_dir_gate_disable_yaw_rate_deg_s: 45.0
   apply_failsoft_max_offset_m: 130.0
-  apply_failsoft_max_reproj_error: 1.2
+  apply_failsoft_max_reproj_error: 2.5
   apply_failsoft_max_speed_m_s: 95.0
-  apply_failsoft_min_confidence: 0.12
-  apply_failsoft_min_inliers: 5
+  apply_failsoft_min_confidence: 0.08
+  apply_failsoft_min_inliers: 4
   apply_failsoft_r_mult: 2.2
-  apply_max_reproj_error: 1.2
+  apply_max_reproj_error: 3.5
   apply_max_speed_m_s: 80.0
-  apply_min_confidence: 0.18
-  apply_min_inliers: 8
+  apply_min_confidence: 0.10
+  apply_min_inliers: 6
   apply_warning_conf_mult: 1.15
   apply_warning_inlier_bonus: 2
   apply_warning_reproj_mult: 0.9
@@ -1534,9 +1577,12 @@ vps:
   image_forward_axis: bottom
   device: cuda
   matcher_mode: orb
-  rescue_min_inliers: 8
+  strict_min_inlier_ratio: 0.30
+  failsoft_min_inlier_ratio: 0.25
+  strict_max_reproj_error: 3.5
+  rescue_min_inliers: 6
   rescue_min_confidence: 0.12
-  rescue_max_reproj_error: 2.5
+  rescue_max_reproj_error: 3.5
   rescue_local_only_enable: true
   rescue_local_topk_candidates: 2
   rescue_disable_above_speed_m_s: 22.0
@@ -1547,14 +1593,15 @@ vps:
   failover_fail_streak: 6
   failsoft_r_inflate: 4.0
   max_altitude: 500.0
-  max_candidates: 6
-  global_max_candidates: 10
-  max_total_candidates: 16
-  max_frame_time_ms_local: 300.0
-  max_frame_time_ms_global: 900.0
+  max_candidates: 12
+  global_max_candidates: 18
+  max_total_candidates: 40
+  max_frame_time_ms_local: 600.0
+  max_frame_time_ms_global: 2400.0
   max_clones: 3
   max_delay_sec: 0.5
   max_keypoints: 2048
+  hard_disable_below_m: 10.0
   temporal_consensus_max_dir_change_deg: 50.0
   temporal_consensus_max_rel_mag_change: 0.55
   temporal_consensus_max_hits: 5
@@ -1564,23 +1611,27 @@ vps:
   quality_weight_temporal: 0.10
   quality_weight_locality: 0.10
   baro_scale_prune_enable: true
-  baro_scale_prune_sigma_z_m: 12.0
+  baro_scale_prune_sigma_z_m: 8.0
   baro_scale_prune_min_band_frac: 0.10
-  baro_scale_prune_max_band_frac: 0.30
+  baro_scale_prune_max_band_frac: 0.18
   baro_scale_prune_speed_gain: 0.002
+  scale_guided_matching_enable: true
+  scale_guided_max_band_frac: 0.16
+  scale_guided_low_alt_max_band_frac: 0.10
+  scale_guided_low_alt_m: 30.0
   tile_cache_max_tiles: 48
   mps_cache_clear_interval: 6
   max_offset_px_failsoft: 900.0
   max_reproj_error: 5.0
-  max_reproj_error_failsoft: 1.2
+  max_reproj_error_failsoft: 2.5
   min_altitude: 30.0
   min_altitude_unknown_speed: 12.0
   min_altitude_accuracy_mode: 10.0
   min_confidence: 0.3
-  min_confidence_failsoft: 0.12
+  min_confidence_failsoft: 0.08
   min_content_ratio: 0.2
-  min_inliers: 12
-  min_inliers_failsoft: 5
+  min_inliers: 8
+  min_inliers_failsoft: 4
   min_texture_std: 8.0
   min_update_interval: 0.5
   worker_busy_force_local_streak: 120
