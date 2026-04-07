@@ -35,6 +35,14 @@ class VIOService:
         self.runner = runner
         self.vps_position_controller = VPSPositionController(runner=runner, vio_service=self)
 
+    def _vps_runtime_log(self, key: str, msg: str, force: bool = False) -> None:
+        """Forward VPS-related runtime logs through the runner throttler when available."""
+        vps_runner = getattr(self.runner, "vps_runner", None)
+        if vps_runner is not None and hasattr(vps_runner, "_runtime_log"):
+            vps_runner._runtime_log(key, msg, force=force)
+            return
+        print(msg)
+
     def _compute_vps_quality_metrics(self, img: np.ndarray) -> Dict[str, float]:
         """Compute lightweight image-quality metrics for VPS call-rate adaptation."""
         if img is None or getattr(img, "size", 0) == 0:
@@ -1487,20 +1495,25 @@ class VIOService:
                             new_until = float(t_cam + max(0.0, busy_force_sec))
                             runner._vps_force_local_until_t = max(prev_until, new_until)
                             if prev_until < float(t_cam):
-                                print(
+                                self._vps_runtime_log(
+                                    "vps_busy_guard_force_local",
                                     f"[VPS] busy guard: force_local enabled for {busy_force_sec:.1f}s "
-                                    f"(streak={runner._vps_thread_busy_streak})"
+                                    f"(streak={runner._vps_thread_busy_streak})",
                                 )
-                        if (runner._vps_thread_busy_skip_count % 100) == 0:
-                            print(
+                        if (runner._vps_thread_busy_skip_count % 20) == 0:
+                            self._vps_runtime_log(
+                                "vps_worker_busy_skip",
                                 f"[VPS] worker busy; skipped {runner._vps_thread_busy_skip_count} frame(s) "
-                                "while previous VPS attempt is still running"
+                                "while previous VPS attempt is still running",
                             )
                     elif skip_reason == "memory_pressure":
                         runner._vps_thread_busy_streak = 0
-                        if (int(runner._vps_attempt_count) % 100) == 0 and bool(getattr(runner.config, "save_debug_data", False)):
+                        if (int(runner._vps_attempt_count) % 20) == 0:
                             rem = float(getattr(runner, "_vps_memory_pressure_until_t", -1e9)) - float(t_cam)
-                            print(f"[VPS] memory pressure: suppress VPS submit (remaining={max(0.0, rem):.1f}s)")
+                            self._vps_runtime_log(
+                                "vps_memory_pressure",
+                                f"[VPS] memory pressure: suppress VPS submit (remaining={max(0.0, rem):.1f}s)",
+                            )
                     elif skip_reason != "busy_backpressure":
                         runner._vps_thread_busy_streak = 0
                     if runner.vps_logger is not None and skip_reason != "interval_hold":
@@ -1556,9 +1569,12 @@ class VIOService:
                     force_local_busy_guard = bool(
                         float(t_cam) < float(getattr(runner, "_vps_force_local_until_t", -1e9))
                     )
-                    if force_local_busy_guard and (runner._vps_attempt_count % 20) == 0:
+                    if force_local_busy_guard and (runner._vps_attempt_count % 10) == 0:
                         rem = float(getattr(runner, "_vps_force_local_until_t", -1e9)) - float(t_cam)
-                        print(f"[VPS] force_local active (remaining={max(0.0, rem):.1f}s)")
+                        self._vps_runtime_log(
+                            "vps_force_local_active",
+                            f"[VPS] force_local active (remaining={max(0.0, rem):.1f}s)",
+                        )
 
                     # Define VPS processing function for thread
                     def run_vps_in_thread():

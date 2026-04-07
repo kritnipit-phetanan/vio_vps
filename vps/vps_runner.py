@@ -95,6 +95,7 @@ class VPSConfig:
     rescue_rate_window_sec: float = 0.0
     rescue_rate_max_attempts: int = 0
     max_image_side: int = 1024
+    matcher_timeout_ms: float = 80.0
     mps_cache_clear_interval: int = 0
     max_cached_tiles: int = 50
     image_forward_axis: str = "top"  # top|bottom (front direction in image)
@@ -309,6 +310,7 @@ class VPSRunner:
             rescue_min_confidence=config.rescue_min_confidence,
             rescue_max_reproj_error=config.rescue_max_reproj_error,
             max_image_side=config.max_image_side,
+            match_timeout_ms=config.matcher_timeout_ms,
             mps_cache_clear_interval=config.mps_cache_clear_interval,
         )
         
@@ -1094,6 +1096,7 @@ class VPSRunner:
                 rescue_rate_window_sec=float(vps_cfg.get("rescue_rate_window_sec", 0.0)),
                 rescue_rate_max_attempts=int(vps_cfg.get("rescue_rate_max_attempts", 0)),
                 max_image_side=int(vps_cfg.get("max_image_side", 1024)),
+                matcher_timeout_ms=float(vps_cfg.get("matcher_timeout_ms", 80.0)),
                 mps_cache_clear_interval=int(vps_cfg.get("mps_cache_clear_interval", 8)),
                 image_forward_axis=str(vps_cfg.get("image_forward_axis", vps_cfg.get("camera_forward_axis", "top"))),
                 temporal_consensus_max_dir_change_deg=float(
@@ -1342,7 +1345,9 @@ class VPSRunner:
                 f"min_inliers={vps_config.min_inliers}, failsoft={vps_config.min_inliers_failsoft}, "
                 f"candidates<={vps_config.max_candidates}, matcher={vps_config.matcher_mode}, "
                 f"rectifier={int(bool(vps_config.use_rectifier))}, "
+                f"max_keypoints={vps_config.max_keypoints}, "
                 f"max_image_side={vps_config.max_image_side}, "
+                f"matcher_timeout_ms={vps_config.matcher_timeout_ms:.0f}, "
                 f"max_total_candidates={vps_config.max_total_candidates}, "
                 f"budget_ms(local/global)={vps_config.max_frame_time_ms_local:.0f}/{vps_config.max_frame_time_ms_global:.0f}, "
                 f"gbackoff_fail={vps_config.reloc_global_backoff_fail_streak},"
@@ -2424,10 +2429,26 @@ class VPSRunner:
                                 self.stats.get("rescue_block_rate_count", 0)
                             ) + 1
                 try:
+                    elapsed_match_budget_ms = float((time.time() - t_start) * 1000.0)
+                    remaining_frame_budget_ms = 0.0
+                    if frame_budget_ms > 0.0:
+                        remaining_frame_budget_ms = max(0.0, float(frame_budget_ms) - elapsed_match_budget_ms)
+                    match_timeout_ms = float(max(0.0, getattr(self.config, "matcher_timeout_ms", 0.0)))
+                    if remaining_frame_budget_ms > 0.0:
+                        match_timeout_ms = (
+                            min(match_timeout_ms, remaining_frame_budget_ms)
+                            if match_timeout_ms > 0.0
+                            else remaining_frame_budget_ms
+                        )
+                    if frame_budget_ms > 0.0 and match_timeout_ms <= 0.0:
+                        stopped_by_time_budget = True
+                        stop_search = True
+                        break
                     match_result = self.matcher.match_with_homography(
                         drone_img=preprocess_result.image,
                         sat_img=sat_img,
                         rescue_allowed=bool(rescue_allowed),
+                        timeout_ms=(match_timeout_ms if match_timeout_ms > 0.0 else None),
                     )
                 except Exception:
                     match_ms += (time.time() - t_match_start) * 1000.0

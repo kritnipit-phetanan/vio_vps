@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import os
 import sys
+import time
 
 # Try to import LightGlue (optional dependency). If the package is not
 # installed globally, try local clone at <repo>/LightGlue.
@@ -98,6 +99,7 @@ class SatelliteMatcher:
                  rescue_min_confidence: float = 0.12,
                  rescue_max_reproj_error: float = 2.5,
                  max_image_side: int = 1024,
+                 match_timeout_ms: float = 0.0,
                  mps_cache_clear_interval: int = 0):
         """
         Initialize matcher.
@@ -121,8 +123,11 @@ class SatelliteMatcher:
         self.rescue_min_confidence = float(np.clip(rescue_min_confidence, 0.0, 1.0))
         self.rescue_max_reproj_error = max(0.1, float(rescue_max_reproj_error))
         self.max_image_side = int(max(128, max_image_side))
+        self.match_timeout_ms = float(max(0.0, match_timeout_ms))
         self.mps_cache_clear_interval = int(max(0, mps_cache_clear_interval))
         self._match_counter = 0
+        self._last_timeout_hit = False
+        self._last_timeout_reason = "none"
 
         self._lightglue_ready = False
         self._orb_ready = False
@@ -239,10 +244,51 @@ class SatelliteMatcher:
     def _init_orb_fallback(self):
         """Initialize ORB matcher backend."""
         print("[SatelliteMatcher] Initializing ORB matcher backend")
-        self.orb = cv2.ORB_create(nfeatures=4000)  # Increased from 2048
+        orb_features = int(np.clip(int(self.max_keypoints), 256, 4000))
+        self.orb = cv2.ORB_create(nfeatures=orb_features)
         self.bf_matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
         self.ratio_test_threshold = 0.78  # Balanced setting for VPS matching
         self._orb_ready = True
+
+    def _reset_timeout_state(self) -> None:
+        self._last_timeout_hit = False
+        self._last_timeout_reason = "none"
+
+    def _effective_timeout_ms(self, timeout_ms: Optional[float]) -> Optional[float]:
+        if timeout_ms is None:
+            timeout_ms = self.match_timeout_ms
+        timeout_ms = float(timeout_ms)
+        if timeout_ms <= 0.0 or not np.isfinite(timeout_ms):
+            return None
+        return timeout_ms
+
+    def _mark_timeout(self, reason: str = "MATCH_FAILED_TIMEOUT") -> None:
+        self._last_timeout_hit = True
+        self._last_timeout_reason = str(reason)
+
+    def _timed_out(self, start_t: Optional[float], timeout_ms: Optional[float]) -> bool:
+        timeout_ms_eff = self._effective_timeout_ms(timeout_ms)
+        if start_t is None or timeout_ms_eff is None:
+            return False
+        if ((time.time() - float(start_t)) * 1000.0) > float(timeout_ms_eff):
+            self._mark_timeout()
+            return True
+        return False
+
+    def _timeout_result(self) -> MatchResult:
+        return MatchResult(
+            success=False,
+            H=None,
+            num_matches=0,
+            num_inliers=0,
+            reproj_error=float("inf"),
+            confidence=0.0,
+            offset_px=(0.0, 0.0),
+            keypoints_drone=None,
+            keypoints_sat=None,
+            rescue_trigger_reason=str(self._last_timeout_reason or "MATCH_FAILED_TIMEOUT"),
+            rescue_used=False,
+        )
     
     def extract_features_lightglue(self, img: np.ndarray) -> Dict[str, "torch.Tensor"]:
         """Extract SuperPoint features."""
@@ -274,7 +320,8 @@ class SatelliteMatcher:
         scale = float(self.max_image_side / max_side)
         new_w = max(64, int(round(w * scale)))
         new_h = max(64, int(round(h * scale)))
-        resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        # Prefer cheaper interpolation to keep VPS matching within wall-time budget.
+        resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
         self.stats["image_resized_count"] = int(self.stats.get("image_resized_count", 0)) + 1
         return resized, (new_w / float(w)), (new_h / float(h))
 
@@ -305,7 +352,9 @@ class SatelliteMatcher:
     
     def match_lightglue(self, 
                         drone_img: np.ndarray, 
-                        sat_img: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+                        sat_img: np.ndarray,
+                        start_t: Optional[float] = None,
+                        timeout_ms: Optional[float] = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Match images using LightGlue.
         
@@ -314,17 +363,27 @@ class SatelliteMatcher:
         """
         if not self._lightglue_ready:
             return np.array([]), np.array([]), np.array([])
+        if self._timed_out(start_t, timeout_ms):
+            return np.array([]), np.array([]), np.array([])
 
         drone_img_in, sx0, sy0 = self._resize_for_match(drone_img)
         sat_img_in, sx1, sy1 = self._resize_for_match(sat_img)
+        if self._timed_out(start_t, timeout_ms):
+            return np.array([]), np.array([]), np.array([])
 
         # Extract features
         feats0 = self.extract_features_lightglue(drone_img_in)
+        if self._timed_out(start_t, timeout_ms):
+            return np.array([]), np.array([]), np.array([])
         feats1 = self.extract_features_lightglue(sat_img_in)
+        if self._timed_out(start_t, timeout_ms):
+            return np.array([]), np.array([]), np.array([])
         
         # Match
         with (torch.inference_mode() if hasattr(torch, "inference_mode") else torch.no_grad()):
             matches_dict = self.matcher({'image0': feats0, 'image1': feats1})
+        if self._timed_out(start_t, timeout_ms):
+            return np.array([]), np.array([]), np.array([])
         
         # Get matched keypoints
         feats0, feats1, matches_dict = [rbd(x) for x in [feats0, feats1, matches_dict]]
@@ -385,7 +444,9 @@ class SatelliteMatcher:
     
     def match_orb(self, 
                   drone_img: np.ndarray, 
-                  sat_img: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+                  sat_img: np.ndarray,
+                  start_t: Optional[float] = None,
+                  timeout_ms: Optional[float] = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Match images using ORB (fallback).
         
@@ -394,21 +455,33 @@ class SatelliteMatcher:
         """
         if not self._orb_ready:
             return np.array([]), np.array([]), np.array([])
+        if self._timed_out(start_t, timeout_ms):
+            return np.array([]), np.array([]), np.array([])
 
         drone_img_in, sx0, sy0 = self._resize_for_match(drone_img)
         sat_img_in, sx1, sy1 = self._resize_for_match(sat_img)
+        if self._timed_out(start_t, timeout_ms):
+            return np.array([]), np.array([]), np.array([])
         kp0, desc0 = self.extract_features_orb(drone_img_in)
+        if self._timed_out(start_t, timeout_ms):
+            return np.array([]), np.array([]), np.array([])
         kp1, desc1 = self.extract_features_orb(sat_img_in)
+        if self._timed_out(start_t, timeout_ms):
+            return np.array([]), np.array([]), np.array([])
         
         if desc0 is None or desc1 is None or len(kp0) < 10 or len(kp1) < 10:
             return np.array([]), np.array([]), np.array([])
         
         # KNN match
         matches = self.bf_matcher.knnMatch(desc0, desc1, k=2)
+        if self._timed_out(start_t, timeout_ms):
+            return np.array([]), np.array([]), np.array([])
         
         # Ratio test
         good_matches = []
-        for m_list in matches:
+        for idx, m_list in enumerate(matches):
+            if (idx % 64) == 0 and self._timed_out(start_t, timeout_ms):
+                return np.array([]), np.array([]), np.array([])
             if len(m_list) == 2:
                 m, n = m_list
                 if m.distance < self.ratio_test_threshold * n.distance:
@@ -422,19 +495,25 @@ class SatelliteMatcher:
         # mapping to the same satellite keypoint), which causes degenerate
         # homography and misleading debug visualizations.
         best_by_train: Dict[int, Any] = {}
-        for m in good_matches:
+        for idx, m in enumerate(good_matches):
+            if (idx % 64) == 0 and self._timed_out(start_t, timeout_ms):
+                return np.array([]), np.array([]), np.array([])
             prev = best_by_train.get(int(m.trainIdx))
             if prev is None or m.distance < prev.distance:
                 best_by_train[int(m.trainIdx)] = m
 
         # Keep best per query index as an additional safety guard.
         best_by_query: Dict[int, Any] = {}
-        for m in best_by_train.values():
+        for idx, m in enumerate(best_by_train.values()):
+            if (idx % 64) == 0 and self._timed_out(start_t, timeout_ms):
+                return np.array([]), np.array([]), np.array([])
             prev = best_by_query.get(int(m.queryIdx))
             if prev is None or m.distance < prev.distance:
                 best_by_query[int(m.queryIdx)] = m
 
         good_matches = sorted(best_by_query.values(), key=lambda mm: mm.distance)
+        if self._timed_out(start_t, timeout_ms):
+            return np.array([]), np.array([]), np.array([])
         if len(good_matches) < 4:
             return np.array([]), np.array([]), np.array([])
         
@@ -454,7 +533,9 @@ class SatelliteMatcher:
     
     def match(self, 
               drone_img: np.ndarray, 
-              sat_img: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+              sat_img: np.ndarray,
+              start_t: Optional[float] = None,
+              timeout_ms: Optional[float] = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Match drone image against satellite image.
         
@@ -467,18 +548,18 @@ class SatelliteMatcher:
         """
         mode = str(self.match_mode).lower()
         if mode == "orb":
-            return self.match_orb(drone_img, sat_img)
+            return self.match_orb(drone_img, sat_img, start_t=start_t, timeout_ms=timeout_ms)
         if mode == "lightglue":
             if self._lightglue_ready:
-                return self.match_lightglue(drone_img, sat_img)
-            return self.match_orb(drone_img, sat_img)
+                return self.match_lightglue(drone_img, sat_img, start_t=start_t, timeout_ms=timeout_ms)
+            return self.match_orb(drone_img, sat_img, start_t=start_t, timeout_ms=timeout_ms)
         if mode == "orb_lightglue_rescue":
             # Primary path for hybrid mode is ORB; rescue handled in match_with_homography().
-            return self.match_orb(drone_img, sat_img)
+            return self.match_orb(drone_img, sat_img, start_t=start_t, timeout_ms=timeout_ms)
         # auto
         if self._lightglue_ready:
-            return self.match_lightglue(drone_img, sat_img)
-        return self.match_orb(drone_img, sat_img)
+            return self.match_lightglue(drone_img, sat_img, start_t=start_t, timeout_ms=timeout_ms)
+        return self.match_orb(drone_img, sat_img, start_t=start_t, timeout_ms=timeout_ms)
 
     def _result_score(self, result: MatchResult) -> float:
         """Monotonic quality score used to compare ORB vs LightGlue candidates."""
@@ -527,8 +608,12 @@ class SatelliteMatcher:
                                   drone_img: np.ndarray,
                                   sat_img: np.ndarray,
                                   pts_drone: np.ndarray,
-                                  pts_sat: np.ndarray) -> MatchResult:
+                                  pts_sat: np.ndarray,
+                                  start_t: Optional[float] = None,
+                                  timeout_ms: Optional[float] = None) -> MatchResult:
         """Build MatchResult from matched points (shared by ORB and LightGlue paths)."""
+        if self._timed_out(start_t, timeout_ms):
+            return self._timeout_result()
         num_matches = len(pts_drone)
         if num_matches < 4:
             return MatchResult(
@@ -544,7 +629,11 @@ class SatelliteMatcher:
             )
 
         # Estimate homography
-        H, inlier_mask, reproj_error = self.estimate_homography(pts_drone, pts_sat)
+        H, inlier_mask, reproj_error = self.estimate_homography(
+            pts_drone, pts_sat, start_t=start_t, timeout_ms=timeout_ms
+        )
+        if self._timed_out(start_t, timeout_ms):
+            return self._timeout_result()
         num_inliers = int(np.sum(inlier_mask)) if len(inlier_mask) > 0 else 0
 
         if H is None:
@@ -655,7 +744,9 @@ class SatelliteMatcher:
     
     def estimate_homography(self, 
                             pts_drone: np.ndarray, 
-                            pts_sat: np.ndarray) -> Tuple[Optional[np.ndarray], np.ndarray, float]:
+                            pts_sat: np.ndarray,
+                            start_t: Optional[float] = None,
+                            timeout_ms: Optional[float] = None) -> Tuple[Optional[np.ndarray], np.ndarray, float]:
         """
         Estimate homography using RANSAC.
         
@@ -668,6 +759,8 @@ class SatelliteMatcher:
         """
         if len(pts_drone) < 4:
             return None, np.array([]), float('inf')
+        if self._timed_out(start_t, timeout_ms):
+            return None, np.array([]), float('inf')
         
         # Find homography with RANSAC
         H, mask = cv2.findHomography(
@@ -675,6 +768,8 @@ class SatelliteMatcher:
             cv2.RANSAC,
             ransacReprojThreshold=self.reproj_threshold
         )
+        if self._timed_out(start_t, timeout_ms):
+            return None, np.array([]), float('inf')
         
         if H is None or mask is None:
             return None, np.array([]), float('inf')
@@ -685,6 +780,8 @@ class SatelliteMatcher:
         if np.sum(mask) > 0:
             inlier_pts_drone = pts_drone[mask]
             inlier_pts_sat = pts_sat[mask]
+            if self._timed_out(start_t, timeout_ms):
+                return None, np.array([]), float('inf')
             
             # Project drone points to satellite space
             ones = np.ones((len(inlier_pts_drone), 1))
@@ -746,7 +843,8 @@ class SatelliteMatcher:
     def match_with_homography(self, 
                               drone_img: np.ndarray, 
                               sat_img: np.ndarray,
-                              rescue_allowed: bool = True) -> MatchResult:
+                              rescue_allowed: bool = True,
+                              timeout_ms: Optional[float] = None) -> MatchResult:
         """
         Full matching pipeline: feature matching + homography estimation.
         
@@ -757,10 +855,21 @@ class SatelliteMatcher:
         Returns:
             MatchResult with homography and offset
         """
+        self._reset_timeout_state()
+        start_t = time.time()
+
         # Hybrid mode: ORB primary, LightGlue rescue on weak ORB outcome.
         if str(self.match_mode).lower() == "orb_lightglue_rescue":
-            pts_orb_drone, pts_orb_sat, _ = self.match_orb(drone_img, sat_img)
-            orb_result = self._build_result_from_points(drone_img, sat_img, pts_orb_drone, pts_orb_sat)
+            pts_orb_drone, pts_orb_sat, _ = self.match_orb(
+                drone_img, sat_img, start_t=start_t, timeout_ms=timeout_ms
+            )
+            if self._last_timeout_hit:
+                return self._timeout_result()
+            orb_result = self._build_result_from_points(
+                drone_img, sat_img, pts_orb_drone, pts_orb_sat, start_t=start_t, timeout_ms=timeout_ms
+            )
+            if self._last_timeout_hit:
+                return self._timeout_result()
             rescue_reason = self._rescue_trigger_reason(orb_result)
             orb_result.rescue_trigger_reason = str(rescue_reason)
             orb_result.rescue_used = False
@@ -770,8 +879,16 @@ class SatelliteMatcher:
                 return orb_result
             if self._lightglue_ready and need_rescue:
                 self.stats["rescue_attempts"] = int(self.stats.get("rescue_attempts", 0)) + 1
-                pts_lg_drone, pts_lg_sat, _ = self.match_lightglue(drone_img, sat_img)
-                lg_result = self._build_result_from_points(drone_img, sat_img, pts_lg_drone, pts_lg_sat)
+                pts_lg_drone, pts_lg_sat, _ = self.match_lightglue(
+                    drone_img, sat_img, start_t=start_t, timeout_ms=timeout_ms
+                )
+                if self._last_timeout_hit:
+                    return self._timeout_result()
+                lg_result = self._build_result_from_points(
+                    drone_img, sat_img, pts_lg_drone, pts_lg_sat, start_t=start_t, timeout_ms=timeout_ms
+                )
+                if self._last_timeout_hit:
+                    return self._timeout_result()
                 lg_result.rescue_trigger_reason = str(rescue_reason)
                 lg_result.rescue_used = True
                 if self._result_score(lg_result) > self._result_score(orb_result):
@@ -782,8 +899,14 @@ class SatelliteMatcher:
             return orb_result
 
         # Standard single-backend mode.
-        pts_drone, pts_sat, _ = self.match(drone_img, sat_img)
-        result = self._build_result_from_points(drone_img, sat_img, pts_drone, pts_sat)
+        pts_drone, pts_sat, _ = self.match(drone_img, sat_img, start_t=start_t, timeout_ms=timeout_ms)
+        if self._last_timeout_hit:
+            return self._timeout_result()
+        result = self._build_result_from_points(
+            drone_img, sat_img, pts_drone, pts_sat, start_t=start_t, timeout_ms=timeout_ms
+        )
+        if self._last_timeout_hit:
+            return self._timeout_result()
         result.rescue_used = False
         return result
     
