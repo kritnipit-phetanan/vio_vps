@@ -96,7 +96,32 @@ class VPSConfig:
     rescue_rate_max_attempts: int = 0
     max_image_side: int = 1024
     matcher_timeout_ms: float = 80.0
+    match_scale_aware_enable: bool = True
+    match_scale_aware_min_ratio: float = 0.25
+    match_scale_aware_max_ratio: float = 4.0
     mps_cache_clear_interval: int = 0
+    structure_gate_enable: bool = False
+    structure_gate_max_side: int = 256
+    structure_gate_canny_low: int = 50
+    structure_gate_canny_high: int = 150
+    structure_gate_hough_threshold: int = 50
+    structure_gate_min_line_length_px: int = 30
+    structure_gate_max_line_gap_px: int = 10
+    structure_gate_min_lines: int = 3
+    debug_match_dump_enable: bool = False
+    debug_match_dump_start_t: float = 1750.0
+    debug_match_dump_end_t: float = 1755.0
+    debug_match_dump_max_frames: int = 8
+    debug_match_dump_failures: bool = True
+    debug_match_dump_successes: bool = True
+    map_rotation_rectify_enable: bool = False
+    map_offset_e_m: float = 0.0
+    map_offset_n_m: float = 0.0
+    scale_aware_crop_enable: bool = False
+    scale_aware_crop_fov_deg: float = 90.0
+    scale_aware_crop_margin_mult: float = 1.5
+    scale_aware_crop_min_patch_px: int = 128
+    scale_aware_crop_max_patch_px: int = 512
     max_cached_tiles: int = 50
     image_forward_axis: str = "top"  # top|bottom (front direction in image)
     temporal_consensus_max_dir_change_deg: float = 50.0
@@ -177,6 +202,8 @@ class VPSConfig:
     reloc_local_first_min_candidates: int = 8
     reloc_local_first_min_time_ms: float = 220.0
     reloc_local_first_center_radius_m: float = 180.0
+    reloc_high_alt_enable_above_m: float = 30.0
+    reloc_high_alt_local_first_center_radius_m: float = 75.0
     q2_reloc_burst_enable: bool = False
     q2_reloc_burst_trigger_streak: int = 3
     q2_reloc_burst_offset_m: float = 25.0
@@ -205,6 +232,7 @@ class VPSConfig:
     reloc_coarse_center_limit: int = 3
     reloc_coarse_candidate_limit: int = 4
     reloc_fine_refine_radius_m: float = 120.0
+    reloc_high_alt_fine_refine_radius_m: float = 120.0
     reloc_fine_refine_max_centers: int = 6
     reloc_coarse_anchor_require_strict: bool = True
     reloc_coarse_anchor_min_inliers: int = 5
@@ -276,6 +304,8 @@ class VPSRunner:
         self._runtime_quiet = self._runtime_verbosity in ("release", "quiet", "minimal")
         self._runtime_log_interval_sec = max(0.0, float(self.config.runtime_log_interval_sec))
         self._last_runtime_log_ts: Dict[str, float] = {}
+        self._debug_match_dump_count = 0
+        self._debug_match_dumped_frames: set[int] = set()
         self.imgs = None
         self.imu = None
         self._trace_q_start_t = float("nan")
@@ -310,6 +340,9 @@ class VPSRunner:
             rescue_min_confidence=config.rescue_min_confidence,
             rescue_max_reproj_error=config.rescue_max_reproj_error,
             max_image_side=config.max_image_side,
+            scale_aware_match_enable=config.match_scale_aware_enable,
+            scale_aware_match_min_ratio=config.match_scale_aware_min_ratio,
+            scale_aware_match_max_ratio=config.match_scale_aware_max_ratio,
             match_timeout_ms=config.matcher_timeout_ms,
             mps_cache_clear_interval=config.mps_cache_clear_interval,
         )
@@ -366,6 +399,7 @@ class VPSRunner:
         
         # Save match visualizations directory
         self.save_matches_dir = save_matches_dir
+        self.debug_only_match_dump = False
         if save_matches_dir:
             import os
             os.makedirs(save_matches_dir, exist_ok=True)
@@ -415,6 +449,10 @@ class VPSRunner:
             'rescue_block_speed_count': 0,
             'rescue_block_interval_count': 0,
             'rescue_block_rate_count': 0,
+            'structure_gate_skips': 0,
+            'structure_gate_passes': 0,
+            'structure_gate_samples': 0,
+            'structure_gate_line_count_sum': 0.0,
         }
         
         print("[VPSRunner] Ready")
@@ -430,6 +468,35 @@ class VPSRunner:
         if (now - last) >= self._runtime_log_interval_sec:
             print(msg)
             self._last_runtime_log_ts[key] = now
+
+    def _should_dump_match_debug(self, *, t_cam: float, frame_idx: int, success_like: bool) -> bool:
+        """Return True when this frame should emit a visual matcher dump."""
+        if not self.save_matches_dir or frame_idx < 0:
+            return False
+        if frame_idx in self._debug_match_dumped_frames:
+            return False
+        if not bool(getattr(self.config, "debug_match_dump_enable", False)):
+            return False
+        max_frames = int(max(0, getattr(self.config, "debug_match_dump_max_frames", 0)))
+        if max_frames > 0 and int(self._debug_match_dump_count) >= max_frames:
+            return False
+        start_t = float(getattr(self.config, "debug_match_dump_start_t", float("-inf")))
+        end_t = float(getattr(self.config, "debug_match_dump_end_t", float("inf")))
+        if np.isfinite(start_t) and float(t_cam) < start_t:
+            return False
+        if np.isfinite(end_t) and float(t_cam) > end_t:
+            return False
+        if success_like and not bool(getattr(self.config, "debug_match_dump_successes", True)):
+            return False
+        if (not success_like) and not bool(getattr(self.config, "debug_match_dump_failures", True)):
+            return False
+        return True
+
+    def _mark_match_debug_dumped(self, frame_idx: int) -> None:
+        if frame_idx < 0:
+            return
+        self._debug_match_dumped_frames.add(int(frame_idx))
+        self._debug_match_dump_count = int(self._debug_match_dump_count) + 1
 
     def _activate_global_backoff(self, *, t_cam: float, backoff_sec: float, reason_tag: str) -> None:
         """Activate/extend global-search backoff window."""
@@ -447,6 +514,76 @@ class VPSRunner:
                 f"reason={reason_tag}, duration={backoff_sec:.1f}s, "
                 f"fail_streak={int(self._fail_streak)}, until={self._global_backoff_until_t:.2f}",
             )
+
+    def _apply_map_offset(self, lat: float, lon: float) -> tuple[float, float]:
+        """Apply configured EN offset to map search centers only."""
+        off_e = float(getattr(self.config, "map_offset_e_m", 0.0))
+        off_n = float(getattr(self.config, "map_offset_n_m", 0.0))
+        if (not np.isfinite(off_e)) or (not np.isfinite(off_n)) or (abs(off_e) < 1e-9 and abs(off_n) < 1e-9):
+            return float(lat), float(lon)
+        lat_f = float(lat)
+        lon_f = float(lon)
+        m_per_deg_lat = 111320.0
+        m_per_deg_lon = 111320.0 * max(1e-6, float(np.cos(np.radians(lat_f))))
+        return (
+            float(lat_f + off_n / m_per_deg_lat),
+            float(lon_f + off_e / m_per_deg_lon),
+        )
+
+    def _count_structural_lines(self, img: np.ndarray) -> int:
+        """Count long line segments in a downsampled camera frame."""
+        if img is None or getattr(img, "size", 0) == 0:
+            return 0
+        try:
+            import cv2
+        except Exception:
+            return 0
+
+        if img.ndim == 3:
+            try:
+                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            except Exception:
+                gray = img[..., 0]
+        else:
+            gray = img
+        if gray is None or getattr(gray, "size", 0) == 0:
+            return 0
+
+        h, w = gray.shape[:2]
+        max_side = max(32, int(getattr(self.config, "structure_gate_max_side", 256)))
+        scale = min(1.0, float(max_side) / float(max(1, max(h, w))))
+        if scale < 0.999:
+            new_w = max(16, int(round(float(w) * scale)))
+            new_h = max(16, int(round(float(h) * scale)))
+            gray = cv2.resize(gray, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+
+        canny_low = max(0, int(getattr(self.config, "structure_gate_canny_low", 50)))
+        canny_high = max(canny_low + 1, int(getattr(self.config, "structure_gate_canny_high", 150)))
+        hough_threshold = max(1, int(getattr(self.config, "structure_gate_hough_threshold", 50)))
+        min_line_length = max(4, int(getattr(self.config, "structure_gate_min_line_length_px", 30)))
+        max_line_gap = max(0, int(getattr(self.config, "structure_gate_max_line_gap_px", 10)))
+
+        try:
+            edges = cv2.Canny(gray, canny_low, canny_high)
+            lines = cv2.HoughLinesP(
+                edges,
+                1.0,
+                np.pi / 180.0,
+                threshold=hough_threshold,
+                minLineLength=min_line_length,
+                maxLineGap=max_line_gap,
+            )
+        except Exception:
+            return 0
+        return 0 if lines is None else int(len(lines))
+
+    def _passes_structure_gate(self, img: np.ndarray) -> tuple[bool, int]:
+        """Return whether the current frame has enough linear structure for VPS."""
+        if not bool(getattr(self.config, "structure_gate_enable", False)):
+            return True, -1
+        line_count = int(self._count_structural_lines(img))
+        min_lines = max(0, int(getattr(self.config, "structure_gate_min_lines", 3)))
+        return bool(line_count >= min_lines), line_count
 
     def _trace_q_bucket(self, t_now: float) -> int:
         """Deterministic run-progress bucket [1..4] for VPS-side telemetry and routing."""
@@ -786,6 +923,11 @@ class VPSRunner:
             else:
                 search_centers = [(float(est_lat), float(est_lon))]
 
+        search_centers = [
+            self._apply_map_offset(float(a), float(b))
+            for a, b in search_centers
+        ]
+
         return VPSRelocalizationPlan(
             global_mode=bool(global_mode),
             trigger_reason=str(trigger_reason),
@@ -1096,8 +1238,26 @@ class VPSRunner:
                 rescue_rate_window_sec=float(vps_cfg.get("rescue_rate_window_sec", 0.0)),
                 rescue_rate_max_attempts=int(vps_cfg.get("rescue_rate_max_attempts", 0)),
                 max_image_side=int(vps_cfg.get("max_image_side", 1024)),
+                match_scale_aware_enable=bool(vps_cfg.get("match_scale_aware_enable", True)),
+                match_scale_aware_min_ratio=float(vps_cfg.get("match_scale_aware_min_ratio", 0.25)),
+                match_scale_aware_max_ratio=float(vps_cfg.get("match_scale_aware_max_ratio", 4.0)),
                 matcher_timeout_ms=float(vps_cfg.get("matcher_timeout_ms", 80.0)),
                 mps_cache_clear_interval=int(vps_cfg.get("mps_cache_clear_interval", 8)),
+                structure_gate_enable=bool(vps_cfg.get("structure_gate_enable", False)),
+                structure_gate_max_side=int(vps_cfg.get("structure_gate_max_side", 256)),
+                structure_gate_canny_low=int(vps_cfg.get("structure_gate_canny_low", 50)),
+                structure_gate_canny_high=int(vps_cfg.get("structure_gate_canny_high", 150)),
+                structure_gate_hough_threshold=int(vps_cfg.get("structure_gate_hough_threshold", 50)),
+                structure_gate_min_line_length_px=int(vps_cfg.get("structure_gate_min_line_length_px", 30)),
+                structure_gate_max_line_gap_px=int(vps_cfg.get("structure_gate_max_line_gap_px", 10)),
+                structure_gate_min_lines=int(vps_cfg.get("structure_gate_min_lines", 3)),
+                debug_match_dump_enable=bool(vps_cfg.get("debug_match_dump_enable", False)),
+                debug_match_dump_start_t=float(vps_cfg.get("debug_match_dump_start_t", 1750.0)),
+                debug_match_dump_end_t=float(vps_cfg.get("debug_match_dump_end_t", 1755.0)),
+                debug_match_dump_max_frames=int(vps_cfg.get("debug_match_dump_max_frames", 8)),
+                debug_match_dump_failures=bool(vps_cfg.get("debug_match_dump_failures", True)),
+                debug_match_dump_successes=bool(vps_cfg.get("debug_match_dump_successes", True)),
+                map_rotation_rectify_enable=bool(vps_cfg.get("map_rotation_rectify_enable", False)),
                 image_forward_axis=str(vps_cfg.get("image_forward_axis", vps_cfg.get("camera_forward_axis", "top"))),
                 temporal_consensus_max_dir_change_deg=float(
                     vps_cfg.get("temporal_consensus_max_dir_change_deg", 50.0)
@@ -1233,6 +1393,12 @@ class VPSRunner:
                 reloc_local_first_center_radius_m=float(
                     reloc_cfg.get("local_first_center_radius_m", 180.0)
                 ),
+                reloc_high_alt_enable_above_m=float(
+                    reloc_cfg.get("high_alt_enable_above_m", 30.0)
+                ),
+                reloc_high_alt_local_first_center_radius_m=float(
+                    reloc_cfg.get("high_alt_local_first_center_radius_m", 75.0)
+                ),
                 q2_reloc_burst_enable=bool(
                     reloc_cfg.get("q2_reloc_burst_enable", False)
                 ),
@@ -1315,6 +1481,9 @@ class VPSRunner:
                 reloc_fine_refine_radius_m=float(
                     reloc_coarse_fine_cfg.get("fine_refine_radius_m", 120.0)
                 ),
+                reloc_high_alt_fine_refine_radius_m=float(
+                    reloc_coarse_fine_cfg.get("high_alt_fine_refine_radius_m", 120.0)
+                ),
                 reloc_fine_refine_max_centers=int(
                     reloc_coarse_fine_cfg.get("fine_refine_max_centers", 6)
                 ),
@@ -1339,6 +1508,13 @@ class VPSRunner:
                         logging_cfg.get("runtime_log_interval_sec", runtime_log_interval_default),
                     )
                 ),
+                map_offset_e_m=float(vps_cfg.get("map_offset_e_m", 0.0)),
+                map_offset_n_m=float(vps_cfg.get("map_offset_n_m", 0.0)),
+                scale_aware_crop_enable=bool(vps_cfg.get("scale_aware_crop_enable", False)),
+                scale_aware_crop_fov_deg=float(vps_cfg.get("scale_aware_crop_fov_deg", 90.0)),
+                scale_aware_crop_margin_mult=float(vps_cfg.get("scale_aware_crop_margin_mult", 1.5)),
+                scale_aware_crop_min_patch_px=int(vps_cfg.get("scale_aware_crop_min_patch_px", 128)),
+                scale_aware_crop_max_patch_px=int(vps_cfg.get("scale_aware_crop_max_patch_px", 512)),
             )
             print(
                 f"[VPSRunner] VPS cfg: patch={vps_config.patch_size_px}/{vps_config.patch_size_failover_px}, "
@@ -1348,6 +1524,10 @@ class VPSRunner:
                 f"max_keypoints={vps_config.max_keypoints}, "
                 f"max_image_side={vps_config.max_image_side}, "
                 f"matcher_timeout_ms={vps_config.matcher_timeout_ms:.0f}, "
+                f"debug_dump={int(bool(vps_config.debug_match_dump_enable))}, "
+                f"map_rectify={int(bool(vps_config.map_rotation_rectify_enable))}, "
+                f"map_offset_EN=({vps_config.map_offset_e_m:.1f},{vps_config.map_offset_n_m:.1f})m, "
+                f"scale_crop={int(bool(vps_config.scale_aware_crop_enable))}, "
                 f"max_total_candidates={vps_config.max_total_candidates}, "
                 f"budget_ms(local/global)={vps_config.max_frame_time_ms_local:.0f}/{vps_config.max_frame_time_ms_global:.0f}, "
                 f"gbackoff_fail={vps_config.reloc_global_backoff_fail_streak},"
@@ -1367,13 +1547,29 @@ class VPSRunner:
             camera_yaw_offset_rad=camera_yaw_offset_rad
         )
 
-    def _select_patch_size(self) -> int:
-        """Adaptive map patch size based on consecutive VPS failures."""
-        base = max(256, int(self.config.patch_size_px))
+    def _select_patch_size(self, *, est_alt: float = float("nan"), lat: float = float("nan")) -> int:
+        """Adaptive map patch size based on failures and optionally AGL-derived footprint."""
+        base = max(128, int(self.config.patch_size_px))
         failover = max(base, int(self.config.patch_size_failover_px))
-        if self._fail_streak >= int(self.config.failover_fail_streak):
-            return failover
-        return base
+        patch_px = failover if self._fail_streak >= int(self.config.failover_fail_streak) else base
+        if not bool(getattr(self.config, "scale_aware_crop_enable", False)):
+            return int(patch_px)
+        alt_m = float(est_alt)
+        lat_f = float(lat)
+        if (not np.isfinite(alt_m)) or alt_m <= 0.0 or (not np.isfinite(lat_f)):
+            return int(patch_px)
+        fov_deg = float(getattr(self.config, "scale_aware_crop_fov_deg", 90.0))
+        margin_mult = float(max(1.0, getattr(self.config, "scale_aware_crop_margin_mult", 1.5)))
+        gsd = float(self.tile_cache.get_gsd(lat_f))
+        if (not np.isfinite(gsd)) or gsd <= 0.0:
+            return int(patch_px)
+        footprint_m = float(alt_m * 2.0 * np.tan(np.radians(max(1e-3, fov_deg)) * 0.5))
+        desired_width_m = float(max(footprint_m * margin_mult, gsd * 16.0))
+        desired_px = int(np.ceil(desired_width_m / gsd))
+        min_px = int(max(64, getattr(self.config, "scale_aware_crop_min_patch_px", 128)))
+        max_px = int(max(min_px, getattr(self.config, "scale_aware_crop_max_patch_px", failover)))
+        desired_px = int(np.clip(desired_px, min_px, max_px))
+        return int(desired_px)
 
     def _build_preprocess_candidates(
         self,
@@ -1720,7 +1916,7 @@ class VPSRunner:
         t_tile_start = t_start
         t_pose_start = t_start
         tile_ms = preprocess_ms = match_ms = pose_ms = 0.0
-        patch_size_px = int(self._select_patch_size())
+        patch_size_px = int(self._select_patch_size(est_alt=float(est_alt), lat=float(est_lat)))
 
         num_candidates = 0
         selected_candidate_idx = -1
@@ -1760,6 +1956,8 @@ class VPSRunner:
         coverage_found = False
         burst_active = bool(self._q2_burst_active(q_bucket=q_bucket, attempt_idx=attempt_idx, t_cam=float(t_cam)))
         hypothesis_candidates: list[dict[str, Any]] = []
+        debug_dump_best_score = float("-inf")
+        debug_dump_payload: Optional[Dict[str, Any]] = None
         state_speed_val = float(state_speed_m_s) if state_speed_m_s is not None else float("nan")
         if not np.isfinite(state_speed_val):
             state_speed_val = float("nan")
@@ -1984,11 +2182,16 @@ class VPSRunner:
         def _save_match_visualization(tag: str,
                                       preprocess_result: Optional[PreprocessResult] = None,
                                       map_patch: Optional[MapPatch] = None,
-                                      match_result: Optional[MatchResult] = None):
+                                      match_result: Optional[MatchResult] = None,
+                                      drone_img: Optional[np.ndarray] = None,
+                                      sat_img: Optional[np.ndarray] = None,
+                                      title_lines: Optional[List[str]] = None):
             """Persist VPS matching visualization for both success and failure cases."""
             if not self.save_matches_dir or frame_idx < 0:
                 return
-            if preprocess_result is None or map_patch is None or match_result is None:
+            if bool(getattr(self, "debug_only_match_dump", False)) and not str(tag).startswith("debug_"):
+                return
+            if match_result is None:
                 return
             try:
                 import os
@@ -1997,14 +2200,37 @@ class VPSRunner:
                     self.save_matches_dir,
                     f"vps_{safe_tag}_{frame_idx:06d}_{t_cam:.2f}s.jpg",
                 )
+                drone_vis = drone_img if drone_img is not None else getattr(preprocess_result, "image", None)
+                sat_vis = sat_img if sat_img is not None else getattr(map_patch, "image", None)
+                if drone_vis is None or sat_vis is None:
+                    return
                 self.matcher.visualize_matches(
-                    drone_img=preprocess_result.image,
-                    sat_img=map_patch.image,
+                    drone_img=drone_vis,
+                    sat_img=sat_vis,
                     result=match_result,
                     output_path=output_path,
+                    title_lines=title_lines,
                 )
             except Exception as e:
                 print(f"[VPS] Failed to save match visualization ({tag}): {e}")
+
+        def _save_debug_dump_if_ready(success_like: bool):
+            if debug_dump_payload is None:
+                return
+            if not self._should_dump_match_debug(
+                t_cam=float(t_cam),
+                frame_idx=int(frame_idx),
+                success_like=bool(success_like),
+            ):
+                return
+            _save_match_visualization(
+                f"debug_{debug_dump_payload.get('tag', 'match')}",
+                match_result=debug_dump_payload.get("match_result"),
+                drone_img=debug_dump_payload.get("drone_img"),
+                sat_img=debug_dump_payload.get("sat_img"),
+                title_lines=debug_dump_payload.get("title_lines"),
+            )
+            self._mark_match_debug_dumped(int(frame_idx))
 
         def _log_reloc(success: bool, reason: str):
             self._log_reloc_summary(
@@ -2060,14 +2286,31 @@ class VPSRunner:
             return None
         
         # 2. Check altitude limits (AGL fail-soft + hysteresis).
+        debug_force_match_dump_window = self._should_dump_match_debug(
+            t_cam=float(t_cam),
+            frame_idx=int(frame_idx),
+            success_like=False,
+        )
         est_alt_f = float(est_alt)
         hard_disable_below_m = float(getattr(self.config, "hard_disable_below_m", 10.0))
         if np.isfinite(est_alt_f) and est_alt_f < float(hard_disable_below_m):
             self._altitude_gate_open = False
             self.stats["altitude_hard_disable"] = int(self.stats.get("altitude_hard_disable", 0)) + 1
-            _log_reloc(False, "altitude_hard_disable")
-            _record_runtime_stats_once()
-            return None
+            if bool(debug_force_match_dump_window):
+                self.stats["altitude_hard_disable_debug_bypass"] = int(
+                    self.stats.get("altitude_hard_disable_debug_bypass", 0)
+                ) + 1
+                self._runtime_log(
+                    "vps_altitude_debug_bypass",
+                    (
+                        f"[VPS][DEBUG] altitude hard-disable bypass for match dump: "
+                        f"t={float(t_cam):.2f}s alt={est_alt_f:.2f}m < {hard_disable_below_m:.2f}m"
+                    ),
+                )
+            else:
+                _log_reloc(False, "altitude_hard_disable")
+                _record_runtime_stats_once()
+                return None
         if not altitude_ok:
             pos_first_bypass = bool(
                 bool(self.config.position_first_altitude_bypass_enable)
@@ -2093,6 +2336,18 @@ class VPSRunner:
                         f"gate=[{float(agl_gate_min_thresh):.1f},{float(agl_gate_max_thresh):.1f}]"
                     ),
                 )
+            elif bool(debug_force_match_dump_window):
+                altitude_ok = True
+                self.stats["altitude_debug_dump_bypass"] = int(
+                    self.stats.get("altitude_debug_dump_bypass", 0)
+                ) + 1
+                self._runtime_log(
+                    "vps_altitude_debug_dump_bypass",
+                    (
+                        f"[VPS][DEBUG] altitude gate bypass for match dump: alt={est_alt_f:.1f}m, "
+                        f"gate=[{float(agl_gate_min_thresh):.1f},{float(agl_gate_max_thresh):.1f}]"
+                    ),
+                )
             else:
                 _log_reloc(False, "altitude_out_of_range")
                 _record_runtime_stats_once()
@@ -2107,6 +2362,28 @@ class VPSRunner:
             _log_attempt_and_profile(False, "empty_input_image")
             _log_reloc(False, "empty_input_image")
             return None
+
+        structure_ok, structure_line_count = self._passes_structure_gate(img)
+        if int(structure_line_count) >= 0:
+            self.stats["structure_gate_samples"] = int(self.stats.get("structure_gate_samples", 0)) + 1
+            self.stats["structure_gate_line_count_sum"] = float(
+                self.stats.get("structure_gate_line_count_sum", 0.0)
+            ) + float(structure_line_count)
+        if not bool(structure_ok):
+            self.stats["structure_gate_skips"] = int(self.stats.get("structure_gate_skips", 0)) + 1
+            self._runtime_log(
+                "vps_structure_gate_skip",
+                (
+                    f"[VPS] structural gate skip: t={float(t_cam):.2f}s "
+                    f"alt={float(est_alt_f):.1f}m "
+                    f"lines={int(structure_line_count)} < {int(getattr(self.config, 'structure_gate_min_lines', 3))}"
+                ),
+            )
+            _log_attempt_and_profile(False, f"skip_no_structure:{int(structure_line_count)}")
+            _log_reloc(False, "skip_no_structure")
+            return None
+        if int(structure_line_count) >= 0:
+            self.stats["structure_gate_passes"] = int(self.stats.get("structure_gate_passes", 0)) + 1
 
         # 3/4/5/6. Search centers + preprocess hypotheses + matching
         camera_yaw_base = est_yaw + self.camera_yaw_offset_rad
@@ -2127,6 +2404,14 @@ class VPSRunner:
         coarse_anchor_lat = float("nan")
         coarse_anchor_lon = float("nan")
         fine_refine_radius_m = max(0.0, float(self.config.reloc_fine_refine_radius_m))
+        if (
+            np.isfinite(float(est_alt))
+            and float(est_alt) >= float(self.config.reloc_high_alt_enable_above_m)
+        ):
+            fine_refine_radius_m = max(
+                float(fine_refine_radius_m),
+                float(self.config.reloc_high_alt_fine_refine_radius_m),
+            )
         fine_refine_max_centers = max(1, int(self.config.reloc_fine_refine_max_centers))
         fine_refine_seen_centers = set()
         fine_refine_skips = 0
@@ -2153,6 +2438,11 @@ class VPSRunner:
                 float(est_lon),
             )
             radius_m = float(max(5.0, self.config.reloc_local_first_center_radius_m))
+            if (
+                np.isfinite(float(est_alt))
+                and float(est_alt) >= float(self.config.reloc_high_alt_enable_above_m)
+            ):
+                radius_m = float(max(radius_m, float(self.config.reloc_high_alt_local_first_center_radius_m)))
             local_centers = []
             global_centers = []
             for c_lat, c_lon in search_centers:
@@ -2313,6 +2603,7 @@ class VPSRunner:
                     else:
                         global_eval_count = int(global_eval_count) + 1
                 yaw_used_rad = float(camera_yaw_base + np.deg2rad(float(yaw_delta_deg)))
+                rotate_drone_to_north = not bool(getattr(self.config, "map_rotation_rectify_enable", False))
 
                 t_preprocess_start = time.time()
                 try:
@@ -2323,6 +2614,7 @@ class VPSRunner:
                         target_gsd=map_patch.meters_per_pixel,
                         grayscale=True,
                         target_gsd_scale=float(scale_mult),
+                        rotate_to_north_up=bool(rotate_drone_to_north),
                     )
                 except Exception:
                     preprocess_ms += (time.time() - t_preprocess_start) * 1000.0
@@ -2376,6 +2668,21 @@ class VPSRunner:
                             match_success=False, decision="low_content",
                         )
                     continue
+
+                map_rotation_deg = 0.0
+                sat_match_img = sat_img
+                fov_deg = float(getattr(self.config, "scale_aware_crop_fov_deg", 90.0))
+                camera_footprint_width_m = float(
+                    max(1e-3, float(est_alt)) * 2.0 * np.tan(np.radians(max(1e-3, fov_deg)) * 0.5)
+                ) if np.isfinite(float(est_alt)) else float("nan")
+                gsd_match_ratio = (
+                    float(map_patch.width_m) / float(camera_footprint_width_m)
+                    if np.isfinite(float(camera_footprint_width_m)) and float(camera_footprint_width_m) > 0.0
+                    else float("nan")
+                )
+                if bool(getattr(self.config, "map_rotation_rectify_enable", False)):
+                    map_rotation_deg = float(_wrap_angle_deg(np.degrees(yaw_used_rad)))
+                    sat_match_img = self.matcher.rotate_reference_image(sat_img, map_rotation_deg)
 
                 t_match_start = time.time()
                 rescue_allowed = True
@@ -2446,7 +2753,9 @@ class VPSRunner:
                         break
                     match_result = self.matcher.match_with_homography(
                         drone_img=preprocess_result.image,
-                        sat_img=sat_img,
+                        sat_img=sat_match_img,
+                        camera_footprint_width_m=camera_footprint_width_m,
+                        map_crop_width_m=float(map_patch.width_m),
                         rescue_allowed=bool(rescue_allowed),
                         timeout_ms=(match_timeout_ms if match_timeout_ms > 0.0 else None),
                     )
@@ -2501,6 +2810,26 @@ class VPSRunner:
                     match_result.success = True
 
                 decision = "matched_strict" if strict_ok else ("matched_failsoft" if failsoft_ok else "match_failed")
+                if self._should_dump_match_debug(
+                    t_cam=float(t_cam),
+                    frame_idx=int(frame_idx),
+                    success_like=bool(strict_ok or failsoft_ok),
+                ) and score > debug_dump_best_score:
+                    debug_dump_best_score = float(score)
+                    debug_dump_payload = {
+                        "tag": decision,
+                        "drone_img": np.array(preprocess_result.image, copy=True),
+                        "sat_img": np.array(sat_match_img, copy=True),
+                        "match_result": match_result,
+                        "title_lines": [
+                            f"t={float(t_cam):.3f}s frame={int(frame_idx)} cand={int(candidate_idx)+1}/{max(1, int(num_candidates))}",
+                            f"yaw_used={float(np.degrees(yaw_used_rad)):.1f}deg drone_rot={float(preprocess_result.rotation_deg):.1f}deg map_rot={float(map_rotation_deg):.1f}deg",
+                            f"score={float(score):.2f} conf={float(conf):.3f} mode={'local' if bool(center_is_local) else 'global'} scale={float(scale_mult):.3f}",
+                            f"center=({float(map_patch.center_lat):.6f}, {float(map_patch.center_lon):.6f}) mpp={float(map_patch.meters_per_pixel):.3f} patch={int(patch_size_px)}px/{float(map_patch.width_m):.1f}m",
+                            f"footprint={float(camera_footprint_width_m):.1f}m mapw={float(map_patch.width_m):.1f}m gsd_ratio={float(gsd_match_ratio):.2f}",
+                            f"decision={decision}",
+                        ],
+                    }
                 if self.logger:
                     self.logger.log_candidate(
                         t=t_cam,
@@ -2676,6 +3005,7 @@ class VPSRunner:
                     f"conf={float(best_conf):.3f}, reproj={float(best_reproj):.2f}px, "
                     f"fail_streak={int(self._fail_streak)}",
                 )
+                _save_debug_dump_if_ready(False)
                 _log_attempt_and_profile(False, f"{fail_reason}_partial_progress")
                 _log_reloc(False, f"{fail_reason}_partial_progress")
                 return None
@@ -2715,6 +3045,7 @@ class VPSRunner:
                     else:
                         self._fail_streak += 1
             _maybe_backoff_after_failure(fail_reason)
+            _save_debug_dump_if_ready(False)
             _log_attempt_and_profile(False, fail_reason)
             _log_reloc(False, fail_reason)
             return None
@@ -2731,6 +3062,7 @@ class VPSRunner:
             self._fail_streak += 1
             _maybe_backoff_after_failure("match_failed")
             _save_match_visualization("match_failed", preprocess_result, map_patch, match_result)
+            _save_debug_dump_if_ready(False)
             _log_attempt_and_profile(False, "match_failed")
             _log_reloc(False, "match_failed")
             return None
@@ -2745,6 +3077,7 @@ class VPSRunner:
             self._fail_streak += 1
             _maybe_backoff_after_failure("quality_inliers")
             _save_match_visualization("quality_inliers", preprocess_result, map_patch, match_result)
+            _save_debug_dump_if_ready(False)
             _log_attempt_and_profile(False, "quality_inliers")
             _log_reloc(False, "quality_inliers")
             return None
@@ -2758,6 +3091,7 @@ class VPSRunner:
             self._fail_streak += 1
             _maybe_backoff_after_failure("quality_reproj")
             _save_match_visualization("quality_reproj", preprocess_result, map_patch, match_result)
+            _save_debug_dump_if_ready(False)
             _log_attempt_and_profile(False, "quality_reproj")
             _log_reloc(False, "quality_reproj")
             return None
@@ -2771,6 +3105,7 @@ class VPSRunner:
             self._fail_streak += 1
             _maybe_backoff_after_failure("quality_confidence")
             _save_match_visualization("quality_confidence", preprocess_result, map_patch, match_result)
+            _save_debug_dump_if_ready(False)
             _log_attempt_and_profile(False, "quality_confidence")
             _log_reloc(False, "quality_confidence")
             return None
@@ -2793,6 +3128,7 @@ class VPSRunner:
             self._budget_escalator_note_nonbudget_failure()
             self._fail_streak += 1
             _maybe_backoff_after_failure("pose_estimation_exception")
+            _save_debug_dump_if_ready(False)
             _log_attempt_and_profile(False, "pose_estimation_exception")
             _log_reloc(False, "pose_estimation_exception")
             return None
@@ -2807,6 +3143,7 @@ class VPSRunner:
             self._fail_streak += 1
             _maybe_backoff_after_failure("pose_estimation_failed")
             _save_match_visualization("pose_failed", preprocess_result, map_patch, match_result)
+            _save_debug_dump_if_ready(False)
             _log_attempt_and_profile(False, "pose_estimation_failed")
             _log_reloc(False, "pose_estimation_failed")
             return None
@@ -2877,6 +3214,7 @@ class VPSRunner:
                     self.stats["hypothesis_discard_count"] = int(
                         self.stats.get("hypothesis_discard_count", 0)
                     ) + 1
+                _save_debug_dump_if_ready(False)
                 _log_attempt_and_profile(False, "hypothesis_delay_wait")
                 _log_reloc(False, "hypothesis_delay_wait")
                 return None
@@ -3193,6 +3531,7 @@ class VPSRunner:
             _save_match_visualization("matched_failsoft", preprocess_result, map_patch, match_result)
         else:
             _save_match_visualization("matched", preprocess_result, map_patch, match_result)
+        _save_debug_dump_if_ready(True)
         _log_reloc(True, success_reason)
         
         return vps_measurement

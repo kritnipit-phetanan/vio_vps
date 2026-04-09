@@ -99,6 +99,9 @@ class SatelliteMatcher:
                  rescue_min_confidence: float = 0.12,
                  rescue_max_reproj_error: float = 2.5,
                  max_image_side: int = 1024,
+                 scale_aware_match_enable: bool = False,
+                 scale_aware_match_min_ratio: float = 0.25,
+                 scale_aware_match_max_ratio: float = 4.0,
                  match_timeout_ms: float = 0.0,
                  mps_cache_clear_interval: int = 0):
         """
@@ -123,6 +126,11 @@ class SatelliteMatcher:
         self.rescue_min_confidence = float(np.clip(rescue_min_confidence, 0.0, 1.0))
         self.rescue_max_reproj_error = max(0.1, float(rescue_max_reproj_error))
         self.max_image_side = int(max(128, max_image_side))
+        self.scale_aware_match_enable = bool(scale_aware_match_enable)
+        self.scale_aware_match_min_ratio = float(max(1e-3, scale_aware_match_min_ratio))
+        self.scale_aware_match_max_ratio = float(
+            max(self.scale_aware_match_min_ratio, scale_aware_match_max_ratio)
+        )
         self.match_timeout_ms = float(max(0.0, match_timeout_ms))
         self.mps_cache_clear_interval = int(max(0, mps_cache_clear_interval))
         self._match_counter = 0
@@ -139,6 +147,7 @@ class SatelliteMatcher:
             "rescue_lightglue_fail": 0,
             "rescue_blocked": 0,
             "image_resized_count": 0,
+            "scale_aware_match_count": 0,
             "cache_clear_count": 0,
         }
 
@@ -325,6 +334,81 @@ class SatelliteMatcher:
         self.stats["image_resized_count"] = int(self.stats.get("image_resized_count", 0)) + 1
         return resized, (new_w / float(w)), (new_h / float(h))
 
+    def _nonzero_content_span_px(self, img: np.ndarray) -> float:
+        """Approximate content width in pixels, ignoring black padding bands."""
+        if img is None or getattr(img, "size", 0) == 0:
+            return float("nan")
+        gray = img if len(img.shape) == 2 else cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        ys, xs = np.nonzero(gray > 8)
+        if xs.size <= 1:
+            return float(gray.shape[1])
+        return float(max(1.0, float(xs.max() - xs.min() + 1)))
+
+    def _scale_reference_to_world_ratio(
+        self,
+        drone_img: np.ndarray,
+        sat_img: np.ndarray,
+        camera_footprint_width_m: Optional[float],
+        map_crop_width_m: Optional[float],
+    ) -> Tuple[np.ndarray, float, float]:
+        """
+        Resize reference/map image so its pixel scale matches the drone footprint.
+
+        Returns:
+            scaled_sat_img, sx, sy where sx/sy are scaled/original factors.
+        """
+        if not bool(self.scale_aware_match_enable):
+            return sat_img, 1.0, 1.0
+        if sat_img is None or getattr(sat_img, "size", 0) == 0:
+            return sat_img, 1.0, 1.0
+        try:
+            footprint_m = float(camera_footprint_width_m)
+            map_width_m = float(map_crop_width_m)
+        except Exception:
+            return sat_img, 1.0, 1.0
+        if (not np.isfinite(footprint_m)) or (not np.isfinite(map_width_m)) or footprint_m <= 0.0 or map_width_m <= 0.0:
+            return sat_img, 1.0, 1.0
+
+        drone_span_px = self._nonzero_content_span_px(drone_img)
+        if (not np.isfinite(drone_span_px)) or drone_span_px <= 1.0:
+            return sat_img, 1.0, 1.0
+
+        scale_ratio = float(map_width_m / footprint_m)
+        if not np.isfinite(scale_ratio) or scale_ratio <= 0.0:
+            return sat_img, 1.0, 1.0
+        scale_ratio = float(np.clip(scale_ratio, self.scale_aware_match_min_ratio, self.scale_aware_match_max_ratio))
+
+        h, w = sat_img.shape[:2]
+        target_w = int(round(float(drone_span_px) * scale_ratio))
+        if target_w <= 1:
+            return sat_img, 1.0, 1.0
+        target_w = int(np.clip(target_w, 64, 4096))
+        target_h = int(np.clip(round(float(h) * (float(target_w) / max(1.0, float(w)))), 64, 4096))
+        if target_w == int(w) and target_h == int(h):
+            return sat_img, 1.0, 1.0
+
+        resized = cv2.resize(sat_img, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+        self.stats["scale_aware_match_count"] = int(self.stats.get("scale_aware_match_count", 0)) + 1
+        return resized, (target_w / float(w)), (target_h / float(h))
+
+    def rotate_reference_image(self, img: np.ndarray, rotation_deg: float) -> np.ndarray:
+        """Rotate a reference/map patch around its center for heading alignment experiments."""
+        if img is None or getattr(img, "size", 0) == 0:
+            return img
+        angle = float(rotation_deg)
+        if (not np.isfinite(angle)) or abs(angle) < 1e-3:
+            return img
+        h, w = img.shape[:2]
+        center = (w * 0.5, h * 0.5)
+        M = cv2.getRotationMatrix2D(center, angle, 1.0)
+        return cv2.warpAffine(
+            img,
+            M,
+            (w, h),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_REFLECT_101,
+        )
+
     def _maybe_clear_device_cache(self):
         """Periodically clear device cache on MPS/CUDA to reduce memory spikes."""
         self._match_counter += 1
@@ -353,6 +437,8 @@ class SatelliteMatcher:
     def match_lightglue(self, 
                         drone_img: np.ndarray, 
                         sat_img: np.ndarray,
+                        camera_footprint_width_m: Optional[float] = None,
+                        map_crop_width_m: Optional[float] = None,
                         start_t: Optional[float] = None,
                         timeout_ms: Optional[float] = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
@@ -366,8 +452,14 @@ class SatelliteMatcher:
         if self._timed_out(start_t, timeout_ms):
             return np.array([]), np.array([]), np.array([])
 
+        sat_img_phys, spx1, spy1 = self._scale_reference_to_world_ratio(
+            drone_img,
+            sat_img,
+            camera_footprint_width_m,
+            map_crop_width_m,
+        )
         drone_img_in, sx0, sy0 = self._resize_for_match(drone_img)
-        sat_img_in, sx1, sy1 = self._resize_for_match(sat_img)
+        sat_img_in, sx1, sy1 = self._resize_for_match(sat_img_phys)
         if self._timed_out(start_t, timeout_ms):
             return np.array([]), np.array([]), np.array([])
 
@@ -415,9 +507,11 @@ class SatelliteMatcher:
         if sx0 > 0.0 and sy0 > 0.0:
             mkpts0[:, 0] /= float(sx0)
             mkpts0[:, 1] /= float(sy0)
-        if sx1 > 0.0 and sy1 > 0.0:
-            mkpts1[:, 0] /= float(sx1)
-            mkpts1[:, 1] /= float(sy1)
+        sat_total_sx = float(sx1) * float(spx1)
+        sat_total_sy = float(sy1) * float(spy1)
+        if sat_total_sx > 0.0 and sat_total_sy > 0.0:
+            mkpts1[:, 0] /= sat_total_sx
+            mkpts1[:, 1] /= sat_total_sy
         
         # Get confidence scores if available
         if 'scores' in matches_dict:
@@ -445,6 +539,8 @@ class SatelliteMatcher:
     def match_orb(self, 
                   drone_img: np.ndarray, 
                   sat_img: np.ndarray,
+                  camera_footprint_width_m: Optional[float] = None,
+                  map_crop_width_m: Optional[float] = None,
                   start_t: Optional[float] = None,
                   timeout_ms: Optional[float] = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
@@ -458,8 +554,14 @@ class SatelliteMatcher:
         if self._timed_out(start_t, timeout_ms):
             return np.array([]), np.array([]), np.array([])
 
+        sat_img_phys, spx1, spy1 = self._scale_reference_to_world_ratio(
+            drone_img,
+            sat_img,
+            camera_footprint_width_m,
+            map_crop_width_m,
+        )
         drone_img_in, sx0, sy0 = self._resize_for_match(drone_img)
-        sat_img_in, sx1, sy1 = self._resize_for_match(sat_img)
+        sat_img_in, sx1, sy1 = self._resize_for_match(sat_img_phys)
         if self._timed_out(start_t, timeout_ms):
             return np.array([]), np.array([]), np.array([])
         kp0, desc0 = self.extract_features_orb(drone_img_in)
@@ -523,9 +625,11 @@ class SatelliteMatcher:
         if sx0 > 0.0 and sy0 > 0.0:
             pts0[:, 0] /= float(sx0)
             pts0[:, 1] /= float(sy0)
-        if sx1 > 0.0 and sy1 > 0.0:
-            pts1[:, 0] /= float(sx1)
-            pts1[:, 1] /= float(sy1)
+        sat_total_sx = float(sx1) * float(spx1)
+        sat_total_sy = float(sy1) * float(spy1)
+        if sat_total_sx > 0.0 and sat_total_sy > 0.0:
+            pts1[:, 0] /= sat_total_sx
+            pts1[:, 1] /= sat_total_sy
         scores = np.array([1.0 - m.distance / 256.0 for m in good_matches])
         self._maybe_clear_device_cache()
         
@@ -534,6 +638,8 @@ class SatelliteMatcher:
     def match(self, 
               drone_img: np.ndarray, 
               sat_img: np.ndarray,
+              camera_footprint_width_m: Optional[float] = None,
+              map_crop_width_m: Optional[float] = None,
               start_t: Optional[float] = None,
               timeout_ms: Optional[float] = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
@@ -548,18 +654,48 @@ class SatelliteMatcher:
         """
         mode = str(self.match_mode).lower()
         if mode == "orb":
-            return self.match_orb(drone_img, sat_img, start_t=start_t, timeout_ms=timeout_ms)
+            return self.match_orb(
+                drone_img, sat_img,
+                camera_footprint_width_m=camera_footprint_width_m,
+                map_crop_width_m=map_crop_width_m,
+                start_t=start_t, timeout_ms=timeout_ms,
+            )
         if mode == "lightglue":
             if self._lightglue_ready:
-                return self.match_lightglue(drone_img, sat_img, start_t=start_t, timeout_ms=timeout_ms)
-            return self.match_orb(drone_img, sat_img, start_t=start_t, timeout_ms=timeout_ms)
+                return self.match_lightglue(
+                    drone_img, sat_img,
+                    camera_footprint_width_m=camera_footprint_width_m,
+                    map_crop_width_m=map_crop_width_m,
+                    start_t=start_t, timeout_ms=timeout_ms,
+                )
+            return self.match_orb(
+                drone_img, sat_img,
+                camera_footprint_width_m=camera_footprint_width_m,
+                map_crop_width_m=map_crop_width_m,
+                start_t=start_t, timeout_ms=timeout_ms,
+            )
         if mode == "orb_lightglue_rescue":
             # Primary path for hybrid mode is ORB; rescue handled in match_with_homography().
-            return self.match_orb(drone_img, sat_img, start_t=start_t, timeout_ms=timeout_ms)
+            return self.match_orb(
+                drone_img, sat_img,
+                camera_footprint_width_m=camera_footprint_width_m,
+                map_crop_width_m=map_crop_width_m,
+                start_t=start_t, timeout_ms=timeout_ms,
+            )
         # auto
         if self._lightglue_ready:
-            return self.match_lightglue(drone_img, sat_img, start_t=start_t, timeout_ms=timeout_ms)
-        return self.match_orb(drone_img, sat_img, start_t=start_t, timeout_ms=timeout_ms)
+            return self.match_lightglue(
+                drone_img, sat_img,
+                camera_footprint_width_m=camera_footprint_width_m,
+                map_crop_width_m=map_crop_width_m,
+                start_t=start_t, timeout_ms=timeout_ms,
+            )
+        return self.match_orb(
+            drone_img, sat_img,
+            camera_footprint_width_m=camera_footprint_width_m,
+            map_crop_width_m=map_crop_width_m,
+            start_t=start_t, timeout_ms=timeout_ms,
+        )
 
     def _result_score(self, result: MatchResult) -> float:
         """Monotonic quality score used to compare ORB vs LightGlue candidates."""
@@ -843,6 +979,8 @@ class SatelliteMatcher:
     def match_with_homography(self, 
                               drone_img: np.ndarray, 
                               sat_img: np.ndarray,
+                              camera_footprint_width_m: Optional[float] = None,
+                              map_crop_width_m: Optional[float] = None,
                               rescue_allowed: bool = True,
                               timeout_ms: Optional[float] = None) -> MatchResult:
         """
@@ -861,7 +999,10 @@ class SatelliteMatcher:
         # Hybrid mode: ORB primary, LightGlue rescue on weak ORB outcome.
         if str(self.match_mode).lower() == "orb_lightglue_rescue":
             pts_orb_drone, pts_orb_sat, _ = self.match_orb(
-                drone_img, sat_img, start_t=start_t, timeout_ms=timeout_ms
+                drone_img, sat_img,
+                camera_footprint_width_m=camera_footprint_width_m,
+                map_crop_width_m=map_crop_width_m,
+                start_t=start_t, timeout_ms=timeout_ms
             )
             if self._last_timeout_hit:
                 return self._timeout_result()
@@ -880,7 +1021,10 @@ class SatelliteMatcher:
             if self._lightglue_ready and need_rescue:
                 self.stats["rescue_attempts"] = int(self.stats.get("rescue_attempts", 0)) + 1
                 pts_lg_drone, pts_lg_sat, _ = self.match_lightglue(
-                    drone_img, sat_img, start_t=start_t, timeout_ms=timeout_ms
+                    drone_img, sat_img,
+                    camera_footprint_width_m=camera_footprint_width_m,
+                    map_crop_width_m=map_crop_width_m,
+                    start_t=start_t, timeout_ms=timeout_ms
                 )
                 if self._last_timeout_hit:
                     return self._timeout_result()
@@ -899,7 +1043,12 @@ class SatelliteMatcher:
             return orb_result
 
         # Standard single-backend mode.
-        pts_drone, pts_sat, _ = self.match(drone_img, sat_img, start_t=start_t, timeout_ms=timeout_ms)
+        pts_drone, pts_sat, _ = self.match(
+            drone_img, sat_img,
+            camera_footprint_width_m=camera_footprint_width_m,
+            map_crop_width_m=map_crop_width_m,
+            start_t=start_t, timeout_ms=timeout_ms,
+        )
         if self._last_timeout_hit:
             return self._timeout_result()
         result = self._build_result_from_points(
@@ -914,7 +1063,8 @@ class SatelliteMatcher:
                           drone_img: np.ndarray, 
                           sat_img: np.ndarray,
                           result: MatchResult,
-                          output_path: Optional[str] = None) -> np.ndarray:
+                          output_path: Optional[str] = None,
+                          title_lines: Optional[List[str]] = None) -> np.ndarray:
         """
         Visualize matches between drone and satellite images.
         
@@ -941,6 +1091,10 @@ class SatelliteMatcher:
         vis[:h1, :w1] = drone_img
         vis[:h2, w1:w1+w2] = sat_img
         
+        # Draw centers to make scale/orientation mismatch easier to inspect.
+        cv2.drawMarker(vis, (w1 // 2, h1 // 2), (255, 255, 0), markerType=cv2.MARKER_CROSS, markerSize=18, thickness=2)
+        cv2.drawMarker(vis, (w1 + (w2 // 2), h2 // 2), (255, 255, 0), markerType=cv2.MARKER_CROSS, markerSize=18, thickness=2)
+
         # Draw matches
         if result.keypoints_drone is not None and result.keypoints_sat is not None:
             for i in range(len(result.keypoints_drone)):
@@ -951,15 +1105,34 @@ class SatelliteMatcher:
                 cv2.circle(vis, pt1, 3, color, -1)
                 cv2.circle(vis, pt2, 3, color, -1)
                 cv2.line(vis, pt1, pt2, color, 1)
-        
+
+        # Draw the projected drone footprint on the map side when homography exists.
+        if result.H is not None and np.all(np.isfinite(result.H)):
+            corners = np.array(
+                [[[0.0, 0.0], [w1 - 1.0, 0.0], [w1 - 1.0, h1 - 1.0], [0.0, h1 - 1.0]]],
+                dtype=np.float32,
+            )
+            try:
+                proj = cv2.perspectiveTransform(corners, result.H.astype(np.float64))[0]
+                proj[:, 0] += float(w1)
+                cv2.polylines(vis, [proj.astype(np.int32)], True, (0, 255, 255), 2, cv2.LINE_AA)
+            except Exception:
+                pass
+
         # Add text
         status = "SUCCESS" if result.success else "FAILED"
-        text = f"{status}: {result.num_inliers}/{result.num_matches} inliers, err={result.reproj_error:.2f}px"
-        cv2.putText(vis, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-        
+        text_lines = [
+            f"{status}: {result.num_inliers}/{result.num_matches} inliers, err={result.reproj_error:.2f}px"
+        ]
+        if title_lines:
+            text_lines.extend(str(line) for line in title_lines if line)
+
         if result.success:
-            offset_text = f"Offset: ({result.offset_px[0]:.1f}, {result.offset_px[1]:.1f}) px"
-            cv2.putText(vis, offset_text, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+            text_lines.append(f"Offset: ({result.offset_px[0]:.1f}, {result.offset_px[1]:.1f}) px")
+
+        for idx, line in enumerate(text_lines):
+            y = 30 + idx * 28
+            cv2.putText(vis, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
         
         if output_path:
             cv2.imwrite(output_path, vis)

@@ -1532,7 +1532,7 @@ vps:
   position_first_direct_xy_failsoft_guard_lowq_min_inliers: 4
   position_first_direct_xy_failsoft_guard_lowq_max_reproj_error: 1.6
   position_first_direct_xy_failsoft_guard_lowq_max_apply_dp_xy_m: 7.0
-  position_first_altitude_bypass_enable: true
+  position_first_altitude_bypass_enable: false
   position_first_altitude_bypass_min_m: -150.0
   position_first_altitude_bypass_max_m: 1500.0
   position_first_altitude_bypass_below_floor_m: 20.0
@@ -1599,11 +1599,36 @@ vps:
   max_frame_time_ms_local: 100.0
   max_frame_time_ms_global: 250.0
   max_clones: 3
-  max_delay_sec: 0.5
+  max_delay_sec: 1.0
   max_keypoints: 256
   max_image_side: 256
+  match_scale_aware_enable: true
+  match_scale_aware_min_ratio: 0.25
+  match_scale_aware_max_ratio: 4.0
+  structure_gate_enable: false
+  structure_gate_max_side: 256
+  structure_gate_canny_low: 50
+  structure_gate_canny_high: 150
+  structure_gate_hough_threshold: 20
+  structure_gate_min_line_length_px: 15
+  structure_gate_max_line_gap_px: 20
+  structure_gate_min_lines: 3
   matcher_timeout_ms: 80.0
-  hard_disable_below_m: 10.0
+  debug_match_dump_enable: false
+  debug_match_dump_start_t: 1774.0
+  debug_match_dump_end_t: 1776.0
+  debug_match_dump_max_frames: 6
+  debug_match_dump_failures: true
+  debug_match_dump_successes: true
+  map_rotation_rectify_enable: false
+  map_offset_e_m: 0.0
+  map_offset_n_m: 0.0
+  scale_aware_crop_enable: true
+  scale_aware_crop_fov_deg: 90.0
+  scale_aware_crop_margin_mult: 1.5
+  scale_aware_crop_min_patch_px: 128
+  scale_aware_crop_max_patch_px: 384
+  hard_disable_below_m: 45.0
   temporal_consensus_max_dir_change_deg: 50.0
   temporal_consensus_max_rel_mag_change: 0.55
   temporal_consensus_max_hits: 5
@@ -1626,9 +1651,13 @@ vps:
   max_offset_px_failsoft: 900.0
   max_reproj_error: 5.0
   max_reproj_error_failsoft: 4.0
-  min_altitude: 30.0
-  min_altitude_unknown_speed: 12.0
-  min_altitude_accuracy_mode: 10.0
+  min_altitude: 45.0
+  min_altitude_floor: 45.0
+  min_altitude_phase_early: 45.0
+  min_altitude_low_speed: 45.0
+  min_altitude_unknown_speed: 45.0
+  min_altitude_accuracy_mode: 45.0
+  min_altitude_high_speed: 45.0
   min_confidence: 0.22
   min_confidence_failsoft: 0.05
   min_content_ratio: 0.2
@@ -1682,7 +1711,9 @@ vps:
     local_first_time_fraction: 0.65
     local_first_min_candidates: 8
     local_first_min_time_ms: 220.0
-    local_first_center_radius_m: 45.0
+    local_first_center_radius_m: 180.0
+    high_alt_enable_above_m: 45.0
+    high_alt_local_first_center_radius_m: 180.0
     q2_reloc_burst_enable: false
     q2_reloc_burst_trigger_streak: 3
     q2_reloc_burst_offset_m: 25.0
@@ -1707,6 +1738,7 @@ vps:
       coarse_center_limit: 2
       coarse_candidate_limit: 3
       fine_refine_radius_m: 90.0
+      high_alt_fine_refine_radius_m: 120.0
       fine_refine_max_centers: 4
       anchor_require_strict: false
       anchor_min_inliers: 4

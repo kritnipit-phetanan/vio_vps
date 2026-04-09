@@ -758,11 +758,20 @@ class BootstrapService:
         else:
             print("[DEBUG] Debug tier=light (heavy CSV debug disabled)")
 
+        vps_debug_dump_enable = False
+        try:
+            if hasattr(runner.config, "_yaml_config") and runner.config._yaml_config:
+                vps_cfg = runner.config._yaml_config.get("vps", {})
+                vps_debug_dump_enable = bool(vps_cfg.get("debug_match_dump_enable", False))
+        except Exception:
+            vps_debug_dump_enable = False
+
         if runner.config.save_keyframe_images:
             runner.keyframe_dir = os.path.join(runner.config.output_dir, "debug_keyframes")
             os.makedirs(runner.keyframe_dir, exist_ok=True)
             print(f"[DEBUG] Keyframe images will be saved to: {runner.keyframe_dir}")
 
+        if runner.config.save_keyframe_images or bool(vps_debug_dump_enable):
             runner.vps_matches_dir = os.path.join(runner.config.output_dir, "debug_vps_matches")
             os.makedirs(runner.vps_matches_dir, exist_ok=True)
             print(f"[DEBUG] VPS match images will be saved to: {runner.vps_matches_dir}")
@@ -828,6 +837,9 @@ class BootstrapService:
 
                     if hasattr(runner, "vps_matches_dir") and runner.vps_matches_dir:
                         runner.vps_runner.save_matches_dir = runner.vps_matches_dir
+                        runner.vps_runner.debug_only_match_dump = bool(
+                            vps_debug_dump_enable and (not bool(runner.config.save_keyframe_images))
+                        )
                         print(f"[VPS] Match visualizations will be saved")
                     if getattr(runner, "vps_reloc_summary_csv", None):
                         runner.vps_runner.reloc_summary_csv = runner.vps_reloc_summary_csv

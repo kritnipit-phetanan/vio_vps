@@ -29,6 +29,7 @@ References:
 Author: VIO project
 """
 
+import os
 import time
 import heapq
 import copy
@@ -938,6 +939,11 @@ def run_event_driven_loop(runner):
     print("\n=== Running (Pure Event-driven mode) ===")
     print(f"[FUSION] Fusion delay: {filter_state.fusion_delay*1000:.1f}ms")
     tic_all = time.time()
+    stop_time_env = os.getenv("VIO_STOP_TIME", "").strip()
+    try:
+        stop_time_sim = float(stop_time_env) if stop_time_env else float("nan")
+    except Exception:
+        stop_time_sim = float("nan")
     
     last_a_world = np.array([0.0, 0.0, 0.0])
     last_output_time = filter_state.t0
@@ -1079,6 +1085,9 @@ def run_event_driven_loop(runner):
             fusion_lag = filter_state.output_time - filter_state.filter_time
             print(f"t={time_elapsed:8.3f}s | speed={speed_ms*3.6:5.1f}km/h | "
                   f"lag={fusion_lag*1000:.1f}ms | events={event_count}", end="\r")
+        if np.isfinite(stop_time_sim) and float(t_measurement) >= float(stop_time_sim):
+            print(f"\n[STOP] VIO_STOP_TIME reached at t={float(t_measurement):.6f}s")
+            break
     
     # =========================================================================
     # Step 5: Finish

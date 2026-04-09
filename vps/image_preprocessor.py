@@ -292,7 +292,8 @@ class VPSImagePreprocessor:
                    altitude_m: float,
                    target_gsd: float,
                    grayscale: bool = True,
-                   target_gsd_scale: float = 1.0) -> PreprocessResult:
+                   target_gsd_scale: float = 1.0,
+                   rotate_to_north_up: bool = True) -> PreprocessResult:
         """
         Full preprocessing pipeline.
         
@@ -303,6 +304,7 @@ class VPSImagePreprocessor:
             target_gsd: Satellite map GSD (m/px)
             grayscale: Convert to grayscale (most matchers prefer this)
             target_gsd_scale: Multiplier for target GSD (for scale hypothesis search)
+            rotate_to_north_up: Rotate drone image into map-aligned north-up frame
             
         Returns:
             PreprocessResult with processed image and metadata
@@ -310,8 +312,8 @@ class VPSImagePreprocessor:
         # 1. Undistort
         undistorted = self.undistort(img)
         
-        # 2. Rotate to North-Up
-        rotated = self.rotate_to_north_up(undistorted, yaw_rad)
+        # 2. Rotate to North-Up unless caller wants raw heading retained.
+        rotated = self.rotate_to_north_up(undistorted, yaw_rad) if rotate_to_north_up else undistorted
         
         # 3. Scale to match satellite GSD
         drone_gsd = self.compute_drone_gsd(altitude_m)
@@ -335,7 +337,7 @@ class VPSImagePreprocessor:
         return PreprocessResult(
             image=final,
             scale_factor=scale_factor,
-            rotation_deg=-math.degrees(yaw_rad),
+            rotation_deg=(-math.degrees(yaw_rad) if rotate_to_north_up else 0.0),
             drone_gsd=drone_gsd,
             target_gsd=target_gsd_eff,
             content_ratio=content_ratio,

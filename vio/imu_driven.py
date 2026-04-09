@@ -6,6 +6,7 @@ Separated from main_loop.py for modularity.
 
 Author: VIO project
 """
+import os
 import time
 import gc
 import sys
@@ -299,6 +300,11 @@ def run_imu_driven_loop(runner):
     # Main IMU-driven loop
     print("\n=== Running (IMU-driven with preintegration cache) ===")
     tic_all = time.time()
+    stop_time_env = os.getenv("VIO_STOP_TIME", "").strip()
+    try:
+        stop_time_sim = float(stop_time_env) if stop_time_env else float("nan")
+    except Exception:
+        stop_time_sim = float("nan")
     
     # Store last a_world for state_debug logging
     last_a_world = np.array([0.0, 0.0, 0.0])
@@ -600,6 +606,9 @@ def run_imu_driven_loop(runner):
             speed_ms = float(np.linalg.norm(runner.kf.x[3:6, 0]))
             print(f"t={time_elapsed:8.3f}s | speed={speed_ms*3.6:5.1f}km/h | "
                     f"phase={runner.PHASE_NAMES[runner.state.current_phase]}", end="\r")
+        if np.isfinite(stop_time_sim) and float(t) >= float(stop_time_sim):
+            print(f"\n[STOP] VIO_STOP_TIME reached at t={float(t):.6f}s")
+            break
     
     toc_all = time.time()
     
